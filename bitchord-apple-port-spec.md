@@ -217,18 +217,23 @@ All files in `ui/screens/*.kt` and `ui/components/*.kt` are Compose — full rew
 |---|---|---|
 | `HomeScreen.kt` | `HomeView.swift` | |
 | `SearchScreen.kt` | `SearchView.swift` | |
-| `LibraryScreen.kt` | `LibraryView.swift` | |
+| `LibraryScreen.kt` | `LibraryView.swift` | Includes `LibraryGridPage` — the full-screen "see all" grid the library shelves open into. |
 | `LocalMusicScreen.kt` | `LocalMusicView.swift` | Local file scanning — use `MediaLibrary`/manual directory scan on macOS, `MPMediaLibrary` is iOS-only and permission-gated; for macOS, scan a user-selected folder via `NSOpenPanel` + security-scoped bookmarks. |
 | `DetailScreen.kt` | `DetailView.swift` | |
+| `HistoryScreen.kt` | `HistoryView.swift` | Listening history page (opened from settings/player menu). |
 | `SourcesScreen.kt` | `SourcesView.swift` | |
 | `DiscordScreen.kt`, `auth/DiscordLoginScreen.kt` | `DiscordSettingsView.swift`, `DiscordLoginView.swift` | Discord OAuth flow — use `ASWebAuthenticationSession` on Apple, replacing whatever Android custom-tabs/WebView flow upstream uses. |
 | `auth/YtMusicLoginScreen.kt` | `YtMusicLoginView.swift` | Same OAuth pattern via `ASWebAuthenticationSession`. |
+| `SpotifyCanvasAuthScreen.kt` | `SpotifyCanvasAuthView.swift` | Spotify OAuth for the canvas-artwork source — same `ASWebAuthenticationSession` pattern. |
+| `ui/replay/*.kt` (`ReplayScreen`, `ReplayCard`, `ReplayModel`, `ReplayPoster`, `ReplayStories`, `ReplayShareSheet`) | `ReplayView.swift` + supporting views | Year-in-review package (stats, story pages, shareable poster/images). All rendering — rebase on SwiftUI `Canvas`/`ImageRenderer` for the poster and story exports; the model logic (`ReplayModel`) is pure Kotlin and belongs in `shared`. |
 | `AccountAndScrobblingScreen.kt` | `AccountSettingsView.swift` | |
 | `SettingsSheet.kt` | `SettingsView.swift` | |
 | `ui/player/NowPlayingScreen.kt`, `CanvasArtworkPlayer.kt`, `MeshGradient.kt`, `ThinSlider.kt` | `NowPlayingView.swift` + supporting views | `MeshGradient.kt`'s animated gradient background has a near-direct SwiftUI equivalent in `MeshGradient` (SwiftUI, iOS 18+/macOS 15+ native API) — check minimum OS target before relying on it; fall back to a custom `Canvas`-based gradient if targeting earlier OS versions. |
-| `ui/components/*` (MiniPlayer, FloatingBottomBar, FrostedTopBar, TopFadeBlur, BottomFadeBlur, ArtworkBackdrop, PlaylistPickerSheet, SongActionsSheet, LyricsSourcesDialog, AccountAlerts, Skeletons, Common) | One SwiftUI view per file, same names minus `.kt` | Frosted/blur effects → `.background(.ultraThinMaterial)` or `NSVisualEffectView` wrapper on macOS. |
+| `ui/components/*` (MiniPlayer, FloatingBottomBar, FrostedTopBar, TopFadeBlur, BottomFadeScrim, ArtworkBackdrop, PlaylistPickerSheet, SongActionsSheet, BrowseActionsSheet, DownloadManagerSheet, LyricsSourcesDialog, AppLanguageDialog, UpdateAvailableDialog, AccountAlerts, Skeletons, Common) | One SwiftUI view per file, same names minus `.kt` | Frosted/blur effects → `.background(.ultraThinMaterial)` or `NSVisualEffectView` wrapper on macOS. |
+| `ui/haptics/Haptics.kt` | Haptics helper in Swift | Named haptic events (`Select`, `Tick`, …) → `UIImpactFeedbackGenerator`/`sensoryFeedback` on iOS; no-op fallback on macOS. |
+| `ui/ForegroundState.kt` | Scene-phase handling | App foreground/background observation — `\.scenePhase` in SwiftUI. |
 | `ui/theme/Theme.kt`, `ArtworkPalette.kt` | `Theme.swift`, `ArtworkPalette.swift` | Color-from-artwork extraction logic (palette generation) is a pure algorithm — port the *algorithm* into `shared` as common Kotlin if it doesn't depend on Android's `Palette` library; if it does depend on `androidx.palette`, reimplement using a Swift color-quantization approach (e.g. k-means on downsampled pixel data) instead of porting. |
-| `ui/icons/BitChordIcons.kt` | SF Symbols where equivalents exist, custom SVG→SwiftUI `Path` otherwise | |
+| `ui/icons/BitChordIcons.kt` | Upstream-first: export each glyph's path data to SVG → asset-catalog template images (UI spec §6); SF Symbols only for the documented exceptions (transport glyphs, back chevron, share) | |
 | `MainViewModel.kt` | Split: portable state-derivation logic → `shared` as a common `StateFlow`-based ViewModel-equivalent (exposed to Swift via KMP-NativeCoroutines); platform glue (navigation, lifecycle) → native Swift `@Observable` view models per screen |
 
 ---
