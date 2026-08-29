@@ -1,0 +1,23 @@
+# Gradle / Kotlin
+.gradle/
+.kotlin/
+**/build/
+local.properties
+
+# Rust
+native-core/target/
+native-core/bindings/
+native-core/build-xcframework/
+
+# Xcode — all generated: project by xcodegen, frameworks by the build scripts,
+# Info.plists + entitlements by xcodegen from project.yml
+AppleApp/*.xcodeproj
+AppleApp/Frameworks/
+AppleApp/Generated/
+AppleApp/BitChord-Info.plist
+AppleApp/BitChordWidget-Info.plist
+AppleApp/*.entitlements
+xcuserdata/
+DerivedData/
+
+.DS_Store

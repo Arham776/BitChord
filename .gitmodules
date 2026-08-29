@@ -1,0 +1,3 @@
+[submodule "vendor/bitchord-upstream"]
+	path = vendor/bitchord-upstream
+	url = https://github.com/kushagrasinghx/BitChord
