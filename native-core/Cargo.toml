@@ -1,0 +1,33 @@
+[package]
+name = "native-core"
+version = "0.1.0"
+edition = "2021"
+description = "BitChord native core: analyzer + decode/mix playback engine behind one UniFFI boundary (spec sections 2 and 3)."
+
+[lib]
+name = "native_core"
+crate-type = ["staticlib", "cdylib"]
+
+# UniFFI ships no published bindgen CLI crate; the official route is a bin in
+# your own crate calling uniffi::uniffi_bindgen_main(). Version match with the
+# uniffi crate is automatic. required-features keeps cross-compilation of the
+# staticlib free of the CLI feature; run it via scripts/build-native-core.sh.
+[[bin]]
+name = "uniffi-bindgen"
+path = "uniffi-bindgen.rs"
+required-features = ["uniffi/cli"]
+
+[dependencies]
+# One FFI boundary for Swift and Kotlin bindings (spec §2).
+uniffi = "0.32"
+
+# --- Deferred until the milestones that need them (kept here as the shopping list) ---
+# symphonia = "0.6.1"   # §3.1 Decoder — enable after the milestone-4 format-coverage spike
+# cpal = "0.18.2"       # §3.1 audio output — milestone 4
+# oddio = "0.7.4"       # §3.1 candidate mixer — gated by the milestone-4 go/no-go
+# lofty = "0.25.1"      # §4 tagging — milestone 9 (verify WebM/Opus write support first)
+# ort = "2.0.0-rc.13"   # §2 ONNX inference — no stable release yet; pin to the opset of
+#                       # upstream's ONNX Runtime dependency before enabling (milestone 5)
+
+# No build.rs needed: the proc-macro route (#[uniffi::export] + setup_scaffolding!)
+# replaces the UDL/uniffi-build setup.

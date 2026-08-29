@@ -1,0 +1,77 @@
+# xcodegen spec — app target + WidgetKit extension target, shared App Group
+# entitlement (spec §0, §9). Generate with: xcodegen generate
+# Deployment targets sit at the interactive-widget floor (spec §9); if they are
+# ever lowered, widget transport controls degrade to tap-to-open.
+name: BitChord
+options:
+  bundleIdPrefix: com.music.bitchord
+  createIntermediateGroups: true
+  deploymentTarget:
+    iOS: "17.0"
+    macOS: "14.0"
+settings:
+  base:
+    SWIFT_VERSION: "5"
+    MARKETING_VERSION: "0.1.0"
+    CURRENT_PROJECT_VERSION: "1"
+    # The spec (§0) ports arm64 targets only: iosArm64, iosSimulatorArm64,
+    # macosArm64. Generic iOS Simulator destinations otherwise attempt a
+    # universal arm64+x86_64 build, which cannot link against the arm64-only
+    # BitChordShared / NativeCoreFFI slices.
+    EXCLUDED_ARCHS[sdk=iphonesimulator*]: x86_64
+    EXCLUDED_ARCHS[sdk=macosx*]: x86_64
+targets:
+  BitChord:
+    type: application
+    supportedDestinations: [iOS, macOS]
+    sources:
+      - path: Sources
+        excludes:
+          - "Widget/**"
+      # UniFFI-generated NativeCore.swift lands here via scripts/build-native-core.sh.
+      - path: Generated
+        optional: true
+    dependencies:
+      - target: BitChordWidget
+        embed: true
+      - framework: Frameworks/BitChordShared.xcframework
+        embed: true
+      - framework: Frameworks/NativeCoreFFI.xcframework
+        embed: true
+    info:
+      path: BitChord-Info.plist
+      properties:
+        CFBundleDisplayName: BitChord
+        CFBundleShortVersionString: "$(MARKETING_VERSION)"
+        CFBundleVersion: "$(CURRENT_PROJECT_VERSION)"
+        LSApplicationCategoryType: public.app-category.music
+        UIBackgroundModes:
+          - audio
+        UILaunchScreen: {}
+    entitlements:
+      path: BitChord.entitlements
+      properties:
+        com.apple.security.app-sandbox: true
+        com.apple.security.network.client: true
+        com.apple.security.files.user-selected.read-write: true
+        com.apple.security.application-groups:
+          - group.com.music.bitchord
+  BitChordWidget:
+    type: app-extension
+    supportedDestinations: [iOS, macOS]
+    sources:
+      - Sources/Widget
+    info:
+      path: BitChordWidget-Info.plist
+      properties:
+        CFBundleDisplayName: BitChord Widget
+        CFBundleShortVersionString: "$(MARKETING_VERSION)"
+        CFBundleVersion: "$(CURRENT_PROJECT_VERSION)"
+        NSExtension:
+          NSExtensionPointIdentifier: com.apple.widgetkit-extension
+    entitlements:
+      path: BitChordWidget.entitlements
+      properties:
+        com.apple.security.app-sandbox: true
+        com.apple.security.application-groups:
+          - group.com.music.bitchord
