@@ -4,7 +4,7 @@
 # ever lowered, widget transport controls degrade to tap-to-open.
 name: BitChord
 options:
-  bundleIdPrefix: com.music.bitchord
+  bundleIdPrefix: com.example
   createIntermediateGroups: true
   deploymentTarget:
     iOS: "17.0"
@@ -24,6 +24,9 @@ targets:
   BitChord:
     type: application
     supportedDestinations: [iOS, macOS]
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.example.bitchord
     sources:
       - path: Sources
         excludes:
@@ -55,10 +58,13 @@ targets:
         com.apple.security.network.client: true
         com.apple.security.files.user-selected.read-write: true
         com.apple.security.application-groups:
-          - group.com.music.bitchord
+          - group.com.example.bitchord
   BitChordWidget:
     type: app-extension
     supportedDestinations: [iOS, macOS]
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.example.bitchord.widget
     sources:
       - Sources/Widget
     info:
@@ -74,4 +80,4 @@ targets:
       properties:
         com.apple.security.app-sandbox: true
         com.apple.security.application-groups:
-          - group.com.music.bitchord
+          - group.com.example.bitchord
