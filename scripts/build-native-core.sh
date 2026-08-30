@@ -10,6 +10,12 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT/native-core"
+# Match AppleApp/project.yml deployment targets (iOS 18, macOS 15) — avoids
+# "was built for newer macOS version (26.5) than being linked (15.0)" warnings
+# and keeps the Rust standard library's darwin thread-parking QoS aligned.
+export MACOSX_DEPLOYMENT_TARGET=15.0
+export IPHONEOS_DEPLOYMENT_TARGET=18.0
+export IPHONESIMULATOR_DEPLOYMENT_TARGET=18.0
 
 TARGETS=(
   aarch64-apple-darwin
@@ -57,7 +63,7 @@ rm -rf "$STAGE"
 CREATE_ARGS=()
 
 platform_dir_for() { case "$1" in aarch64-apple-darwin) echo macos ;; aarch64-apple-ios) echo ios ;; *) echo ios-simulator ;; esac; }
-min_os_for()       { case "$1" in aarch64-apple-darwin) echo 14.0 ;; *) echo 17.0 ;; esac; }
+min_os_for()       { case "$1" in aarch64-apple-darwin) echo 15.0 ;; *) echo 18.0 ;; esac; }
 platform_name_for(){ case "$1" in aarch64-apple-darwin) echo MacOSX ;; aarch64-apple-ios) echo iPhoneOS ;; *) echo iPhoneSimulator ;; esac; }
 
 for t in "${TARGETS[@]}"; do

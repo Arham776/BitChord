@@ -6,7 +6,7 @@ description = "BitChord native core: analyzer + decode/mix playback engine behin
 
 [lib]
 name = "native_core"
-crate-type = ["staticlib", "cdylib"]
+crate-type = ["staticlib", "cdylib", "rlib"]
 
 # UniFFI ships no published bindgen CLI crate; the official route is a bin in
 # your own crate calling uniffi::uniffi_bindgen_main(). Version match with the
@@ -20,14 +20,35 @@ required-features = ["uniffi/cli"]
 [dependencies]
 # One FFI boundary for Swift and Kotlin bindings (spec §2).
 uniffi = "0.32"
+log = "0.4"
+env_logger = "0.11"
 
-# --- Deferred until the milestones that need them (kept here as the shopping list) ---
-# symphonia = "0.6.1"   # §3.1 Decoder — enable after the milestone-4 format-coverage spike
-# cpal = "0.18.2"       # §3.1 audio output — milestone 4
-# oddio = "0.7.4"       # §3.1 candidate mixer — gated by the milestone-4 go/no-go
-# lofty = "0.25.1"      # §4 tagging — milestone 9 (verify WebM/Opus write support first)
-# ort = "2.0.0-rc.13"   # §2 ONNX inference — no stable release yet; pin to the opset of
-#                       # upstream's ONNX Runtime dependency before enabling (milestone 5)
+# §3.1 Decoder — enabled after the milestone-4 format-coverage spike. Feature
+# list mirrors the container/codec matrix the spec calls out: FLAC, MP3,
+# AAC/M4A, ALAC, Vorbis, PCM/WAV, AIFF. Milestone-4 gate result (§3.4):
+# symphonia 0.6 ships no Opus codec; the app mirrors upstream's own
+# `pickAac`/`isM4a` preference so playback targets AAC/MP4 renditions, and
+# Opus-in-WebM decode is the documented residual gap (libopus bindings if a
+# source only ever offers Opus).
+symphonia = { version = "0.6.1", default-features = false, features = [
+  "flac", "mp3", "aac", "alac", "vorbis", "pcm", "wav", "ogg", "isomp4", "mkv", "aiff",
+] }
+
+# §3.1 audio output — CoreAudio backend on Apple.
+cpal = "0.18"
+
+# §4 tagging + local-library metadata reads (milestone 9, pulled early because
+# LocalMusicView needs real tags to be a working app).
+lofty = "0.25"
+
+# §3.1 StreamingReader — blocking HTTP client behind a background fetch thread.
+# native-tls uses the system TLS (Secure Transport on Apple) so the TLS
+# fingerprint matches what googlevideo expects — rustls gets 403'd.
+ureq = { version = "2", features = ["native-tls"] }
+
+# Mixer plumbing: control→render commands and the real-time output ring.
+crossbeam-channel = "0.5"
+rtrb = "0.3"
 
 # No build.rs needed: the proc-macro route (#[uniffi::export] + setup_scaffolding!)
 # replaces the UDL/uniffi-build setup.

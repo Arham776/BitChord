@@ -31,7 +31,6 @@ kotlin {
             implementation("io.ktor:ktor-client-core:3.2.0")
             implementation("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.10.2")
             implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.9.0")
-            implementation("com.russhwolf:multiplatform-settings:1.3.0")
             implementation("com.rickclephas.kmp:kmp-nativecoroutines-core:1.0.5")
             // sqldelight: add only if upstream Room usage is confirmed (spec §1.1).
         }

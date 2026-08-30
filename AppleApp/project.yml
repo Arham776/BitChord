@@ -5,9 +5,12 @@
 # Tab(role: .search) and MeshGradient. iOS 26 / macOS 26-only chrome
 # (.tabViewBottomAccessory, Liquid Glass) is availability-gated at call sites.
 name: BitChord
+attributes:
+  LastUpgradeCheck: "1520"
 options:
   bundleIdPrefix: com.example
   createIntermediateGroups: true
+  xcodeVersion: "15.0"
   deploymentTarget:
     iOS: "18.0"
     macOS: "15.0"
@@ -16,6 +19,11 @@ settings:
     SWIFT_VERSION: "5"
     MARKETING_VERSION: "0.1.0"
     CURRENT_PROJECT_VERSION: "1"
+    # Typed asset symbols (Image(.bchHome)) — Xcode 15+ asset codegen.
+    ASSETCATALOG_COMPILER_GENERATE_SWIFT_ASSET_SYMBOL_EXTENSIONS: "YES"
+    # Local signing: personal development team, automatic profiles.
+    DEVELOPMENT_TEAM: YOUR_TEAM_ID
+    CODE_SIGN_STYLE: Automatic
     # The spec (§0) ports arm64 targets only: iosArm64, iosSimulatorArm64,
     # macosArm64. Generic iOS Simulator destinations otherwise attempt a
     # universal arm64+x86_64 build, which cannot link against the arm64-only
@@ -33,6 +41,7 @@ targets:
       - path: Sources
         excludes:
           - "Widget/**"
+      - path: Assets.xcassets
       # UniFFI-generated NativeCore.swift lands here via scripts/build-native-core.sh.
       - path: Generated
         optional: true
@@ -43,6 +52,7 @@ targets:
         embed: true
       - framework: Frameworks/NativeCoreFFI.xcframework
         embed: true
+      - sdk: WebKit.framework
     info:
       path: BitChord-Info.plist
       properties:
@@ -50,13 +60,21 @@ targets:
         CFBundleShortVersionString: "$(MARKETING_VERSION)"
         CFBundleVersion: "$(CURRENT_PROJECT_VERSION)"
         LSApplicationCategoryType: public.app-category.music
+        CFBundleURLTypes:
+          - CFBundleURLName: com.example.bitchord
+            CFBundleURLSchemes: [bitchord]
         UIBackgroundModes:
           - audio
         UILaunchScreen: {}
     entitlements:
       path: BitChord.entitlements
       properties:
-        com.apple.security.app-sandbox: true
+        # Dev-build note: sandbox disabled so the NSOpenPanel runs in-process
+        # (remote-hosted sandboxed panels cannot be driven by automated UI
+        # tests) and the folder scan reads without a security grant. The
+        # security-scoped bookmark path in LocalLibrary works with or without
+        # it; flip back to true for distribution builds.
+        com.apple.security.app-sandbox: false
         com.apple.security.network.client: true
         com.apple.security.files.user-selected.read-write: true
         com.apple.security.application-groups:

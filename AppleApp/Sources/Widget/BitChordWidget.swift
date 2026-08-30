@@ -1,27 +1,60 @@
 import SwiftUI
 import WidgetKit
 
-// Milestone-1 scaffold of the §9 widget: placeholder provider + families only.
-// Real snapshot rendering (App Group state), transport App Intents, and the
-// deep link land at milestone 13. The extension never links native-core.
+// The §9 widget, snapshot-driven per the parity contract: ready-to-play
+// state with no position, prev/next availability dimmed not removed, dark
+// gradient placeholder when there is no art, single-entry timeline pushed by
+// WidgetStatePublisher. The extension never links native-core and never
+// touches the network. Tapping opens the player (deep link §9).
+
+private let groupDefaults = UserDefaults(suiteName: "group.com.example.bitchord")
 
 struct MediaWidgetEntry: TimelineEntry {
     let date: Date
+    let title: String
+    let artist: String
+    let playing: Bool
+    let canNext: Bool
+    let canPrevious: Bool
+    let artwork: Data?
+    let hasSession: Bool
+
+    /// Upstream's last-played fallback: the widget is never blank after a
+    /// first play, so an empty snapshot renders the placeholder, not nothing.
+    static let empty = MediaWidgetEntry(
+        date: .now, title: "BitChord", artist: "Nothing queued",
+        playing: false, canNext: false, canPrevious: false,
+        artwork: nil, hasSession: false
+    )
 }
 
 struct MediaWidgetProvider: TimelineProvider {
-    func placeholder(in context: Context) -> MediaWidgetEntry {
-        MediaWidgetEntry(date: .now)
-    }
+    func placeholder(in context: Context) -> MediaWidgetEntry { snapshot() }
 
     func getSnapshot(in context: Context, completion: @escaping (MediaWidgetEntry) -> Void) {
-        completion(MediaWidgetEntry(date: .now))
+        completion(snapshot())
     }
 
     func getTimeline(in context: Context, completion: @escaping (Timeline<MediaWidgetEntry>) -> Void) {
-        // Single-entry timeline; freshness is push-driven by WidgetStatePublisher
-        // (spec §3.2) calling WidgetCenter.reloadTimelines — no polling.
-        completion(Timeline(entries: [MediaWidgetEntry(date: .now)], policy: .never))
+        // Single entry: freshness is push-driven by WidgetStatePublisher's
+        // reloadTimelines, never polled (spec §9).
+        completion(Timeline(entries: [snapshot()], policy: .never))
+    }
+
+    private func snapshot() -> MediaWidgetEntry {
+        guard let defaults = groupDefaults, let title = defaults.string(forKey: "widget.title") else {
+            return .empty
+        }
+        return MediaWidgetEntry(
+            date: .now,
+            title: title,
+            artist: defaults.string(forKey: "widget.artist") ?? "",
+            playing: defaults.bool(forKey: "widget.playing"),
+            canNext: defaults.bool(forKey: "widget.canNext"),
+            canPrevious: defaults.bool(forKey: "widget.canPrevious"),
+            artwork: defaults.string(forKey: "widget.artworkPath").flatMap { try? Data(contentsOf: URL(fileURLWithPath: $0)) },
+            hasSession: true
+        )
     }
 }
 
@@ -29,17 +62,78 @@ struct MediaWidgetView: View {
     var entry: MediaWidgetEntry
 
     var body: some View {
-        VStack(spacing: 4) {
-            Text("BitChord")
-                .font(.headline)
-            Text("Widget scaffold — snapshot state will come from the App Group (spec §9).")
-                .font(.caption2)
-                .foregroundStyle(.secondary)
-                .multilineTextAlignment(.center)
+        content
+            .widgetURL(URL(string: "bitchord://open-player"))
+            .containerBackground(.fill.tertiary, for: .widget)
+    }
+
+    @ViewBuilder
+    private var content: some View {
+        if entry.hasSession {
+            HStack(spacing: 12) {
+                artwork
+                    .frame(width: 56, height: 56)
+                    .clipShape(.rect(cornerRadius: 9, style: .continuous))
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(entry.title)
+                        .font(.callout.weight(.semibold))
+                        .lineLimit(1)
+                    Text(entry.artist)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                    HStack(spacing: 6) {
+                        Image(systemName: entry.playing ? "pause.fill" : "play.fill")
+                            .font(.system(size: 10, weight: .bold))
+                        Text(entry.playing ? "Playing" : "Ready to play")
+                            .font(.caption2.weight(.medium))
+                    }
+                    .foregroundStyle(entry.playing ? Color.accentColor : .secondary)
+                }
+                Spacer(minLength: 0)
+            }
+            .padding(4)
+        } else {
+            VStack(spacing: 6) {
+                Image(systemName: "music.note")
+                    .foregroundStyle(.secondary)
+                Text("BitChord")
+                    .font(.callout.weight(.semibold))
+            }
         }
-        .containerBackground(.fill.tertiary, for: .widget)
+    }
+
+    @ViewBuilder
+    private var artwork: some View {
+        if let data = entry.artwork, let image = platformImage(data) {
+            Image(platform: image)
+                .resizable()
+                .scaledToFill()
+        } else {
+            ZStack {
+                LinearGradient(
+                    colors: [Color(red: 0.12, green: 0.10, blue: 0.16),
+                             Color(red: 0.05, green: 0.05, blue: 0.08)],
+                    startPoint: .top, endPoint: .bottom
+                )
+                Image(systemName: "music.note")
+                    .foregroundStyle(.white.opacity(0.55))
+            }
+        }
     }
 }
+
+#if os(macOS)
+private func platformImage(_ data: Data) -> NSImage? { NSImage(data: data) }
+private extension Image {
+    init(platform image: NSImage) { self.init(nsImage: image) }
+}
+#else
+private func platformImage(_ data: Data) -> UIImage? { UIImage(data: data) }
+private extension Image {
+    init(platform image: UIImage) { self.init(uiImage: image) }
+}
+#endif
 
 struct BitChordMediaWidget: Widget {
     var body: some WidgetConfiguration {
