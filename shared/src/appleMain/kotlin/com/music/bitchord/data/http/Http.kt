@@ -4,6 +4,7 @@ import io.ktor.client.HttpClient
 import io.ktor.client.engine.darwin.Darwin
 import io.ktor.client.plugins.HttpTimeout
 import io.ktor.client.plugins.timeout
+import io.ktor.client.request.forms.FormDataContent
 import io.ktor.client.request.get
 import io.ktor.client.request.header
 import io.ktor.client.request.parameter
@@ -14,29 +15,42 @@ import io.ktor.client.statement.bodyAsBytes
 import io.ktor.client.statement.bodyAsChannel
 import io.ktor.client.statement.bodyAsText
 import io.ktor.http.ContentType
+import io.ktor.http.Parameters
 import io.ktor.http.contentType
 import io.ktor.utils.io.cancel
 import io.ktor.utils.io.readRemaining
 import kotlinx.io.readByteArray
+import platform.Foundation.NSHTTPCookie
+import platform.Foundation.NSHTTPCookieDomain
+import platform.Foundation.NSHTTPCookieName
+import platform.Foundation.NSHTTPCookieOriginURL
+import platform.Foundation.NSHTTPCookiePath
+import platform.Foundation.NSHTTPCookieSecure
+import platform.Foundation.NSHTTPCookieStorage
+import platform.Foundation.NSHTTPCookieValue
+import platform.Foundation.NSURL
 
 /**
- * Port of upstream `data/Http.kt`, Swift-flavoured per spec §1.2: a single
- * Ktor `HttpClient(Darwin)` for the whole app, preserving the header/user-
- * agent logic Innertube is sensitive to. (Upstream's connection-pool sizing
- * is OkHttp-specific; the Darwin engine manages its own session pool.)
+ * Port of upstream `data/Http.kt`, Swift-flavoured per spec §1.2.
+ *
+ * Darwin URLSession strips a `Cookie` header the way OkHttp does not, so
+ * WEB_REMIX cookies live in an isolated [NSHTTPCookieStorage] the API
+ * client actually sends. The media client keeps storage off so googlevideo
+ * never sees the session (LOGIN_REQUIRED).
  */
 actual object Http {
+
+    private const val COOKIE_GROUP = "group.com.example.bitchord"
+
+    private val apiCookies: NSHTTPCookieStorage =
+        NSHTTPCookieStorage.sharedCookieStorageForGroupContainerIdentifier(COOKIE_GROUP)
 
     /** API client — non-2xx is an error for innertube POSTs/GETs. */
     private val client: HttpClient = HttpClient(Darwin) {
         engine {
-            // Session cookies are attached explicitly on WEB_REMIX browse
-            // (Innertube.authHeaders). Auto-handling would also send them on
-            // ANDROID player / googlevideo ranges — Google answers that with
-            // LOGIN_REQUIRED, and it is the misuse we must not do.
             configureSession {
-                HTTPShouldSetCookies = false
-                HTTPCookieStorage = null
+                HTTPShouldSetCookies = true
+                HTTPCookieStorage = apiCookies
             }
         }
         install(HttpTimeout)
@@ -44,11 +58,61 @@ actual object Http {
     }
 
     /**
-     * Media client sharing the same Darwin engine/session pool as [client].
-     * `expectSuccess` is off so a 403 probe is data, not an exception.
-     * Built once — never via per-call `client.config {}`.
+     * Media client: a separate Darwin session with no cookie jar. Built
+     * once — never via per-call `client.config {}`, which would inherit
+     * the API session's cookies.
      */
-    private val mediaClient: HttpClient = client.config { expectSuccess = false }
+    private val mediaClient: HttpClient = HttpClient(Darwin) {
+        engine {
+            configureSession {
+                HTTPShouldSetCookies = false
+                HTTPCookieStorage = null
+            }
+        }
+        install(HttpTimeout)
+        expectSuccess = false
+    }
+
+    actual fun installSessionCookies(header: String?) {
+        apiCookies.cookies?.let { list ->
+            (list as List<*>).filterIsInstance<NSHTTPCookie>().forEach { cookie ->
+                apiCookies.deleteCookie(cookie)
+            }
+        }
+        if (header.isNullOrBlank()) return
+        var installed = 0
+        header.split(';').forEach { entry ->
+            val name = entry.substringBefore('=').trim()
+            val value = entry.substringAfter('=', "").trim()
+            if (name.isEmpty() || value.isEmpty()) return@forEach
+            cookieWith(name, value)?.let {
+                apiCookies.setCookie(it)
+                installed++
+            }
+        }
+        println("[Http] installed $installed session cookies for WEB_REMIX")
+    }
+
+    private fun cookieWith(name: String, value: String): NSHTTPCookie? {
+        val props: Map<Any?, Any> = if (name.startsWith("__Host-")) {
+            mapOf(
+                NSHTTPCookieName to name,
+                NSHTTPCookieValue to value,
+                NSHTTPCookiePath to "/",
+                NSHTTPCookieSecure to "TRUE",
+                NSHTTPCookieOriginURL to (NSURL(string = "https://music.youtube.com/") ?: return null),
+            )
+        } else {
+            mapOf(
+                NSHTTPCookieName to name,
+                NSHTTPCookieValue to value,
+                NSHTTPCookieDomain to ".youtube.com",
+                NSHTTPCookiePath to "/",
+                NSHTTPCookieSecure to "TRUE",
+            )
+        }
+        return NSHTTPCookie.cookieWithProperties(props)
+    }
 
     /** POST JSON, return the response body as text — the shape every
      *  innertube call takes. Timeouts mirror upstream's 20 s connect /
@@ -85,6 +149,20 @@ actual object Http {
         query.forEach { (key, value) -> parameter(key, value) }
     }.bodyAsText()
 
+    actual suspend fun getStatus(
+        url: String,
+        headers: Map<String, String>,
+        query: Map<String, String>,
+        timeoutMillis: Long,
+    ): Int = client.get(url) {
+        timeout {
+            requestTimeoutMillis = timeoutMillis
+            connectTimeoutMillis = 20_000
+        }
+        headers.forEach { (key, value) -> header(key, value) }
+        query.forEach { (key, value) -> parameter(key, value) }
+    }.status.value
+
     /** GET, return the response body as raw bytes. */
     actual suspend fun getBytes(
         url: String,
@@ -103,6 +181,22 @@ actual object Http {
         }
         return response.bodyAsBytes()
     }
+
+    actual suspend fun postForm(
+        url: String,
+        fields: Map<String, String>,
+        headers: Map<String, String>,
+        timeoutMillis: Long,
+    ): String = mediaClient.post(url) {
+        timeout {
+            requestTimeoutMillis = timeoutMillis
+            connectTimeoutMillis = 20_000
+        }
+        headers.forEach { (key, value) -> header(key, value) }
+        setBody(FormDataContent(Parameters.build {
+            fields.forEach { (k, v) -> append(k, v) }
+        }))
+    }.bodyAsText()
 
     /**
      * A ranged GET with a short leash — upstream's stream `probe`.
@@ -142,9 +236,6 @@ actual object Http {
             if (!bodyArrived) {
                 return ProbeResult(status = status, contentType = ct, bodyArrived = false)
             }
-            // One 16 KiB peek. A second 1 MiB range doubled first-play latency
-            // and is redundant for ANDROID itag-18: grudging VR URLs still die
-            // when StreamDownload asks for the next chunk.
             ProbeResult(status = status, contentType = ct, bodyArrived = true)
         } catch (_: Exception) {
             ProbeResult(status = -1, contentType = null, bodyArrived = false)

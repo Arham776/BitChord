@@ -1,18 +1,24 @@
 //! Analyzer (spec §2): Rust port of upstream `native/analyzer` C++.
 //!
-//! This module carries the pure-DSP half of the analyzer — the resampler and
-//! the Slaney-mel beat spectrogram — ported from `resampler.cpp` and
-//! `mel_spectrogram.cpp` with numeric behavior matched step for step. The
-//! ONNX inference half (`beat_this_int8.onnx` / `vocals_umxhq_int8.onnx` via
-//! `ort`) is gated behind the `ort` cargo feature so the crate builds
-//! everywhere; without it the model-backed entry points report unavailable
-//! and Automix falls back to the plain equal-power crossfade (upstream's own
-//! behavior for unanalysed pairs).
+//! This module carries the DSP half of the analyzer — the resampler and the
+//! Slaney-mel beat spectrogram — ported from `resampler.cpp` and
+//! `mel_spectrogram.cpp`, plus the ONNX inference half (Beat This! and
+//! open-unmix vocals) via `rten`. Missing models fall back to the energy
+//! envelope planner, matching upstream's unanalysed-pair behaviour.
 //!
 //! Ported from Orchard (https://github.com/SFG5453/Orchard) via BitChord's
 //! `native/analyzer` — Copyright (C) 2026 SFG545, Copyright (C) 2026 Kushagra
 //! Singh. The original is AGPLv3-or-later; this port keeps that status as
 //! part of the same GPL-3 combined work.
+
+mod beat;
+mod models;
+mod plan;
+mod vocal;
+
+pub use beat::Grid;
+pub use models::{analyzer_ready, configure};
+pub use plan::plan_pair;
 
 const PI: f64 = core::f64::consts::PI;
 
@@ -84,6 +90,47 @@ pub fn resample(input: &[f32], input_rate: f64, output_rate: f64) -> Vec<f32> {
         };
     }
     output
+}
+
+/// Energy-envelope BPM estimate used by Automix when ONNX is unavailable.
+/// Autocorrelation of a 50 ms hop RMS series, searched over 70–180 BPM.
+pub fn estimate_tempo(samples: &[f32], sample_rate: f64) -> f64 {
+    if samples.is_empty() || sample_rate <= 0.0 {
+        return 120.0;
+    }
+    let hop = (sample_rate * 0.05).max(1.0) as usize;
+    let mut envelope = Vec::new();
+    let mut i = 0;
+    while i + hop <= samples.len() {
+        let mut acc = 0.0f64;
+        for s in &samples[i..i + hop] {
+            acc += (*s as f64) * (*s as f64);
+        }
+        envelope.push((acc / hop as f64).sqrt());
+        i += hop;
+    }
+    if envelope.len() < 16 {
+        return 120.0;
+    }
+    let min_lag = ((60.0_f64 / 180.0) / 0.05).round() as usize; // 180 BPM
+    let max_lag = ((60.0_f64 / 70.0) / 0.05).round() as usize; // 70 BPM
+    let max_lag = max_lag.min(envelope.len() / 2).max(min_lag + 1);
+    let mut best_lag = min_lag;
+    let mut best = f64::MIN;
+    for lag in min_lag..=max_lag {
+        let mut corr = 0.0;
+        let n = envelope.len() - lag;
+        for i in 0..n {
+            corr += envelope[i] * envelope[i + lag];
+        }
+        corr /= n as f64;
+        if corr > best {
+            best = corr;
+            best_lag = lag;
+        }
+    }
+    let bpm = 60.0 / (best_lag as f64 * 0.05);
+    bpm.clamp(70.0, 180.0)
 }
 
 fn sinc(x: f64) -> f64 {
@@ -179,7 +226,7 @@ fn mel_filterbank(sample_rate: f64) -> Vec<MelFilter> {
 }
 
 /// Unnormalized in-place radix-2 FFT (size must be a power of two).
-fn fft(values: &mut [Complex]) {
+pub(crate) fn fft(values: &mut [Complex]) {
     let size = values.len();
     let mut swapped = 0usize;
     for index in 1..size {
@@ -211,7 +258,7 @@ fn fft(values: &mut [Complex]) {
 }
 
 #[derive(Clone, Copy)]
-struct Complex {
+pub(crate) struct Complex {
     re: f64,
     im: f64,
 }
@@ -240,7 +287,7 @@ impl Complex {
     }
 }
 
-fn hann_window(size: usize) -> Vec<f64> {
+pub(crate) fn hann_window(size: usize) -> Vec<f64> {
     // Periodic Hann, matching torch.hann_window(periodic=True).
     (0..size)
         .map(|index| 0.5 - 0.5 * (2.0 * PI * index as f64 / size as f64).cos())

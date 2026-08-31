@@ -6,17 +6,20 @@ struct DetailPageModel: Decodable {
     let title: String
     let subtitle: String
     let thumbnailUrl: String?
-    let songs: [SongPayload]
+    var songs: [SongPayload]
     let sections: [FeedShelf]
     let description: String?
     let subscriberCountText: String?
     let monthlyListenerCount: String?
-    let continuation: String?
-    // Kotlin's DetailPage adds `type` (BrowseType) which we ignore in Swift – keep decoder tolerant.
+    var continuation: String?
+    var suggestedSongs: [SongPayload]
+    let libraryPlaylistId: String?
+    let librarySaved: Bool?
+    let playlistOwned: Bool?
     let type: String?
 
     enum CodingKeys: String, CodingKey {
-        case browseId, title, subtitle, thumbnailUrl, songs, sections, description, subscriberCountText, monthlyListenerCount, continuation, type
+        case browseId, title, subtitle, thumbnailUrl, songs, sections, description, subscriberCountText, monthlyListenerCount, continuation, type, suggestedSongs, libraryPlaylistId, librarySaved, playlistOwned
     }
 
     init(from decoder: Decoder) throws {
@@ -32,6 +35,10 @@ struct DetailPageModel: Decodable {
         monthlyListenerCount = try c.decodeIfPresent(String.self, forKey: .monthlyListenerCount)
         continuation = try c.decodeIfPresent(String.self, forKey: .continuation)
         type = try c.decodeIfPresent(String.self, forKey: .type)
+        suggestedSongs = try c.decodeIfPresent([SongPayload].self, forKey: .suggestedSongs) ?? []
+        libraryPlaylistId = try c.decodeIfPresent(String.self, forKey: .libraryPlaylistId)
+        librarySaved = try c.decodeIfPresent(Bool.self, forKey: .librarySaved)
+        playlistOwned = try c.decodeIfPresent(Bool.self, forKey: .playlistOwned)
     }
 
     struct SongPayload: Decodable {
@@ -44,9 +51,10 @@ struct DetailPageModel: Decodable {
         let isVideo: Bool
         let artistId: String?
         let albumId: String?
+        let setVideoId: String?
 
         enum CodingKeys: String, CodingKey {
-            case videoId, title, artist, thumbnailUrl, durationText, albumName, isVideo, artistId, albumId
+            case videoId, title, artist, thumbnailUrl, durationText, albumName, isVideo, artistId, albumId, setVideoId
         }
 
         init(from decoder: Decoder) throws {
@@ -60,6 +68,15 @@ struct DetailPageModel: Decodable {
             isVideo = try c.decodeIfPresent(Bool.self, forKey: .isVideo) ?? false
             artistId = try c.decodeIfPresent(String.self, forKey: .artistId)
             albumId = try c.decodeIfPresent(String.self, forKey: .albumId)
+            setVideoId = try c.decodeIfPresent(String.self, forKey: .setVideoId)
+        }
+
+        func asEntry(fallbackArt: String? = nil) -> QueueEntry {
+            QueueEntry.youtube(
+                videoId: videoId, title: title, artist: artist,
+                thumbnailUrl: thumbnailUrl ?? fallbackArt, durationText: durationText,
+                albumName: albumName, artistId: artistId, albumId: albumId, setVideoId: setVideoId
+            )
         }
     }
 }
@@ -100,6 +117,23 @@ final class InnertubeDetail: Sendable {
                     }
                 } else {
                     cont.resume(throwing: DetailError(msg ?? "browse failed"))
+                }
+            })
+        }
+    }
+
+    func more(token: String) async throws -> DetailPageModel {
+        try await withCheckedThrowingContinuation { cont in
+            DetailBridge.shared.more(token: token, callback: DetailCallback { json, msg in
+                if let json {
+                    do {
+                        let page = try JSONDecoder().decode(DetailPageModel.self, from: Data(json.utf8))
+                        cont.resume(returning: page)
+                    } catch {
+                        cont.resume(throwing: error)
+                    }
+                } else {
+                    cont.resume(throwing: DetailError(msg ?? "continuation failed"))
                 }
             })
         }

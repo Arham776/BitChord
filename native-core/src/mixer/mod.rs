@@ -14,7 +14,7 @@
 //! arm-lead/timeout, and the 120 ms bail ramp.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crossbeam_channel::{Receiver, Sender};
@@ -22,6 +22,7 @@ use rtrb::Producer;
 
 use crate::decode::resampler::StreamResampler;
 use crate::decode::{SourceKind, SymphoniaDecoder};
+use crate::eq::GraphicEq;
 use crate::spatial::SpatialRenderer;
 use crate::transition_filter::TransitionFilter;
 
@@ -42,6 +43,11 @@ pub struct TrackInfo {
     pub artist: String,
     pub source: String,
     pub duration_seconds: f64,
+    pub codec: String,
+    pub sample_rate: u32,
+    pub bit_depth: u32,
+    pub channels: u32,
+    pub kbps: u32,
 }
 
 /// What to load and how a transition out of/into it should be rendered.
@@ -55,6 +61,8 @@ pub struct TrackSource {
     pub plan: TransitionPlan,
     /// HTTP headers for the streaming reader (User-Agent, Origin, Referer).
     pub headers: std::collections::HashMap<String, String>,
+    /// Claimed bitrate from the resolver (0 = unknown).
+    pub claimed_kbps: u32,
 }
 
 /// Port of upstream `playback.smart.TransitionStyle`.
@@ -128,6 +136,14 @@ pub enum Command {
         high_hz: f32,
     },
     OpenFilters,
+    SetPlaybackSpeed(f32),
+    SetSkipSilence(bool),
+    SetEqGains(Vec<f32>),
+    /// AirPods / speaker swap: new ring producer plus the device's native rate.
+    SetOutputFormat {
+        rate: u32,
+        producer: Producer<f32>,
+    },
     Shutdown,
 }
 
@@ -136,6 +152,9 @@ pub enum Command {
 const BAIL_MS: u64 = 120;
 const ARM_LEAD_MS: u64 = 4_000;
 const ARM_TIMEOUT_MS: u64 = 12_000;
+/// Leave this much of the incoming track after a cue so a mix-in cannot
+/// land in the outro (upstream `MIN_INCOMING_CLEARANCE_SECONDS`).
+const MIN_INCOMING_CLEARANCE_S: f64 = 5.0;
 
 const FILTER_ENTRY_HZ: f64 = 7_000.0;
 const FILTER_FLOOR_HZ: f64 = 300.0;
@@ -270,6 +289,8 @@ struct Voice {
     decoder: SymphoniaDecoder,
     resample_l: StreamResampler,
     resample_r: StreamResampler,
+    speed_l: StreamResampler,
+    speed_r: StreamResampler,
     spatial: SpatialRenderer,
     filter: TransitionFilter,
     gain: f32,
@@ -287,9 +308,13 @@ struct Voice {
     /// read cursor — pull never returns more than the caller asked for.
     pending_dev: Vec<f32>,
     pending_dev_cursor: usize,
-    /// Interleaved scratch so the pre-mix DSP writes into samples that are
-    /// actually kept.
-    stereo_scratch: Vec<f32>,
+    skip_silence: bool,
+    /// Consecutive silent frames in the *device* domain. Dividing by the
+    /// source rate (the earlier bug) made the 1 s floor shrink on 48/96 kHz
+    /// output — the "make the music sound rushed" failure upstream raised
+    /// `MIN_SILENCE_US` to avoid.
+    silent_dev_frames: u64,
+    effective_speed: f32,
 }
 
 impl Voice {
@@ -298,30 +323,51 @@ impl Voice {
         spatial_enabled: bool,
         head_yaw: f32,
         device_rate: u32,
+        playback_speed: f32,
+        skip_silence: bool,
     ) -> Result<Voice, String> {
         let kind = SourceKind::parse(&request.source);
         let mut decoder = SymphoniaDecoder::open(&kind, &request.headers)
             .map_err(|e| e.to_string())?;
         let src_rate = decoder.sample_rate();
-        let mut spatial = SpatialRenderer::new(src_rate);
-        spatial.set_enabled(spatial_enabled);
+        // Spatial + transition filter run in the device domain, after
+        // resample — same 15 ms Haas window the DAC hears, and clip
+        // harmonics never hit the sinc. Upstream's processor is also at
+        // the sink rate; an earlier port ran this on source PCM and then
+        // resampled the hard-clipped output, which rang.
+        let mut spatial = SpatialRenderer::new(device_rate);
+        spatial.set_enabled(spatial_enabled && decoder.channels() >= 2);
         spatial.set_head_yaw(head_yaw);
-        if request.start_seconds > 0.0 {
-            decoder.seek_seconds(request.start_seconds).map_err(|e| e.to_string())?;
-        }
         let duration = decoder.duration_seconds().unwrap_or(0.0);
+        let start = clamp_start_seconds(request.start_seconds, duration);
+        if start > 0.0 {
+            decoder.seek_seconds(start).map_err(|e| e.to_string())?;
+        }
+        let plan_rate = if request.plan.playback_rate > 0.05 {
+            request.plan.playback_rate
+        } else {
+            1.0
+        };
+        let effective = (playback_speed as f64 * plan_rate).clamp(0.5, 2.0) as f32;
         Ok(Voice {
             resample_l: StreamResampler::new(src_rate, device_rate),
             resample_r: StreamResampler::new(src_rate, device_rate),
+            speed_l: speed_resampler(device_rate, effective),
+            speed_r: speed_resampler(device_rate, effective),
             spatial,
-            filter: TransitionFilter::new(2, src_rate),
+            filter: TransitionFilter::new(2, device_rate),
             gain: 1.0,
-            base_position: if request.start_seconds > 0.0 { 0.0 } else { request.start_seconds },
+            base_position: 0.0,
             info: TrackInfo {
                 title: request.title.clone(),
                 artist: request.artist.clone(),
                 source: request.source.clone(),
                 duration_seconds: duration,
+                codec: decoder.codec().to_string(),
+                sample_rate: src_rate,
+                bit_depth: decoder.bit_depth(),
+                channels: decoder.channels() as u32,
+                kbps: request.claimed_kbps,
             },
             decoder,
             finished: false,
@@ -330,8 +376,37 @@ impl Voice {
             channel_r: Vec::new(),
             pending_dev: Vec::new(),
             pending_dev_cursor: 0,
-            stereo_scratch: Vec::new(),
+            skip_silence,
+            silent_dev_frames: 0,
+            effective_speed: effective,
         })
+    }
+
+    fn set_playback_speed(&mut self, speed: f32, device_rate: u32) {
+        let speed = speed.clamp(0.5, 2.0);
+        if (speed - self.effective_speed).abs() < 0.001 {
+            return;
+        }
+        self.effective_speed = speed;
+        self.speed_l = speed_resampler(device_rate, speed);
+        self.speed_r = speed_resampler(device_rate, speed);
+    }
+
+    /// Rebuild post-decode DSP for a new DAC rate (AirPods connect/disconnect).
+    fn retarget_device(&mut self, device_rate: u32, spatial_enabled: bool, head_yaw: f32) {
+        let src = self.info.sample_rate.max(1);
+        let enabled = self.spatial.enabled();
+        self.resample_l = StreamResampler::new(src, device_rate);
+        self.resample_r = StreamResampler::new(src, device_rate);
+        self.speed_l = speed_resampler(device_rate, self.effective_speed);
+        self.speed_r = speed_resampler(device_rate, self.effective_speed);
+        let mut spatial = SpatialRenderer::new(device_rate);
+        spatial.set_enabled(enabled && spatial_enabled && self.info.channels >= 2);
+        spatial.set_head_yaw(head_yaw);
+        self.spatial = spatial;
+        self.filter = TransitionFilter::new(2, device_rate);
+        self.pending_dev.clear();
+        self.pending_dev_cursor = 0;
     }
 
     fn position_seconds(&self) -> f64 {
@@ -349,7 +424,7 @@ impl Voice {
     /// Pulls up to `frames` device-domain interleaved stereo frames. Never
     /// returns more than asked: decoded batches overshooting the request are
     /// stashed in `pending_dev` and served on later calls.
-    fn pull(&mut self, frames: usize, _device_rate: u32) -> Vec<f32> {
+    fn pull(&mut self, frames: usize, device_rate: u32) -> Vec<f32> {
         let want = (frames * 2).max(2);
         let mut out: Vec<f32> = Vec::with_capacity(want);
 
@@ -379,6 +454,10 @@ impl Voice {
                     self.pending_dev.push(tail_l[i]);
                     self.pending_dev.push(tail_r[i]);
                 }
+                // Device-domain DSP (spatial, then transition filter) — same
+                // order as upstream's sink processors, at the rate the DAC hears.
+                self.spatial.process(&mut self.pending_dev);
+                self.filter.process(&mut self.pending_dev);
                 serve_pending(&mut out, self);
                 break;
             }
@@ -388,30 +467,43 @@ impl Voice {
                 self.channel_l.push(pair[0]);
                 self.channel_r.push(pair[1]);
             }
-            // Per-stream pre-mix DSP, in source domain (upstream order:
-            // spatial stage, then transition filter).
-            self.stereo_scratch.clear();
-            for i in 0..self.channel_l.len() {
-                self.stereo_scratch.push(self.channel_l[i]);
-                self.stereo_scratch.push(self.channel_r[i]);
-            }
-            self.spatial.process(&mut self.stereo_scratch);
-            self.filter.process(&mut self.stereo_scratch);
-            self.channel_l.clear();
-            self.channel_r.clear();
-            for pair in self.stereo_scratch.chunks_exact(2) {
-                self.channel_l.push(pair[0]);
-                self.channel_r.push(pair[1]);
-            }
 
             let out_l = self.resample_l.process(&self.channel_l);
             let out_r = self.resample_r.process(&self.channel_r);
             let n = out_l.len().min(out_r.len());
+            let (speed_l, speed_r) = if (self.effective_speed - 1.0).abs() < 0.001 {
+                (out_l, out_r)
+            } else {
+                (
+                    self.speed_l.process(&out_l[..n]),
+                    self.speed_r.process(&out_r[..n]),
+                )
+            };
+            let n = speed_l.len().min(speed_r.len());
             self.pending_dev.clear();
             self.pending_dev_cursor = 0;
             for i in 0..n {
-                self.pending_dev.push(out_l[i]);
-                self.pending_dev.push(out_r[i]);
+                self.pending_dev.push(speed_l[i]);
+                self.pending_dev.push(speed_r[i]);
+            }
+            // Classify silence on the dry buffer. Spatial's 0.82 makeup
+            // would otherwise pull quiet music under the threshold whenever
+            // widening is on. DSP still runs so the delay line stays
+            // continuous across a drop.
+            let silent = self.skip_silence && is_silent(&self.pending_dev);
+            self.spatial.process(&mut self.pending_dev);
+            self.filter.process(&mut self.pending_dev);
+            if silent {
+                self.silent_dev_frames += (self.pending_dev.len() / 2) as u64;
+                // Upstream MIN_SILENCE_US = 1 s: keep the first second so a
+                // breath still lands, then drop the rest of the gap.
+                if silence_exceeds_floor(self.silent_dev_frames, device_rate) {
+                    self.pending_dev.clear();
+                    self.pending_dev_cursor = 0;
+                    continue;
+                }
+            } else {
+                self.silent_dev_frames = 0;
             }
             serve_pending(&mut out, self);
         }
@@ -419,13 +511,45 @@ impl Voice {
     }
 }
 
-fn interleave(l: &[f32], r: &[f32]) -> Vec<f32> {
-    let mut out = Vec::with_capacity(l.len() * 2);
-    for i in 0..l.len().min(r.len()) {
-        out.push(l[i]);
-        out.push(r[i]);
+/// Media3 `DEFAULT_SILENCE_THRESHOLD_LEVEL` (1024 of int16 full scale).
+const SILENCE_THRESHOLD: f32 = 1024.0 / 32768.0;
+/// Upstream `PlaybackService.MIN_SILENCE_US` — shortest gap we'll trim.
+const MIN_SILENCE_SECS: f64 = 1.0;
+
+fn speed_resampler(device_rate: u32, speed: f32) -> StreamResampler {
+    let speed = speed.clamp(0.5, 2.0) as f64;
+    StreamResampler::with_rates(device_rate as f64 * speed, device_rate as f64)
+}
+
+fn is_silent(interleaved: &[f32]) -> bool {
+    // Empty is "no audio yet" (resampler still priming), not a gap to trim.
+    if interleaved.is_empty() {
+        return false;
     }
-    out
+    interleaved.iter().all(|s| s.abs() < SILENCE_THRESHOLD)
+}
+
+fn silence_exceeds_floor(silent_dev_frames: u64, device_rate: u32) -> bool {
+    silent_dev_frames as f64 / device_rate.max(1) as f64 > MIN_SILENCE_SECS
+}
+
+/// A cue in the last few seconds is the outro, not a mix-in. Fall back to
+/// the top of the file rather than starting the next song near its end.
+fn clamp_start_seconds(requested: f64, duration: f64) -> f64 {
+    let requested = requested.max(0.0);
+    if requested <= 0.0 {
+        return 0.0;
+    }
+    if duration <= 0.0 {
+        return requested;
+    }
+    if requested >= (duration - MIN_INCOMING_CLEARANCE_S).max(0.0) {
+        log::warn!(
+            "cue {requested:.1}s is within {MIN_INCOMING_CLEARANCE_S}s of duration {duration:.1}s; starting at 0"
+        );
+        return 0.0;
+    }
+    requested
 }
 
 // ---- Transition state -------------------------------------------------------
@@ -464,7 +588,6 @@ struct MixerState {
     spatial_enabled: bool,
     head_yaw: f32,
     device_rate: u32,
-    device_channels: usize,
     /// Frames pushed to the ring minus frames the callback consumed. The
     /// render loop needs this to know how much audio is still *audible* (ring
     /// backlog counts toward a track's tail).
@@ -476,6 +599,19 @@ struct MixerState {
     /// Set by Load/Stop; the device callback discards leftover ring samples
     /// so the previous track cannot keep sounding under the new one.
     flush_ring: Arc<AtomicBool>,
+    playback_speed: f32,
+    skip_silence: bool,
+    eq: GraphicEq,
+    nerd: Arc<Mutex<NerdSnapshot>>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct NerdSnapshot {
+    pub codec: String,
+    pub sample_rate: u32,
+    pub bit_depth: u32,
+    pub channels: u32,
+    pub kbps: u32,
 }
 
 impl MixerState {
@@ -483,6 +619,18 @@ impl MixerState {
         if self.state != state {
             self.state = state;
             self.events.state_changed(state);
+        }
+    }
+
+    fn publish_nerd(&self, info: &TrackInfo) {
+        if let Ok(mut nerd) = self.nerd.lock() {
+            *nerd = NerdSnapshot {
+                codec: info.codec.clone(),
+                sample_rate: info.sample_rate,
+                bit_depth: info.bit_depth,
+                channels: info.channels,
+                kbps: info.kbps,
+            };
         }
     }
 
@@ -502,11 +650,27 @@ impl MixerState {
         let Some(request) = self.pending_next.take() else {
             return;
         };
-        match Voice::open(&request, self.spatial_enabled, self.head_yaw, self.device_rate) {
+        match Voice::open(
+            &request,
+            self.spatial_enabled,
+            self.head_yaw,
+            self.device_rate,
+            self.playback_speed,
+            self.skip_silence,
+        ) {
             Ok(mut voice) => {
                 voice.gain = 1.0;
                 let info = voice.info.clone();
                 let duration = info.duration_seconds;
+                if let Ok(mut nerd) = self.nerd.lock() {
+                    *nerd = NerdSnapshot {
+                        codec: info.codec.clone(),
+                        sample_rate: info.sample_rate,
+                        bit_depth: info.bit_depth,
+                        channels: info.channels,
+                        kbps: info.kbps,
+                    };
+                }
                 log::info!("promoted pending next: {}", info.title);
                 self.current = Some(voice);
                 self.duration_ms
@@ -514,6 +678,7 @@ impl MixerState {
                 if duration > 0.0 {
                     self.events.duration_changed(duration);
                 }
+                self.publish_audible_position();
                 self.events.handoff(info);
             }
             Err(e) => {
@@ -535,6 +700,8 @@ impl MixerState {
             if duration > 0.0 {
                 self.events.duration_changed(duration);
             }
+            self.publish_nerd(&info);
+            self.publish_audible_position();
             self.events.handoff(info);
         }
         self.transition = None;
@@ -575,7 +742,14 @@ impl MixerState {
         let fade_frames =
             ((if plan.fade_seconds > 0.0 { plan.fade_seconds } else { fade_s })
                 * self.device_rate as f64) as u64;
-        match Voice::open(&request, self.spatial_enabled, self.head_yaw, self.device_rate) {
+        match Voice::open(
+            &request,
+            self.spatial_enabled,
+            self.head_yaw,
+            self.device_rate,
+            self.playback_speed,
+            self.skip_silence,
+        ) {
             Ok(mut voice) => {
                 voice.gain = 0.0; // silent until the fade lifts it
                 log::info!("armed next track: {}", request.title);
@@ -658,38 +832,59 @@ impl MixerState {
             t.phase = Phase::Fading;
             t.handed_off = true;
         }
+        self.publish_nerd(&info);
+        // Playhead follows the incoming track from this moment — upstream
+        // swaps the session player at handoff. Leaving it on the outgoing
+        // voice published a time near that track's end under the new
+        // duration, so the next song appeared to start in its outro.
+        self.publish_audible_position();
         self.events.handoff(info);
     }
 
     /// Drives gains + filter ride for the fade in flight. Returns true when
     /// the transition finished this chunk.
     fn drive_fade(&mut self) -> bool {
-        let Some(t) = &mut self.transition else {
-            return false;
-        };
-        if t.phase != Phase::Fading {
+        if !self
+            .transition
+            .as_ref()
+            .is_some_and(|t| t.phase == Phase::Fading)
+        {
             return false;
         }
         let Some(incoming) = &self.incoming else {
             return false;
         };
-        let progress = if t.fade_frames == 0 {
+        let incoming_cap_frames = incoming
+            .remaining_seconds()
+            .map(|remaining| {
+                let played = incoming.emitted_dev_frames as f64;
+                let total_from_cue = played + remaining * self.device_rate as f64;
+                ((total_from_cue / 3.0) as u64).max(1)
+            })
+            .unwrap_or(u64::MAX);
+        let emitted = incoming.emitted_dev_frames;
+        let fade_frames = self.transition.as_ref().map(|t| t.fade_frames).unwrap_or(0);
+        let span = if fade_frames == 0 {
+            0
+        } else {
+            fade_frames.min(incoming_cap_frames).max(1)
+        };
+        let p = if span == 0 {
             1.0
         } else {
-            incoming.emitted_dev_frames as f64 / t.fade_frames as f64
+            (emitted as f64 / span as f64).clamp(0.0, 1.0)
         };
-        let p = progress.clamp(0.0, 1.0);
         let rise = rise_gain(p);
         let fall = fall_gain(p);
-        if let (Some(current), Some(incoming)) =
-            (&mut self.current, &mut self.incoming)
+        let plan = self.transition.as_ref().map(|t| t.plan.clone());
+        if let (Some(current), Some(incoming), Some(plan)) =
+            (&mut self.current, &mut self.incoming, plan)
         {
             current.gain = fall;
             incoming.gain = rise;
-            ride_filters(p, &t.plan, &mut current.filter, &mut incoming.filter);
+            ride_filters(p, &plan, &mut current.filter, &mut incoming.filter);
         }
-        let done = p >= 1.0 || self.current.as_ref().is_some_and(|c| c.finished);
-        done
+        p >= 1.0 || self.current.as_ref().is_some_and(|c| c.finished)
     }
 
     fn finish_transition(&mut self) {
@@ -753,14 +948,27 @@ impl MixerState {
     }
 
     /// Playhead the listener hears: decoder time minus samples still in the
-    /// output ring (not yet consumed by the device callback).
+    /// output ring (not yet consumed by the device callback). After handoff
+    /// this is the incoming track — the session has already moved on.
     fn publish_audible_position(&mut self) {
-        let Some(voice) = &self.current else {
+        let handed_off = self.transition.as_ref().is_some_and(|t| t.handed_off);
+        let Some(voice) = (if handed_off {
+            self.incoming.as_ref().or(self.current.as_ref())
+        } else {
+            self.current.as_ref()
+        }) else {
             return;
         };
         let buffered_s = self.buffered_frames.load(Ordering::Relaxed) as f64
             / self.device_rate.max(1) as f64;
-        let audible = (voice.position_seconds() - buffered_s).max(0.0);
+        // Incoming has not filled the ring yet; subtracting the outgoing
+        // backlog would clamp a just-cued track to 0 every time. Only the
+        // current (session) voice's own backlog counts.
+        let audible = if handed_off {
+            voice.position_seconds().max(0.0)
+        } else {
+            (voice.position_seconds() - buffered_s).max(0.0)
+        };
         self.position_ms
             .store((audible * 1000.0) as u64, Ordering::Relaxed);
     }
@@ -775,10 +983,10 @@ pub fn run_mixer(
     position_ms: Arc<AtomicU64>,
     duration_ms: Arc<AtomicU64>,
     device_rate: u32,
-    device_channels: usize,
     events: Arc<dyn EngineEvents>,
     shutdown: Arc<AtomicBool>,
     flush_ring: Arc<AtomicBool>,
+    nerd: Arc<Mutex<NerdSnapshot>>,
 ) {
     let mut state = MixerState {
         current: None,
@@ -792,13 +1000,16 @@ pub fn run_mixer(
         spatial_enabled: false,
         head_yaw: 0.0,
         device_rate,
-        device_channels,
         buffered_frames,
         position_ms,
         duration_ms,
         events,
         state: crate::PlaybackState::Stopped,
         flush_ring,
+        playback_speed: 1.0,
+        skip_silence: false,
+        eq: GraphicEq::new(device_rate),
+        nerd,
     };
 
     loop {
@@ -821,7 +1032,7 @@ pub fn run_mixer(
     }
 }
 
-fn handle_command(state: &mut MixerState, cmd: Command, _ring: &mut Producer<f32>) {
+fn handle_command(state: &mut MixerState, cmd: Command, ring: &mut Producer<f32>) {
     match cmd {
         Command::Load { request, reply } => {
             // Upstream: a skip/replace is not a blend. `onSkipRequested` bails
@@ -829,10 +1040,26 @@ fn handle_command(state: &mut MixerState, cmd: Command, _ring: &mut Producer<f32
             // `stop()`+`clearMediaItems()`. Mixing the old voice under the new
             // one reads as the tap being ignored.
             state.hard_cut();
-            match Voice::open(&request, state.spatial_enabled, state.head_yaw, state.device_rate) {
+            match Voice::open(
+                &request,
+                state.spatial_enabled,
+                state.head_yaw,
+                state.device_rate,
+                state.playback_speed,
+                state.skip_silence,
+            ) {
                 Ok(voice) => {
                     let info = voice.info.clone();
                     let duration = voice.info.duration_seconds;
+                    if let Ok(mut nerd) = state.nerd.lock() {
+                        *nerd = NerdSnapshot {
+                            codec: info.codec.clone(),
+                            sample_rate: info.sample_rate,
+                            bit_depth: info.bit_depth,
+                            channels: info.channels,
+                            kbps: info.kbps,
+                        };
+                    }
                     state.current = Some(voice);
                     state.playing = true;
                     state.position_ms.store(0, Ordering::Relaxed);
@@ -891,6 +1118,7 @@ fn handle_command(state: &mut MixerState, cmd: Command, _ring: &mut Producer<f32
                             voice.filter.flush();
                             voice.pending_dev.clear();
                             voice.pending_dev_cursor = 0;
+                            voice.silent_dev_frames = 0;
                             voice.finished = false;
                             state.flush_ring.store(true, Ordering::Release);
                             state.buffered_frames.store(0, Ordering::Relaxed);
@@ -944,6 +1172,49 @@ fn handle_command(state: &mut MixerState, cmd: Command, _ring: &mut Producer<f32
             if let Some(incoming) = &mut state.incoming {
                 incoming.filter.open();
             }
+        }
+        Command::SetPlaybackSpeed(speed) => {
+            state.playback_speed = speed.clamp(0.5, 2.0);
+            if let Some(v) = &mut state.current {
+                v.set_playback_speed(state.playback_speed, state.device_rate);
+            }
+            if let Some(v) = &mut state.incoming {
+                v.set_playback_speed(state.playback_speed, state.device_rate);
+            }
+        }
+        Command::SetSkipSilence(enabled) => {
+            state.skip_silence = enabled;
+            if let Some(v) = &mut state.current {
+                v.skip_silence = enabled;
+            }
+            if let Some(v) = &mut state.incoming {
+                v.skip_silence = enabled;
+            }
+        }
+        Command::SetEqGains(gains) => {
+            state.eq.set_gains_db(&gains);
+        }
+        Command::SetOutputFormat { rate, producer } => {
+            *ring = producer;
+            let rate = rate.max(1);
+            if rate != state.device_rate {
+                log::info!("output format {} Hz -> {rate} Hz", state.device_rate);
+                state.device_rate = rate;
+                state.eq.retarget(rate);
+                let spatial = state.spatial_enabled;
+                let yaw = state.head_yaw;
+                if let Some(v) = &mut state.current {
+                    v.retarget_device(rate, spatial, yaw);
+                }
+                if let Some(v) = &mut state.incoming {
+                    v.retarget_device(rate, spatial, yaw);
+                }
+                for ret in &mut state.retiring {
+                    ret.voice.retarget_device(rate, spatial, yaw);
+                }
+            }
+            state.flush_ring.store(true, Ordering::Release);
+            state.buffered_frames.store(0, Ordering::Relaxed);
         }
         Command::Shutdown => {
             state.stop_all();
@@ -1070,6 +1341,7 @@ fn render_available(state: &mut MixerState, ring: &mut Producer<f32>) {
         // Push interleaved, clamped — only what the voices actually rendered.
         let mut pushed = 0;
         if produced > 0 {
+            state.eq.process(&mut scratch[..produced]);
             for s in scratch.into_iter().take(produced) {
                 if ring.push(s.clamp(-1.0, 1.0)).is_ok() {
                     pushed += 1;
@@ -1090,8 +1362,8 @@ fn render_available(state: &mut MixerState, ring: &mut Producer<f32>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::AtomicBool;
-    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicBool, AtomicU64};
+    use std::sync::{Arc, Mutex};
 
     #[derive(Default)]
     struct RecordedEvents {
@@ -1099,6 +1371,8 @@ mod tests {
         ended: Mutex<Vec<&'static str>>,
         states: Mutex<Vec<&'static str>>,
         errors: Mutex<Vec<String>>,
+        position_ms: Option<Arc<AtomicU64>>,
+        position_at_handoff: Mutex<Vec<u64>>,
     }
 
     impl EngineEvents for RecordedEvents {
@@ -1121,6 +1395,12 @@ mod tests {
             self.errors.lock().unwrap().push(message);
         }
         fn handoff(&self, info: TrackInfo) {
+            if let Some(position) = &self.position_ms {
+                self.position_at_handoff
+                    .lock()
+                    .unwrap()
+                    .push(position.load(Ordering::Relaxed));
+            }
             self.handoffs.lock().unwrap().push(info.title);
         }
         fn duration_changed(&self, _seconds: f64) {}
@@ -1178,7 +1458,7 @@ mod tests {
             let duration = duration.clone();
             let shutdown = shutdown.clone();
             move || {
-                run_mixer(rx, consumer_side, buffered, position, duration, 44_100, 2, events, shutdown, std::sync::Arc::new(AtomicBool::new(false)))
+                run_mixer(rx, consumer_side, buffered, position, duration, 44_100, events, shutdown, std::sync::Arc::new(AtomicBool::new(false)), std::sync::Arc::new(Mutex::new(NerdSnapshot::default())))
             }
         });
 
@@ -1190,6 +1470,7 @@ mod tests {
                 start_seconds: 0.0,
                 plan: TransitionPlan::default(),
                 headers: std::collections::HashMap::new(),
+                claimed_kbps: 0,
             },
             reply: crossbeam_channel::bounded(1).0,
         })
@@ -1202,6 +1483,7 @@ mod tests {
                 start_seconds: 0.0,
                 plan: TransitionPlan::default(),
                 headers: std::collections::HashMap::new(),
+                claimed_kbps: 0,
             },
         })
         .unwrap();
@@ -1269,10 +1551,10 @@ mod tests {
                     position,
                     duration,
                     44_100,
-                    2,
                     events,
                     shutdown,
                     std::sync::Arc::new(AtomicBool::new(false)),
+                    std::sync::Arc::new(Mutex::new(NerdSnapshot::default())),
                 )
             }
         });
@@ -1285,6 +1567,7 @@ mod tests {
                 start_seconds: 0.0,
                 plan: TransitionPlan::default(),
                 headers: std::collections::HashMap::new(),
+                claimed_kbps: 0,
             },
             reply: crossbeam_channel::bounded(1).0,
         })
@@ -1299,6 +1582,157 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
         assert!(samples > 0, "current voice must reach the ring (got {samples})");
+
+        shutdown.store(true, Ordering::Relaxed);
+        let _ = handle.join();
+    }
+
+    #[test]
+    fn silence_floor_uses_device_rate_not_source_rate() {
+        // The bug: 44100 device frames at 96 kHz is 0.46 s, well under the
+        // 1 s floor. Dividing by a 44.1 kHz source rate treated it as 1 s
+        // and ate musical pauses.
+        assert!(!super::silence_exceeds_floor(44_100, 96_000));
+        assert!(!super::silence_exceeds_floor(48_000, 48_000));
+        assert!(super::silence_exceeds_floor(48_001, 48_000));
+        assert!(super::silence_exceeds_floor(96_001, 96_000));
+    }
+
+    #[test]
+    fn silence_classifier_matches_media3_int16_threshold() {
+        let just_under = 1023.0 / 32768.0;
+        let just_over = 1025.0 / 32768.0;
+        assert!(super::is_silent(&vec![just_under; 64]));
+        assert!(!super::is_silent(&vec![just_over; 64]));
+        let mut mixed = vec![0.0f32; 64];
+        mixed[10] = just_over;
+        assert!(!super::is_silent(&mixed));
+        assert!(!super::is_silent(&[]));
+    }
+
+    #[test]
+    fn cue_in_the_outro_starts_at_zero() {
+        assert_eq!(super::clamp_start_seconds(0.0, 180.0), 0.0);
+        assert_eq!(super::clamp_start_seconds(12.0, 180.0), 12.0);
+        assert_eq!(super::clamp_start_seconds(176.0, 180.0), 0.0);
+        assert_eq!(super::clamp_start_seconds(175.0, 180.0), 0.0);
+        assert_eq!(super::clamp_start_seconds(174.9, 180.0), 174.9);
+        assert_eq!(super::clamp_start_seconds(8.0, 0.0), 8.0);
+    }
+
+    fn drain_until_handoff(
+        consumer: &mut rtrb::Consumer<f32>,
+        buffered: &AtomicU64,
+        events: &RecordedEvents,
+        seconds: u64,
+    ) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(seconds);
+        loop {
+            while consumer.pop().is_ok() {
+                let mut current = buffered.load(Ordering::Relaxed);
+                while current > 0 {
+                    match buffered.compare_exchange_weak(
+                        current,
+                        current - 1,
+                        Ordering::Relaxed,
+                        Ordering::Relaxed,
+                    ) {
+                        Ok(_) => break,
+                        Err(v) => current = v,
+                    }
+                }
+            }
+            if !events.handoffs.lock().unwrap().is_empty()
+                || std::time::Instant::now() > deadline
+            {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn crossfade_handoff_playhead_is_incoming_not_outgoing_tail() {
+        let dir = std::env::temp_dir().join("bitchord-mixer-xfade-pos");
+        std::fs::create_dir_all(&dir).unwrap();
+        let a = dir.join("out.wav");
+        let b = dir.join("in.wav");
+        test_wav(&a, 3.0, 440.0);
+        test_wav(&b, 3.0, 660.0);
+
+        let position = std::sync::Arc::new(AtomicU64::new(0));
+        let events = std::sync::Arc::new(RecordedEvents {
+            position_ms: Some(position.clone()),
+            ..RecordedEvents::default()
+        });
+        let (tx, rx) = crossbeam_channel::unbounded::<Command>();
+        let (consumer_side, mut consumer) = rtrb::RingBuffer::<f32>::new(44_100 * 2 * 4);
+        let buffered = std::sync::Arc::new(AtomicU64::new(0));
+        let duration = std::sync::Arc::new(AtomicU64::new(0));
+        let shutdown = std::sync::Arc::new(AtomicBool::new(false));
+
+        let handle = std::thread::spawn({
+            let events = events.clone();
+            let buffered = buffered.clone();
+            let position = position.clone();
+            let duration = duration.clone();
+            let shutdown = shutdown.clone();
+            move || {
+                run_mixer(
+                    rx,
+                    consumer_side,
+                    buffered,
+                    position,
+                    duration,
+                    44_100,
+                    events,
+                    shutdown,
+                    std::sync::Arc::new(AtomicBool::new(false)),
+                    std::sync::Arc::new(Mutex::new(NerdSnapshot::default())),
+                )
+            }
+        });
+
+        tx.send(Command::SetCrossfadeWindow(1.0)).unwrap();
+        tx.send(Command::Load {
+            request: TrackSource {
+                source: a.display().to_string(),
+                title: "A".into(),
+                artist: String::new(),
+                start_seconds: 0.0,
+                plan: TransitionPlan::default(),
+                headers: std::collections::HashMap::new(),
+                claimed_kbps: 0,
+            },
+            reply: crossbeam_channel::bounded(1).0,
+        })
+        .unwrap();
+        tx.send(Command::QueueNext {
+            request: TrackSource {
+                source: b.display().to_string(),
+                title: "B".into(),
+                artist: String::new(),
+                start_seconds: 0.0,
+                plan: TransitionPlan::default(),
+                headers: std::collections::HashMap::new(),
+                claimed_kbps: 0,
+            },
+        })
+        .unwrap();
+
+        drain_until_handoff(&mut consumer, &buffered, &events, 20);
+
+        let handoffs = events.handoffs.lock().unwrap().clone();
+        assert_eq!(handoffs, vec!["B".to_string()], "handoff to B must fire");
+        let at = events.position_at_handoff.lock().unwrap().clone();
+        assert_eq!(at.len(), 1);
+        // Outgoing is 3 s; fade starts with ~1 s left, so the old playhead
+        // would be ~2000 ms. Incoming must be at (or very near) its cue.
+        assert!(
+            at[0] < 1_500,
+            "handoff playhead {} ms is the outgoing tail, not the incoming start",
+            at[0]
+        );
 
         shutdown.store(true, Ordering::Relaxed);
         let _ = handle.join();

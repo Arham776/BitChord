@@ -4,10 +4,15 @@ import com.music.bitchord.data.model.Account
 import com.music.bitchord.data.model.BrowseItem
 import com.music.bitchord.data.model.BrowseType
 import com.music.bitchord.data.model.HomeShelf
+import com.music.bitchord.data.model.LibraryState
+import com.music.bitchord.data.model.LikeStatus
 import com.music.bitchord.data.model.SearchFilter
 import com.music.bitchord.data.model.SearchResult
 import com.music.bitchord.data.model.ShelfItem
 import com.music.bitchord.data.model.Song
+import com.music.bitchord.data.model.SongMenu
+import com.music.bitchord.data.model.UserPlaylist
+import com.music.bitchord.data.settings.AppSettings
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonObject
@@ -40,7 +45,7 @@ object InnertubeParser {
                 }
             }
             parseResponsiveListItem(renderer)?.let { song ->
-                if (song.isVideo) return@mapNotNull null
+                if (song.isVideo && !AppSettings.convertVideoToAudio.value) return@mapNotNull null
                 if (seen.add("v:${song.videoId}")) SearchResult.Track(song) else null
             }
         }
@@ -233,15 +238,55 @@ object InnertubeParser {
      * arrive through `browse`). Upstream's `parseHome` verbatim.
      */
     fun parseHome(response: JsonObject): List<HomeShelf> {
-        val sections = response.o("contents")
-            .o("singleColumnBrowseResultsRenderer").a("tabs")?.firstOrNull()
-            .o("tabRenderer").o("content").o("sectionListRenderer").a("contents")
-            .orEmpty()
-
-        return sections.mapNotNull { section ->
+        val sections = homeSectionContents(response)
+        val fromColumn = sections.mapNotNull { section ->
             section.o("musicCarouselShelfRenderer")?.let(::carouselShelf)
                 ?: section.o("musicShelfRenderer")?.let(::plainShelf)
         }
+        if (fromColumn.isNotEmpty()) return fromColumn
+        // Signed-in WEB_REMIX often serves twoColumnBrowseResultsRenderer;
+        // walk the tree the same way continuations do.
+        return parseHomeContinuation(response)
+    }
+
+    private fun homeSectionContents(response: JsonObject): List<JsonElement> {
+        val contents = response.o("contents")
+        contents.o("singleColumnBrowseResultsRenderer")
+            .a("tabs")?.firstOrNull()
+            .o("tabRenderer").o("content").o("sectionListRenderer").a("contents")
+            ?.takeIf { it.isNotEmpty() }
+            ?.let { return it }
+        val two = contents.o("twoColumnBrowseResultsRenderer")
+        sequenceOf(
+            two.o("primaryContents").o("sectionListRenderer").a("contents"),
+            two.o("secondaryContents").o("sectionListRenderer").a("contents"),
+            two.a("tabs")?.firstOrNull()
+                .o("tabRenderer").o("content").o("sectionListRenderer").a("contents"),
+        ).firstOrNull { !it.isNullOrEmpty() }?.let { return it }
+        return emptyList()
+    }
+
+    /**
+     * More Home shelves off a continuation (or a two-column first page).
+     * Walks carousel/plain shelves wherever they land.
+     */
+    fun parseHomeContinuation(root: JsonElement): List<HomeShelf> {
+        val out = mutableListOf<HomeShelf>()
+        fun walk(node: JsonElement) {
+            when (node) {
+                is JsonObject -> {
+                    (node["musicCarouselShelfRenderer"] as? JsonObject)
+                        ?.let(::carouselShelf)?.let(out::add)
+                    (node["musicShelfRenderer"] as? JsonObject)
+                        ?.let(::plainShelf)?.let(out::add)
+                    node.values.forEach(::walk)
+                }
+                is JsonArray -> node.forEach(::walk)
+                else -> Unit
+            }
+        }
+        walk(root)
+        return out
     }
 
     /** The token for the next page of a browse feed, null once exhausted. */
@@ -283,6 +328,25 @@ object InnertubeParser {
         }.filterNot { it.isVideo }
             .map { ShelfItem(it.title, it.artist, it.thumbnailUrl, it.videoId, null) }
         return if (items.isEmpty()) null else HomeShelf(title.ifBlank { "For you" }, items)
+    }
+
+    /**
+     * Cards on a library feed — saved playlists, albums, artists.
+     * Grid view is `musicTwoRowItemRenderer`; list view is responsive rows.
+     */
+    fun parseLibraryItems(root: JsonElement): List<ShelfItem> {
+        val out = LinkedHashMap<String, ShelfItem>()
+        collectRenderers(root, "musicTwoRowItemRenderer").forEach { renderer ->
+            val item = parseTwoRowItem(renderer) ?: return@forEach
+            item.browseId?.let { id -> out.getOrPut(id) { item } }
+        }
+        collectRenderers(root, "musicResponsiveListItemRenderer").forEach { renderer ->
+            val item = parseBrowseItem(renderer) ?: return@forEach
+            out.getOrPut(item.browseId) {
+                ShelfItem(item.title, item.subtitle, item.thumbnailUrl, null, item.browseId)
+            }
+        }
+        return out.values.toList()
     }
 
     /**
@@ -491,10 +555,11 @@ object InnertubeParser {
         return out.values.toList()
     }
 
-    /** A playlist page's own tracks, plus the token for the rest. */
+    /** A playlist page's own tracks, plus suggested rows and the token for the rest. */
     data class PlaylistShelfPage(
         val songs: List<Song>,
         val continuation: String?,
+        val suggested: List<Song> = emptyList(),
     )
 
     /**
@@ -514,14 +579,15 @@ object InnertubeParser {
         if (!looksLikePlaylist) return null
 
         val pageCredit = pageCredit(root)
-        val songs = collectRenderers(scope, "musicResponsiveListItemRenderer")
+        val parsed = collectRenderers(scope, "musicResponsiveListItemRenderer")
             .mapNotNull { parseResponsiveListItem(it, pageCredit) }
             .distinctBy { it.videoId }
-            .filter { it.setVideoId != null }
+        val songs = parsed.filter { it.setVideoId != null }
+        val suggested = parsed.filter { it.setVideoId == null }
         val token = collectRenderers(scope, "continuationItemRenderer").firstOrNull()
             .o("continuationEndpoint").o("continuationCommand").s("token")
             ?: collectRenderers(scope, "nextContinuationData").firstOrNull().s("continuation")
-        return PlaylistShelfPage(songs, token)
+        return PlaylistShelfPage(songs, token, suggested)
     }
 
     /** How an album or playlist page bills itself, off its own header. */
@@ -619,6 +685,96 @@ object InnertubeParser {
             photoUrl = header.o("accountPhoto").a("thumbnails").best(),
         )
     }
+
+    fun parseSongMenu(root: JsonElement, videoId: String): SongMenu? {
+        val row = collectRenderers(root, "playlistPanelVideoRenderer")
+            .firstOrNull { it.s("videoId") == videoId }
+            ?: return null
+        val likeStatus = when (
+            collectRenderers(row, "likeButtonRenderer").firstOrNull().s("likeStatus")
+        ) {
+            "LIKE" -> LikeStatus.LIKE
+            "DISLIKE" -> LikeStatus.DISLIKE
+            "INDIFFERENT" -> LikeStatus.INDIFFERENT
+            else -> null
+        }
+        val toggle = collectRenderers(row, "toggleMenuServiceItemRenderer")
+            .firstOrNull { it.feedbackToken("defaultServiceEndpoint") != null && it.isLibraryToggle }
+        val defaultAdds = toggle.o("defaultIcon").s("iconType") == "LIBRARY_ADD"
+        val defaultToken = toggle.feedbackToken("defaultServiceEndpoint")
+        val toggledToken = toggle.feedbackToken("toggledServiceEndpoint")
+        return SongMenu(
+            likeStatus = likeStatus?.name,
+            inLibrary = toggle != null && !defaultAdds,
+            addToLibraryToken = if (defaultAdds) defaultToken else toggledToken,
+            removeFromLibraryToken = if (defaultAdds) toggledToken else defaultToken,
+        )
+    }
+
+    private fun JsonElement?.feedbackToken(endpoint: String): String? =
+        this.o(endpoint).o("feedbackEndpoint").s("feedbackToken")
+
+    private val JsonElement?.isLibraryToggle: Boolean
+        get() = LIBRARY_ICONS.any {
+            o("defaultIcon").s("iconType") == it || o("toggledIcon").s("iconType") == it
+        }
+
+    private val LIBRARY_ICONS = setOf("LIBRARY_ADD", "LIBRARY_REMOVE", "LIBRARY_SAVED")
+
+    fun parseLibraryState(root: JsonElement): LibraryState? {
+        val buttons = collectRenderers(root, "musicResponsiveHeaderRenderer")
+            .firstOrNull()
+            .a("buttons")
+            .orEmpty()
+        val save = buttons.firstNotNullOfOrNull {
+            it.o("toggleButtonRenderer")?.takeIf { b -> b.isSaveToggle }
+        } ?: return null
+        if (save.s("isDisabled") == "true") return null
+        val play = buttons.firstNotNullOfOrNull {
+            it.o("musicPlayButtonRenderer").o("playNavigationEndpoint")
+        }
+        return LibraryState(
+            playlistId = play.o("watchPlaylistEndpoint").s("playlistId")
+                ?: play.o("watchEndpoint").s("playlistId")
+                ?: return null,
+            saved = save.s("isToggled") == "true",
+        )
+    }
+
+    private val JsonElement?.isSaveToggle: Boolean
+        get() = o("defaultIcon").s("iconType") == "BOOKMARK_BORDER" ||
+            o("toggledIcon").s("iconType") == "BOOKMARK"
+
+    fun parsePlaylistOwned(root: JsonElement): Boolean? {
+        if (collectRenderers(root, "musicEditablePlaylistDetailHeaderRenderer").isNotEmpty()) {
+            return true
+        }
+        val header = collectRenderers(root, "musicResponsiveHeaderRenderer").firstOrNull()
+            ?: return null
+        if (collectRenderers(header, "menuNavigationItemRenderer")
+                .any { it.o("icon").s("iconType") in OWNER_ICONS }
+        ) {
+            return true
+        }
+        return header.a("buttons").orEmpty().none { it.o("toggleButtonRenderer").isSaveToggle }
+    }
+
+    private val OWNER_ICONS = setOf("DELETE", "EDIT")
+
+    fun parseUserPlaylists(root: JsonElement): List<UserPlaylist> =
+        parseLibraryItems(root).mapNotNull { item ->
+            val browseId = item.browseId ?: return@mapNotNull null
+            if (!browseId.startsWith("VL")) return@mapNotNull null
+            if (NOT_EDITABLE.any { browseId.startsWith("VL$it") }) return@mapNotNull null
+            UserPlaylist(
+                playlistId = browseId.removePrefix("VL"),
+                title = item.title,
+                subtitle = item.subtitle,
+                thumbnailUrl = item.thumbnailUrl,
+            )
+        }
+
+    private val NOT_EDITABLE = listOf("LM", "SE", "RD", "OLAK", "MPRE")
 
     // ---- Filter scope -------------------------------------------------------
 

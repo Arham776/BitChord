@@ -5,14 +5,17 @@ import UIKit
 import AppKit
 #endif
 
-/// Loads one signed-out feed (Home or Explore) off the shared bridge,
-/// upstream's `UiState` loading/error/success shape.
+/// Loads one Home/Explore feed off the shared bridge, including signed-in
+/// continuation paging (upstream `moreHome`).
 @MainActor @Observable
 final class FeedLoader {
     enum Source { case home, explore }
     enum Phase { case loading, loaded([FeedShelf]), failed(String) }
 
     private(set) var phase: Phase = .loading
+    private(set) var loadingMore = false
+    private var continuation: String?
+    private var loadedEpoch: Int?
     private let source: Source
 
     init(_ source: Source) {
@@ -20,14 +23,41 @@ final class FeedLoader {
     }
 
     func load() async {
+        await load(force: true, epoch: nil)
+    }
+
+    /// Skip the network trip when this loader already has shelves for `epoch`.
+    /// Used so a remounted Home tab does not flash a skeleton after Now Playing.
+    func load(force: Bool, epoch: Int?) async {
+        if !force, let epoch, loadedEpoch == epoch, case .loaded = phase { return }
         phase = .loading
+        continuation = nil
         do {
-            let shelves = source == .home
+            let result = source == .home
                 ? try await InnertubeFeed.shared.home()
                 : try await InnertubeFeed.shared.explore()
-            phase = .loaded(shelves)
+            continuation = result.continuation
+            loadedEpoch = epoch
+            phase = .loaded(result.shelves)
         } catch {
             phase = .failed(error.localizedDescription)
+        }
+    }
+
+    func loadMore() async {
+        guard source == .home || source == .explore, let token = continuation, !token.isEmpty, !loadingMore else { return }
+        loadingMore = true
+        defer { loadingMore = false }
+        do {
+            let result = source == .home
+                ? try await InnertubeFeed.shared.moreHome(token: token)
+                : try await InnertubeFeed.shared.moreExplore(token: token)
+            continuation = result.continuation
+            if case .loaded(let existing) = phase {
+                let seen = Set(existing.map(\.title))
+                phase = .loaded(existing + result.shelves.filter { !seen.contains($0.title) })
+            }
+        } catch {
         }
     }
 }
@@ -68,18 +98,10 @@ struct ShelfCardView: View {
                 .buttonStyle(.plain)
             } else if let videoId = card.videoId, !videoId.isEmpty {
                 Button {
-                    let entry = QueueEntry(
-                        id: videoId,
-                        title: card.title,
-                        artist: card.subtitle ?? "",
-                        source: "yt:\(videoId)",
-                        thumbnailUrl: card.thumbnailUrl,
-                        durationText: nil,
-                        albumName: nil,
-                        artworkData: nil,
-                        isLocal: false
-                    )
-                    controller.play([entry], at: 0)
+                    controller.playRadio(QueueEntry.youtube(
+                        videoId: videoId, title: card.title, artist: card.subtitle ?? "",
+                        thumbnailUrl: card.thumbnailUrl
+                    ))
                 } label: {
                     cardContent
                         .overlay(alignment: .topLeading) {
@@ -114,12 +136,27 @@ struct ShelfCardView: View {
         }
         .frame(width: 160, alignment: .leading)
         .contentShape(.rect)
+        .contextMenu {
+            if let videoId = card.videoId, !videoId.isEmpty {
+                SongActionButtons(entry: QueueEntry.youtube(
+                    videoId: videoId, title: card.title, artist: card.subtitle ?? "",
+                    thumbnailUrl: card.thumbnailUrl
+                ))
+            } else {
+                BrowseActionButtons(card: card)
+            }
+        }
     }
 }
 
 /// Navigation destination for detail drill-down from any shelf.
-enum BrowseDestination: Hashable {
+enum BrowseDestination: Hashable, Identifiable {
     case detail(browseId: String, title: String)
+    var id: String {
+        switch self {
+        case .detail(let browseId, _): browseId
+        }
+    }
 }
 
 /// Upstream's `SignInBanner`. Opens the in-app Google login WebView — never
@@ -175,5 +212,24 @@ struct FeedSkeleton: View {
         }
         .padding(.horizontal, 24)
         .padding(.vertical, 20)
+    }
+}
+
+/// First Home shelf as a larger pager, matching upstream's hero row.
+struct HeroShelf: View {
+    let shelf: FeedShelf
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text(shelf.title)
+                .font(.title2.weight(.bold))
+            ScrollView(.horizontal, showsIndicators: false) {
+                LazyHStack(spacing: 16) {
+                    ForEach(shelf.items) { card in
+                        ShelfCardView(card: card)
+                    }
+                }
+            }
+        }
     }
 }

@@ -29,7 +29,9 @@ object LrcLib {
         val seconds = (durationMs / 1000).toInt()
         val synced = runCatching { exactMatch(cleanTitle, cleanArtist, seconds) }.getOrNull()
             ?: runCatching { bestSearchHit(cleanTitle, cleanArtist, seconds) }.getOrNull()
-        return synced?.let(::parseLrc)?.takeIf { it.isNotEmpty() }
+        val raw = synced?.takeIf { it.isNotBlank() } ?: return null
+        EnhancedLrc.parse(raw).takeIf { it.isNotEmpty() }?.let { return it }
+        return parseLrc(raw).takeIf { it.isNotEmpty() }
     }
 
     private suspend fun exactMatch(title: String, artist: String, seconds: Int): String? {

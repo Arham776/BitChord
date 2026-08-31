@@ -42,6 +42,33 @@ expect object Http {
      * read, before it is handed to the engine.
      */
     suspend fun probe(url: String, headers: Map<String, String> = emptyMap()): ProbeResult
+
+    /**
+     * GET that returns the status code and ignores the body. Stats pings
+     * (`s.youtube.com`) answer 204; treating that as an error would drop plays.
+     */
+    suspend fun getStatus(
+        url: String,
+        headers: Map<String, String> = emptyMap(),
+        query: Map<String, String> = emptyMap(),
+        timeoutMillis: Long = 15_000,
+    ): Int
+
+    /**
+     * Darwin URLSession ignores a `Cookie` header on the request (OkHttp
+     * does not). Session cookies are therefore also written into an isolated
+     * `HTTPCookieStorage` the API client actually sends. No-op on engines
+     * that honour the header. Never used for googlevideo.
+     */
+    fun installSessionCookies(header: String?)
+
+    /** POST application/x-www-form-urlencoded. Non-2xx still returns the body. */
+    suspend fun postForm(
+        url: String,
+        fields: Map<String, String>,
+        headers: Map<String, String> = emptyMap(),
+        timeoutMillis: Long = 30_000,
+    ): String
 }
 
 /** [Http.probe]'s verdict input; the classification happens where it is read. */

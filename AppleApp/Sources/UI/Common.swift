@@ -1,4 +1,5 @@
 import SwiftUI
+import BitChordShared
 #if os(iOS)
 import UIKit
 #else
@@ -109,32 +110,56 @@ private struct RemoteArtwork: View {
     }
 }
 
+#if os(iOS)
+typealias PlatformImage = UIImage
+#else
+typealias PlatformImage = NSImage
+#endif
+
+/// Memory + disk artwork cache — Apple stand-in for Coil's LRU.
 @MainActor
 final class ArtworkCache {
     static let shared = ArtworkCache()
-#if os(iOS)
-    private var cache: [String: UIImage] = [:]
-    func get(_ url: String) -> UIImage? { cache[url] }
-    func load(_ url: String) async -> UIImage? {
-        if let hit = cache[url] { return hit }
-        guard let endpoint = URL(string: url) else { return nil }
-        guard let (data, _) = try? await URLSession.shared.data(from: endpoint),
-              let image = UIImage(data: data) else { return nil }
-        cache[url] = image
+    private let memory = NSCache<NSString, PlatformImage>()
+    private let folder = DiskCache.cachesSubfolder("images")
+    private static let diskLimit: Int64 = 128 * 1024 * 1024
+
+    init() {
+        memory.totalCostLimit = 48 * 1024 * 1024
+        memory.countLimit = 400
+    }
+
+    func get(_ url: String) -> PlatformImage? {
+        if let hit = memory.object(forKey: url as NSString) { return hit }
+        let file = diskURL(url)
+        guard FileManager.default.fileExists(atPath: file.path),
+              let data = try? Data(contentsOf: file),
+              let image = PlatformImage(data: data) else { return nil }
+        memory.setObject(image, forKey: url as NSString, cost: data.count)
+        DiskCache.touch(file)
         return image
     }
-#else
-    private var cache: [String: NSImage] = [:]
-    func get(_ url: String) -> NSImage? { cache[url] }
-    func load(_ url: String) async -> NSImage? {
-        if let hit = cache[url] { return hit }
+
+    func load(_ url: String) async -> PlatformImage? {
+        if let hit = get(url) { return hit }
         guard let endpoint = URL(string: url) else { return nil }
         guard let (data, _) = try? await URLSession.shared.data(from: endpoint),
-              let image = NSImage(data: data) else { return nil }
-        cache[url] = image
+              let image = PlatformImage(data: data) else { return nil }
+        memory.setObject(image, forKey: url as NSString, cost: data.count)
+        let file = diskURL(url)
+        try? data.write(to: file, options: .atomic)
+        DiskCache.trimFolder(folder, limitBytes: Self.diskLimit)
         return image
     }
-#endif
+
+    func clear() {
+        memory.removeAllObjects()
+        DiskCache.clearFolder(folder)
+    }
+
+    private func diskURL(_ url: String) -> URL {
+        folder.appendingPathComponent(DiskCache.hashName(url))
+    }
 }
 
 enum SharedArtwork {
@@ -197,15 +222,19 @@ struct EmptyStateView: View {
 }
 
 /// A queue row: artwork, title/artist, duration; hover highlight, context
-/// menu (macOS nuance from UI spec §5).
+/// menu (macOS nuance from UI spec §5). Rows always show a sleeve — album
+/// tracks that omit per-song art inherit the page cover at the call site.
 struct SongRow: View {
     let entry: QueueEntry
     var isCurrent: Bool = false
     var play: () -> Void
     var playNext: (() -> Void)?
     var addToQueue: (() -> Void)?
+    var playlistBrowseId: String? = nil
+    var playlistOwned: Bool = false
 
     @Environment(PlaybackController.self) private var controller
+    @Environment(AuthController.self) private var auth
     @State private var hovering = false
 
     private var active: Bool { isCurrent || controller.current?.id == entry.id }
@@ -223,15 +252,17 @@ struct SongRow: View {
                 }
                 VStack(alignment: .leading, spacing: 2) {
                     Text(entry.title)
-                        .font(.body.weight(active ? .bold : .medium))
+                        .font(.body.weight(active ? .semibold : .regular))
                         .foregroundStyle(active ? Color.accentColor : .primary)
                         .lineLimit(1)
-                    Text(entry.artist)
-                        .font(.callout)
-                        .foregroundStyle(.secondary)
-                        .lineLimit(1)
+                    if !entry.artist.isEmpty {
+                        Text(entry.artist)
+                            .font(.callout)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                    }
                 }
-                Spacer()
+                Spacer(minLength: 8)
                 if let text = entry.durationText, !text.isEmpty {
                     Text(text)
                         .font(.callout.monospacedDigit())
@@ -249,17 +280,72 @@ struct SongRow: View {
             .contentShape(.rect)
         }
         .buttonStyle(.plain)
-        .background(hovering ? Color.primary.opacity(0.05) : .clear)
+        .background {
+            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                .fill(rowFill)
+        }
         .onHover { hovering = $0 }
         .contextMenu {
-            Button("Play", action: play)
-            if let playNext {
-                Button("Play Next", action: playNext)
+            SongActionButtons(entry: entry, playlistBrowseId: playlistBrowseId, setVideoId: entry.setVideoId, playlistOwned: playlistOwned)
+        }
+        #if os(iOS)
+        .swipeActions(edge: .trailing, allowsFullSwipe: true) {
+            let playNext = PlatformSettings.shared.getBoolean(key: "swipe_to_play_next", default: false)
+            if playNext {
+                Button { (self.playNext ?? { controller.playNext(entry) })() } label: {
+                    Label("Play Next", systemImage: "text.line.first.and.arrowtriangle.forward")
+                }
+                .tint(.orange)
+            } else {
+                Button { (self.addToQueue ?? { controller.addToQueue(entry) })() } label: {
+                    Label("Queue", systemImage: "text.badge.plus")
+                }
+                .tint(.blue)
             }
-            if let addToQueue {
-                Button("Add to Queue", action: addToQueue)
+            if auth.signedIn, let vid = entry.videoId {
+                Button {
+                    Task { _ = await LibraryActions.rate(videoId: vid, status: LibraryActions.cachedLike(vid) == "LIKE" ? "INDIFFERENT" : "LIKE") }
+                } label: {
+                    Label(LibraryActions.cachedLike(vid) == "LIKE" ? "Unlike" : "Like", systemImage: LibraryActions.cachedLike(vid) == "LIKE" ? "heart.fill" : "heart")
+                }
+                .tint(.pink)
+            }
+            if !entry.isLocal {
+                Button { DownloadStore.shared.download(entry) } label: {
+                    Label("Download", systemImage: "arrow.down.circle")
+                }
+                .tint(.indigo)
             }
         }
+        #endif
+    }
+
+    private var rowFill: Color {
+        if active { return Color.primary.opacity(0.08) }
+        if hovering { return Color.primary.opacity(0.05) }
+        return .clear
+    }
+}
+
+/// Repeat glyph with a centred "1" when only the current track is looping —
+/// the same differentiator Music uses on `repeat.1`.
+struct RepeatGlyph: View {
+    var mode: PlaybackController.RepeatMode
+    var size: CGFloat = 15
+
+    var body: some View {
+        ZStack {
+            Image(.bchRepeat)
+                .resizable()
+                .scaledToFit()
+                .frame(width: size, height: size)
+            if mode == .one {
+                Text("1")
+                    .font(.system(size: max(7, size * 0.42), weight: .bold, design: .rounded))
+                    .offset(y: size * 0.02)
+            }
+        }
+        .accessibilityLabel(mode == .one ? "Repeat one" : mode == .all ? "Repeat all" : "Repeat off")
     }
 }
 

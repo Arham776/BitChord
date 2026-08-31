@@ -68,6 +68,24 @@ object MusicLink {
     }
 
     /**
+     * Consume the outstanding request as JSON for Swift (`kind` + `id`/`query`/`play`).
+     */
+    fun takePendingJson(): String? {
+        val req = _pending.value ?: return null
+        _pending.value = null
+        return when (req) {
+            is LinkRequest.Track -> """{"kind":"track","id":${jsonQuote(req.videoId)}}"""
+            is LinkRequest.Page -> """{"kind":"page","id":${jsonQuote(req.browseId)}}"""
+            is LinkRequest.Search ->
+                """{"kind":"search","query":${jsonQuote(req.query)},"play":${req.play}}"""
+            LinkRequest.Resume -> """{"kind":"resume"}"""
+        }
+    }
+
+    private fun jsonQuote(s: String): String =
+        "\"" + s.replace("\\", "\\\\").replace("\"", "\\\"") + "\""
+
+    /**
      * What a YouTube or YouTube Music URL points at, or null for one this app
      * has nothing to show for. Forgiving about the host: `music.youtube.com`,
      * `www.youtube.com`, `m.youtube.com` and `youtu.be` all address the same

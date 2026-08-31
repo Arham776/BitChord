@@ -66,6 +66,8 @@ pub struct SymphoniaDecoder {
     /// Interleaved stereo f32 left over from the last decoded packet.
     pending: Vec<f32>,
     pending_cursor: usize,
+    codec: String,
+    bit_depth: u32,
 }
 
 #[derive(Debug)]
@@ -96,10 +98,15 @@ fn open_audio_decoder(
         Err(e) => log::warn!("AAC decoder rejected container config: {e}"),
     }
 
-    // YouTube itag-18 esds often advertises HE-AAC/SBR or a 960-sample frame.
-    // Symphonia's AAC decoder only accepts AAC-LC, 1024 samples, ≤2 channels.
-    // Rebuild a minimal LC stereo AudioSpecificConfig from the track rate.
+    // itag 18 / HE-AAC: Symphonia has no SBR. Strip to the LC core so the
+    // track still plays (half-rate, no air band) when the resolver could not
+    // land itag 140. Silence is worse; the resolver still prefers AAC-LC.
     let rate = audio.sample_rate.unwrap_or(44_100);
+    if is_he_aac(audio) {
+        log::warn!(
+            "HE-AAC/SBR at {rate} Hz — decoding LC core only (no reconstructed highs)"
+        );
+    }
     let mut stripped = audio.clone();
     stripped.extra_data = Some(lc_stereo_asc(rate).into());
     stripped.profile = None;
@@ -109,6 +116,60 @@ fn open_audio_decoder(
     codecs
         .make_audio_decoder(&stripped, &opts)
         .map_err(|e| DecodeError(format!("decoder: {e}")))
+}
+
+/// MPEG-4 AudioSpecificConfig: AOT 5 = SBR, 29 = HE-AACv2/PS. LC+SBR
+/// also appends syncExtensionType 0x2B7 after the core ASC.
+fn is_he_aac(audio: &symphonia::core::codecs::audio::AudioCodecParameters) -> bool {
+    audio
+        .extra_data
+        .as_ref()
+        .is_some_and(|d| is_he_aac_config(d.as_ref()))
+}
+
+fn is_he_aac_config(extra: &[u8]) -> bool {
+    if extra.is_empty() {
+        return false;
+    }
+    match aac_audio_object_type(extra) {
+        Some(5 | 29) => true,
+        Some(2) => extra.len() > 4 || has_sbr_sync(extra),
+        _ => has_sbr_sync(extra),
+    }
+}
+
+/// 11-bit `syncExtensionType` 0x2B7 that marks an SBR extension after LC.
+fn has_sbr_sync(extra: &[u8]) -> bool {
+    if extra.len() < 2 {
+        return false;
+    }
+    let mut acc = 0u32;
+    let mut bits = 0u32;
+    for &b in extra {
+        acc = (acc << 8) | u32::from(b);
+        bits += 8;
+        while bits >= 11 {
+            if (acc >> (bits - 11)) & 0x7FF == 0x2B7 {
+                return true;
+            }
+            bits -= 1;
+        }
+    }
+    false
+}
+
+fn aac_audio_object_type(extra: &[u8]) -> Option<u8> {
+    if extra.is_empty() {
+        return None;
+    }
+    let aot = extra[0] >> 3;
+    if aot != 31 {
+        return Some(aot);
+    }
+    if extra.len() < 2 {
+        return None;
+    }
+    Some(32 + (((extra[0] & 0x07) << 3) | (extra[1] >> 5)))
 }
 
 /// Two-byte AudioSpecificConfig: AAC-LC, stereo, 1024-sample frames.
@@ -130,6 +191,39 @@ fn lc_stereo_asc(sample_rate: u32) -> [u8; 2] {
     };
     let bits: u16 = (2 << 11) | (freq_idx << 7) | (2 << 3);
     [(bits >> 8) as u8, bits as u8]
+}
+
+fn codec_label(source: &SourceKind, audio: &symphonia::core::codecs::audio::AudioCodecParameters) -> String {
+    let from_path = match source {
+        SourceKind::Path(p) => std::path::Path::new(p)
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_ascii_lowercase()),
+        SourceKind::Url(u) => {
+            let path = u.split('?').next().unwrap_or(u);
+            std::path::Path::new(path)
+                .extension()
+                .and_then(|e| e.to_str())
+                .map(|e| e.to_ascii_lowercase())
+        }
+    };
+    match from_path.as_deref() {
+        Some("flac") => return "FLAC".into(),
+        Some("alac") => return "ALAC".into(),
+        Some("mp3") => return "MP3".into(),
+        Some("ogg" | "oga") => return "Vorbis".into(),
+        Some("wav") => return "PCM".into(),
+        Some("aiff" | "aif") => return "AIFF".into(),
+        Some("opus" | "webm") => return "Opus".into(),
+        Some("m4a" | "aac" | "mp4") => {
+            if audio.profile.is_some() {
+                return "AAC".into();
+            }
+            return "AAC".into();
+        }
+        _ => {}
+    }
+    "AAC".into()
 }
 
 impl SymphoniaDecoder {
@@ -207,13 +301,15 @@ impl SymphoniaDecoder {
         };
 
         let decoder = open_audio_decoder(&audio)?;
+        let codec = codec_label(source, &audio);
+        let bit_depth = 16;
 
         let label = match source {
             SourceKind::Path(p) => p.rsplit('/').next().unwrap_or(p),
             SourceKind::Url(_) => "url",
         };
         log::info!(
-            "opened {label}: rate={sample_rate} ch={channels} duration={duration_secs:?}s frames={:?}",
+            "opened {label}: codec={codec} rate={sample_rate} ch={channels} bits={bit_depth} duration={duration_secs:?}s frames={:?}",
             track.num_frames
         );
 
@@ -227,6 +323,8 @@ impl SymphoniaDecoder {
             decoded_frames: 0,
             pending: Vec::new(),
             pending_cursor: 0,
+            codec,
+            bit_depth,
         })
     }
 
@@ -236,6 +334,14 @@ impl SymphoniaDecoder {
 
     pub fn channels(&self) -> usize {
         self.channels
+    }
+
+    pub fn codec(&self) -> &str {
+        &self.codec
+    }
+
+    pub fn bit_depth(&self) -> u32 {
+        self.bit_depth
     }
 
     /// Source-domain duration in seconds, when the container declares it.
@@ -525,9 +631,35 @@ impl StreamBuffer {
     fn end(&self) -> u64 {
         self.start + self.data.len() as u64
     }
+
+    /// Bytes already fetched that sit at or after `read_pos`. Zero when the
+    /// cursor has been left behind `start` (a seek restarted the window
+    /// without moving the cursor — the old `loaded()` treated that as a
+    /// huge positive length and the read path underflowed).
     fn loaded(&self) -> u64 {
-        self.end().saturating_sub(self.read_pos)
+        if self.read_pos < self.start {
+            0
+        } else {
+            self.end().saturating_sub(self.read_pos)
+        }
     }
+
+    /// Index of `read_pos` inside `data`, if it still lands in the window.
+    fn cursor(&self) -> Option<usize> {
+        let rel = self.read_pos.checked_sub(self.start)?;
+        let rel = usize::try_from(rel).ok()?;
+        (rel <= self.data.len()).then_some(rel)
+    }
+}
+
+fn lock_buf(mutex: &Mutex<StreamBuffer>) -> std::sync::MutexGuard<'_, StreamBuffer> {
+    mutex.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+fn lock_handle(
+    mutex: &Mutex<Option<JoinHandle<()>>>,
+) -> std::sync::MutexGuard<'_, Option<JoinHandle<()>>> {
+    mutex.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 struct FetchState {
@@ -575,16 +707,21 @@ impl HttpMediaSource {
     fn spawn_fetch(&self, from: u64) {
         let generation = self.state.generation.fetch_add(1, Ordering::SeqCst) + 1;
         {
-            let mut buf = self.state.buffer.lock().unwrap();
+            let mut buf = lock_buf(&self.state.buffer);
             buf.fetch_dead = false;
             buf.fetch_error = None;
-            // Trim everything before the new fetch start.
-            if from >= buf.start {
+            // Keep an overlapping tail when the new origin still sits inside
+            // the current window; otherwise drop it — appending onto stale
+            // bytes would desync `start` from the HTTP range.
+            if from >= buf.start && from <= buf.end() {
                 let cut = (from - buf.start) as usize;
                 let cut = cut.min(buf.data.len());
                 buf.data.drain(..cut);
-                buf.start = from;
+            } else {
+                buf.data.clear();
             }
+            buf.start = from;
+            buf.read_pos = from;
         }
         self.state.kill.store(false, Ordering::SeqCst);
         let url = self.url.clone();
@@ -594,7 +731,7 @@ impl HttpMediaSource {
             .name("native-core-http".into())
             .spawn(move || fetch_loop(url, headers, state, from, generation))
             .expect("spawn fetch thread");
-        *self.fetcher.lock().unwrap() = Some(handle);
+        *lock_handle(&self.fetcher) = Some(handle);
     }
 }
 
@@ -613,16 +750,28 @@ fn fetch_loop(url: String, headers: HashMap<String, String>, state: Arc<FetchSta
             {
                 return Ok(());
             }
-            let end = pos + HTTP_CHUNK - 1;
+            let known_total = lock_buf(&state.buffer).total_len;
+            if known_total.is_some_and(|t| pos >= t) {
+                return Ok(());
+            }
+            let end = known_total
+                .map(|t| (pos + HTTP_CHUNK - 1).min(t.saturating_sub(1)))
+                .unwrap_or(pos + HTTP_CHUNK - 1);
             let range = format!("bytes={pos}-{end}");
             let mut req = ureq::get(&url).set("Range", &range);
             for (key, value) in &headers {
                 req = req.set(key, value);
             }
-            let response = req.call().map_err(|e| format!("GET: {e}"))?;
+            let response = match req.call() {
+                Ok(r) => r,
+                // Past EOF (MP4 probe seeking to moov, or a CDN that does not
+                // honour a range past Content-Length). Same as a clean end.
+                Err(ureq::Error::Status(416, _)) => return Ok(()),
+                Err(e) => return Err(format!("GET: {e}")),
+            };
 
             {
-                let mut buf = state.buffer.lock().unwrap();
+                let mut buf = lock_buf(&state.buffer);
                 if buf.total_len.is_none() {
                     if let Some(range) = response.header("content-range") {
                         if let Some(total) =
@@ -655,7 +804,7 @@ fn fetch_loop(url: String, headers: HashMap<String, String>, state: Arc<FetchSta
                 }
                 got += n as u64;
                 {
-                    let mut buf = state.buffer.lock().unwrap();
+                    let mut buf = lock_buf(&state.buffer);
                     buf.data.extend_from_slice(&chunk[..n]);
                     state.cond.notify_all();
                 }
@@ -666,8 +815,8 @@ fn fetch_loop(url: String, headers: HashMap<String, String>, state: Arc<FetchSta
                         return Ok(());
                     }
                     let buffered = {
-                        let buf = state.buffer.lock().unwrap();
-                        (buf.end().saturating_sub(buf.read_pos)) as i64
+                        let buf = lock_buf(&state.buffer);
+                        buf.loaded() as i64
                     };
                     if buffered < 32 * 1024 * 1024 {
                         break;
@@ -679,14 +828,14 @@ fn fetch_loop(url: String, headers: HashMap<String, String>, state: Arc<FetchSta
                 return Ok(());
             }
             pos += got;
-            let total = state.buffer.lock().unwrap().total_len;
+            let total = lock_buf(&state.buffer).total_len;
             if got < HTTP_CHUNK || total.is_some_and(|t| pos >= t) {
                 return Ok(());
             }
         }
     })();
 
-    let mut buf = state.buffer.lock().unwrap();
+    let mut buf = lock_buf(&state.buffer);
     if let Err(e) = result {
         log::error!("HttpMediaSource fetch failed: {e}");
         buf.fetch_error = Some(e);
@@ -697,7 +846,7 @@ fn fetch_loop(url: String, headers: HashMap<String, String>, state: Arc<FetchSta
 
 impl Read for HttpMediaSource {
     fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
-        let mut buf = self.state.buffer.lock().unwrap();
+        let mut buf = lock_buf(&self.state.buffer);
         loop {
             if let Some(err) = &buf.fetch_error {
                 if buf.loaded() == 0 {
@@ -705,34 +854,39 @@ impl Read for HttpMediaSource {
                 }
                 // Serve what remains before surfacing the failure.
             }
-            if buf.loaded() > 0 {
-                let offset = (buf.read_pos - buf.start) as usize;
-                let take = out.len().min(buf.data.len() - offset);
-                out[..take].copy_from_slice(&buf.data[offset..offset + take]);
-                buf.read_pos += take as u64;
-                // Drop consumed bytes behind a 4 MB window so the buffer does
-                // not grow without bound on long tracks.
-                const KEEP_BEHIND: usize = 4 * 1024 * 1024;
-                let consumed = (buf.read_pos - buf.start) as usize;
-                if consumed > KEEP_BEHIND {
-                    let cut = consumed - KEEP_BEHIND;
-                    buf.data.drain(..cut);
-                    buf.start += cut as u64;
+            if let Some(offset) = buf.cursor() {
+                let available = buf.data.len().saturating_sub(offset);
+                if available > 0 {
+                    let take = out.len().min(available);
+                    out[..take].copy_from_slice(&buf.data[offset..offset + take]);
+                    buf.read_pos += take as u64;
+                    // Drop consumed bytes behind a 4 MB window so the buffer does
+                    // not grow without bound on long tracks.
+                    const KEEP_BEHIND: usize = 4 * 1024 * 1024;
+                    let consumed = buf
+                        .read_pos
+                        .saturating_sub(buf.start)
+                        .min(buf.data.len() as u64) as usize;
+                    if consumed > KEEP_BEHIND {
+                        let cut = consumed - KEEP_BEHIND;
+                        buf.data.drain(..cut);
+                        buf.start += cut as u64;
+                    }
+                    return Ok(take);
                 }
-                return Ok(take);
             }
             if buf.fetch_dead {
                 return Ok(0); // clean EOF
             }
-            buf = self.state.cond.wait(buf).unwrap();
+            buf = self.state.cond.wait(buf).unwrap_or_else(|e| e.into_inner());
         }
     }
 }
 
 impl Seek for HttpMediaSource {
     fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
-        let total = self.state.buffer.lock().unwrap().total_len;
-        let mut buf = self.state.buffer.lock().unwrap();
+        let total = lock_buf(&self.state.buffer).total_len;
+        let mut buf = lock_buf(&self.state.buffer);
         let target = match pos {
             SeekFrom::Start(offset) => offset as i64,
             SeekFrom::Current(delta) => buf.read_pos as i64 + delta,
@@ -748,12 +902,14 @@ impl Seek for HttpMediaSource {
         }
         let target = target as u64;
 
-        if target > buf.end() {
-            // Outside the fetched window: restart the ranged fetch there.
+        // MP4 probe commonly seeks to the moov atom past the first range, or
+        // back into bytes already dropped by KEEP_BEHIND. Either side of the
+        // window needs a fresh ranged fetch — and `read_pos` must move with
+        // `start` or the next read underflows.
+        if target < buf.start || target > buf.end() {
             drop(buf);
-            // Kill the current fetcher first so it stops appending behind us.
             self.state.kill.store(true, Ordering::SeqCst);
-            if let Some(handle) = self.fetcher.lock().unwrap().take() {
+            if let Some(handle) = lock_handle(&self.fetcher).take() {
                 let _ = handle.join();
             }
             self.spawn_fetch(target);
@@ -770,7 +926,7 @@ impl MediaSource for HttpMediaSource {
     }
 
     fn byte_len(&self) -> Option<u64> {
-        self.state.buffer.lock().unwrap().total_len
+        lock_buf(&self.state.buffer).total_len
     }
 }
 
@@ -778,7 +934,7 @@ impl Drop for HttpMediaSource {
     fn drop(&mut self) {
         self.state.kill.store(true, Ordering::SeqCst);
         self.state.cond.notify_all();
-        if let Some(handle) = self.fetcher.lock().unwrap().take() {
+        if let Some(handle) = lock_handle(&self.fetcher).take() {
             let _ = handle.join();
         }
     }
@@ -804,5 +960,56 @@ mod tests {
     #[test]
     fn growing_file_waits_only_with_grow_marker() {
         assert!(!GrowingFile::is_growing("/tmp/bitchord-no-such.mp4"));
+    }
+
+    #[test]
+    fn lc_asc_is_not_he_aac() {
+        let asc = lc_stereo_asc(44_100);
+        assert_eq!(aac_audio_object_type(&asc), Some(2));
+        assert!(!is_he_aac_config(&asc));
+    }
+
+    #[test]
+    fn long_itag18_extra_is_he_aac() {
+        // 25-byte esds: LC core plus SBR extension (the "aac too complex" path).
+        let mut extra = lc_stereo_asc(22_050).to_vec();
+        extra.extend_from_slice(&[0u8; 23]);
+        assert!(is_he_aac_config(&extra));
+    }
+
+    #[test]
+    fn sbr_and_ps_aot_are_he_aac() {
+        assert_eq!(aac_audio_object_type(&[0x2B, 0x10]), Some(5));
+        assert!(is_he_aac_config(&[0x2B, 0x10]));
+        assert_eq!(aac_audio_object_type(&[0xE8, 0x10]), Some(29));
+        assert!(is_he_aac_config(&[0xE8, 0x10]));
+    }
+
+    #[test]
+    fn stream_buffer_loaded_is_zero_when_cursor_is_behind_window() {
+        let buf = StreamBuffer {
+            data: vec![],
+            start: 7_000_000,
+            read_pos: 0,
+            total_len: Some(7_737_024),
+            fetch_dead: false,
+            fetch_error: None,
+        };
+        assert_eq!(buf.loaded(), 0);
+        assert_eq!(buf.cursor(), None);
+    }
+
+    #[test]
+    fn stream_buffer_cursor_stays_in_window() {
+        let buf = StreamBuffer {
+            data: vec![0; 1024],
+            start: 1000,
+            read_pos: 1500,
+            total_len: None,
+            fetch_dead: false,
+            fetch_error: None,
+        };
+        assert_eq!(buf.cursor(), Some(500));
+        assert_eq!(buf.loaded(), 524);
     }
 }

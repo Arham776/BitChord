@@ -15,6 +15,12 @@ final class AuthController {
     /// Home/Explore observe this and reload after sign-in / sign-out.
     var sessionEpoch = 0
 
+    init() {
+        // Apply the Keychain cookie before the first Home `.task` so the
+        // signed-in browse is not raced by a guest fetch.
+        restore()
+    }
+
     func restore() {
         guard let cookie = AuthStore.cookie else { return }
         guard AuthBridge.shared.applyCookie(cookieHeader: cookie) else {
@@ -22,6 +28,7 @@ final class AuthController {
             return
         }
         signedIn = true
+        sessionEpoch += 1
         Task { await refreshAccount() }
     }
 

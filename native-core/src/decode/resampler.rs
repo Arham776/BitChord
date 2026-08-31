@@ -42,8 +42,13 @@ pub struct StreamResampler {
 
 impl StreamResampler {
     pub fn new(input_rate: u32, output_rate: u32) -> Self {
-        let input_rate = input_rate as f64;
-        let output_rate = output_rate as f64;
+        Self::with_rates(input_rate as f64, output_rate as f64)
+    }
+
+    /// Fractional rates — used for playback-speed / Automix tempo stretch.
+    pub fn with_rates(input_rate: f64, output_rate: f64) -> Self {
+        let input_rate = input_rate.max(1.0);
+        let output_rate = output_rate.max(1.0);
         let ratio = output_rate / input_rate;
         let cutoff = 0.5 * ratio.min(1.0);
         let half_width = ZERO_CROSSINGS / (2.0 * cutoff);

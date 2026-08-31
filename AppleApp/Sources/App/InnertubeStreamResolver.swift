@@ -16,10 +16,11 @@ struct ResolvedYouTubeStream {
 final class InnertubeStreamResolver: Sendable {
     static let shared = InnertubeStreamResolver()
 
-    func resolve(videoId: String) async throws -> ResolvedYouTubeStream {
+    func resolve(videoId: String, maxKbps: Int = Int.max) async throws -> ResolvedYouTubeStream {
         var stream = try await withCheckedThrowingContinuation { continuation in
             PlayerBridge.shared.resolve(
                 videoId: videoId,
+                maxKbps: Swift.Int32(clamping: maxKbps == Int.max ? Int(Swift.Int32.max) : maxKbps),
                 callback: ResolveCallbackAdapter { json, message in
                     if let json {
                         do {

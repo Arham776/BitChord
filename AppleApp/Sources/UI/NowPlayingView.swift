@@ -1,15 +1,22 @@
 import SwiftUI
 import BitChordShared
+import AVKit
+#if os(iOS)
+import UIKit
+#else
+import AppKit
+#endif
 
-/// Full Now Playing (UI spec §3.3). On macOS this is the full-window
-/// in-place takeover: artwork left with title beneath, transport below, a
-/// lyrics pane filling the right half ("Play a song to see lyrics here." when
-/// empty), volume top-right, dismiss top-left. On iOS it is a full-screen
-/// cover. Background is an animated `MeshGradient` driven by the artwork's
-/// palette (native iOS 18 / macOS 15 API per the raised floor).
+/// Full Now Playing (UI spec §3.3). On macOS this *is* the window: traffic
+/// lights stay, close / volume / AirPlay live in the real toolbar, and the
+/// wash shows through a hidden title. On iPhone it is a swipe-to-dismiss
+/// sheet that zooms from the mini player; on iPad a page-sized sheet.
 struct NowPlayingView: View {
     @Environment(PlaybackController.self) private var controller
     @Environment(AppModel.self) private var appModel
+    @Environment(\.dismiss) private var dismiss
+    @Environment(AuthController.self) private var auth
+    @State private var pane: PlayerPane = .lyrics
 
     var body: some View {
         #if os(macOS)
@@ -19,122 +26,273 @@ struct NowPlayingView: View {
         #endif
     }
 
-    // ---- macOS: full-window takeover ---------------------------------------
+    // ---- macOS: window-root player -----------------------------------------
     #if os(macOS)
     private var macOSBody: some View {
         ZStack {
-            MeshBackdrop(seed: controller.current?.id.hashValue ?? 0)
+            MeshBackdrop(seed: controller.current?.id.hashValue ?? 0, artwork: controller.current?.artworkData)
                 .ignoresSafeArea()
-                .id(controller.current?.id)
-            HStack(spacing: 0) {
-                // Left column: artwork, metadata, transport.
-                VStack(spacing: 16) {
-                    HStack {
-                        Button {
-                            appModel.nowPlayingPresented = false
-                        } label: {
-                            Image(systemName: "xmark")
-                                .font(.system(size: 13, weight: .semibold))
-                                .foregroundStyle(.white.opacity(0.85))
+                .allowsHitTesting(false)
+
+            HStack(alignment: .top, spacing: 8) {
+                leftColumn
+                    .frame(width: 420)
+                rightColumn
+                    .frame(maxWidth: .infinity)
+            }
+            .padding(.top, 8)
+            .padding(.bottom, 16)
+
+            VStack {
+                Spacer()
+                    .allowsHitTesting(false)
+                HStack {
+                    Spacer()
+                        .allowsHitTesting(false)
+                    HStack(spacing: 8) {
+                        GlassCircleButton(icon: .bchLyrics, selected: pane == .lyrics) {
+                            pane = .lyrics
                         }
-                        .buttonStyle(.plain)
-                        Spacer()
+                        .help("Lyrics")
+                        GlassCircleButton(system: "list.bullet", selected: pane == .queue) {
+                            pane = .queue
+                        }
+                        .help("Up Next")
                     }
-                    .padding(.top, 20)
-                    .padding(.horizontal, 24)
-
-                    ArtworkView(entry: controller.current)
-                        .frame(maxWidth: 340, maxHeight: 340)
-                        .clipShape(.rect(cornerRadius: 14, style: .continuous))
-                        .shadow(color: .black.opacity(0.4), radius: 24, y: 10)
-                        .scaleEffect(controller.isPlaying ? 1 : 0.86)
-                        .animation(.spring(response: 0.55, dampingFraction: 0.68), value: controller.isPlaying)
-                        .id(controller.current?.id)
-
-                    VStack(spacing: 6) {
-                        Text(controller.current?.title ?? "Nothing playing")
-                            .font(.title2.weight(.bold))
-                            .foregroundStyle(.white)
-                            .lineLimit(1)
-                        Text(controller.current?.artist ?? "")
-                            .font(.callout)
-                            .foregroundStyle(.white.opacity(0.75))
-                            .lineLimit(1)
-                    }
-
-                    transport
-                        .padding(.bottom, 24)
+                    .padding(.trailing, 22)
+                    .padding(.bottom, 18)
                 }
-                .frame(maxWidth: 460)
-                .padding(.horizontal, 40)
+            }
+        }
+        .toolbar { macPlayerToolbar }
+        .toolbar(removing: .title)
+        .toolbarBackground(.hidden, for: .windowToolbar)
+        .toolbarBackgroundVisibility(.hidden, for: .windowToolbar)
+        .navigationTitle("")
+        .environment(\.colorScheme, .dark)
+    }
 
-                // Right column: lyrics pane.
-                VStack(spacing: 0) {
-                    HStack {
-                        Spacer()
-                        PillSlider(volume: Binding(
-                            get: { controller.volume },
-                            set: { controller.volume = $0 }
-                        ))
-                        .foregroundStyle(.white)
-                        .frame(width: 150)
-                        .padding(.trailing, 24)
-                    }
-                    Spacer()
-                    LyricsPane(
-                        lines: controller.lyrics,
-                        loading: controller.lyricsLoading,
-                        position: controller.position,
-                        hasTrack: controller.current != nil
-                    )
-                    Spacer()
-                }
-                .frame(maxWidth: .infinity)
+    @ToolbarContentBuilder
+    private var macPlayerToolbar: some ToolbarContent {
+        ToolbarItem(placement: .navigation) {
+            Button("Close", systemImage: "xmark") {
+                appModel.nowPlayingPresented = false
+            }
+            .labelStyle(.iconOnly)
+            .help("Close")
+        }
+
+        if #available(macOS 26.0, *) {
+            ToolbarSpacer(.flexible)
+        }
+
+        if !controller.hideVolumeBar {
+            ToolbarItem {
+                ToolbarVolumeSlider(volume: Binding(
+                    get: { controller.volume },
+                    set: { controller.volume = $0 }
+                ))
+                .help("Volume")
+            }
+        }
+
+        if #available(macOS 26.0, *) {
+            ToolbarSpacer(.fixed)
+            ToolbarSpacer(.fixed)
+        }
+
+        if #available(macOS 26.0, *) {
+            ToolbarItem {
+                AirPlayRouteButton()
+                    .frame(width: 22, height: 22)
+                    .frame(width: 32, height: 32)
+                    .glassEffect(.regular, in: Circle())
+                    .help("AirPlay")
+            }
+            .sharedBackgroundVisibility(.hidden)
+        } else {
+            ToolbarItem {
+                AirPlayRouteButton()
+                    .frame(width: 22, height: 22)
+                    .frame(width: 32, height: 32)
+                    .background(.ultraThinMaterial, in: Circle())
+                    .help("AirPlay")
             }
         }
     }
-    #endif
 
-    // ---- iOS: full-screen cover --------------------------------------------
-    #if os(iOS)
-    private var iOSBody: some View {
-        ZStack {
-            MeshBackdrop(seed: controller.current?.id.hashValue ?? 0)
-                .ignoresSafeArea()
-            VStack(spacing: 28) {
-                HStack {
-                    Button {
-                        appModel.nowPlayingPresented = false
-                    } label: {
-                        Image(systemName: "chevron.down")
-                            .font(.system(size: 15, weight: .semibold))
-                            .foregroundStyle(.white)
-                    }
-                    Spacer()
-                }
-                .padding(.horizontal, 24)
+    private var leftColumn: some View {
+        VStack(spacing: 0) {
+            HeroArtwork(
+                entry: controller.current,
+                canvasURL: controller.canvasURL,
+                fallbackURL: controller.canvasFallbackURL,
+                isPlaying: controller.isPlaying
+            )
+            .id(controller.current?.id)
 
-                ArtworkView(entry: controller.current, side: 300)
-                    .clipShape(.rect(cornerRadius: 16, style: .continuous))
-                    .shadow(radius: 24, y: 12)
-                    .scaleEffect(controller.isPlaying ? 1 : 0.86)
-                    .animation(.spring(response: 0.55, dampingFraction: 0.68), value: controller.isPlaying)
-                    .id(controller.current?.id)
-
-                VStack(spacing: 6) {
+            VStack(spacing: 18) {
+            HStack(alignment: .top, spacing: 12) {
+                VStack(alignment: .leading, spacing: 4) {
                     Text(controller.current?.title ?? "Nothing playing")
                         .font(.title2.weight(.bold))
                         .foregroundStyle(.white)
-                    Text(controller.current?.artist ?? "")
+                        .lineLimit(2)
+                        .shadow(color: .black.opacity(0.45), radius: 6, y: 1)
+                    Text(creditLine)
                         .font(.callout)
-                        .foregroundStyle(.white.opacity(0.75))
+                        .foregroundStyle(.white.opacity(0.78))
+                        .lineLimit(1)
+                        .shadow(color: .black.opacity(0.4), radius: 4, y: 1)
                 }
-
-                positionControls
-                    .padding(.horizontal, 32)
-                transport
-                Spacer(minLength: 20)
+                Spacer(minLength: 8)
+                if auth.signedIn, controller.current?.videoId != nil {
+                    GlassCircleButton(system: controller.isLiked ? "heart.fill" : "heart") {
+                        controller.toggleLike()
+                    }
+                    .help(controller.isLiked ? "Remove from Liked Music" : "Like")
+                }
+                moreMenu
             }
+
+            positionControls
+            playerTransport
+            if PlatformSettings.shared.getBoolean(key: "show_nerd_stats", default: false),
+               let nerd = controller.nerd, !nerd.codec.isEmpty {
+                Text(nerdLine(nerd))
+                    .font(.caption2.monospaced())
+                    .foregroundStyle(.white.opacity(0.7))
+            }
+            Spacer(minLength: 12)
+            }
+            .padding(.horizontal, 36)
+            .padding(.top, 4)
+        }
+    }
+
+    private var rightColumn: some View {
+        Group {
+            switch pane {
+            case .lyrics:
+                LyricsPane(
+                    lines: controller.lyrics,
+                    loading: controller.lyricsLoading,
+                    position: controller.position,
+                    hasTrack: controller.current != nil,
+                    onSeek: { controller.seek(to: $0) }
+                )
+            case .queue:
+                UpNextPane()
+            }
+        }
+        .padding(.trailing, 28)
+        .padding(.leading, 8)
+        .padding(.bottom, 56)
+    }
+
+    private var creditLine: String {
+        let artist = controller.current?.artist ?? ""
+        let album = controller.current?.albumName ?? ""
+        if artist.isEmpty { return album }
+        if album.isEmpty { return artist }
+        return "\(artist) — \(album)"
+    }
+    #endif
+
+    // ---- iOS sheet ----------------------------------------------------------
+    #if os(iOS)
+    private var iOSBody: some View {
+        NavigationStack {
+            ZStack {
+                MeshBackdrop(seed: controller.current?.id.hashValue ?? 0, artwork: controller.current?.artworkData)
+                    .ignoresSafeArea()
+                VStack(spacing: 0) {
+                    HeroArtwork(
+                        entry: controller.current,
+                        canvasURL: controller.canvasURL,
+                        fallbackURL: controller.canvasFallbackURL,
+                        isPlaying: controller.isPlaying
+                    )
+                    .id(controller.current?.id)
+                    VStack(spacing: 16) {
+                        VStack(spacing: 6) {
+                            Text(controller.current?.title ?? "Nothing playing")
+                                .font(.title2.weight(.bold))
+                                .foregroundStyle(.white)
+                                .multilineTextAlignment(.center)
+                                .lineLimit(2)
+                                .shadow(color: .black.opacity(0.45), radius: 6, y: 1)
+                            Text(controller.current?.artist ?? "")
+                                .font(.callout)
+                                .foregroundStyle(.white.opacity(0.75))
+                                .shadow(color: .black.opacity(0.4), radius: 4, y: 1)
+                        }
+                        positionControls
+                            .padding(.horizontal, 32)
+                        if PlatformSettings.shared.getBoolean(key: "show_nerd_stats", default: false),
+                           let nerd = controller.nerd, !nerd.codec.isEmpty {
+                            Text(nerdLine(nerd))
+                                .font(.caption2.monospaced())
+                                .foregroundStyle(.white.opacity(0.7))
+                        }
+                        playerTransport
+                        Group {
+                            switch pane {
+                            case .lyrics:
+                                LyricsPane(
+                                    lines: controller.lyrics,
+                                    loading: controller.lyricsLoading,
+                                    position: controller.position,
+                                    hasTrack: controller.current != nil,
+                                    onSeek: { controller.seek(to: $0) }
+                                )
+                            case .queue:
+                                UpNextPane()
+                            }
+                        }
+                        .frame(maxHeight: 220)
+                        Spacer(minLength: 20)
+                    }
+                }
+                VStack {
+                    HStack {
+                        Spacer()
+                        if auth.signedIn, controller.current?.videoId != nil {
+                            GlassCircleButton(system: controller.isLiked ? "heart.fill" : "heart") {
+                                controller.toggleLike()
+                            }
+                        }
+                        GlassCircleButton(icon: .bchLyrics, selected: pane == .lyrics) {
+                            pane = .lyrics
+                        }
+                        GlassCircleButton(system: "list.bullet", selected: pane == .queue) {
+                            pane = .queue
+                        }
+                        moreMenu
+                    }
+                    .padding(.horizontal, 24)
+                    .padding(.top, 12)
+                    Spacer()
+                }
+            }
+            .toolbar { playerToolbar }
+            .toolbarTitleDisplayMode(.inline)
+        }
+    }
+
+    @ToolbarContentBuilder
+    private var playerToolbar: some ToolbarContent {
+        ToolbarItem(placement: .cancellationAction) {
+            if #available(iOS 26.0, *) {
+                Button(role: .close) { dismiss() }
+            } else {
+                Button("Close", systemImage: "xmark") { dismiss() }
+            }
+        }
+        ToolbarItem(placement: .primaryAction) {
+            AirPlayRouteButton()
+                .frame(width: 22, height: 22)
+                .help("AirPlay")
         }
     }
     #endif
@@ -147,82 +305,123 @@ struct NowPlayingView: View {
                 value: controller.position,
                 maximum: controller.duration
             ) { controller.seek(to: $0) }
-            .tint(.white.opacity(0.9))
+            .tint(.white)
 
             HStack {
                 Text(Self.timestamp(controller.position))
                 Spacer()
-                Text(Self.timestamp(controller.duration))
+                Text(remainingLabel)
             }
-            .font(.caption2.monospacedDigit())
+            .font(.caption.monospacedDigit().weight(.medium))
             .foregroundStyle(.white.opacity(0.7))
+            .shadow(color: .black.opacity(0.4), radius: 3, y: 1)
         }
     }
 
-    private var transport: some View {
-        HStack(spacing: 30) {
-            Button {
-                controller.cycleRepeat()
-            } label: {
-                ZStack {
-                    Image(.bchRepeat)
-                        .resizable()
-                        .scaledToFit()
-                        .frame(width: 19)
-                    if controller.repeatMode == .one {
-                        Text("1")
-                            .font(.system(size: 8, weight: .bold))
-                            .offset(y: 10)
-                    }
-                }
-            }
-            .buttonStyle(.plain)
-            .foregroundStyle(controller.repeatMode == .off ? .white.opacity(0.7) : .white)
-            .help(controller.repeatMode == .one ? "Repeat one" : controller.repeatMode == .all ? "Repeat all" : "Repeat off")
+    private var remainingLabel: String {
+        guard controller.duration > 0 else { return "-0:00" }
+        return "-\(Self.timestamp(max(0, controller.duration - controller.position)))"
+    }
 
-            Button {
-                controller.previous()
-            } label: {
-                Image(systemName: "backward.fill")
-                    .font(.system(size: 20, weight: .bold))
-            }
-            .buttonStyle(.plain)
-
-            Button {
-                controller.togglePlayPause()
-            } label: {
-                if controller.isBuffering {
-                    ProgressView()
-                        .controlSize(.regular)
-                        .tint(.white)
-                } else {
-                    Image(systemName: controller.isPlaying ? "pause.fill" : "play.fill")
-                        .font(.system(size: 28, weight: .bold))
-                }
-            }
-            .buttonStyle(.plain)
-
-            Button {
-                controller.next()
-            } label: {
-                Image(systemName: "forward.fill")
-                    .font(.system(size: 20, weight: .bold))
-            }
-            .buttonStyle(.plain)
-
+    /// Music's order: shuffle · previous · play-in-circle · next · repeat.
+    /// Play sits on a white disc so it never disappears into a bright wash.
+    private var playerTransport: some View {
+        HStack(spacing: 28) {
             Button {
                 controller.toggleShuffle()
             } label: {
                 Image(.bchShuffle)
                     .resizable()
                     .scaledToFit()
-                    .frame(width: 19)
+                    .frame(width: 18, height: 18)
+                    .playerGlyph()
             }
             .buttonStyle(.plain)
-            .foregroundStyle(controller.shuffleEnabled ? .white : .white.opacity(0.7))
+            .foregroundStyle(controller.shuffleEnabled ? .white : .white.opacity(0.72))
             .help(controller.shuffleEnabled ? "Shuffle on" : "Shuffle off")
+
+            Button {
+                controller.previous()
+            } label: {
+                Image(systemName: "backward.fill")
+                    .font(.system(size: 20, weight: .semibold))
+                    .playerGlyph()
+            }
+            .buttonStyle(.plain)
+            .disabled(!controller.canPlayPrevious)
+
+            Button {
+                controller.togglePlayPause()
+            } label: {
+                ZStack {
+                    Circle()
+                        .fill(.white)
+                        .shadow(color: .black.opacity(0.35), radius: 10, y: 3)
+                    if controller.isBuffering {
+                        ProgressView()
+                            .controlSize(.regular)
+                            .tint(.black)
+                    } else {
+                        Image(systemName: controller.isPlaying ? "pause.fill" : "play.fill")
+                            .font(.system(size: 22, weight: .bold))
+                            .foregroundStyle(.black)
+                            .offset(x: controller.isPlaying ? 0 : 1)
+                    }
+                }
+                .frame(width: 58, height: 58)
+            }
+            .buttonStyle(.plain)
+            .disabled(controller.current == nil && !controller.isBuffering)
+            .help(controller.isPlaying ? "Pause" : "Play")
+
+            Button {
+                controller.next()
+            } label: {
+                Image(systemName: "forward.fill")
+                    .font(.system(size: 20, weight: .semibold))
+                    .playerGlyph()
+            }
+            .buttonStyle(.plain)
+            .disabled(!controller.canPlayNext)
+
+            Button {
+                controller.cycleRepeat()
+            } label: {
+                RepeatGlyph(mode: controller.repeatMode, size: 18)
+                    .playerGlyph()
+            }
+            .buttonStyle(.plain)
+            .foregroundStyle(controller.repeatMode == .off ? .white.opacity(0.72) : .white)
+            .help(controller.repeatMode == .one ? "Repeat one" : controller.repeatMode == .all ? "Repeat all" : "Repeat off")
         }
         .foregroundStyle(.white)
+    }
+
+    private var moreMenu: some View {
+        Menu {
+            if let current = controller.current {
+                SongActionButtons(entry: current)
+                Divider()
+            }
+            Button("Sleep 15 min") { controller.startSleep(minutes: 15) }
+            Button("Sleep 30 min") { controller.startSleep(minutes: 30) }
+            Button("Sleep 45 min") { controller.startSleep(minutes: 45) }
+            Button("Sleep 60 min") { controller.startSleep(minutes: 60) }
+            Button("Stop after this track") { controller.startSleepAfterTrack() }
+            if controller.sleepUntil != nil || controller.sleepAfterTrack {
+                Button("Cancel timer", role: .destructive) { controller.cancelSleep() }
+            }
+            Divider()
+            Button("Download") { controller.downloadCurrent() }
+        } label: {
+            Image(systemName: "ellipsis")
+                .font(.system(size: 13, weight: .semibold))
+                .foregroundStyle(.white)
+                .frame(width: 32, height: 32)
+                .background(.white.opacity(0.14), in: Circle())
+        }
+        .buttonStyle(.plain)
+        .help("More")
     }
 
     static func timestamp(_ seconds: Double) -> String {
@@ -235,60 +434,336 @@ struct NowPlayingView: View {
             ? String(format: "%d:%02d:%02d", hours, mins % 60, secs)
             : String(format: "%d:%02d", mins, secs)
     }
+
+    private func nerdLine(_ nerd: NerdStatsRec) -> String {
+        var parts = [nerd.codec]
+        if nerd.kbps > 0 { parts.append("\(nerd.kbps) kbps") }
+        if nerd.bitDepth > 0 { parts.append("\(nerd.bitDepth)-bit") }
+        if nerd.sampleRate > 0 { parts.append("\(nerd.sampleRate) Hz") }
+        if nerd.channels > 0 { parts.append("\(nerd.channels) ch") }
+        return parts.joined(separator: " · ")
+    }
 }
 
-/// Animated `MeshGradient` backdrop (UI spec §7) — gently drifting control
-/// points over a palette implied by the artwork hue. Upstream's
-/// `MeshGradient.kt`/`CanvasArtworkPlayer.kt` equivalent.
-struct MeshBackdrop: View {
-    var seed: Int
+private enum PlayerPane {
+    case lyrics, queue
+}
+
+/// Frosted circular chrome used for dismiss / lyrics / queue.
+struct GlassCircleButton: View {
+    var system: String? = nil
+    var icon: ImageResource? = nil
+    var selected: Bool = false
+    var action: () -> Void
 
     var body: some View {
-        let palette = Self.palette(seed: seed)
-        TimelineView(.animation) { timeline in
-            let cycle = 12.5
-            let t = Float(
-                timeline.date.timeIntervalSinceReferenceDate
-                    .truncatingRemainder(dividingBy: cycle) / cycle
-            )
-            MeshGradient(width: 3, height: 3, points: Self.points(t: t), colors: palette)
-                .ignoresSafeArea()
+        Button(action: action) {
+            Group {
+                if let icon {
+                    Image(icon).resizable().scaledToFit().frame(width: 15, height: 15)
+                } else if let system {
+                    Image(systemName: system).font(.system(size: 12, weight: .semibold))
+                }
+            }
+            .foregroundStyle(.white)
+            .frame(width: 34, height: 34)
+            .background(.white.opacity(selected ? 0.28 : 0.14), in: Circle())
         }
-    }
-
-    static func points(t: Float) -> [SIMD2<Float>] {
-        let wobble = sin(t * .pi * 2) * 0.06
-        return [
-            [0, 0], [0.5, -wobble * 0.3], [1, 0],
-            [-wobble * 0.4, 0.5], [0.5 + wobble, 0.5], [1 + wobble * 0.4, 0.5],
-            [0, 1], [0.5, 1 + wobble * 0.3], [1, 1],
-        ]
-    }
-
-    /// Deterministic per-track deep-tone palette.
-    static func palette(seed: Int) -> [Color] {
-        let base = Double(abs(seed) % 360)
-        func hsl(_ offset: Double, _ s: Double, _ l: Double) -> Color {
-            let hue = (base + offset).truncatingRemainder(dividingBy: 360) / 360
-            return Color(hue: hue, saturation: s, brightness: l)
-        }
-        return [
-            hsl(0, 0.65, 0.10), hsl(30, 0.60, 0.14), hsl(60, 0.55, 0.10),
-            hsl(330, 0.55, 0.13), hsl(0, 0.70, 0.18), hsl(120, 0.45, 0.12),
-            hsl(210, 0.60, 0.08), hsl(180, 0.55, 0.13), hsl(300, 0.50, 0.09),
-        ]
+        .buttonStyle(.plain)
     }
 }
 
-/// Upstream's lyrics strip: the current line is bright, others recede.
+private extension View {
+    /// Soft shadow so white glyphs stay readable on a bright artwork wash.
+    func playerGlyph() -> some View {
+        shadow(color: .black.opacity(0.55), radius: 5, y: 1)
+    }
+}
+
+/// Music's Up Next column: AutoPlay / AutoMix pills, then the remaining queue.
+private struct UpNextPane: View {
+    @Environment(PlaybackController.self) private var controller
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            HStack(spacing: 8) {
+                autoPill(
+                    title: "AutoPlay",
+                    on: controller.autoplayEnabled
+                ) { controller.toggleAutoplay() }
+                autoPill(
+                    title: "AutoMix",
+                    on: controller.automixEnabled
+                ) { controller.toggleAutomix() }
+                Spacer(minLength: 0)
+            }
+
+            HStack(alignment: .firstTextBaseline) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Continue Playing")
+                        .font(.title3.weight(.bold))
+                        .foregroundStyle(.white)
+                    Text(subtitle)
+                        .font(.caption)
+                        .foregroundStyle(.white.opacity(0.6))
+                }
+                Spacer()
+                if upcoming.count > 0 {
+                    Button("Clear") { controller.clearUpcoming() }
+                        .buttonStyle(.plain)
+                        .font(.callout.weight(.semibold))
+                        .foregroundStyle(Color.accentColor)
+                }
+            }
+
+            if upcoming.isEmpty {
+                Text("Nothing else queued. Turn on AutoPlay to keep the music going.")
+                    .font(.callout)
+                    .foregroundStyle(.white.opacity(0.55))
+                    .padding(.top, 8)
+                Spacer()
+            } else {
+                ScrollView {
+                    LazyVStack(spacing: 2) {
+                        ForEach(upcoming, id: \.entry.id) { item in
+                            Button {
+                                controller.playQueueItem(at: item.index)
+                            } label: {
+                                HStack(spacing: 12) {
+                                    ArtworkView(entry: item.entry, side: 40)
+                                        .clipShape(.rect(cornerRadius: 6, style: .continuous))
+                                    VStack(alignment: .leading, spacing: 2) {
+                                        Text(item.entry.title)
+                                            .font(.body.weight(.medium))
+                                            .foregroundStyle(.white)
+                                            .lineLimit(1)
+                                        Text(item.entry.artist)
+                                            .font(.caption)
+                                            .foregroundStyle(.white.opacity(0.65))
+                                            .lineLimit(1)
+                                    }
+                                    Spacer(minLength: 0)
+                                }
+                                .padding(.vertical, 6)
+                                .padding(.horizontal, 6)
+                                .contentShape(.rect)
+                            }
+                            .buttonStyle(.plain)
+                            .contextMenu {
+                                Button("Play") { controller.playQueueItem(at: item.index) }
+                                Button("Remove from Queue") {
+                                    controller.removeFromQueue(at: IndexSet(integer: item.index))
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        .padding(.top, 8)
+    }
+
+    private var upcoming: [(index: Int, entry: QueueEntry)] {
+        controller.queue.enumerated().dropFirst(controller.playingIndex + 1).map { ($0.offset, $0.element) }
+    }
+
+    private var subtitle: String {
+        let artist = controller.current?.artist ?? ""
+        if upcoming.contains(where: { $0.entry.fromAutoplay }) {
+            return artist.isEmpty ? "Similar artists" : "From \(artist) & Similar Artists"
+        }
+        let n = upcoming.count
+        if n == 0 { return "Nothing queued" }
+        return n == 1 ? "1 song" : "\(n) songs"
+    }
+
+    private func autoPill(title: String, on: Bool, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            HStack(spacing: 6) {
+                Image(.bchInfinity)
+                    .resizable()
+                    .scaledToFit()
+                    .frame(width: 14, height: 14)
+                Text(title)
+                    .font(.callout.weight(.semibold))
+            }
+            .foregroundStyle(.white)
+            .padding(.horizontal, 14)
+            .padding(.vertical, 8)
+            .background(.white.opacity(on ? 0.28 : 0.12), in: Capsule())
+        }
+        .buttonStyle(.plain)
+        .help(on ? "\(title) on" : "\(title) off")
+    }
+}
+
+/// Square sleeve: still art, motion canvas cropped to fill, Apple Music pause
+/// shrink inside a fixed slot so the column does not reflow. Used when the
+/// full-bleed banner is off.
+private struct SleeveArt: View {
+    var entry: QueueEntry?
+    var canvasURL: URL?
+    var fallbackURL: URL? = nil
+    var isPlaying: Bool
+    var side: CGFloat
+
+    var body: some View {
+        ZStack {
+            ArtworkView(entry: entry, side: side)
+            if let canvasURL {
+                CanvasPlayer(url: canvasURL, fallbackURL: fallbackURL, isPlaying: isPlaying)
+            }
+        }
+        .frame(width: side, height: side)
+        .clipShape(.rect(cornerRadius: 12, style: .continuous))
+        .shadow(color: .black.opacity(0.45), radius: 24, y: 10)
+        .scaleEffect(isPlaying ? 1 : 0.86)
+        .animation(.spring(response: 0.85, dampingFraction: 0.75), value: isPlaying)
+        .frame(width: side, height: side)
+    }
+}
+
+/// Upstream's full-bleed banner (`NowPlayingScreen` heroMode): the cover is
+/// cropped to fill, and the bottom 42% dissolves into the mesh. That dissolve
+/// is the artwork "effect" — not a warp of the pixels. A motion clip, when
+/// one exists, plays in the same frame with the same mask.
+private struct HeroArtwork: View {
+    var entry: QueueEntry?
+    var canvasURL: URL?
+    var fallbackURL: URL? = nil
+    var isPlaying: Bool
+
+    private let fadeFraction: CGFloat = 0.42
+
+    var body: some View {
+        GeometryReader { geo in
+            ZStack {
+                ArtworkView(entry: entry, side: max(geo.size.width, geo.size.height))
+                    .frame(width: geo.size.width, height: geo.size.height)
+                    .clipped()
+                if let canvasURL {
+                    CanvasPlayer(url: canvasURL, fallbackURL: fallbackURL, isPlaying: isPlaying)
+                        .frame(width: geo.size.width, height: geo.size.height)
+                }
+            }
+            .compositingGroup()
+            .mask {
+                LinearGradient(
+                    stops: [
+                        .init(color: .white, location: 0),
+                        .init(color: .white, location: 1 - fadeFraction),
+                        .init(color: .clear, location: 1),
+                    ],
+                    startPoint: .top,
+                    endPoint: .bottom
+                )
+            }
+        }
+        .aspectRatio(1, contentMode: .fit)
+        .allowsHitTesting(false)
+    }
+}
+
+/// Upstream `MeshGradientBackground`: four luminous radial blobs sampled from
+/// the sleeve, blurred into a wash. Not SwiftUI `MeshGradient` — that warps a
+/// vertex grid and is what tore the artwork's edges. Blobs drift once on a
+/// track change, then rest.
+struct MeshBackdrop: View {
+    var seed: Int
+    var artwork: Data? = nil
+
+    @State private var phase: Double = 0
+    @State private var base: Color = .black
+    @State private var blob0 = Color.clear
+    @State private var blob1 = Color.clear
+    @State private var blob2 = Color.clear
+    @State private var blob3 = Color.clear
+
+    private var reduceBlur: Bool {
+        PlatformSettings.shared.getBoolean(key: "reduce_dynamic_blur", default: false)
+    }
+    private var reduceAnimation: Bool {
+        PlatformSettings.shared.getBoolean(key: "reduce_animation", default: false)
+    }
+
+    var body: some View {
+        let blobs = [blob0, blob1, blob2, blob3]
+        Canvas { context, size in
+            let anchors: [(CGFloat, CGFloat)] = [
+                (0.20, 0.25), (0.80, 0.20), (0.75, 0.80), (0.25, 0.75),
+            ]
+            let speeds: [Double] = [1, -0.7, 0.85, -1.15]
+            let radius = max(size.width, size.height) * 0.62
+            for i in 0..<4 {
+                let color = blobs[i]
+                let x = (anchors[i].0 + 0.16 * cos(phase * speeds[i] + Double(i) * 1.7)) * size.width
+                let y = (anchors[i].1 + 0.16 * sin(phase * speeds[i] * 0.9 + Double(i) * 2.3)) * size.height
+                let rect = CGRect(x: x - radius, y: y - radius, width: radius * 2, height: radius * 2)
+                context.fill(
+                    Path(ellipseIn: rect),
+                    with: .radialGradient(
+                        Gradient(colors: [color.opacity(0.85), color.opacity(0)]),
+                        center: CGPoint(x: x, y: y),
+                        startRadius: 0,
+                        endRadius: radius
+                    )
+                )
+            }
+            context.fill(
+                Path(CGRect(origin: .zero, size: size)),
+                with: .linearGradient(
+                    Gradient(colors: [Color.black.opacity(0.10), Color.black.opacity(0.38)]),
+                    startPoint: .zero,
+                    endPoint: CGPoint(x: 0, y: size.height)
+                )
+            )
+        }
+        .background(base)
+        .blur(radius: reduceBlur ? 0 : 64)
+        .scaleEffect(1.3)
+        .clipped()
+        .ignoresSafeArea()
+        .allowsHitTesting(false)
+        .onAppear { settle(seed: seed, artwork: artwork, first: true) }
+        .onChange(of: seed) { _, new in settle(seed: new, artwork: artwork, first: false) }
+        .onChange(of: artwork) { _, data in apply(ArtworkPalette.meshBlobs(from: data, seed: seed), animated: true) }
+    }
+
+    private func settle(seed: Int, artwork: Data?, first: Bool) {
+        apply(ArtworkPalette.meshBlobs(from: artwork, seed: seed), animated: !first)
+        guard !reduceAnimation else { return }
+        withAnimation(.timingCurve(0.4, 0.0, 0.2, 1.0, duration: 8)) {
+            phase += .pi * 0.45
+        }
+    }
+
+    private func apply(_ mesh: ArtworkPalette.MeshBlobs, animated: Bool) {
+        let run = {
+            base = mesh.base
+            blob0 = mesh.blobs[0]
+            blob1 = mesh.blobs[1]
+            blob2 = mesh.blobs[2]
+            blob3 = mesh.blobs[3]
+        }
+        if animated && !reduceAnimation {
+            withAnimation(.easeInOut(duration: 1.4), run)
+        } else {
+            run()
+        }
+    }
+}
+
+/// Upstream's lyrics strip: the current line is bright and sharp; neighbours
+/// recede by opacity, the same treatment as the Android panel.
 struct LyricsPane: View {
     var lines: [LyricLineDto]
     var loading: Bool
     var position: Double
     var hasTrack: Bool
+    var onSeek: ((Double) -> Void)? = nil
 
     private var activeIndex: Int {
-        let ms = Int64(position * 1000)
+        let ms = Swift.Int64(position * 1000)
         return lines.lastIndex { $0.timeMs <= ms } ?? 0
     }
 
@@ -296,7 +771,7 @@ struct LyricsPane: View {
         Group {
             if !hasTrack {
                 Text("Play a song to see lyrics here.")
-                    .font(.callout)
+                    .font(.title3)
                     .foregroundStyle(.white.opacity(0.6))
             } else if loading {
                 ProgressView()
@@ -304,24 +779,33 @@ struct LyricsPane: View {
                     .tint(.white)
             } else if lines.isEmpty {
                 Text("No lyrics for this track.")
-                    .font(.callout)
+                    .font(.title3)
                     .foregroundStyle(.white.opacity(0.6))
             } else {
                 ScrollViewReader { proxy in
                     ScrollView {
-                        LazyVStack(alignment: .leading, spacing: 14) {
+                        VStack(alignment: .leading, spacing: 18) {
                             ForEach(Array(lines.enumerated()), id: \.offset) { index, line in
-                                Text(line.text.isEmpty ? "♪" : line.text)
-                                    .font(.title3.weight(index == activeIndex ? .bold : .regular))
-                                    .foregroundStyle(.white.opacity(index == activeIndex ? 1 : 0.38))
-                                    .id(index)
+                                WordSyncedLine(
+                                    line: line,
+                                    active: index == activeIndex,
+                                    distance: abs(index - activeIndex),
+                                    position: position
+                                )
+                                .id(index)
+                                .contentShape(.rect)
+                                .onTapGesture {
+                                    onSeek?(Double(line.timeMs) / 1000.0)
+                                }
                             }
                         }
-                        .padding(.horizontal, 28)
-                        .padding(.vertical, 12)
+                        .padding(.horizontal, 12)
+                        .padding(.vertical, 20)
+                        .frame(maxWidth: .infinity, alignment: .leading)
                     }
+                    .scrollIndicators(.never)
                     .onChange(of: activeIndex) { _, index in
-                        withAnimation(.easeInOut(duration: 0.25)) {
+                        withAnimation(.easeInOut(duration: 0.28)) {
                             proxy.scrollTo(index, anchor: .center)
                         }
                     }
@@ -331,3 +815,132 @@ struct LyricsPane: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 }
+
+private struct WordSyncedLine: View {
+    let line: LyricLineDto
+    let active: Bool
+    let distance: Int
+    let position: Double
+
+    var body: some View {
+        Text(rendered)
+            .font(.title)
+            .multilineTextAlignment(.leading)
+            .fixedSize(horizontal: false, vertical: true)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .shadow(color: active ? .black.opacity(0.35) : .clear, radius: 6, y: 1)
+            .animation(.easeInOut(duration: 0.2), value: active)
+            .animation(.easeInOut(duration: 0.12), value: Int(position * 10))
+    }
+
+    private var rendered: AttributedString {
+        if line.words.isEmpty {
+            var s = AttributedString(line.text.isEmpty ? "♪" : line.text)
+            s.font = .title.weight(active ? .bold : .regular)
+            s.foregroundColor = Color.white.opacity(active ? 1 : max(0.22, 0.55 - Double(distance) * 0.12))
+            return s
+        }
+        let ms = Swift.Int64(position * 1000)
+        var result = AttributedString()
+        for (i, word) in line.words.enumerated() {
+            var run = AttributedString(word.text)
+            let sung = ms >= word.startMs
+            let current = sung && ms < word.endMs
+            run.font = .title.weight(current ? .bold : .regular)
+            run.foregroundColor = Color.white.opacity(sung ? 1 : 0.38)
+            result.append(run)
+            if i < line.words.count - 1 {
+                result.append(AttributedString(" "))
+            }
+        }
+        return result
+    }
+}
+
+/// Fixed-size volume control. Intrinsic width so the capsule glass stays a pill.
+private struct ToolbarVolumeSlider: View {
+    @Binding var volume: Double
+
+    private let trackWidth: CGFloat = 112
+
+    var body: some View {
+        HStack(spacing: 10) {
+            Image(systemName: volume == 0 ? "speaker.slash.fill" : "speaker.fill")
+                .font(.system(size: 12, weight: .semibold))
+                .frame(width: 16, height: 16)
+            ZStack(alignment: .leading) {
+                Capsule()
+                    .fill(.quaternary)
+                    .frame(width: trackWidth, height: 4)
+                Capsule()
+                    .fill(.primary.opacity(0.55))
+                    .frame(width: max(4, trackWidth * volume), height: 4)
+                Circle()
+                    .fill(.primary)
+                    .frame(width: 10, height: 10)
+                    .offset(x: min(max(0, trackWidth * volume - 5), trackWidth - 10))
+            }
+            .frame(width: trackWidth, height: 14)
+            .contentShape(.rect)
+            .gesture(
+                DragGesture(minimumDistance: 0)
+                    .onChanged { g in
+                        volume = min(max(0, g.location.x / trackWidth), 1)
+                    }
+            )
+        }
+        .padding(.horizontal, 8)
+        .frame(width: 176, height: 22)
+        .accessibilityElement()
+        .accessibilityLabel("Volume")
+        .accessibilityValue("\(Int(volume * 100)) percent")
+        .accessibilityAdjustableAction { direction in
+            switch direction {
+            case .increment: volume = min(1, volume + 0.1)
+            case .decrement: volume = max(0, volume - 0.1)
+            default: break
+            }
+        }
+    }
+}
+
+#if os(iOS)
+private struct AirPlayRouteButton: UIViewRepresentable {
+    func makeUIView(context: Context) -> AVRoutePickerView {
+        let view = AVRoutePickerView()
+        view.prioritizesVideoDevices = false
+        return view
+    }
+    func updateUIView(_ uiView: AVRoutePickerView, context: Context) {}
+}
+#else
+private struct AirPlayRouteButton: NSViewRepresentable {
+    func makeNSView(context: Context) -> SquareRoutePicker {
+        SquareRoutePicker()
+    }
+    func updateNSView(_ nsView: SquareRoutePicker, context: Context) {}
+}
+
+/// AVRoutePickerView's intrinsic size is not square, so toolbar glass becomes
+/// a squircle. Pin it to a 22pt box so the item can be a circle.
+private final class SquareRoutePicker: NSView {
+    private let picker = AVRoutePickerView()
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        picker.isRoutePickerButtonBordered = false
+        picker.setContentHuggingPriority(.required, for: .horizontal)
+        picker.setContentHuggingPriority(.required, for: .vertical)
+        addSubview(picker)
+    }
+
+    required init?(coder: NSCoder) { nil }
+
+    override var intrinsicContentSize: NSSize { NSSize(width: 22, height: 22) }
+
+    override func layout() {
+        super.layout()
+        picker.frame = bounds
+    }
+}
+#endif

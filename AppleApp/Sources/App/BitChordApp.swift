@@ -16,25 +16,34 @@ struct BitChordApp: App {
                 .environment(auth)
                 .task {
                     CipherUnlockWiring.install()
-                    auth.restore()
+                    installAutomixModels()
                     controller.startEngineIfNeeded()
                     LocalLibrary.shared.restore()
+                    DownloadStore.shared.refresh()
+                    Task { await StreamFileCache.shared.trim() }
+                    let token = PlatformSettings.shared.getString(key: "discord_token", default: "")
+                    if !token.isEmpty { DiscordGateway.shared.connect(token: token) }
                 }
                 .onChange(of: scenePhase) { _, phase in
                     appModel.scenePhase = phase
+                    if phase == .background {
+                        controller.persistSession()
+                        if PlatformSettings.shared.getBoolean(key: "stop_when_backgrounded", default: false) {
+                            controller.pauseForBackground()
+                        }
+                    }
                 }
                 .onOpenURL { url in
-                    // External link intake (spec §1.3): the parser lives in
-                    // `shared` (MusicLink); the seam is here. v1 routes the
-                    // widget's player deep link; full link resolution lands
-                    // with the browse milestones.
                     if url.absoluteString.contains("open-player") {
                         appModel.nowPlayingPresented = true
                     }
                     _ = MusicLink.shared.submitUrl(url: url.absoluteString)
+                    consumeMusicLink(appModel: appModel, controller: controller)
                 }
         }
 #if os(macOS)
+        .defaultSize(width: 1280, height: 820)
+        .windowResizability(.contentMinSize)
         .windowStyle(.automatic)
 #endif
 #if os(macOS)
@@ -43,9 +52,22 @@ struct BitChordApp: App {
                 .environment(controller)
                 .environment(appModel)
                 .environment(auth)
+                .preferredColorScheme(appModel.preferredScheme)
+                .environment(\.locale, appModel.appLanguage.isEmpty ? .autoupdatingCurrent : Locale(identifier: appModel.appLanguage))
         }
-#endif
+        #endif
     }
+}
+
+private func installAutomixModels() {
+    let beat = Bundle.main.url(forResource: "beat_this", withExtension: "onnx", subdirectory: "Models")
+        ?? Bundle.main.url(forResource: "beat_this", withExtension: "onnx")
+    let vocal = Bundle.main.url(forResource: "vocals_umxhq", withExtension: "onnx", subdirectory: "Models")
+        ?? Bundle.main.url(forResource: "vocals_umxhq", withExtension: "onnx")
+    _ = configureAnalyzer(
+        beatModelPath: beat?.path ?? "",
+        vocalModelPath: vocal?.path ?? ""
+    )
 }
 
 /// App-level state that is not playback: navigation triggers, external-link
@@ -56,9 +78,65 @@ final class AppModel {
     var nowPlayingPresented = false
     /// Cross-tab navigation request — RootView observes and consumes it.
     var requestedTab: Tab?
+    var pendingDetail: BrowseDestination?
+    var playlistPicker: PlaylistPickerRequest?
+    var downloadManagerPresented = false
+    var replayPresented = false
+    var focusSearch = false
+    var pendingSearchQuery: String?
+    var themeMode = PlatformSettings.shared.getString(key: "theme_mode", default: "dark")
+    var appLanguage = PlatformSettings.shared.getString(key: "app_language", default: "")
 
-    /// The four canonical tabs (UI spec §2).
+    var preferredScheme: ColorScheme? {
+        switch themeMode {
+        case "light": return .light
+        case "dark": return .dark
+        default: return nil
+        }
+    }
+
+    /// Canonical tabs (UI spec §2). macOS Library sub-destinations live as
+    /// extra cases so they can group under a `TabSection` in the sidebar.
     enum Tab: Int, Hashable {
         case home, explore, library, search
+        case libraryYouTube, librarySongs, libraryAlbums
+        case libraryArtists, libraryDownloads, libraryHistory
+    }
+}
+
+@MainActor
+func consumeMusicLink(appModel: AppModel, controller: PlaybackController) {
+    guard let json = MusicLink.shared.takePendingJson(),
+          let data = json.data(using: .utf8),
+          let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+          let kind = obj["kind"] as? String else { return }
+    switch kind {
+    case "track":
+        if let id = obj["id"] as? String {
+            controller.play([
+                QueueEntry.youtube(videoId: id, title: "Loading…", artist: "", thumbnailUrl: nil)
+            ], at: 0)
+        }
+    case "page":
+        if let id = obj["id"] as? String {
+            appModel.pendingDetail = .detail(browseId: id, title: "")
+        }
+    case "search":
+        if let query = obj["query"] as? String {
+            appModel.pendingSearchQuery = query
+            appModel.requestedTab = .search
+            appModel.focusSearch = true
+            if obj["play"] as? Bool == true {
+                Task {
+                    if let hit = try? await InnertubeSearch.shared.search(query, scope: "songs").first(where: { !$0.isBrowse }) {
+                        controller.play([hit.asEntry()], at: 0)
+                    }
+                }
+            }
+        }
+    case "resume":
+        if !controller.isPlaying { controller.togglePlayPause() }
+    default:
+        break
     }
 }

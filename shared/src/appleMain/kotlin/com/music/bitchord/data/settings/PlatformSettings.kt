@@ -25,4 +25,18 @@ actual object PlatformSettings {
     actual fun putBoolean(key: String, value: Boolean) {
         defaults.setBool(value, forKey = key)
     }
+
+    actual fun getFloat(key: String, default: Float): Float =
+        if (defaults.objectForKey(key) != null) defaults.floatForKey(key) else default
+
+    actual fun putFloat(key: String, value: Float) {
+        defaults.setFloat(value, forKey = key)
+    }
+
+    actual fun getLong(key: String, default: Long): Long =
+        if (defaults.objectForKey(key) != null) defaults.integerForKey(key) else default
+
+    actual fun putLong(key: String, value: Long) {
+        defaults.setInteger(value, forKey = key)
+    }
 }

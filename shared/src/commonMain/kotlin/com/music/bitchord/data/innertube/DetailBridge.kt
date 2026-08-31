@@ -1,7 +1,8 @@
 package com.music.bitchord.data.innertube
 
+import com.music.bitchord.data.model.BrowseType
 import com.music.bitchord.data.model.DetailPage
-import com.music.bitchord.data.model.Song
+import com.music.bitchord.data.model.browseTypeOf
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -30,6 +31,8 @@ object DetailBridge {
                 val songs = InnertubeParser.collectSongsDeep(response)
                 val description = InnertubeParser.parseDescription(response)
                 val playlistShelf = InnertubeParser.parsePlaylistShelf(response)
+                val library = InnertubeParser.parseLibraryState(response)
+                val owned = InnertubeParser.parsePlaylistOwned(response)
 
                 val page = DetailPage(
                     browseId = browseId,
@@ -37,10 +40,15 @@ object DetailBridge {
                     subtitle = header?.subtitle ?: "",
                     thumbnailUrl = header?.thumbnailUrl,
                     songs = playlistShelf?.songs ?: songs,
+                    type = browseTypeOf(browseId),
                     sections = emptyList(),
                     description = description,
                     continuation = playlistShelf?.continuation
                         ?: InnertubeParser.continuationToken(response),
+                    suggestedSongs = playlistShelf?.suggested.orEmpty(),
+                    libraryPlaylistId = library?.playlistId,
+                    librarySaved = library?.saved,
+                    playlistOwned = owned,
                 )
                 callback.onResult(
                     json.encodeToString(DetailPage.serializer(), page),
@@ -63,14 +71,40 @@ object DetailBridge {
                     subtitle = artistPage.subscriberCountText ?: "",
                     thumbnailUrl = artistPage.thumbnailUrl,
                     songs = artistPage.songs,
+                    type = BrowseType.ARTIST,
                     sections = artistPage.sections,
                     description = artistPage.description,
+                    subscriberCountText = artistPage.subscriberCountText,
                     monthlyListenerCount = artistPage.monthlyListenerCount,
                 )
                 callback.onResult(
                     json.encodeToString(DetailPage.serializer(), page),
                     null,
                 )
+            } catch (e: Throwable) {
+                callback.onResult(null, e.message ?: e.toString())
+            }
+        }
+    }
+
+    fun more(token: String, callback: DetailCallback) {
+        bridgeScope.launch {
+            try {
+                val response = Innertube.browseContinuation(token)
+                val playlistShelf = InnertubeParser.parsePlaylistShelf(response)
+                val songs = playlistShelf?.songs
+                    ?: InnertubeParser.collectSongsDeep(response)
+                val page = DetailPage(
+                    browseId = "",
+                    title = "",
+                    subtitle = "",
+                    thumbnailUrl = null,
+                    songs = songs,
+                    continuation = playlistShelf?.continuation
+                        ?: InnertubeParser.continuationToken(response),
+                    suggestedSongs = playlistShelf?.suggested.orEmpty(),
+                )
+                callback.onResult(json.encodeToString(DetailPage.serializer(), page), null)
             } catch (e: Throwable) {
                 callback.onResult(null, e.message ?: e.toString())
             }

@@ -45,6 +45,10 @@ targets:
       # UniFFI-generated NativeCore.swift lands here via scripts/build-native-core.sh.
       - path: Generated
         optional: true
+      - path: Resources/Models
+        optional: true
+        type: folder
+        buildPhase: resources
     dependencies:
       - target: BitChordWidget
         embed: true
@@ -53,6 +57,10 @@ targets:
       - framework: Frameworks/NativeCoreFFI.xcframework
         embed: true
       - sdk: WebKit.framework
+      - sdk: JavaScriptCore.framework
+      - sdk: AVKit.framework
+      - sdk: AVFoundation.framework
+      - sdk: CoreMotion.framework
     info:
       path: BitChord-Info.plist
       properties:
@@ -66,6 +74,7 @@ targets:
         UIBackgroundModes:
           - audio
         UILaunchScreen: {}
+        NSMotionUsageDescription: BitChord uses headphone motion to keep spatial audio anchored when you turn your head.
     entitlements:
       path: BitChord.entitlements
       properties:

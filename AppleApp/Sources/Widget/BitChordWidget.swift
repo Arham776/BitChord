@@ -1,5 +1,6 @@
 import SwiftUI
 import WidgetKit
+import AppIntents
 
 // The §9 widget, snapshot-driven per the parity contract: ready-to-play
 // state with no position, prev/next availability dimmed not removed, dark
@@ -60,6 +61,7 @@ struct MediaWidgetProvider: TimelineProvider {
 
 struct MediaWidgetView: View {
     var entry: MediaWidgetEntry
+    @Environment(\.widgetFamily) private var family
 
     var body: some View {
         content
@@ -70,27 +72,47 @@ struct MediaWidgetView: View {
     @ViewBuilder
     private var content: some View {
         if entry.hasSession {
-            HStack(spacing: 12) {
-                artwork
-                    .frame(width: 56, height: 56)
-                    .clipShape(.rect(cornerRadius: 9, style: .continuous))
-                VStack(alignment: .leading, spacing: 3) {
-                    Text(entry.title)
-                        .font(.callout.weight(.semibold))
-                        .lineLimit(1)
-                    Text(entry.artist)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .lineLimit(1)
-                    HStack(spacing: 6) {
-                        Image(systemName: entry.playing ? "pause.fill" : "play.fill")
-                            .font(.system(size: 10, weight: .bold))
-                        Text(entry.playing ? "Playing" : "Ready to play")
-                            .font(.caption2.weight(.medium))
+            VStack(alignment: .leading, spacing: 8) {
+                HStack(spacing: 12) {
+                    artwork
+                        .frame(width: 56, height: 56)
+                        .clipShape(.rect(cornerRadius: 9, style: .continuous))
+                    VStack(alignment: .leading, spacing: 3) {
+                        Text(entry.title)
+                            .font(.callout.weight(.semibold))
+                            .lineLimit(1)
+                        Text(entry.artist)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                        HStack(spacing: 6) {
+                            Image(systemName: entry.playing ? "pause.fill" : "play.fill")
+                                .font(.system(size: 10, weight: .bold))
+                            Text(entry.playing ? "Playing" : "Ready to play")
+                                .font(.caption2.weight(.medium))
+                        }
+                        .foregroundStyle(entry.playing ? Color.accentColor : .secondary)
                     }
-                    .foregroundStyle(entry.playing ? Color.accentColor : .secondary)
+                    Spacer(minLength: 0)
                 }
-                Spacer(minLength: 0)
+                if family != .systemSmall {
+                    HStack(spacing: 16) {
+                        Button(intent: WidgetTransportIntent(command: "previous")) {
+                            Image(systemName: "backward.fill")
+                        }
+                        .disabled(!entry.canPrevious)
+                        Button(intent: WidgetTransportIntent(command: "toggle")) {
+                            Image(systemName: entry.playing ? "pause.fill" : "play.fill")
+                        }
+                        Button(intent: WidgetTransportIntent(command: "next")) {
+                            Image(systemName: "forward.fill")
+                        }
+                        .disabled(!entry.canNext)
+                        Spacer(minLength: 0)
+                    }
+                    .font(.title3)
+                    .tint(.primary)
+                }
             }
             .padding(4)
         } else {
@@ -151,5 +173,21 @@ struct BitChordMediaWidget: Widget {
 struct BitChordWidgetBundle: WidgetBundle {
     var body: some Widget {
         BitChordMediaWidget()
+    }
+}
+
+struct WidgetTransportIntent: AppIntent {
+    static var title: LocalizedStringResource = "BitChord Transport"
+    static var isDiscoverable = false
+
+    @Parameter(title: "Command")
+    var command: String
+
+    init() { command = "toggle" }
+    init(command: String) { self.command = command }
+
+    func perform() async throws -> some IntentResult {
+        UserDefaults(suiteName: "group.com.example.bitchord")?.set(command, forKey: "widget.command")
+        return .result()
     }
 }

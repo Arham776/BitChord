@@ -20,4 +20,7 @@ AppleApp/*.entitlements
 xcuserdata/
 DerivedData/
 
+# Automix ONNX graphs — fetched by scripts/fetch-automix-models.sh
+AppleApp/Resources/Models/*.onnx
+
 .DS_Store

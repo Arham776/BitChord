@@ -1,8 +1,11 @@
 import Foundation
 #if os(macOS)
 import AppKit
+#else
+import UIKit
 #endif
 import MediaPlayer
+import BitChordShared
 
 /// Lock-screen / media-key / Bluetooth controls (spec §3.2 NowPlayingController).
 /// MPNowPlayingInfoCenter + MPRemoteCommandCenter work identically on macOS
@@ -57,7 +60,7 @@ final class NowPlayingController {
             MPMediaItemPropertyTitle: title,
             MPMediaItemPropertyArtist: artist,
             MPMediaItemPropertyPlaybackDuration: duration,
-            MPNowPlayingInfoPropertyPlaybackRate: isPlaying ? 1.0 : 0.0,
+            MPNowPlayingInfoPropertyPlaybackRate: isPlaying ? Double(PlatformSettings.shared.getFloat(key: "playback_speed", default: 1)) : 0.0,
         ]
         if let artwork = resolvedArtwork(data: artworkData, url: thumbnailUrl) {
             info[MPMediaItemPropertyArtwork] = artwork
@@ -68,6 +71,12 @@ final class NowPlayingController {
     func update(position: Double) {
         var info = MPNowPlayingInfoCenter.default().nowPlayingInfo ?? [:]
         info[MPNowPlayingInfoPropertyElapsedPlaybackTime] = position
+        MPNowPlayingInfoCenter.default().nowPlayingInfo = info
+    }
+
+    func updateRate(_ rate: Double) {
+        var info = MPNowPlayingInfoCenter.default().nowPlayingInfo ?? [:]
+        info[MPNowPlayingInfoPropertyPlaybackRate] = rate
         MPNowPlayingInfoCenter.default().nowPlayingInfo = info
     }
 

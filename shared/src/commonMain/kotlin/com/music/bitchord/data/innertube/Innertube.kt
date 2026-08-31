@@ -12,8 +12,16 @@ import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.contentOrNull
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import com.music.bitchord.data.model.LikeStatus
+import com.music.bitchord.data.model.PlaylistPrivacy
+import kotlinx.serialization.json.add
+import kotlinx.serialization.json.addJsonObject
+import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.put
+import kotlinx.serialization.json.putJsonArray
 import kotlinx.serialization.json.putJsonObject
+import kotlinx.serialization.json.JsonArrayBuilder
 import kotlin.concurrent.Volatile
 import kotlin.time.Clock
 
@@ -55,6 +63,7 @@ object Innertube {
     private val json = Json { ignoreUnknownKeys = true }
 
     /** Session cookie captured by the login WebView; null = browse as guest. */
+    @Volatile
     var cookie: String? = null
         set(value) {
             if (field != value) {
@@ -190,6 +199,7 @@ object Innertube {
         val signedIn = CONFIG_LOGGED_IN.find(html)?.groupValues?.get(1) == "true"
         val clientVersion = CONFIG_CLIENT_VERSION.find(html)?.groupValues?.get(1)
         if (!signedIn) {
+            println("[Innertube] music.youtube.com served a signed-out shell; not scoping requests")
             return clientVersion?.let { SessionScope(null, null, "0", it) }
         }
         val dataSyncId = CONFIG_DATASYNC_ID.find(html)?.groupValues?.get(1)
@@ -382,6 +392,245 @@ object Innertube {
         }
     }
 
+    // ---- Play registration (account history / recommendations) --------------
+
+    class PlaybackTracking(
+        val playbackUrl: String,
+        val watchtimeUrl: String?,
+        val atrUrl: String?,
+        val atrAfterSeconds: Long,
+    )
+
+    /**
+     * WEB_REMIX `player` *with* the session, purely to read `playbackTracking`.
+     * Device-client [player] skips auth so it never sees this block.
+     */
+    suspend fun playbackTracking(videoId: String, signatureTimestamp: Int?): PlaybackTracking? {
+        if (cookie == null) return null
+        ensureSessionScope()
+        val response = postMusic("player") {
+            put("videoId", videoId)
+            put("contentCheckOk", true)
+            put("racyCheckOk", true)
+            putJsonObject("playbackContext") {
+                putJsonObject("contentPlaybackContext") {
+                    put("html5Preference", "HTML5_PREF_WANTS")
+                    put("referer", "$MUSIC_ORIGIN/watch?v=$videoId")
+                    signatureTimestamp?.let { put("signatureTimestamp", it) }
+                }
+            }
+        }
+        val tracking = response["playbackTracking"] as? JsonObject ?: return null
+        val playbackUrl = tracking.trackingUrl("videostatsPlaybackUrl") ?: return null
+        return PlaybackTracking(
+            playbackUrl = playbackUrl,
+            watchtimeUrl = tracking.trackingUrl("videostatsWatchtimeUrl"),
+            atrUrl = tracking.trackingUrl("atrUrl"),
+            atrAfterSeconds = ((tracking["atrUrl"] as? JsonObject)
+                ?.get("elapsedMediaTimeSeconds") as? JsonPrimitive)
+                ?.contentOrNull?.toLongOrNull() ?: 5L,
+        )
+    }
+
+    private fun JsonObject.trackingUrl(key: String): String? =
+        ((this[key] as? JsonObject)?.get("baseUrl") as? JsonPrimitive)?.contentOrNull
+
+    suspend fun pingPlayback(baseUrl: String, cpn: String): Int =
+        pingStats(baseUrl, cpn)
+
+    suspend fun pingWatchtime(baseUrl: String, cpn: String, seconds: Long, final: Boolean = false): Int =
+        pingStats(
+            baseUrl,
+            cpn,
+            extra = buildMap {
+                put("st", "0")
+                put("et", seconds.toString())
+                put("cmt", seconds.toString())
+                put("state", if (final) "paused" else "playing")
+                if (final) put("final", "1")
+            },
+        )
+
+    suspend fun pingAtr(baseUrl: String, cpn: String): Int =
+        Http.getStatus(
+            url = baseUrl,
+            headers = statsHeaders(),
+            query = mapOf("cpn" to cpn),
+        )
+
+    private suspend fun pingStats(
+        baseUrl: String,
+        cpn: String,
+        extra: Map<String, String> = emptyMap(),
+    ): Int = Http.getStatus(
+        url = baseUrl,
+        headers = statsHeaders(),
+        query = mapOf(
+            "ver" to "2",
+            "c" to "WEB_REMIX",
+            "cver" to webRemixVersion,
+            "cpn" to cpn,
+            "cplayer" to "UNIPLAYER",
+            "cbr" to "Chrome",
+            "cbrver" to "141.0.0.0",
+            "cos" to "Windows",
+            "cosver" to "10.0",
+            "hl" to "en_US",
+            "cr" to "US",
+        ) + extra,
+    )
+
+    private fun statsHeaders(): Map<String, String> = buildMap {
+        put("X-Origin", MUSIC_ORIGIN)
+        put("Origin", MUSIC_ORIGIN)
+        put("Referer", "$MUSIC_ORIGIN/")
+        put("User-Agent", WEB_USER_AGENT)
+        visitorData?.let { put("X-Goog-Visitor-Id", it) }
+        putAll(authHeaders(MUSIC_ORIGIN))
+    }
+
+    fun newCpn(): String {
+        val alphabet = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_"
+        return CharArray(16) { alphabet.random() }.concatToString()
+    }
+
+    // ---- Writes -------------------------------------------------------------
+
+    class NotSignedInException : IllegalStateException("Sign in to YouTube Music to do that")
+
+    private fun requireSession() {
+        if (cookie == null) throw NotSignedInException()
+    }
+
+    suspend fun rate(videoId: String, status: LikeStatus) {
+        requireSession()
+        val endpoint = when (status) {
+            LikeStatus.LIKE -> "like/like"
+            LikeStatus.DISLIKE -> "like/dislike"
+            LikeStatus.INDIFFERENT -> "like/removelike"
+        }
+        val response = postMusic(endpoint) {
+            putJsonObject("target") { put("videoId", videoId) }
+        }
+        response["error"]?.let { error ->
+            val message = error.jsonObject["message"]?.jsonPrimitive?.contentOrNull
+            error("YouTube Music refused the rating: ${message ?: error}")
+        }
+    }
+
+    suspend fun ratePlaylist(playlistId: String, saved: Boolean) {
+        requireSession()
+        val endpoint = if (saved) "like/like" else "like/removelike"
+        val response = postMusic(endpoint) {
+            putJsonObject("target") { put("playlistId", playlistId) }
+        }
+        response["error"]?.let { error ->
+            val message = error.jsonObject["message"]?.jsonPrimitive?.contentOrNull
+            error("YouTube Music refused the change: ${message ?: error}")
+        }
+    }
+
+    suspend fun sendFeedback(token: String) {
+        requireSession()
+        postMusic("feedback") {
+            putJsonArray("feedbackTokens") { add(token) }
+        }
+    }
+
+    suspend fun createPlaylist(
+        title: String,
+        privacy: PlaylistPrivacy,
+        description: String? = null,
+        videoIds: List<String> = emptyList(),
+    ): String {
+        requireSession()
+        val response = postMusic("playlist/create") {
+            put("title", title)
+            put("description", description.orEmpty())
+            put("privacyStatus", privacy.apiValue)
+            if (videoIds.isNotEmpty()) {
+                putJsonArray("videoIds") { videoIds.forEach { add(it) } }
+            }
+        }
+        return response["playlistId"]?.jsonPrimitive?.contentOrNull
+            ?: findString(response, "playlistId")
+            ?: error("playlist created but no id came back")
+    }
+
+    suspend fun deletePlaylist(playlistId: String) {
+        requireSession()
+        postMusic("playlist/delete") { put("playlistId", playlistId.removePrefix("VL")) }
+    }
+
+    private suspend fun editPlaylist(
+        playlistId: String,
+        actions: JsonArrayBuilder.() -> Unit,
+    ): JsonObject {
+        requireSession()
+        val response = postMusic("browse/edit_playlist") {
+            put("playlistId", playlistId.removePrefix("VL"))
+            putJsonArray("actions", actions)
+        }
+        val status = response["status"]?.jsonPrimitive?.contentOrNull
+        if (status != null && status != "STATUS_SUCCEEDED") {
+            error("YouTube Music refused the edit ($status)")
+        }
+        return response
+    }
+
+    suspend fun addToPlaylist(playlistId: String, videoIds: List<String>): Map<String, String> {
+        val response = editPlaylist(playlistId) {
+            videoIds.forEach { videoId ->
+                addJsonObject {
+                    put("action", "ACTION_ADD_VIDEO")
+                    put("addedVideoId", videoId)
+                }
+            }
+        }
+        return (response["playlistEditResults"] as? JsonArray)
+            .orEmpty()
+            .mapNotNull { result ->
+                val added = (result as? JsonObject)
+                    ?.get("playlistEditVideoAddedResultData") as? JsonObject
+                    ?: return@mapNotNull null
+                val videoId = (added["videoId"] as? JsonPrimitive)?.contentOrNull
+                    ?: return@mapNotNull null
+                val setVideoId = (added["setVideoId"] as? JsonPrimitive)?.contentOrNull
+                    ?: return@mapNotNull null
+                videoId to setVideoId
+            }
+            .toMap()
+    }
+
+    suspend fun removeFromPlaylist(playlistId: String, entries: List<Pair<String, String>>) {
+        editPlaylist(playlistId) {
+            entries.forEach { (setVideoId, videoId) ->
+                addJsonObject {
+                    put("action", "ACTION_REMOVE_VIDEO")
+                    put("setVideoId", setVideoId)
+                    put("removedVideoId", videoId)
+                }
+            }
+        }
+    }
+
+    suspend fun renamePlaylist(playlistId: String, title: String) {
+        editPlaylist(playlistId) {
+            addJsonObject {
+                put("action", "ACTION_SET_PLAYLIST_NAME")
+                put("playlistName", title)
+            }
+        }
+    }
+
+    /** First string value under [key] anywhere in [element], depth-first. */
+    private fun findString(element: JsonElement, key: String): String? = when (element) {
+        is JsonObject -> (element[key] as? JsonPrimitive)?.contentOrNull
+            ?: element.values.firstNotNullOfOrNull { findString(it, key) }
+        is JsonArray -> element.firstNotNullOfOrNull { findString(it, key) }
+        else -> null
+    }
+
     // ---- Request plumbing ---------------------------------------------------
 
     private suspend fun postMusic(
@@ -410,6 +659,7 @@ object Innertube {
             bodyExtras()
         }
         val headers = buildMap {
+            put("User-Agent", WEB_USER_AGENT)
             put("X-Origin", MUSIC_ORIGIN)
             put("Origin", MUSIC_ORIGIN)
             put("Referer", "$MUSIC_ORIGIN/")

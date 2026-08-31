@@ -67,6 +67,14 @@ const val NOTIFICATION_ART_PX = 544
 
 enum class BrowseType { ALBUM, ARTIST, PLAYLIST, OTHER }
 
+/** YouTube Music browse ids are prefixed by kind. */
+fun browseTypeOf(browseId: String, fallback: BrowseType = BrowseType.OTHER): BrowseType = when {
+    browseId.startsWith("UC") -> BrowseType.ARTIST
+    browseId.startsWith("MPREb") || browseId.startsWith("OLAK") -> BrowseType.ALBUM
+    browseId.startsWith("VL") || browseId.startsWith("PL") -> BrowseType.PLAYLIST
+    else -> fallback
+}
+
 /** A non-track search result: album, artist or playlist. */
 @Serializable
 data class BrowseItem(
@@ -133,6 +141,10 @@ data class DetailPage(
     val monthlyListenerCount: String? = null,
     /** Token for the rest of the track list — null once it is all in. */
     val continuation: String? = null,
+    val suggestedSongs: List<Song> = emptyList(),
+    val libraryPlaylistId: String? = null,
+    val librarySaved: Boolean? = null,
+    val playlistOwned: Boolean? = null,
 )
 
 /** The next page of a paged track list (a big playlist's continuation). */
@@ -159,6 +171,63 @@ data class Account(
     val name: String,
     val email: String,
     val photoUrl: String? = null,
+)
+
+/**
+ * Whether an album or playlist is in the library, and the id that changes that.
+ * YouTube likes the playlist behind the page, not the browse id.
+ */
+@Serializable
+data class LibraryState(
+    val playlistId: String,
+    val saved: Boolean,
+)
+
+enum class LikeStatus { LIKE, DISLIKE, INDIFFERENT }
+
+/** Who can see a playlist. YouTube's own three values, sent verbatim. */
+enum class PlaylistPrivacy(val label: String, val apiValue: String) {
+    PRIVATE("Private", "PRIVATE"),
+    UNLISTED("Unlisted", "UNLISTED"),
+    PUBLIC("Public", "PUBLIC"),
+}
+
+/** One of the account's own playlists, as the picker lists them. */
+@Serializable
+data class UserPlaylist(
+    val playlistId: String,
+    val title: String,
+    val subtitle: String,
+    val thumbnailUrl: String?,
+) {
+    val browseId: String get() = "VL$playlistId"
+}
+
+/** Per-track rating and library tokens from the watch-queue menu. */
+@Serializable
+data class SongMenu(
+    val likeStatus: String? = null,
+    val inLibrary: Boolean = false,
+    val addToLibraryToken: String? = null,
+    val removeFromLibraryToken: String? = null,
+)
+
+/** A search row that Swift can decode without sealed-class discriminators. */
+@Serializable
+data class SearchHit(
+    val kind: String,
+    val videoId: String? = null,
+    val title: String,
+    val subtitle: String = "",
+    val thumbnailUrl: String? = null,
+    val durationText: String? = null,
+    val albumName: String? = null,
+    val browseId: String? = null,
+    val browseType: String? = null,
+    val artistId: String? = null,
+    val albumId: String? = null,
+    val isVideo: Boolean = false,
+    val setVideoId: String? = null,
 )
 
 sealed interface UiState<out T> {

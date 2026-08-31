@@ -1,6 +1,7 @@
 #if os(macOS)
 import AppKit
 #endif
+import Observation
 import BitChordShared
 
 /// One scanned local audio file.
@@ -20,6 +21,7 @@ struct LocalTrack: Identifiable, Hashable {
 /// is iOS-only and permission-gated). Metadata comes from native-core's
 /// lofty reader so tags decode identically to the playback engine.
 @MainActor
+@Observable
 final class LocalLibrary {
     static let shared = LocalLibrary()
 
@@ -66,10 +68,22 @@ final class LocalLibrary {
         }
         scan(folder: url)
 #else
-        // iOS: folder picking via Files not yet wired in this milestone.
-        return
+        pickingPlaceholder()
 #endif
     }
+
+    func scanPicked(_ url: URL) {
+        _ = url.startAccessingSecurityScopedResource()
+        securityURL = url
+        if let bookmark = try? url.bookmarkData() {
+            AppSettings.shared.setLocalLibraryPath(value: bookmark.base64EncodedString())
+        }
+        scan(folder: url)
+    }
+
+    #if os(iOS)
+    private func pickingPlaceholder() {}
+    #endif
 
     private func scan(folder: URL) {
         let fm = FileManager.default

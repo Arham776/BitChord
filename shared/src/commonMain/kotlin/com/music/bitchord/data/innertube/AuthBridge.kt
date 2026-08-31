@@ -1,5 +1,6 @@
 package com.music.bitchord.data.innertube
 
+import com.music.bitchord.data.http.Http
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -30,10 +31,12 @@ object AuthBridge {
     fun applyCookie(cookieHeader: String?): Boolean {
         if (cookieHeader == null) {
             Innertube.cookie = null
+            Http.installSessionCookies(null)
             return true
         }
         if (!Innertube.hasApiSid(cookieHeader)) return false
         Innertube.cookie = cookieHeader
+        Http.installSessionCookies(cookieHeader)
         return true
     }
 

@@ -54,19 +54,27 @@ private struct LoginWebView: UIViewRepresentable {
 }
 #endif
 
-final class LoginWebCoordinator: NSObject, WKNavigationDelegate, WKUIDelegate {
+final class LoginWebCoordinator: NSObject, WKNavigationDelegate, WKUIDelegate, WKHTTPCookieStoreObserver {
     private let onCookiesCaptured: (String) -> Void
     private let store = WKWebsiteDataStore.nonPersistent()
     private var captured = false
+    private var lastURL: URL?
+    private var harvestWork: DispatchWorkItem?
 
     init(onCookiesCaptured: @escaping (String) -> Void) {
         self.onCookiesCaptured = onCookiesCaptured
+    }
+
+    deinit {
+        store.httpCookieStore.remove(self)
+        harvestWork?.cancel()
     }
 
     func makeWebView() -> WKWebView {
         let config = WKWebViewConfiguration()
         config.websiteDataStore = store
         config.defaultWebpagePreferences.allowsContentJavaScript = true
+        store.httpCookieStore.add(self)
         let webView = WKWebView(frame: .zero, configuration: config)
         webView.navigationDelegate = self
         webView.uiDelegate = self
@@ -75,7 +83,11 @@ final class LoginWebCoordinator: NSObject, WKNavigationDelegate, WKUIDelegate {
     }
 
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
-        tryCapture(from: webView.url)
+        scheduleHarvest(from: webView.url)
+    }
+
+    func cookiesDidChange(in cookieStore: WKHTTPCookieStore) {
+        scheduleHarvest(from: lastURL)
     }
 
     func webView(
@@ -90,8 +102,20 @@ final class LoginWebCoordinator: NSObject, WKNavigationDelegate, WKUIDelegate {
         return nil
     }
 
-    private func tryCapture(from url: URL?) {
-        guard !captured, let url, url.absoluteString.hasPrefix(Self.musicOrigin) else { return }
+    /// Android's `CookieManager.getCookie` is complete at `onPageFinished`.
+    /// WKWebView commits cookies after `didFinish`, so wait a beat and also
+    /// harvest on `cookiesDidChange`.
+    private func scheduleHarvest(from url: URL?) {
+        if let url { lastURL = url }
+        guard !captured, let url = lastURL, url.absoluteString.hasPrefix(Self.musicOrigin) else { return }
+        harvestWork?.cancel()
+        let work = DispatchWorkItem { [weak self] in self?.harvest() }
+        harvestWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.4, execute: work)
+    }
+
+    private func harvest() {
+        guard !captured else { return }
         store.httpCookieStore.getAllCookies { [weak self] cookies in
             guard let self, !self.captured else { return }
             let header = Self.cookieHeader(cookies)
@@ -103,18 +127,29 @@ final class LoginWebCoordinator: NSObject, WKNavigationDelegate, WKUIDelegate {
         }
     }
 
-    /// Cookies Google would send to music.youtube.com — parent-domain
-    /// `.google.com` / `.youtube.com` included. Names and values only;
-    /// never logged.
+    /// Upstream `CookieManager.getCookie(MUSIC_ORIGIN)`: only cookies the
+    /// browser would send to music.youtube.com. Mixing `.google.com` SID
+    /// with YouTube's SAPISID is a different account than the Music one.
     private static func cookieHeader(_ cookies: [HTTPCookie]) -> String {
-        cookies
-            .filter { cookie in
-                let domain = cookie.domain.lowercased()
-                return domain.contains("youtube.com") || domain.contains("google.com")
-            }
+        guard let url = URL(string: musicOrigin + "/") else { return "" }
+        return cookies
+            .filter { wouldSend($0, to: url) }
             .filter { !$0.value.isEmpty }
             .map { "\($0.name)=\($0.value)" }
             .joined(separator: "; ")
+    }
+
+    private static func wouldSend(_ cookie: HTTPCookie, to url: URL) -> Bool {
+        guard let host = url.host?.lowercased() else { return false }
+        if cookie.isSecure, url.scheme != "https" { return false }
+        if let expiry = cookie.expiresDate, expiry < Date() { return false }
+        let domain = cookie.domain.lowercased()
+        let hostOnly = domain.hasPrefix(".") ? String(domain.dropFirst()) : domain
+        let hostMatch = host == hostOnly || host.hasSuffix("." + hostOnly)
+        guard hostMatch else { return false }
+        let path = url.path.isEmpty ? "/" : url.path
+        let cookiePath = cookie.path.isEmpty ? "/" : cookie.path
+        return path.hasPrefix(cookiePath)
     }
 
     private static let musicOrigin = "https://music.youtube.com"

@@ -10,12 +10,14 @@ use std::sync::{Arc, Mutex};
 
 use analyzer::BeatSpectrogram;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+use cpal::ErrorKind;
 use mixer::{Command, EngineEvents, TrackInfo, TrackSource, TransitionPlan, TransitionStyle};
 
 uniffi::setup_scaffolding!();
 
 pub mod analyzer;
 pub mod decode;
+pub mod eq;
 pub mod mixer;
 pub mod metadata;
 pub mod spatial;
@@ -103,6 +105,8 @@ pub struct LoadRequest {
     /// Referer). googlevideo bakes the minting client into the URL and
     /// compares these on the media fetch — a mismatch throttles or 403s.
     pub headers: Option<std::collections::HashMap<String, String>>,
+    /// Resolver-claimed bitrate (0 = unknown).
+    pub claimed_kbps: Option<u32>,
 }
 
 #[derive(uniffi::Record, Debug, Clone)]
@@ -111,6 +115,20 @@ pub struct TrackInfoRec {
     pub artist: String,
     pub source: String,
     pub duration_seconds: f64,
+    pub codec: String,
+    pub sample_rate: u32,
+    pub bit_depth: u32,
+    pub channels: u32,
+    pub kbps: u32,
+}
+
+#[derive(uniffi::Record, Debug, Clone)]
+pub struct NerdStatsRec {
+    pub codec: String,
+    pub sample_rate: u32,
+    pub bit_depth: u32,
+    pub channels: u32,
+    pub kbps: u32,
 }
 
 #[derive(uniffi::Record, Debug, Clone)]
@@ -208,6 +226,11 @@ impl EngineEvents for SharedEvents {
                 artist: info.artist,
                 source: info.source,
                 duration_seconds: info.duration_seconds,
+                codec: info.codec,
+                sample_rate: info.sample_rate,
+                bit_depth: info.bit_depth,
+                channels: info.channels,
+                kbps: info.kbps,
             });
         }
     }
@@ -232,7 +255,11 @@ pub struct PlayerEngine {
     /// not wait for the mixer to drain ~2 s of already-queued samples.
     output_paused: Arc<AtomicBool>,
     started: AtomicBool,
-    stream: Mutex<Option<cpal::Stream>>,
+    stream: Arc<Mutex<Option<cpal::Stream>>>,
+    rebuilding: Arc<AtomicBool>,
+    output_rate: Arc<AtomicU32>,
+    output_channels: Arc<AtomicU32>,
+    nerd: Arc<Mutex<mixer::NerdSnapshot>>,
 }
 
 #[uniffi::export]
@@ -251,7 +278,11 @@ impl PlayerEngine {
             flush_ring: Arc::new(AtomicBool::new(false)),
             output_paused: Arc::new(AtomicBool::new(false)),
             started: AtomicBool::new(false),
-            stream: Mutex::new(None),
+            stream: Arc::new(Mutex::new(None)),
+            rebuilding: Arc::new(AtomicBool::new(false)),
+            output_rate: Arc::new(AtomicU32::new(0)),
+            output_channels: Arc::new(AtomicU32::new(2)),
+            nerd: Arc::new(Mutex::new(mixer::NerdSnapshot::default())),
         })
     }
 
@@ -274,14 +305,14 @@ impl PlayerEngine {
             .map_err(|e| EngineError::StreamInit(e.to_string()))?;
         let sample_rate = supported.sample_rate();
         let channels = supported.channels() as usize;
-        let config = cpal::StreamConfig {
-            channels: supported.channels(),
-            sample_rate,
-            buffer_size: cpal::BufferSize::Default,
-        };
+        self.output_rate.store(sample_rate, Ordering::Relaxed);
+        self.output_channels.store(channels as u32, Ordering::Relaxed);
+        log::info!("output {sample_rate} Hz, {channels} ch");
 
-        // ~2 s of stereo headroom.
-        let (producer, mut consumer) = rtrb::RingBuffer::<f32>::new(sample_rate as usize * 2 * 2);
+        // ~2 s of stereo at 192 kHz — big enough that a 24 kHz AirPods
+        // rebuild can reuse the same capacity without shrinking.
+        let ring_cap = (sample_rate.max(192_000) as usize) * 2 * 2;
+        let (producer, consumer) = rtrb::RingBuffer::<f32>::new(ring_cap);
         let rx = self
             .command_rx
             .lock()
@@ -293,9 +324,8 @@ impl PlayerEngine {
         let duration = self.duration_ms.clone();
         let events = self.events.clone();
         let shutdown = Arc::new(AtomicBool::new(false));
-        let flush_ring = self.flush_ring.clone();
-        let mixer_flush = flush_ring.clone();
-        let output_paused = self.output_paused.clone();
+        let mixer_flush = self.flush_ring.clone();
+        let nerd = self.nerd.clone();
 
         std::thread::Builder::new()
             .name("native-core-mixer".into())
@@ -307,85 +337,29 @@ impl PlayerEngine {
                     position,
                     duration,
                     sample_rate,
-                    channels,
                     events,
                     shutdown,
                     mixer_flush,
+                    nerd,
                 )
             })
             .map_err(|e| EngineError::StreamInit(e.to_string()))?;
 
-        let volume = self.volume_bits.clone();
-        let buffered = self.buffered_frames.clone();
-        let paused = output_paused;
-        let stream = device
-            .build_output_stream(
-                config,
-                move |data: &mut [f32], _| {
-                    if flush_ring.swap(false, Ordering::AcqRel) {
-                        while consumer.pop().is_ok() {}
-                        buffered.store(0, Ordering::Relaxed);
-                    }
-                    if paused.load(Ordering::Acquire) {
-                        data.fill(0.0);
-                        return;
-                    }
-                    let vol = f32::from_bits(volume.load(Ordering::Relaxed));
-                    match channels {
-                        1 => {
-                            for frame in data.iter_mut() {
-                                let l = consumer.pop().unwrap_or(0.0);
-                                let r = consumer.pop().unwrap_or(0.0);
-                                *frame = (l + r) * 0.5 * vol;
-                            }
-                        }
-                        2 => {
-                            for sample in data.iter_mut() {
-                                *sample = consumer.pop().unwrap_or(0.0) * vol;
-                            }
-                        }
-                        _ => {
-                            let frames = data.len() / channels;
-                            for frame in 0..frames {
-                                let l = consumer.pop().unwrap_or(0.0);
-                                let r = consumer.pop().unwrap_or(0.0);
-                                let base = frame * channels;
-                                for slot in &mut data[base..base + channels] {
-                                    *slot = 0.0;
-                                }
-                                data[base] = l * vol;
-                                data[base + 1] = r * vol;
-                            }
-                        }
-                    }
-                    // Saturating decrement: the callback can run before the
-                    // producer ever fills, and a plain fetch_sub would wrap
-                    // u64::MAX and wedge every tail-length computation.
-                    let consumed = (data.len() / channels.max(1)) as u64;
-                    let mut current = buffered.load(Ordering::Relaxed);
-                    while current > 0 {
-                        let next = current.saturating_sub(consumed);
-                        match buffered.compare_exchange_weak(
-                            current,
-                            next,
-                            Ordering::Relaxed,
-                            Ordering::Relaxed,
-                        ) {
-                            Ok(_) => break,
-                            Err(observed) => current = observed,
-                        }
-                    }
-                },
-                move |err| log::warn!("output stream error: {err}"),
-                None,
-            )
-            .map_err(|e| EngineError::StreamInit(e.to_string()))?;
-        // cpal 0.15+ builds streams in a paused state — without play() the
-        // device never drains the ring and the mixer stalls on a full buffer.
+        let control = OutputControl {
+            commands: self.commands.clone(),
+            stream: self.stream.clone(),
+            rebuilding: self.rebuilding.clone(),
+            output_rate: self.output_rate.clone(),
+            output_channels: self.output_channels.clone(),
+            volume_bits: self.volume_bits.clone(),
+            buffered: self.buffered_frames.clone(),
+            flush_ring: self.flush_ring.clone(),
+            output_paused: self.output_paused.clone(),
+        };
+        let stream = open_output_stream(&device, sample_rate, channels, consumer, &control)?;
         stream
             .play()
             .map_err(|e| EngineError::StreamInit(e.to_string()))?;
-
         *self.stream.lock().unwrap() = Some(stream);
         Ok(())
     }
@@ -398,12 +372,7 @@ impl PlayerEngine {
             reply: reply_tx,
         })?;
         match reply_rx.recv_timeout(std::time::Duration::from_secs(30)) {
-            Ok(Ok(info)) => Ok(TrackInfoRec {
-                title: info.title,
-                artist: info.artist,
-                source: info.source,
-                duration_seconds: info.duration_seconds,
-            }),
+            Ok(Ok(info)) => Ok(info_to_rec(info)),
             Ok(Err(e)) => Err(EngineError::LoadFailed(e)),
             Err(_) => Err(EngineError::LoadFailed("load timed out".into())),
         }
@@ -477,6 +446,29 @@ impl PlayerEngine {
         self.send(Command::OpenFilters)
     }
 
+    pub fn set_playback_speed(&self, speed: f32) -> Result<(), EngineError> {
+        self.send(Command::SetPlaybackSpeed(speed.clamp(0.5, 2.0)))
+    }
+
+    pub fn set_skip_silence(&self, enabled: bool) -> Result<(), EngineError> {
+        self.send(Command::SetSkipSilence(enabled))
+    }
+
+    pub fn set_eq_gains(&self, gains_db: Vec<f32>) -> Result<(), EngineError> {
+        self.send(Command::SetEqGains(gains_db))
+    }
+
+    pub fn nerd_stats(&self) -> NerdStatsRec {
+        let snap = self.nerd.lock().unwrap().clone();
+        NerdStatsRec {
+            codec: snap.codec,
+            sample_rate: snap.sample_rate,
+            bit_depth: snap.bit_depth,
+            channels: snap.channels,
+            kbps: snap.kbps,
+        }
+    }
+
     // ---- Analysis entry points (spec §2, §1.3) -----------------------------
 
     /// Seek-bounded region decode — the contract upstream's `AudioDecoder`
@@ -508,10 +500,21 @@ impl PlayerEngine {
         analyzer::resample(&samples, input_rate, output_rate)
     }
 
-    /// True once ONNX inference (milestone 5, `ort`) is wired in. Until then
-    /// Automix runs the unanalysed fallback: plain equal-power crossfade.
+    /// True once Beat This! loaded. Energy-based tempo planning still works
+    /// without it — Automix falls back to a plain fade, matching upstream.
     pub fn analyzer_available(&self) -> bool {
-        false
+        analyzer::analyzer_ready()
+    }
+
+    /// Plan an Automix transition from two local files (Beat This! + open-unmix
+    /// when models are configured, energy/tempo otherwise).
+    pub fn plan_automix(
+        &self,
+        outgoing_path: String,
+        incoming_path: String,
+        crossfade_seconds: f64,
+    ) -> TransitionPlanRec {
+        plan_automix_impl(&outgoing_path, &incoming_path, crossfade_seconds)
     }
 }
 
@@ -523,6 +526,186 @@ impl PlayerEngine {
     }
 }
 
+#[derive(Clone)]
+struct OutputControl {
+    commands: crossbeam_channel::Sender<Command>,
+    stream: Arc<Mutex<Option<cpal::Stream>>>,
+    rebuilding: Arc<AtomicBool>,
+    output_rate: Arc<AtomicU32>,
+    output_channels: Arc<AtomicU32>,
+    volume_bits: Arc<AtomicU32>,
+    buffered: Arc<AtomicU64>,
+    flush_ring: Arc<AtomicBool>,
+    output_paused: Arc<AtomicBool>,
+}
+
+impl OutputControl {
+    fn on_stream_error(&self, err: cpal::Error) {
+        match err.kind() {
+            ErrorKind::DeviceChanged => {
+                log::info!("output route changed: {err}");
+                self.request_rebuild(false);
+            }
+            ErrorKind::StreamInvalidated => {
+                log::info!("output stream invalidated: {err}");
+                self.request_rebuild(true);
+            }
+            ErrorKind::DeviceNotAvailable => {
+                log::info!("output device unavailable: {err}");
+                self.request_rebuild(true);
+            }
+            ErrorKind::Xrun => {
+                log::debug!("output xrun: {err}");
+            }
+            other => log::warn!("output stream error ({other:?}): {err}"),
+        }
+    }
+
+    fn request_rebuild(&self, force: bool) {
+        if self.rebuilding.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let ctrl = self.clone();
+        let _ = std::thread::Builder::new()
+            .name("native-core-output-rebuild".into())
+            .spawn(move || {
+                for attempt in 0..20 {
+                    std::thread::sleep(std::time::Duration::from_millis(250));
+                    match ctrl.rebuild(force) {
+                        Ok(()) => break,
+                        Err(EngineError::NoOutputDevice) if attempt < 19 => {
+                            log::info!("waiting for an output device…");
+                        }
+                        Err(e) => {
+                            log::warn!("output rebuild failed: {e}");
+                            break;
+                        }
+                    }
+                }
+                ctrl.rebuilding.store(false, Ordering::Release);
+            });
+    }
+
+    fn rebuild(&self, force: bool) -> Result<(), EngineError> {
+        let device = cpal::default_host()
+            .default_output_device()
+            .ok_or(EngineError::NoOutputDevice)?;
+        let supported = device
+            .default_output_config()
+            .map_err(|e| EngineError::StreamInit(e.to_string()))?;
+        let rate = supported.sample_rate();
+        let channels = supported.channels() as usize;
+        let prev_rate = self.output_rate.load(Ordering::Relaxed);
+        let prev_ch = self.output_channels.load(Ordering::Relaxed);
+        if !force && rate == prev_rate && channels as u32 == prev_ch {
+            log::info!("output still {rate} Hz / {channels} ch — keeping stream");
+            return Ok(());
+        }
+
+        let user_paused = self.output_paused.load(Ordering::Acquire);
+        self.output_paused.store(true, Ordering::Release);
+        self.flush_ring.store(true, Ordering::Release);
+        // Drop the old stream so its callback/consumer die before we
+        // hand the mixer a new producer.
+        *self.stream.lock().unwrap() = None;
+
+        let cap = (rate.max(192_000) as usize) * 2 * 2;
+        let (producer, consumer) = rtrb::RingBuffer::<f32>::new(cap);
+        self.commands
+            .send(Command::SetOutputFormat { rate, producer })
+            .map_err(|_| EngineError::NotStarted)?;
+        self.output_rate.store(rate, Ordering::Relaxed);
+        self.output_channels.store(channels as u32, Ordering::Relaxed);
+
+        let stream = open_output_stream(&device, rate, channels, consumer, self)?;
+        stream
+            .play()
+            .map_err(|e| EngineError::StreamInit(e.to_string()))?;
+        *self.stream.lock().unwrap() = Some(stream);
+        self.output_paused.store(user_paused, Ordering::Release);
+        log::info!("output rebuilt: {rate} Hz, {channels} ch");
+        Ok(())
+    }
+}
+
+fn open_output_stream(
+    device: &cpal::Device,
+    sample_rate: u32,
+    channels: usize,
+    mut consumer: rtrb::Consumer<f32>,
+    control: &OutputControl,
+) -> Result<cpal::Stream, EngineError> {
+    let config = cpal::StreamConfig {
+        channels: channels as u16,
+        sample_rate,
+        buffer_size: cpal::BufferSize::Default,
+    };
+    let volume = control.volume_bits.clone();
+    let buffered = control.buffered.clone();
+    let flush_ring = control.flush_ring.clone();
+    let paused = control.output_paused.clone();
+    let err_ctrl = control.clone();
+    device
+        .build_output_stream(
+            config,
+            move |data: &mut [f32], _| {
+                if flush_ring.swap(false, Ordering::AcqRel) {
+                    while consumer.pop().is_ok() {}
+                    buffered.store(0, Ordering::Relaxed);
+                }
+                if paused.load(Ordering::Acquire) {
+                    data.fill(0.0);
+                    return;
+                }
+                let vol = f32::from_bits(volume.load(Ordering::Relaxed));
+                match channels {
+                    1 => {
+                        for frame in data.iter_mut() {
+                            let l = consumer.pop().unwrap_or(0.0);
+                            let r = consumer.pop().unwrap_or(0.0);
+                            *frame = (l + r) * 0.5 * vol;
+                        }
+                    }
+                    2 => {
+                        for sample in data.iter_mut() {
+                            *sample = consumer.pop().unwrap_or(0.0) * vol;
+                        }
+                    }
+                    _ => {
+                        let frames = data.len() / channels;
+                        for frame in 0..frames {
+                            let l = consumer.pop().unwrap_or(0.0);
+                            let r = consumer.pop().unwrap_or(0.0);
+                            let base = frame * channels;
+                            for slot in &mut data[base..base + channels] {
+                                *slot = 0.0;
+                            }
+                            data[base] = l * vol;
+                            data[base + 1] = r * vol;
+                        }
+                    }
+                }
+                let consumed = (data.len() / channels.max(1)) as u64;
+                let mut current = buffered.load(Ordering::Relaxed);
+                while current > 0 {
+                    let next = current.saturating_sub(consumed);
+                    match buffered.compare_exchange_weak(
+                        current,
+                        next,
+                        Ordering::Relaxed,
+                        Ordering::Relaxed,
+                    ) {
+                        Ok(_) => break,
+                        Err(observed) => current = observed,
+                    }
+                }
+            },
+            move |err| err_ctrl.on_stream_error(err),
+            None,
+        )
+        .map_err(|e| EngineError::StreamInit(e.to_string()))
+}
+
 fn to_track_source(request: LoadRequest) -> TrackSource {
     TrackSource {
         source: request.source,
@@ -531,7 +714,85 @@ fn to_track_source(request: LoadRequest) -> TrackSource {
         start_seconds: request.start_seconds,
         plan: request.plan.map(Into::into).unwrap_or_default(),
         headers: request.headers.unwrap_or_default(),
+        claimed_kbps: request.claimed_kbps.unwrap_or(0),
     }
+}
+
+fn info_to_rec(info: TrackInfo) -> TrackInfoRec {
+    TrackInfoRec {
+        title: info.title,
+        artist: info.artist,
+        source: info.source,
+        duration_seconds: info.duration_seconds,
+        codec: info.codec,
+        sample_rate: info.sample_rate,
+        bit_depth: info.bit_depth,
+        channels: info.channels,
+        kbps: info.kbps,
+    }
+}
+
+fn plan_automix_impl(outgoing: &str, incoming: &str, crossfade_seconds: f64) -> TransitionPlanRec {
+    let plan = analyzer::plan_pair(
+        outgoing,
+        incoming,
+        crossfade_seconds,
+        |path, start, dur, mono| {
+            decode_region_impl(path, start, dur, mono)
+                .ok()
+                .map(|r| (r.samples, r.sample_rate, r.start_seconds))
+        },
+        |path| {
+            metadata::read_track_metadata(path)
+                .map(|m| m.duration_seconds)
+                .unwrap_or(0.0)
+        },
+    );
+    TransitionPlanRec {
+        style: match plan.style {
+            TransitionStyle::EqualPower => TransitionStyleRec::EqualPower,
+            TransitionStyle::DjFilter => TransitionStyleRec::DjFilter,
+            TransitionStyle::DjBlend => TransitionStyleRec::DjBlend,
+            TransitionStyle::Gapless => TransitionStyleRec::Gapless,
+        },
+        bass_swap: plan.bass_swap,
+        bass_swap_fraction: plan.bass_swap_fraction,
+        filter_sweep: plan.filter_sweep,
+        vocal_overlap: plan.vocal_overlap,
+        fade_seconds: plan.fade_seconds,
+        cue_seconds: plan.cue_seconds,
+        playback_rate: plan.playback_rate,
+    }
+}
+
+/// lofty-backed metadata read for the local library scanner (spec §4).
+#[uniffi::export]
+pub fn read_track_metadata(path: String) -> Option<TrackMetadata> {
+    metadata::read_track_metadata(&path)
+}
+
+/// Write title/artist/album/artwork onto a downloaded file.
+#[uniffi::export]
+pub fn write_track_tags(
+    path: String,
+    title: String,
+    artist: String,
+    album: String,
+    artwork: Vec<u8>,
+) -> bool {
+    metadata::write_track_tags(&path, &title, &artist, &album, &artwork)
+}
+
+/// Load Automix ONNX graphs. Paths are bundle-resolved by Swift; empty unloads.
+#[uniffi::export]
+pub fn configure_analyzer(beat_model_path: String, vocal_model_path: String) -> bool {
+    analyzer::configure(&beat_model_path, &vocal_model_path)
+}
+
+/// Engine version for the About pane.
+#[uniffi::export]
+pub fn core_version() -> String {
+    env!("CARGO_PKG_VERSION").to_string()
 }
 
 fn decode_region_impl(
@@ -546,6 +807,7 @@ fn decode_region_impl(
     if start_seconds > 0.0 {
         decoder.seek_seconds(start_seconds).map_err(|e| e.to_string())?;
     }
+    let actual_start = decoder.position_seconds();
     let rate = decoder.sample_rate();
     let want_frames = (duration_seconds.max(0.0) * rate as f64) as usize;
     let mut samples: Vec<f32> = Vec::with_capacity(want_frames * 2);
@@ -564,24 +826,12 @@ fn decode_region_impl(
         return Ok(DecodedRegion {
             samples: mono_samples,
             sample_rate: rate,
-            start_seconds: decoder.position_seconds(),
+            start_seconds: actual_start,
         });
     }
     Ok(DecodedRegion {
         samples,
         sample_rate: rate,
-        start_seconds: decoder.position_seconds(),
+        start_seconds: actual_start,
     })
-}
-
-/// lofty-backed metadata read for the local library scanner (spec §4).
-#[uniffi::export]
-pub fn read_track_metadata(path: String) -> Option<TrackMetadata> {
-    metadata::read_track_metadata(&path)
-}
-
-/// Engine version for the About pane.
-#[uniffi::export]
-pub fn core_version() -> String {
-    env!("CARGO_PKG_VERSION").to_string()
 }

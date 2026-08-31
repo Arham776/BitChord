@@ -34,9 +34,13 @@ object PlayerBridge {
     }
 
     fun resolve(videoId: String, callback: ResolveCallback) {
+        resolve(videoId, Int.MAX_VALUE, callback)
+    }
+
+    fun resolve(videoId: String, maxKbps: Int, callback: ResolveCallback) {
         bridgeScope.launch {
             try {
-                val resolved = resolveMutex.withLock { resolveInternal(videoId) }
+                val resolved = resolveMutex.withLock { resolveInternal(videoId, maxKbps) }
                     ?: throw IllegalStateException("No playable stream for $videoId")
                 callback.onResult(
                     json.encodeToString(StreamPayload.serializer(), resolved),
@@ -48,11 +52,12 @@ object PlayerBridge {
         }
     }
 
-    private suspend fun resolveInternal(videoId: String): StreamPayload? {
+    private suspend fun resolveInternal(videoId: String, maxKbps: Int = Int.MAX_VALUE): StreamPayload? {
         Innertube.ensureSessionScope()
         Innertube.ensureVisitorData()
         val errors = mutableListOf<String>()
         var sts: Int? = null
+        var lastResort: StreamPayload? = null
         for (client in clientOrder()) {
             if (client.needsSignatureTimestamp && sts == null) {
                 sts = CipherUnlock.signatureTimestamp()
@@ -62,12 +67,31 @@ object PlayerBridge {
                     continue
                 }
             }
-            val resolved = tryClient(videoId, client, sts, errors) ?: continue
-            preferred = client
-            return resolved
+            val resolved = tryClient(videoId, client, sts, errors, maxKbps) ?: continue
+            if (!isLastResortFormat(resolved.mimeType)) {
+                preferred = client
+                println(
+                    "[PlayerBridge] resolved $videoId via ${client.clientName}@${client.clientVersion} " +
+                        "@ ${resolved.kbps}kbps ${resolved.mimeType}",
+                )
+                return resolved
+            }
+            println(
+                "[PlayerBridge] ${client.clientName}: only muxed/HE-AAC @ ${resolved.kbps}kbps — " +
+                    "trying other clients for AAC-LC",
+            )
+            if (lastResort == null) lastResort = resolved
         }
-        println("[PlayerBridge] all clients refused for $videoId: $errors")
-        return null
+        if (lastResort != null) {
+            val fallback = lastResort
+            println(
+                "[PlayerBridge] resolved $videoId via muxed/HE-AAC fallback " +
+                    "${fallback.mimeType} @ ${fallback.kbps}kbps",
+            )
+        } else {
+            println("[PlayerBridge] all clients refused for $videoId: $errors")
+        }
+        return lastResort
     }
 
     private fun clientOrder(): List<PlayerClient> {
@@ -80,6 +104,7 @@ object PlayerBridge {
         client: PlayerClient,
         sts: Int?,
         errors: MutableList<String>,
+        maxKbps: Int,
     ): StreamPayload? {
         val response = try {
             playerWithBotRetry(videoId, client, sts)
@@ -94,7 +119,7 @@ object PlayerBridge {
             return null
         }
 
-        val formats = extractAudioFormats(response)
+        val formats = extractAudioFormats(response, maxKbps)
         if (formats.isEmpty()) {
             logEmptyFormats(client, response)
             errors += "${client.clientName}: no audio formats"
@@ -130,9 +155,6 @@ object PlayerBridge {
                     "probe ${format.mimeType} ${format.kbps}kbps -> status=${probeResult.status} verdict=$verdict",
             )
             if (verdict == ProbeVerdict.OK) {
-                println(
-                    "[PlayerBridge] resolved $videoId via ${client.clientName}@${client.clientVersion} @ ${format.kbps}kbps",
-                )
                 return StreamPayload(
                     url = url,
                     kbps = format.kbps,
@@ -173,22 +195,27 @@ object PlayerBridge {
         val kbps: Int,
     )
 
-    private fun extractAudioFormats(response: JsonObject): List<AudioFormat> {
+    private fun extractAudioFormats(response: JsonObject, maxKbps: Int = Int.MAX_VALUE): List<AudioFormat> {
         val streamingData = response.o("streamingData") ?: return emptyList()
         val adaptive = streamingData.a("adaptiveFormats").orEmpty().filterIsInstance<JsonObject>()
         val legacy = streamingData.a("formats").orEmpty().filterIsInstance<JsonObject>()
         val all = (adaptive + legacy).mapNotNull { it.toPlayableFormat() }
         if (all.isEmpty()) return emptyList()
-        // Prefer audio-only AAC, then any audio, then muxed MP4 (itag 18).
+        // Prefer adaptive AAC-LC (itag 140), never muxed HE-AAC (itag 18) or
+        // HE-AAC audio-only (itag 139) when an LC ladder exists. Symphonia
+        // cannot decode SBR — feeding those into an LC decoder is the muffled
+        // cheap-MP3 path.
         val audio = all.filter { it.mimeType.startsWith("audio/") }
-        val aac = audio.filter { it.mimeType.contains("mp4", ignoreCase = true) }
-        val muxed = all.filter { it.mimeType.startsWith("video/mp4") }
-        val candidates = when {
-            aac.isNotEmpty() -> aac
-            audio.isNotEmpty() -> audio
-            else -> muxed
-        }
-        return candidates.sortedByDescending { it.kbps }
+        val aacLc = audio.filter { isAacLc(it.mimeType) }
+        val aacOther = audio.filter { isAacMp4(it.mimeType) && !isHeAac(it.mimeType) && !isAacLc(it.mimeType) }
+        val otherAudio = audio.filter { !isAacMp4(it.mimeType) && !isHeAac(it.mimeType) }
+        val muxed = all.filter { it.mimeType.startsWith("video/mp4") && !isHeAac(it.mimeType) }
+        val heAac = all.filter { isHeAac(it.mimeType) }
+        val ranked = listOf(aacLc, aacOther, otherAudio, muxed, heAac)
+            .flatMap { bucket -> bucket.sortedByDescending { it.kbps } }
+        if (maxKbps == Int.MAX_VALUE) return ranked
+        val capped = ranked.filter { it.kbps <= maxKbps }
+        return capped.ifEmpty { ranked.takeLast(1) }
     }
 
     /**
@@ -206,6 +233,28 @@ object PlayerBridge {
         if (url == null && cipher == null) return null
         val bps = (get("bitrate") as? JsonPrimitive)?.intOrNull ?: 0
         return AudioFormat(url, cipher, mime, (bps / 1000).coerceAtLeast(1))
+    }
+
+    private fun isHeAac(mime: String): Boolean {
+        val lower = mime.lowercase()
+        return "mp4a.40.5" in lower || "mp4a.40.29" in lower || "mp4a.40.39" in lower
+    }
+
+    private fun isAacMp4(mime: String): Boolean {
+        val lower = mime.lowercase()
+        return lower.startsWith("audio/") && "mp4" in lower
+    }
+
+    private fun isAacLc(mime: String): Boolean {
+        if (!isAacMp4(mime) || isHeAac(mime)) return false
+        val lower = mime.lowercase()
+        return "mp4a.40.2" in lower || "mp4a.40." !in lower
+    }
+
+    /** Muxed itag 18 / HE-AAC — playable last resort, not a successful AAC-LC resolve. */
+    private fun isLastResortFormat(mime: String): Boolean {
+        val lower = mime.lowercase()
+        return lower.startsWith("video/") || isHeAac(lower)
     }
 
     private fun logEmptyFormats(client: PlayerClient, response: JsonObject) {

@@ -15,4 +15,8 @@ expect object PlatformSettings {
     fun putInt(key: String, value: Int)
     fun getBoolean(key: String, default: Boolean): Boolean
     fun putBoolean(key: String, value: Boolean)
+    fun getFloat(key: String, default: Float): Float
+    fun putFloat(key: String, value: Float)
+    fun getLong(key: String, default: Long): Long
+    fun putLong(key: String, value: Long)
 }

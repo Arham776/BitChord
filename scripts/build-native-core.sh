@@ -10,6 +10,9 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT/native-core"
+# Cursor (and some CI sandboxes) redirect CARGO_TARGET_DIR; UniFFI bindgen and
+# the xcframework copy below read native-core/target/… so force the local dir.
+unset CARGO_TARGET_DIR
 # Match AppleApp/project.yml deployment targets (iOS 18, macOS 15) — avoids
 # "was built for newer macOS version (26.5) than being linked (15.0)" warnings
 # and keeps the Rust standard library's darwin thread-parking QoS aligned.

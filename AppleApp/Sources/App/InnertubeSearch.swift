@@ -1,29 +1,51 @@
 import Foundation
 import BitChordShared
 
-/// A YouTube Music search result row, decoded from the shared module's
-/// serialized `Song` list (the bridge crosses FFI as JSON so Swift never
-/// touches Kotlin collection types).
-struct YouTubeSong: Codable, Identifiable, Hashable {
-    let videoId: String
+struct SearchHitDTO: Codable, Identifiable, Hashable {
+    let kind: String
+    let videoId: String?
     let title: String
-    let artist: String
+    let subtitle: String?
     let thumbnailUrl: String?
     let durationText: String?
     let albumName: String?
+    let browseId: String?
+    let browseType: String?
+    let artistId: String?
+    let albumId: String?
     let isVideo: Bool?
+    let setVideoId: String?
 
-    var id: String { videoId }
+    var id: String { videoId ?? browseId ?? title }
+
+    var isBrowse: Bool { kind == "browse" && browseId != nil }
+
+    func asEntry() -> QueueEntry {
+        if let videoId, videoId.hasPrefix("saavn:") {
+            return QueueEntry(
+                id: videoId, title: title, artist: subtitle ?? "", source: videoId,
+                thumbnailUrl: thumbnailUrl, durationText: durationText, albumName: albumName,
+                artworkData: nil, isLocal: false
+            )
+        }
+        return QueueEntry.youtube(
+            videoId: videoId ?? id,
+            title: title,
+            artist: subtitle ?? "",
+            thumbnailUrl: thumbnailUrl,
+            durationText: durationText,
+            albumName: albumName,
+            artistId: artistId,
+            albumId: albumId,
+            setVideoId: setVideoId
+        )
+    }
 }
 
-/// Swift bridge over the shared module's innertube search (milestone 2):
-/// `SearchBridge` launches the suspend call on Kotlin's dispatcher and
-/// answers exactly once on a background thread; this converts it to
-/// async/await.
 final class InnertubeSearch: Sendable {
     static let shared = InnertubeSearch()
 
-    func search(_ term: String, scope: String) async throws -> [YouTubeSong] {
+    func search(_ term: String, scope: String) async throws -> [SearchHitDTO] {
         try await withCheckedThrowingContinuation { continuation in
             SearchBridge.shared.search(
                 query: term,
@@ -31,9 +53,9 @@ final class InnertubeSearch: Sendable {
                 callback: BridgeCallbackAdapter { json, message in
                     if let json {
                         do {
-                            let songs = try JSONDecoder()
-                                .decode([YouTubeSong].self, from: Data(json.utf8))
-                            continuation.resume(returning: songs.filter { $0.isVideo != true })
+                            let hits = try JSONDecoder()
+                                .decode([SearchHitDTO].self, from: Data(json.utf8))
+                            continuation.resume(returning: hits)
                         } catch {
                             continuation.resume(throwing: error)
                         }
@@ -45,17 +67,30 @@ final class InnertubeSearch: Sendable {
         }
     }
 
+    func suggestions(_ input: String) async -> [String] {
+        await withCheckedContinuation { continuation in
+            SuggestionsBridge.shared.suggest(input: input, callback: SuggestAdapter { json, _ in
+                guard let json, let data = json.data(using: .utf8),
+                      let list = try? JSONDecoder().decode([String].self, from: data) else {
+                    continuation.resume(returning: [])
+                    return
+                }
+                continuation.resume(returning: list)
+            })
+        }
+    }
+
     struct SearchError: Error { let message: String }
 }
 
 private final class BridgeCallbackAdapter: SearchBridgeSearchCallback {
     private let onResult: (String?, String?) -> Void
+    init(onResult: @escaping (String?, String?) -> Void) { self.onResult = onResult }
+    func onResult(json: String?, message: String?) { onResult(json, message) }
+}
 
-    init(onResult: @escaping (String?, String?) -> Void) {
-        self.onResult = onResult
-    }
-
-    func onResult(json: String?, message: String?) {
-        onResult(json, message)
-    }
+private final class SuggestAdapter: SuggestionsBridgeSuggestionsCallback {
+    private let onResult: (String?, String?) -> Void
+    init(onResult: @escaping (String?, String?) -> Void) { self.onResult = onResult }
+    func onResult(json: String?, message: String?) { onResult(json, message) }
 }

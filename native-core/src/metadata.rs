@@ -4,6 +4,8 @@
 
 use std::borrow::Cow;
 
+use lofty::config::WriteOptions;
+use lofty::picture::{MimeType, Picture, PictureType};
 use lofty::prelude::*;
 use lofty::probe::Probe;
 use lofty::tag::Tag;
@@ -36,6 +38,58 @@ pub fn read_track_metadata(path: &str) -> Option<TrackMetadata> {
         duration_seconds: duration,
         artwork,
     })
+}
+
+/// Write ID3/Vorbis/MP4 tags onto a downloaded file (spec §4).
+pub fn write_track_tags(
+    path: &str,
+    title: &str,
+    artist: &str,
+    album: &str,
+    artwork: &[u8],
+) -> bool {
+    let mut tagged = match Probe::open(path).and_then(|p| p.read()) {
+        Ok(t) => t,
+        Err(e) => {
+            log::warn!("tag write: open {path}: {e}");
+            return false;
+        }
+    };
+    let tag = if let Some(existing) = tagged.primary_tag_mut() {
+        existing
+    } else {
+        let tag_type = tagged.primary_tag_type();
+        tagged.insert_tag(Tag::new(tag_type));
+        match tagged.primary_tag_mut() {
+            Some(t) => t,
+            None => return false,
+        }
+    };
+    tag.set_title(title.to_string());
+    tag.set_artist(artist.to_string());
+    if !album.is_empty() {
+        tag.set_album(album.to_string());
+    }
+    if !artwork.is_empty() {
+        let mime = if artwork.len() >= 3 && artwork[0] == 0xFF && artwork[1] == 0xD8 {
+            MimeType::Jpeg
+        } else {
+            MimeType::Png
+        };
+        let picture = Picture::unchecked(artwork.to_vec())
+            .pic_type(PictureType::CoverFront)
+            .mime_type(mime)
+            .build();
+        tag.remove_picture_type(PictureType::CoverFront);
+        tag.push_picture(picture);
+    }
+    match tagged.save_to_path(path, WriteOptions::default()) {
+        Ok(()) => true,
+        Err(e) => {
+            log::warn!("tag write: save {path}: {e}");
+            false
+        }
+    }
 }
 
 /// Quick directory scan: returns paths of files with audio-ish extensions.
