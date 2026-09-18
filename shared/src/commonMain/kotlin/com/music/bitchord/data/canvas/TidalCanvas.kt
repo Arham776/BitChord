@@ -59,6 +59,48 @@ object TidalCanvas {
         return null
     }
 
+    /** Album-page canvas: ask Tidal for albums rather than hoping a track sits on the right record. */
+    suspend fun searchAlbum(album: String, artist: String): CanvasArtworkDto? {
+        val body = runCatching {
+            Http.getText(
+                SEARCH,
+                headers = mapOf(
+                    "X-Tidal-Token" to EMBED_TOKEN,
+                    "User-Agent" to CANVAS_UA,
+                ),
+                query = mapOf(
+                    "query" to "$album $artist",
+                    "limit" to "10",
+                    "types" to "ALBUMS",
+                    "countryCode" to "US",
+                ),
+                timeoutMillis = 8_000,
+            )
+        }.getOrNull() ?: return null
+        val items = runCatching {
+            json.parseToJsonElement(body).jsonObject["albums"]?.jsonObject?.get("items")?.jsonArray
+        }.getOrNull() ?: return null
+        for (item in items) {
+            val record = item as? JsonObject ?: continue
+            val recordTitle = record["title"]?.jsonPrimitive?.contentOrNull ?: continue
+            val artists = record["artists"]?.jsonArray
+                ?.mapNotNull { it.jsonObject["name"]?.jsonPrimitive?.contentOrNull }
+                .orEmpty()
+            if (!isMatch(recordTitle, artists, album, artist)) continue
+            val videoCover = record["videoCover"]?.jsonPrimitive?.contentOrNull
+            if (videoCover.isNullOrBlank()) continue
+            val videoUrl = coverUrl(videoCover) ?: continue
+            return CanvasArtworkDto(
+                url = videoUrl,
+                title = recordTitle,
+                artist = artists.joinToString(", ").ifBlank { null },
+                album = recordTitle,
+                source = "tidal",
+            )
+        }
+        return null
+    }
+
     private fun isMatch(
         gotName: String,
         gotArtists: List<String>,

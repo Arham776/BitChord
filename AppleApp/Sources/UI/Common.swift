@@ -349,31 +349,178 @@ struct RepeatGlyph: View {
     }
 }
 
-/// Upstream `ThinSlider.kt` — hairline track, small knob, timestamp labels.
+/// Upstream `ThinSlider.kt` — hairline capsule, Automix window marker, mix sheen.
 struct ThinSlider: View {
     let value: Double
     let maximum: Double
+    var mixing: Bool = false
+    var transitionWindow: ClosedRange<Double>? = nil
     var onEditingChanged: (Double) -> Void
 
     @State private var dragging = false
     @State private var dragValue: Double?
 
-    private var effective: Double { dragging ? (dragValue ?? value) : value }
+    private var fraction: Double {
+        let current = dragging ? (dragValue ?? value) : value
+        guard maximum > 0 else { return 0 }
+        return min(max(current / maximum, 0), 1)
+    }
 
     var body: some View {
-        Slider(
-            value: Binding(
-                get: { maximum > 0 ? min(effective, maximum) : 0 },
-                set: { dragValue = $0; dragging = true }
-            ),
-            in: 0...max(maximum, 0.01)
-        ) { editing in
-            if !editing {
-                if let v = dragValue { onEditingChanged(v) }
-                dragging = false
-                dragValue = nil
+        GeometryReader { geo in
+            let height: CGFloat = dragging ? 12 : 7
+            ZStack(alignment: .leading) {
+                Capsule().fill(Color.white.opacity(0.26))
+                if !dragging, let window = transitionWindow, window.upperBound > window.lowerBound {
+                    let from = geo.size.width * window.lowerBound
+                    let to = geo.size.width * window.upperBound
+                    Capsule()
+                        .fill(Color.white.opacity(0.5))
+                        .frame(width: max(0, to - from))
+                        .offset(x: from)
+                }
+                if fraction > 0 && !(mixing && !dragging) {
+                    Capsule()
+                        .fill(Color.white.opacity(0.92))
+                        .frame(width: max(height, geo.size.width * fraction))
+                }
+                if mixing && !dragging {
+                    MixSheenBar()
+                }
+            }
+            .frame(height: height)
+            .frame(maxHeight: .infinity, alignment: .center)
+            .contentShape(.rect)
+            .gesture(
+                DragGesture(minimumDistance: 0)
+                    .onChanged { g in
+                        dragging = true
+                        let f = min(max(g.location.x / geo.size.width, 0), 1)
+                        dragValue = f * maximum
+                    }
+                    .onEnded { _ in
+                        if let v = dragValue { onEditingChanged(v) }
+                        dragging = false
+                        dragValue = nil
+                    }
+            )
+            .animation(.spring(response: 0.28, dampingFraction: 0.72), value: dragging)
+        }
+        .frame(height: 34)
+        .accessibilityValue(Text(NowPlayingView.timestamp(dragging ? (dragValue ?? value) : value)))
+    }
+}
+
+private struct MixSheenBar: View {
+    var body: some View {
+        TimelineView(.animation(minimumInterval: 1.0 / 30.0)) { timeline in
+            Canvas { context, size in
+                let period = 0.5
+                let t = timeline.date.timeIntervalSinceReferenceDate
+                let phase = t.truncatingRemainder(dividingBy: period) / period
+                let band = size.width * 0.7
+                let centre = -band + (size.width + band * 2) * phase
+                let gradient = Gradient(stops: [
+                    .init(color: .clear, location: 0),
+                    .init(color: .white.opacity(0.95), location: 0.5),
+                    .init(color: .clear, location: 1),
+                ])
+                context.fill(
+                    Path(roundedRect: CGRect(origin: .zero, size: size), cornerRadius: size.height / 2),
+                    with: .linearGradient(
+                        gradient,
+                        startPoint: CGPoint(x: centre - band / 2, y: 0),
+                        endPoint: CGPoint(x: centre + band / 2, y: 0)
+                    )
+                )
             }
         }
-        .controlSize(.small)
+        .allowsHitTesting(false)
+    }
+}
+
+/// Transport haptics — upstream `Haptics.kt`, respecting system settings.
+enum PlaylistPinning {
+    static let maxPins = 5
+
+    static func pinnedIds() -> [String] {
+        PlatformSettings.shared.getString(key: "pinned_playlists", default: "")
+            .split(separator: ",").map(String.init).filter { !$0.isEmpty }
+    }
+
+    /// Returns false when a sixth pin would be added — caller should toast.
+    @discardableResult
+    static func toggle(browseId: String) -> Bool {
+        let before = pinnedIds()
+        if !before.contains(browseId), before.count >= maxPins { return false }
+        return AppSettings.shared.togglePinnedPlaylist(browseId: browseId) || before.contains(browseId)
+    }
+}
+
+@MainActor
+enum PlayerParity {
+    static func mixInProgress(_ controller: PlaybackController) -> Bool {
+        controller.smartMixInProgress
+    }
+
+    static func transitionWindow(_ controller: PlaybackController) -> ClosedRange<Double>? {
+        guard let w = controller.smartTransitionWindow, w.end > w.start else { return nil }
+        return w.start...w.end
+    }
+
+    static func sleepStatus(_ controller: PlaybackController) -> String? {
+        controller.sleepTimerStatus
+    }
+
+    static func debugLog(_ controller: PlaybackController) -> String {
+        let dump = controller.debugLogText
+        return dump.isEmpty ? "No debug lines yet." : dump
+    }
+
+    static func lyricsSourceLabel(_ controller: PlaybackController) -> String? {
+        guard let label = controller.lyricsSourceLabel, !label.isEmpty else { return nil }
+        return label
+    }
+
+    static func copyToPasteboard(_ text: String) {
+        #if os(iOS)
+        UIPasteboard.general.string = text
+        #else
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(text, forType: .string)
+        #endif
+    }
+}
+
+enum LyricsSourceNames {
+    static let defaultOrder = [
+        "LYRICS_PLUS", "PAXSENIX", "BETTER_LYRICS", "SIMP_MUSIC", "KUGOU", "LRCLIB", "MUSIXMATCH",
+    ]
+    static let defaultEnabled = defaultOrder.joined(separator: ",")
+
+    static func canonical(_ id: String) -> String {
+        switch id.trimmingCharacters(in: .whitespaces) {
+        case "PLUS": "LYRICS_PLUS"
+        case "BETTER": "BETTER_LYRICS"
+        case "SIMP": "SIMP_MUSIC"
+        default: id
+        }
+    }
+
+    static func normalizeList(_ raw: String) -> String {
+        raw.split(separator: ",").map { canonical(String($0)) }.filter { !$0.isEmpty }.joined(separator: ",")
+    }
+
+    static func label(_ id: String) -> String {
+        switch canonical(id) {
+        case "LYRICS_PLUS": "LyricsPlus"
+        case "PAXSENIX": "PaxSenix"
+        case "BETTER_LYRICS": "BetterLyrics"
+        case "SIMP_MUSIC": "SimpMusic"
+        case "KUGOU": "KuGou"
+        case "LRCLIB": "LRCLIB"
+        case "MUSIXMATCH": "Musixmatch"
+        default: id
+        }
     }
 }

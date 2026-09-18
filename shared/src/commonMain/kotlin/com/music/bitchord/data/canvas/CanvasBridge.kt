@@ -29,19 +29,39 @@ object CanvasBridge {
                         { AppleMusicCanvas.search(cleanTitle, cleanArtist, album) },
                         { TidalCanvas.search(cleanTitle, cleanArtist, album) },
                         { CommunityCanvas.search(cleanTitle, cleanArtist, album) },
+                        { SpotifyCanvas.search(cleanTitle, cleanArtist, album) },
                     ) { it.matches(cleanTitle, cleanArtist, album) }
                 }
             }.getOrNull()
-            callback.onResult(
-                art?.let {
-                    json.encodeToString(
-                        Payload.serializer(),
-                        Payload(it.url, it.source, it.fallbackUrl),
-                    )
-                },
-            )
+            callback.onResult(art?.encode())
         }
     }
+
+    /**
+     * Album-page canvas: ask each catalogue for the release itself (Spotify last).
+     * A separate lookup rather than the first track's.
+     */
+    fun lookupAlbum(album: String, artist: String, callback: CanvasCallback) {
+        scope.launch {
+            val art = runCatching {
+                val name = album.cleanedForCanvas()
+                val credit = artist.cleanedForCanvas()
+                if (name.isBlank() || credit.isBlank()) return@runCatching null
+                lock.withLock {
+                    firstHit(
+                        { AppleMusicCanvas.searchAlbum(name, credit) },
+                        { TidalCanvas.searchAlbum(name, credit) },
+                        { CommunityCanvas.searchAlbum(name, credit) },
+                        { SpotifyCanvas.searchAlbum(name, credit) },
+                    ) { it.matches(name, credit, name) }
+                }
+            }.getOrNull()
+            callback.onResult(art?.encode())
+        }
+    }
+
+    private fun CanvasArtworkDto.encode(): String? =
+        json.encodeToString(Payload.serializer(), Payload(url, source, fallbackUrl))
 
     private suspend fun firstHit(
         vararg sources: suspend () -> CanvasArtworkDto?,

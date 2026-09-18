@@ -125,6 +125,13 @@ private struct SongJSON: Codable {
     let fromAutoplay: Bool
 }
 
+/// Where on the playing track the next Automix transition sits, as fractions
+/// of duration (upstream `AppSettings.smartTransitionWindow`).
+struct TransitionWindow: Equatable, Sendable {
+    var start: Double
+    var end: Double
+}
+
 /// The app-level playback controller: owns the Rust engine, the queue, and
 /// the session-layer integration (now playing, widget state).
 ///
@@ -168,10 +175,23 @@ final class PlaybackController {
     private(set) var repeatMode: RepeatMode = .off
     private(set) var shuffleEnabled = false
     private(set) var lyrics: [LyricLineDto] = []
+    /// Empty when lyrics came from the file itself (EmbeddedLyrics).
+    private(set) var lyricsSourceLabel: String?
     private(set) var lyricsLoading = false
     private(set) var canvasURL: URL?
     private(set) var canvasFallbackURL: URL?
     private(set) var nerd: NerdStatsRec?
+    /// True while a lossless/module lookup is still running for the playing track
+    /// (upstream `NerdStats.racingLossless`).
+    private(set) var racingLossless = false
+    /// Automix analysis tier for stats-for-nerds: `beatmatched`, `dj`, or `plain`.
+    private(set) var analysisTier: String?
+    /// Beat-grid confidence when native-core exposes it. Nil until then.
+    private(set) var analysisConfidence: Double?
+    /// Marker on the progress bar while a planned Automix window is known.
+    private(set) var smartTransitionWindow: TransitionWindow?
+    /// True during a real Automix (not a plain equal-power fallback).
+    private(set) var smartMixInProgress = false
     private(set) var sleepUntil: Date?
     private(set) var sleepAfterTrack = false
     private(set) var autoplayEnabled = PlatformSettings.shared.getBoolean(key: "autoplay", default: true)
@@ -179,6 +199,27 @@ final class PlaybackController {
     var hideVolumeBar = PlatformSettings.shared.getBoolean(key: "hide_volume_bar", default: false)
     private var scrobbleArmed = false
     private var scrobbleSent = false
+    /// Upstream `BACK_RESTARTS_AFTER_MS = 10_000`.
+    static let backRestartsAfter: TimeInterval = 10
+
+    /// Song-menu sleep-timer trailing string (`"3:21"` / `"After this song"`).
+    var sleepTimerStatus: String? {
+        if let sleepUntil {
+            let remaining = sleepUntil.timeIntervalSinceNow
+            guard remaining > 0 else { return nil }
+            let seconds = Int(remaining.rounded())
+            return String(format: "%d:%02d", seconds / 60, seconds % 60)
+        }
+        return sleepAfterTrack ? "After this song" : nil
+    }
+
+    /// Last resolve/upgrade/source decisions, for a UI "Debug log" action.
+    var debugLogText: String { debugLog.dump() }
+
+    private let debugLog = PlaybackDebugLog()
+    private var pendingAutomixPlan: TransitionPlanRec?
+    private var upgradeFor: String?
+    private var mixFadeUntil: Date?
 
     private var unshuffledQueue: [QueueEntry]?
     /// Id the engine currently has loaded — nil after a cold restore until Play.
@@ -210,6 +251,7 @@ final class PlaybackController {
         nowPlaying.onPrevious = { [weak self] in self?.previous() }
         nowPlaying.onSeek = { [weak self] seconds in self?.seek(to: seconds) }
         AudioSessionManager.activate()
+        QualityUpgrade.forgetLastSession()
         restoreSession()
         let token = PlatformSettings.shared.getString(key: "discord_token", default: "")
         if !token.isEmpty { DiscordGateway.shared.connect(token: token) }
@@ -333,6 +375,10 @@ final class PlaybackController {
     func playNext(_ entry: QueueEntry) {
         let at = min(playingIndex + 1, queue.count)
         queue.insert(entry, at: at)
+        if var original = unshuffledQueue {
+            original.insert(entry, at: min(at, original.count))
+            unshuffledQueue = original
+        }
         persistSession()
         syncEngineQueueNext()
     }
@@ -343,18 +389,54 @@ final class PlaybackController {
         maybeAutoplay(force: true)
     }
 
+    /// SwiftUI `onMove` entry: destination is the pre-remove insertion index.
     func moveQueue(from source: IndexSet, to destination: Int) {
-        guard let from = source.first, from != playingIndex, destination > playingIndex else { return }
+        guard let from = source.first else { return }
+        let media3 = destination > from ? destination - 1 : destination
+        moveQueueItem(from: from, to: media3)
+    }
+
+    /// Media3 `moveMediaItem(from, to)`: the item at `from` lands at `to`.
+    /// Upcoming tracks only; a drag never crosses the manual/autoplay boundary.
+    func moveQueueItem(from: Int, to requested: Int) {
+        guard queue.indices.contains(from), from != playingIndex else { return }
+        let section = autoplaySectionStart
+        let inMix = from >= section
+        let lo = inMix ? section : playingIndex + 1
+        let hi = inMix ? queue.count : section
+        guard from >= lo, from < hi || (inMix && from < queue.count) else { return }
+        let maxTo = inMix ? queue.count - 1 : max(lo, hi - 1)
+        var to = min(max(requested, lo), maxTo)
+        if !inMix { to = min(to, hi - 1) }
+        if to == from || to < lo { return }
         var copy = queue
         let item = copy.remove(at: from)
-        let dest = destination > from ? destination - 1 : destination
-        copy.insert(item, at: min(max(dest, playingIndex + 1), copy.count))
+        let insertAt = min(max(to, 0), copy.count)
+        copy.insert(item, at: insertAt)
         queue = copy
+        persistSession()
         syncEngineQueueNext()
+    }
+
+    /// Where AutoPlay's section begins — heading index and play-next insertion point.
+    var autoplaySectionStart: Int {
+        Self.autoplaySectionStart(fromAutoplay: queue.map(\.fromAutoplay), currentIndex: playingIndex)
+    }
+
+    /// First upcoming index that may be dragged in the manual section.
+    var firstMovableQueueIndex: Int {
+        min(playingIndex + 1, autoplaySectionStart)
+    }
+
+    static func autoplaySectionStart(fromAutoplay: [Bool], currentIndex: Int) -> Int {
+        let after = min(max(currentIndex + 1, 0), fromAutoplay.count)
+        if after >= fromAutoplay.count { return fromAutoplay.count }
+        return (after..<fromAutoplay.count).first { fromAutoplay[$0] } ?? fromAutoplay.count
     }
 
     func addToQueue(_ entry: QueueEntry) {
         queue.append(entry)
+        unshuffledQueue?.append(entry)
         persistSession()
         syncEngineQueueNext()
     }
@@ -394,7 +476,7 @@ final class PlaybackController {
     }
 
     func previous() {
-        if position > 10 {
+        if position > Self.backRestartsAfter {
             seek(to: 0)
             return
         }
@@ -446,13 +528,21 @@ final class PlaybackController {
     }
 
     func removeFromQueue(at offsets: IndexSet) {
-        let adjusted = offsets.filter { $0 != playingIndex }
+        let adjusted = offsets.filter { $0 != playingIndex && queue.indices.contains($0) }
         guard !adjusted.isEmpty else { return }
-        let removingCurrent = offsets.contains(playingIndex)
+        let removedIds = Set(adjusted.map { queue[$0].id })
         queue.remove(atOffsets: IndexSet(adjusted))
+        if let original = unshuffledQueue {
+            unshuffledQueue = original.filter { !removedIds.contains($0.id) }
+        }
+        removedIds.forEach { QualityUpgrade.forget($0) }
         if playingIndex >= queue.count { playingIndex = max(0, queue.count - 1) }
+        persistSession()
         syncEngineQueueNext()
-        _ = removingCurrent
+    }
+
+    func removeFromQueue(at index: Int) {
+        removeFromQueue(at: IndexSet(integer: index))
     }
 
     func updateCrossfade(seconds: Int) {
@@ -507,7 +597,14 @@ final class PlaybackController {
 
     func clearUpcoming() {
         guard playingIndex + 1 < queue.count else { return }
+        let removed = queue[(playingIndex + 1)...]
+        removed.forEach { QualityUpgrade.forget($0.id) }
         queue.removeSubrange((playingIndex + 1)...)
+        if let original = unshuffledQueue {
+            let kept = Set(queue.map(\.id))
+            unshuffledQueue = original.filter { kept.contains($0.id) }
+        }
+        persistSession()
         syncEngineQueueNext()
     }
 
@@ -518,8 +615,13 @@ final class PlaybackController {
     }
 
     func toggleAutomix() {
-        automixEnabled.toggle()
-        AppSettings.shared.setSmartFadeEnabled(value: automixEnabled)
+        setAutomixEnabled(!automixEnabled)
+    }
+
+    func setAutomixEnabled(_ enabled: Bool) {
+        guard automixEnabled != enabled else { return }
+        automixEnabled = enabled
+        AppSettings.shared.setSmartFadeEnabled(value: enabled)
     }
 
     func authoriseLastFm() {
@@ -549,6 +651,14 @@ final class PlaybackController {
         }
         playGeneration += 1
         let generation = playGeneration
+        upgradeFor = nil
+        racingLossless = false
+        smartMixInProgress = false
+        smartTransitionWindow = nil
+        pendingAutomixPlan = nil
+        mixFadeUntil = nil
+        analysisTier = nil
+        analysisConfidence = nil
         let wasAudible = state == .playing || (state == .paused && engineLoadedId != nil)
         let previousPath = current?.isLocal == true ? current?.source : nil
         playingIndex = index
@@ -577,11 +687,15 @@ final class PlaybackController {
         let resume = startAt ?? 0
         Task.detached(priority: .utility) {
             do {
-                let resolved = try await Self.resolveSource(entry, prefs: prefs)
+                let outcome = try await Self.resolveSource(entry, prefs: prefs)
                 let stillCurrent = await MainActor.run { [weak self] in
                     self?.playGeneration == generation
                 }
                 guard stillCurrent else { return }
+                await MainActor.run { [weak self] in
+                    self?.noteResolved(entry, outcome: outcome, prefs: prefs)
+                }
+                let resolved = outcome.source
                 var plan: TransitionPlanRec?
                 var start = resume
                 if automix, resume == 0, let previousPath, !previousPath.isEmpty {
@@ -624,16 +738,41 @@ final class PlaybackController {
     /// Upstream's ExoPlayer starts on the first bounded range. We do the same:
     /// the first 1 MiB is written and we return that path while later ranges
     /// keep appending. The engine's GrowingFile waits at EOF until `.complete`.
-    private struct ResolvedSource {
+    private struct ResolvedSource: Sendable {
         let source: String
         let headers: [String: String]
         let kbps: Int
+        var lossless: Bool = false
+        var durationSec: Int? = nil
+        var origin: Origin = .other
+
+        enum Origin: Sendable { case local, cache, youtube, substitute, other }
+
+        var format: QualityUpgrade.Format {
+            QualityUpgrade.Format(
+                codec: lossless ? "flac" : nil,
+                kbps: kbps > 0 ? kbps : nil,
+                lossless: lossless
+            )
+        }
+
+        func asCandidate() -> QualityUpgrade.Candidate {
+            QualityUpgrade.Candidate(
+                url: source, headers: headers, format: format, durationSec: durationSec
+            )
+        }
+    }
+
+    private struct ResolveOutcome: Sendable {
+        let source: ResolvedSource
+        let leftover: Task<QualityUpgrade.Candidate?, Never>?
     }
 
     private struct ResolvePrefs: Sendable {
         let maxKbps: Int
         let wantLossless: Bool
         let jiosaavn: Bool
+        let canSubstitute: Bool
 
         @MainActor
         static func current() -> ResolvePrefs {
@@ -642,46 +781,113 @@ final class PlaybackController {
             return ResolvePrefs(
                 maxKbps: Int(NetworkQuality.shared.maxKbps),
                 wantLossless: quality == "LOSSLESS" || wifi == "HIGH",
-                jiosaavn: PlatformSettings.shared.getBoolean(key: "jiosaavn_enabled", default: true)
+                jiosaavn: PlatformSettings.shared.getBoolean(key: "jiosaavn_enabled", default: true),
+                canSubstitute: QualityUpgrade.canSubstituteForYouTube()
             )
         }
     }
 
-    private static func resolveSource(_ entry: QueueEntry, prefs: ResolvePrefs) async throws -> ResolvedSource {
+    private static func resolveSource(_ entry: QueueEntry, prefs: ResolvePrefs) async throws -> ResolveOutcome {
         if entry.source.hasPrefix("saavn:") || entry.id.hasPrefix("saavn:") {
             let id = entry.source.hasPrefix("saavn:") ? String(entry.source.dropFirst(6)) : String(entry.id.dropFirst(6))
             if let hit = await JioSaavn.streamURL(for: id) {
-                return ResolvedSource(source: hit.url, headers: [:], kbps: hit.kbps)
+                return ResolveOutcome(
+                    source: ResolvedSource(
+                        source: hit.url, headers: [:], kbps: hit.kbps,
+                        lossless: false, origin: .substitute
+                    ),
+                    leftover: nil
+                )
             }
             throw InnertubeStreamResolver.StreamError(message: "JioSaavn had no stream")
         }
         guard entry.source.hasPrefix("yt:") else {
-            return ResolvedSource(source: entry.source, headers: [:], kbps: 0)
+            return ResolveOutcome(
+                source: ResolvedSource(source: entry.source, headers: [:], kbps: 0, origin: .local),
+                leftover: nil
+            )
         }
         let videoId = String(entry.source.dropFirst(3))
         if let cached = await StreamFileCache.shared.path(for: videoId) {
-            return ResolvedSource(source: cached, headers: [:], kbps: 0)
+            return ResolveOutcome(
+                source: ResolvedSource(
+                    source: cached, headers: [:], kbps: 0, origin: .cache
+                ),
+                leftover: nil
+            )
         }
-        // Upstream `resolveWithModulePriority`: start YouTube and substitutes
-        // together. First usable URL wins so a slow JioSaavn/module lookup
-        // cannot hold the first note hostage.
-        let won = await withTaskGroup(of: ResolvedSource?.self) { group in
-            group.addTask {
-                try? await Self.resolveYouTube(videoId: videoId, prefs: prefs)
-            }
-            group.addTask {
-                await Self.resolveSubstitute(entry, prefs: prefs)
-            }
-            var first: ResolvedSource?
-            for await hit in group {
-                guard let hit else { continue }
-                group.cancelAll()
-                first = hit
-                break
-            }
-            return first
+        return try await resolveWithModulePriority(entry, videoId: videoId, prefs: prefs)
+    }
+
+    /// Upstream `resolveWithModulePriority`: start YouTube and substitutes
+    /// together. First usable URL wins so a slow lookup cannot hold the first
+    /// note hostage. A lookup that loses is **not** cancelled — it is handed
+    /// to QualityUpgrade as `inFlight`.
+    private static func resolveWithModulePriority(
+        _ entry: QueueEntry, videoId: String, prefs: ResolvePrefs
+    ) async throws -> ResolveOutcome {
+        let lookup = Task<QualityUpgrade.Candidate?, Never> {
+            await Self.resolveSubstitute(entry, prefs: prefs)?.asCandidate()
         }
-        if let won { return won }
+        let fallback = Task<ResolvedSource?, Never> {
+            try? await Self.resolveYouTube(videoId: videoId, prefs: prefs)
+        }
+
+        enum Leg { case lookup(QualityUpgrade.Candidate?); case fallback(ResolvedSource?) }
+
+        // `withTaskGroup` is non-throwing in Swift 6 — collect, then throw outside.
+        let outcome = await withTaskGroup(of: Leg.self) { group in
+            group.addTask { .lookup(await lookup.value) }
+            group.addTask { .fallback(await fallback.value) }
+            var lookupDone: QualityUpgrade.Candidate??
+            var fallbackDone: ResolvedSource??
+            var outcome: ResolveOutcome?
+            for await leg in group {
+                switch leg {
+                case .lookup(let stream):
+                    lookupDone = .some(stream)
+                    if let stream {
+                        fallback.cancel()
+                        let src = ResolvedSource(
+                            source: stream.url, headers: stream.headers,
+                            kbps: stream.format.kbps ?? 0,
+                            lossless: stream.format.lossless,
+                            durationSec: stream.durationSec,
+                            origin: .substitute
+                        )
+                        outcome = ResolveOutcome(source: src, leftover: nil)
+                        group.cancelAll()
+                    } else if case .some(let yt) = fallbackDone {
+                        if let yt {
+                            outcome = ResolveOutcome(source: yt, leftover: nil)
+                        }
+                        group.cancelAll()
+                    }
+                case .fallback(let yt):
+                    fallbackDone = .some(yt)
+                    if let yt {
+                        let leftover = lookupDone == nil ? lookup : nil
+                        outcome = ResolveOutcome(source: yt, leftover: leftover)
+                        group.cancelAll()
+                    } else if case .some(let late) = lookupDone {
+                        if let late {
+                            let src = ResolvedSource(
+                                source: late.url, headers: late.headers,
+                                kbps: late.format.kbps ?? 0,
+                                lossless: late.format.lossless,
+                                durationSec: late.durationSec,
+                                origin: .substitute
+                            )
+                            outcome = ResolveOutcome(source: src, leftover: nil)
+                        }
+                        group.cancelAll()
+                    }
+                }
+                if outcome != nil { break }
+            }
+            return outcome
+        }
+        if let outcome { return outcome }
         throw InnertubeStreamResolver.StreamError(message: "No stream")
     }
 
@@ -693,7 +899,9 @@ final class PlaybackController {
             do {
                 let localPath = try await streamViaKtor(
                     videoId: videoId, url: stream.url, headers: stream.headers)
-                return ResolvedSource(source: localPath, headers: [:], kbps: stream.kbps)
+                return ResolvedSource(
+                    source: localPath, headers: [:], kbps: stream.kbps, origin: .youtube
+                )
             } catch {
                 lastError = error
                 let is403 = "\(error)".contains("403")
@@ -703,29 +911,54 @@ final class PlaybackController {
                     continue
                 }
                 print("[Playback] falling back to direct stream for \(videoId)")
-                return ResolvedSource(source: stream.url, headers: stream.headers, kbps: stream.kbps)
+                return ResolvedSource(
+                    source: stream.url, headers: stream.headers, kbps: stream.kbps, origin: .youtube
+                )
             }
         }
         throw lastError ?? InnertubeStreamResolver.StreamError(message: "YouTube stream failed")
     }
 
     /// Catalogues ranked above YouTube — first match that is the same recording.
-    private static func resolveSubstitute(_ entry: QueueEntry, prefs: ResolvePrefs) async -> ResolvedSource? {
+    private static func resolveSubstitute(
+        _ entry: QueueEntry, prefs: ResolvePrefs, waitForAll: Bool = false,
+        playingDurationSec: Int? = nil
+    ) async -> ResolvedSource? {
         await withTaskGroup(of: ResolvedSource?.self) { group in
-            if prefs.wantLossless {
+            if prefs.wantLossless || waitForAll {
                 group.addTask { await Self.resolveCustom(title: entry.title, artist: entry.artist) }
                 group.addTask {
                     guard let module = await ModuleJsHost.shared.stream(
                         for: entry.title, artist: entry.artist, quality: "LOSSLESS"
                     ) else { return nil }
-                    return ResolvedSource(source: module.url, headers: [:], kbps: module.kbps)
+                    return ResolvedSource(
+                        source: module.url, headers: [:], kbps: module.kbps,
+                        lossless: module.lossless, origin: .substitute
+                    )
                 }
             }
             if prefs.jiosaavn {
                 group.addTask {
-                    guard let matched = await JioSaavn.matchedStream(for: entry), matched.kbps > 256 else { return nil }
-                    return ResolvedSource(source: matched.url, headers: [:], kbps: matched.kbps)
+                    guard let matched = await JioSaavn.matchedStream(
+                        for: entry, playingDurationSec: playingDurationSec
+                    ), matched.kbps > 256 else { return nil }
+                    return ResolvedSource(
+                        source: matched.url, headers: [:], kbps: matched.kbps,
+                        durationSec: matched.durationSec, origin: .substitute
+                    )
                 }
+            }
+            if waitForAll {
+                var best: ResolvedSource?
+                for await hit in group {
+                    guard let hit else { continue }
+                    if hit.lossless {
+                        group.cancelAll()
+                        return hit
+                    }
+                    if best == nil || hit.kbps > (best?.kbps ?? 0) { best = hit }
+                }
+                return best
             }
             var first: ResolvedSource?
             for await hit in group {
@@ -747,7 +980,10 @@ final class PlaybackController {
                     cont.resume(returning: nil)
                     return
                 }
-                cont.resume(returning: ResolvedSource(source: hit.url, headers: [:], kbps: hit.kbps))
+                cont.resume(returning: ResolvedSource(
+                    source: hit.url, headers: [:], kbps: hit.kbps,
+                    lossless: hit.lossless == true, origin: .substitute
+                ))
             })
         }
     }
@@ -806,6 +1042,7 @@ final class PlaybackController {
         fetchLyrics(for: entry)
         fetchCanvas(for: entry)
         nerd = engine.nerdStats()
+        racingLossless = QualityUpgrade.isRacing(entry.id)
         scrobbleArmed = false
         scrobbleSent = false
         if entry.source.hasPrefix("yt:") {
@@ -824,6 +1061,7 @@ final class PlaybackController {
         widgetPublisher.publish(entry: entry, isPlaying: true,
                                 canNext: playingIndex + 1 < queue.count,
                                 canPrevious: index > 0)
+        lookForBetterCopy(entry, codec: info.codec, kbps: info.kbps)
         // Don't steal googlevideo bandwidth from the track that just started
         // — wait until its file is fully on disk (or a few seconds) before
         // prefetching the next one. Upstream's AudioCache also never reads
@@ -871,13 +1109,17 @@ final class PlaybackController {
         let prefs = ResolvePrefs.current()
         Task.detached(priority: .utility) {
             do {
-                let resolved = try await Self.resolveSource(next, prefs: prefs)
+                let outcome = try await Self.resolveSource(next, prefs: prefs)
                 let stillCurrent = await MainActor.run { [weak self] in
                     guard let self else { return false }
                     return self.playGeneration == generation
                         && self.nextEntry?.id == nextId
                 }
                 guard stillCurrent else { return }
+                await MainActor.run { [weak self] in
+                    self?.noteResolved(next, outcome: outcome, prefs: prefs)
+                }
+                let resolved = outcome.source
                 var plan: TransitionPlanRec?
                 var start = 0.0
                 if automix, !currentSource.isEmpty {
@@ -898,6 +1140,11 @@ final class PlaybackController {
                     headers: resolved.headers,
                     claimedKbps: Swift.UInt32(resolved.kbps)
                 ))
+                if let plan {
+                    await MainActor.run { [weak self] in
+                        self?.adoptAutomixPlan(plan)
+                    }
+                }
             } catch {
                 // Prefetch failure is non-fatal; the next tap/natural end re-resolves.
             }
@@ -938,6 +1185,7 @@ final class PlaybackController {
             fetchLyrics(for: entry)
             fetchCanvas(for: entry)
             nerd = engine.nerdStats()
+            racingLossless = QualityUpgrade.isRacing(entry.id)
             scrobbleArmed = false
             scrobbleSent = false
             PlaybackTrackerBridge.shared.onTrackChanged(positionSeconds: Int64(outgoingPosition))
@@ -951,6 +1199,8 @@ final class PlaybackController {
                 thumbnailUrl: entry.thumbnailUrl, isPlaying: true
             )
             engineLoadedId = entry.id
+            beginSmartMixIfNeeded()
+            lookForBetterCopy(entry, codec: info.codec, kbps: info.kbps)
         }
         persistSession()
         syncEngineQueueNext()
@@ -989,10 +1239,15 @@ final class PlaybackController {
 
     fileprivate func handleDuration(_ seconds: Double) {
         duration = seconds
+        publishSmartWindow()
     }
 
     fileprivate func handleError(_ message: String) {
         lastError = message
+        if let id = current?.id, QualityUpgrade.forcedStream(id) != nil {
+            QualityUpgrade.refuseUpgrades(id)
+            debugLog.record("broke on its upgrade; no more swaps", about: id)
+        }
     }
 
     private var nextEntry: QueueEntry? {
@@ -1003,22 +1258,27 @@ final class PlaybackController {
 
     private func fetchLyrics(for entry: QueueEntry) {
         lyrics = []
-        guard PlatformSettings.shared.getBoolean(key: "synced_lyrics", default: true) else {
+        lyricsSourceLabel = nil
+        let localPath = entry.isLocal && !entry.source.isEmpty ? entry.source : nil
+        let allowNetwork = PlatformSettings.shared.getBoolean(key: "synced_lyrics", default: true)
+        if !allowNetwork, localPath == nil {
             lyricsLoading = false
             return
         }
         lyricsLoading = true
         let durationMs = Swift.Int64((entry.durationSeconds > 0 ? entry.durationSeconds : duration) * 1000)
-        LyricsBridge.shared.fetch(
+        LyricsBridge.shared.fetchAttributed(
             title: entry.title,
             artist: entry.artist,
             durationMs: durationMs,
             album: entry.albumName,
             videoId: entry.videoId,
-            callback: LyricsCallbackAdapter { [weak self] lines in
+            localPath: localPath,
+            callback: AttributedLyricsAdapter { [weak self] _, label, lines in
                 Task { @MainActor in
                     guard let self, self.current?.id == entry.id else { return }
                     self.lyrics = lines
+                    self.lyricsSourceLabel = label.isEmpty ? nil : label
                     self.lyricsLoading = false
                 }
             }
@@ -1052,6 +1312,10 @@ final class PlaybackController {
             self.sleepUntil = nil
             try? engine.pause()
             state = .paused
+        }
+        if let mixFadeUntil, Date() >= mixFadeUntil {
+            self.mixFadeUntil = nil
+            smartMixInProgress = false
         }
     }
 
@@ -1173,6 +1437,313 @@ final class PlaybackController {
         )
     }
 
+    // ---- Quality upgrade / Automix UI state ---------------------------------
+
+    private var resolvedOrigin: [String: ResolvedSource.Origin] = [:]
+
+    private func noteResolved(_ entry: QueueEntry, outcome: ResolveOutcome, prefs: ResolvePrefs) {
+        resolvedOrigin[entry.id] = outcome.source.origin
+        debugLog.record(
+            "resolved \(outcome.source.origin) \(outcome.source.format.summary)",
+            about: entry.id
+        )
+        let below = prefs.wantLossless && !outcome.source.lossless
+        let youtubeWon = outcome.source.origin == .youtube
+        let leftover = outcome.leftover
+        if youtubeWon || (outcome.source.origin == .substitute && below) {
+            let pending = QualityUpgrade.settledForLess(
+                mediaId: entry.id,
+                target: QualityUpgrade.Target(
+                    title: entry.title,
+                    artist: entry.artist,
+                    durationSec: {
+                        let s = Int(entry.durationSeconds.rounded())
+                        return s > 0 ? s : nil
+                    }()
+                ),
+                inFlight: leftover,
+                playing: outcome.source.format,
+                canSubstitute: prefs.canSubstitute
+            )
+            if current?.id == entry.id { racingLossless = pending }
+            if pending {
+                debugLog.record(
+                    leftover != nil
+                        ? "started on the fallback; lookup is still running"
+                        : "below request; will look again during playback",
+                    about: entry.id
+                )
+            } else {
+                leftover?.cancel()
+            }
+        } else {
+            leftover?.cancel()
+            if current?.id == entry.id { racingLossless = QualityUpgrade.isRacing(entry.id) }
+        }
+    }
+
+    private func lookForBetterCopy(_ entry: QueueEntry, codec: String, kbps: UInt32) {
+        guard !entry.isLocal, entry.source.hasPrefix("yt:") else { return }
+        let mediaId = entry.id
+        let prefs = ResolvePrefs.current()
+        if let shelved = QualityUpgrade.shelvedFor(mediaId) {
+            debugLog.record("re-offering the upgrade already proved", about: mediaId)
+            QualityUpgrade.onRaceStart(mediaId)
+            racingLossless = true
+            startUpgradeJob(entry: entry, prefs: prefs, shelved: shelved)
+            return
+        }
+        if !QualityUpgrade.isPending(mediaId) {
+            if resolvedOrigin[mediaId] == .cache {
+                let playing = cachedFloor(kbps: kbps)
+                let adopted = QualityUpgrade.adoptUnresolved(
+                    mediaId: mediaId,
+                    target: QualityUpgrade.Target(
+                        title: entry.title, artist: entry.artist,
+                        durationSec: duration > 0 ? Int(duration.rounded()) : nil
+                    ),
+                    playingCodec: codec,
+                    playing: playing,
+                    canSubstitute: prefs.canSubstitute
+                )
+                racingLossless = adopted
+                if adopted {
+                    debugLog.record(
+                        "playing \(playing?.summary ?? "an unmeasured stream") from cache; looking for a better copy",
+                        about: mediaId
+                    )
+                }
+                guard adopted else { return }
+            } else if !QualityUpgrade.couldStillUpgrade(
+                mediaId: mediaId, canSubstitute: prefs.canSubstitute
+            ) {
+                racingLossless = QualityUpgrade.isRacing(mediaId)
+                return
+            }
+        }
+        if upgradeFor == mediaId { return }
+        if QualityUpgrade.isPending(mediaId) {
+            debugLog.record("looking again for a better copy", about: mediaId)
+        }
+        startUpgradeJob(entry: entry, prefs: prefs, shelved: nil)
+    }
+
+    private func cachedFloor(kbps: UInt32) -> QualityUpgrade.Format? {
+        if kbps > 0 { return QualityUpgrade.Format(codec: nil, kbps: Int(kbps), lossless: false) }
+        return nil
+    }
+
+    private func startUpgradeJob(
+        entry: QueueEntry, prefs: ResolvePrefs, shelved: QualityUpgrade.Candidate?
+    ) {
+        let mediaId = entry.id
+        upgradeFor = mediaId
+        let generation = playGeneration
+        racingLossless = true
+        let eng = engine
+        let log = debugLog
+        Task.detached(priority: .utility) { [weak self] in
+            let better: QualityUpgrade.Candidate?
+            if let shelved {
+                better = shelved
+            } else {
+                better = await QualityUpgrade.lookAgain(
+                    mediaId: mediaId,
+                    playingDurationSec: await MainActor.run { [weak self] () -> Int? in
+                        guard let self, self.duration > 0 else { return nil }
+                        return Int(self.duration.rounded())
+                    },
+                    search: {
+                        let playing = await MainActor.run { [weak self] () -> QualityUpgrade.Format? in
+                            guard let self else { return nil }
+                            let kbps = self.nerd?.kbps ?? 0
+                            return kbps > 0
+                                ? QualityUpgrade.Format(codec: nil, kbps: Int(kbps), lossless: false)
+                                : nil
+                        }
+                        let dur = await MainActor.run { [weak self] () -> Int? in
+                            guard let self, self.duration > 0 else { return nil }
+                            return Int(self.duration.rounded())
+                        }
+                        guard let hit = await Self.resolveSubstitute(
+                            entry, prefs: prefs, waitForAll: true, playingDurationSec: dur
+                        ) else { return nil }
+                        let format = hit.format
+                        guard QualityUpgrade.worthSwapping(format, playing: playing) else {
+                            return nil
+                        }
+                        if let dur, !QualityUpgrade.sameRecordingAs(hit.durationSec, dur),
+                           hit.durationSec != nil {
+                            return nil
+                        }
+                        return hit.asCandidate()
+                    }
+                )
+            }
+            defer {
+                Task { @MainActor [weak self] in
+                    guard let self, self.current?.id == mediaId else { return }
+                    self.racingLossless = QualityUpgrade.isRacing(mediaId)
+                    if self.upgradeFor == mediaId { self.upgradeFor = nil }
+                    QualityUpgrade.onRaceEnd(mediaId)
+                }
+            }
+            let still = await MainActor.run { [weak self] in
+                guard let self else { return false }
+                return self.playGeneration == generation && self.current?.id == mediaId
+            }
+            guard still, let better else { return }
+            await self?.performSwap(
+                mediaId: mediaId, stream: better, entry: entry,
+                generation: generation, engine: eng, log: log
+            )
+        }
+    }
+
+    nonisolated private func performSwap(
+        mediaId: String,
+        stream: QualityUpgrade.Candidate,
+        entry: QueueEntry,
+        generation: UInt64,
+        engine: PlayerEngine,
+        log: PlaybackDebugLog
+    ) async {
+        let snapshot = await MainActor.run { () -> (Double, Double, Bool)? in
+            guard self.playGeneration == generation, self.current?.id == mediaId else { return nil }
+            return (self.position, self.duration, self.smartMixInProgress)
+        }
+        guard let (pos, dur, mixing) = snapshot else {
+            QualityUpgrade.shelve(mediaId, stream: stream)
+            log.record("upgrade proved but the queue moved on; shelved", about: mediaId)
+            return
+        }
+        if dur > 0, dur - pos < QualityUpgrade.minRemaining {
+            log.record(
+                "upgrade abandoned: only \(Int((dur - pos) * 1000))ms of the track left",
+                about: mediaId
+            )
+            return
+        }
+        if mixing {
+            QualityUpgrade.shelve(mediaId, stream: stream)
+            log.record("upgrade shelved: a crossfade was still running", about: mediaId)
+            return
+        }
+        QualityUpgrade.force(mediaId, stream: stream)
+        QualityUpgrade.beginAudition(mediaId)
+        let warmed: String?
+        if stream.url.hasPrefix("/") || stream.url.hasPrefix("file:") {
+            let path = stream.url.hasPrefix("file:")
+                ? (URL(string: stream.url)?.path ?? stream.url)
+                : stream.url
+            warmed = FileManager.default.fileExists(atPath: path) ? path : nil
+        } else {
+            warmed = try? await Self.streamViaKtor(
+                videoId: "\(mediaId)#\(QualityUpgrade.upgraded)",
+                url: stream.url,
+                headers: stream.headers
+            )
+        }
+        QualityUpgrade.endAudition(mediaId)
+        guard let path = warmed else {
+            QualityUpgrade.forget(mediaId)
+            log.record("upgrade audition failed", about: mediaId)
+            return
+        }
+        let again = await MainActor.run { () -> (Double, Bool)? in
+            guard self.playGeneration == generation, self.current?.id == mediaId else { return nil }
+            if self.smartMixInProgress { return nil }
+            return (self.position, self.isPlaying)
+        }
+        guard let (nowPos, playing) = again else {
+            QualityUpgrade.shelve(mediaId, stream: stream)
+            log.record("upgrade proved but the queue moved on; shelved", about: mediaId)
+            return
+        }
+        do {
+            let info = try engine.loadTrack(request: LoadRequest(
+                source: path,
+                title: entry.title,
+                artist: entry.artist,
+                startSeconds: nowPos,
+                plan: nil,
+                headers: stream.headers,
+                claimedKbps: Swift.UInt32(stream.format.kbps ?? 0)
+            ))
+            await MainActor.run {
+                guard self.playGeneration == generation, self.current?.id == mediaId else { return }
+                QualityUpgrade.unshelve(mediaId)
+                self.engineLoadedId = entry.id
+                self.duration = info.durationSeconds
+                self.position = nowPos
+                self.nerd = engine.nerdStats()
+                self.racingLossless = false
+                if playing { self.state = .playing }
+                log.record(
+                    "upgraded to \(stream.format.summary) at \(Int(nowPos * 1000))ms",
+                    about: mediaId
+                )
+            }
+        } catch {
+            QualityUpgrade.refuseUpgrades(mediaId)
+            QualityUpgrade.forget(mediaId)
+            log.record("upgrade broke playback; no more swaps", about: mediaId)
+        }
+    }
+
+    private func adoptAutomixPlan(_ plan: TransitionPlanRec) {
+        pendingAutomixPlan = plan
+        analysisTier = Self.tierName(plan)
+        publishSmartWindow()
+    }
+
+    private func publishSmartWindow() {
+        guard automixEnabled, let plan = pendingAutomixPlan, duration > 0 else {
+            smartTransitionWindow = nil
+            return
+        }
+        let fade = plan.fadeSeconds > 0
+            ? plan.fadeSeconds
+            : Double(PlatformSettings.shared.getInt(key: "crossfade_seconds", default: 0))
+        guard fade > 0, Self.isRealMix(plan) else {
+            smartTransitionWindow = nil
+            return
+        }
+        let start = max(0, (duration - fade) / duration)
+        smartTransitionWindow = TransitionWindow(start: start, end: 1)
+    }
+
+    private func beginSmartMixIfNeeded() {
+        smartTransitionWindow = nil
+        guard let plan = pendingAutomixPlan, Self.isRealMix(plan) else {
+            smartMixInProgress = false
+            mixFadeUntil = nil
+            pendingAutomixPlan = nil
+            analysisTier = nil
+            return
+        }
+        smartMixInProgress = true
+        let fade = plan.fadeSeconds > 0 ? plan.fadeSeconds : 6
+        mixFadeUntil = Date().addingTimeInterval(fade)
+        pendingAutomixPlan = nil
+    }
+
+    private static func isRealMix(_ plan: TransitionPlanRec) -> Bool {
+        switch plan.style {
+        case .djBlend, .djFilter: return true
+        default: break
+        }
+        return plan.cueSeconds > 0.05 || abs(plan.playbackRate - 1) > 0.01
+    }
+
+    private static func tierName(_ plan: TransitionPlanRec) -> String {
+        switch plan.style {
+        case .djBlend: return "beatmatched"
+        case .djFilter: return "dj"
+        default: return "plain"
+        }
+    }
+
     private func refreshArtwork(_ entry: QueueEntry) {
         guard let raw = entry.thumbnailUrl, !raw.isEmpty else { return }
         let sized = SharedArtwork.sized(raw, 544) ?? raw
@@ -1244,14 +1815,14 @@ private final class DownloadCallbackAdapter: StreamDownloadBridgeDownloadCallbac
     }
 }
 
-/// Bridge callback adapter for LyricsBridge.
-private final class LyricsCallbackAdapter: LyricsBridgeLyricsCallback {
-    private let handler: ([LyricLineDto]) -> Void
-    init(_ handler: @escaping ([LyricLineDto]) -> Void) {
+/// Bridge callback adapter for LyricsBridge.fetchAttributed.
+private final class AttributedLyricsAdapter: LyricsBridgeAttributedLyricsCallback {
+    private let handler: (String, String, [LyricLineDto]) -> Void
+    init(_ handler: @escaping (String, String, [LyricLineDto]) -> Void) {
         self.handler = handler
     }
-    func onResult(lines: [LyricLineDto]) {
-        handler(lines)
+    func onResult(source: String, sourceLabel: String, lines: [LyricLineDto]) {
+        handler(source, sourceLabel, lines)
     }
 }
 

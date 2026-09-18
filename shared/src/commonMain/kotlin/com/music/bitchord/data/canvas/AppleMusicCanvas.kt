@@ -91,6 +91,54 @@ object AppleMusicCanvas {
         return null
     }
 
+    /**
+     * Motion artwork for a release rather than a track, for the album page.
+     * Albums carry `editorialVideo` inline on the search result.
+     */
+    suspend fun searchAlbum(album: String, artist: String): CanvasArtworkDto? {
+        val bearer = token() ?: return null
+        val term = if (album.contains(artist, ignoreCase = true)) album else "$artist $album"
+        val body = catalogGet(
+            "$AMP/us/search",
+            bearer,
+            mapOf(
+                "term" to term,
+                "types" to "albums",
+                "limit" to "10",
+                "extend" to "editorialVideo",
+            ),
+        ) ?: return null
+        val hits = runCatching {
+            json.parseToJsonElement(body).jsonObject["results"]?.jsonObject
+                ?.get("albums")?.jsonObject?.get("data")?.jsonArray
+        }.getOrNull() ?: return null
+
+        val ranked = hits.mapNotNull { el ->
+            val record = el as? JsonObject ?: return@mapNotNull null
+            val score = score(record, album, artist, album, albumIsSelf = true)
+                ?: return@mapNotNull null
+            score to record
+        }.sortedByDescending { it.first }
+
+        for ((hitScore, record) in ranked) {
+            if (hitScore < MIN_SCORE) break
+            val attributes = record["attributes"]?.jsonObject ?: continue
+            val name = attributes["name"]?.jsonPrimitive?.contentOrNull
+            if (name != null && isCompilation(name)) continue
+            val video = attributes["editorialVideo"]?.jsonObject ?: continue
+            val (primary, alternate) = motionUrls(video) ?: continue
+            return CanvasArtworkDto(
+                url = primary,
+                fallbackUrl = alternate,
+                title = name,
+                artist = attributes["artistName"]?.jsonPrimitive?.contentOrNull,
+                album = name,
+                source = "apple",
+            )
+        }
+        return null
+    }
+
     private suspend fun fetchAlbum(
         albumId: String,
         bearer: String,
@@ -292,4 +340,16 @@ object AppleMusicCanvas {
 internal suspend fun canvasGet(url: String, extraHeaders: Map<String, String> = emptyMap()): String? {
     val headers = mapOf("User-Agent" to CANVAS_UA) + extraHeaders
     return runCatching { Http.getText(url, headers = headers, timeoutMillis = 8_000) }.getOrNull()
+}
+
+internal suspend fun canvasGetWithStatus(
+    url: String,
+    extraHeaders: Map<String, String> = emptyMap(),
+    query: Map<String, String> = emptyMap(),
+): Pair<Int, String?> {
+    val headers = mapOf("User-Agent" to CANVAS_UA) + extraHeaders
+    val raw = runCatching {
+        Http.getRaw(url, headers = headers, query = query, timeoutMillis = 8_000)
+    }.getOrNull() ?: return -1 to null
+    return raw.status to raw.body?.takeIf { raw.status in 200..299 }
 }

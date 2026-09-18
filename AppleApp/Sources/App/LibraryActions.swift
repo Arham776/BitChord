@@ -61,6 +61,49 @@ enum LibraryActions {
         }
     }
 
+    static func setPlaylistPrivacy(playlistId: String, privacy: String) async -> String? {
+        await withCheckedContinuation { cont in
+            LibraryActionsBridge.shared.setPlaylistPrivacy(playlistId: playlistId, privacy: privacy, callback: DoneCB { ok, msg in
+                cont.resume(returning: ok ? nil : msg)
+            })
+        }
+    }
+
+    static func movePlaylistItem(playlistId: String, setVideoId: String, successorSetVideoId: String?) async -> String? {
+        await withCheckedContinuation { cont in
+            LibraryActionsBridge.shared.movePlaylistItem(
+                playlistId: playlistId,
+                setVideoId: setVideoId,
+                successorSetVideoId: successorSetVideoId,
+                callback: DoneCB { ok, msg in
+                    cont.resume(returning: ok ? nil : msg)
+                }
+            )
+        }
+    }
+
+    /// Drops later copies of the same video, keeping the first occurrence.
+    static func removeDuplicates(
+        playlistId: String,
+        songs: [(setVideoId: String, videoId: String)]
+    ) async -> String? {
+        var seen = Set<String>()
+        var extras: [(String, String)] = []
+        for song in songs {
+            if seen.contains(song.videoId) {
+                extras.append((song.setVideoId, song.videoId))
+            } else {
+                seen.insert(song.videoId)
+            }
+        }
+        for extra in extras {
+            if let err = await removeFromPlaylist(playlistId: playlistId, setVideoId: extra.0, videoId: extra.1) {
+                return err
+            }
+        }
+        return extras.isEmpty ? "No duplicates" : nil
+    }
+
     static func userPlaylists() async -> [UserPlaylistDTO] {
         await withCheckedContinuation { cont in
             LibraryActionsBridge.shared.userPlaylists(callback: JsonCB { json, _ in

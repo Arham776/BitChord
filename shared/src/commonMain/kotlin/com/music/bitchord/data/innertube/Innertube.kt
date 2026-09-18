@@ -623,6 +623,34 @@ object Innertube {
         }
     }
 
+    suspend fun setPlaylistPrivacy(playlistId: String, privacy: String) {
+        val p = PlaylistPrivacy.entries.firstOrNull { it.name.equals(privacy, true) }
+            ?: PlaylistPrivacy.PRIVATE
+        editPlaylist(playlistId) {
+            addJsonObject {
+                put("action", "ACTION_SET_PLAYLIST_PRIVACY")
+                put("playlistPrivacyStatus", p.apiValue)
+            }
+        }
+    }
+
+    /** Moves [setVideoId] to sit immediately before [successorSetVideoId], or last if null. */
+    suspend fun movePlaylistItem(
+        playlistId: String,
+        setVideoId: String,
+        successorSetVideoId: String?,
+    ) {
+        editPlaylist(playlistId) {
+            addJsonObject {
+                put("action", "ACTION_MOVE_VIDEO_AFTER")
+                put("setVideoId", setVideoId)
+                if (!successorSetVideoId.isNullOrBlank()) {
+                    put("movedSetVideoIdSuccessor", successorSetVideoId)
+                }
+            }
+        }
+    }
+
     /** First string value under [key] anywhere in [element], depth-first. */
     private fun findString(element: JsonElement, key: String): String? = when (element) {
         is JsonObject -> (element[key] as? JsonPrimitive)?.contentOrNull

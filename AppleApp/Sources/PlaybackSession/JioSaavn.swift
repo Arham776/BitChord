@@ -96,11 +96,13 @@ enum JioSaavn {
 
     /// Upstream `matchAndStream` for this catalogue: search, score, then open
     /// the best row that is the same recording. Nil means fall through to YouTube.
-    static func matchedStream(for entry: QueueEntry) async -> (url: String, kbps: Int)? {
+    static func matchedStream(
+        for entry: QueueEntry, playingDurationSec: Int? = nil
+    ) async -> (url: String, kbps: Int, durationSec: Int?)? {
         let target = TrackMatch.Target(
             title: entry.title,
             artist: entry.artist,
-            durationSec: {
+            durationSec: playingDurationSec ?? {
                 let s = Int(entry.durationSeconds.rounded())
                 return s > 0 ? s : nil
             }()
@@ -113,7 +115,8 @@ enum JioSaavn {
         }
         guard let index = TrackMatch.bestIndex(in: candidates, target: target),
               let sid = hits[index].videoId else { return nil }
-        return await streamURL(for: sid)
+        guard let stream = await streamURL(for: sid) else { return nil }
+        return (stream.url, stream.kbps, TrackMatch.seconds(of: hits[index].durationText))
     }
 
     private static func decryptDES(_ b64: String) -> String? {

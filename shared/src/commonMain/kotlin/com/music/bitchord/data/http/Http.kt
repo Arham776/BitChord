@@ -69,7 +69,37 @@ expect object Http {
         headers: Map<String, String> = emptyMap(),
         timeoutMillis: Long = 30_000,
     ): String
+
+    /**
+     * GET that does not throw on non-2xx. Used by lyrics/canvas providers that
+     * need the status code.
+     */
+    suspend fun getRaw(
+        url: String,
+        headers: Map<String, String> = emptyMap(),
+        query: Map<String, String> = emptyMap(),
+        timeoutMillis: Long = 8_000,
+    ): RawHttpText
+
+    /** POST raw bytes (protobuf / JSON without a forced charset). */
+    suspend fun postBytes(
+        url: String,
+        body: ByteArray,
+        contentType: String,
+        headers: Map<String, String> = emptyMap(),
+        timeoutMillis: Long = 15_000,
+    ): RawHttpBytes
+
+    /**
+     * Write cookies for [originUrl] into the Darwin cookie jar so a subsequent
+     * [getRaw] actually sends them (URLSession ignores a `Cookie` header).
+     */
+    fun setHostCookies(originUrl: String, cookies: Map<String, String>)
 }
+
+data class RawHttpText(val status: Int, val body: String?)
+
+data class RawHttpBytes(val status: Int, val body: ByteArray?)
 
 /** [Http.probe]'s verdict input; the classification happens where it is read. */
 data class ProbeResult(

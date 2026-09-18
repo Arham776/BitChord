@@ -24,28 +24,41 @@ object TtmlLyrics {
             val role = ROLE.find(attrs)?.groupValues?.get(1).orEmpty()
             if (role == "x-translation" || role == "x-roman") return@mapNotNull null
             val inner = p.groupValues[2]
-            val words = SPAN.findAll(inner).mapNotNull { span ->
+            val lead = mutableListOf<LyricWordDto>()
+            val backing = mutableListOf<LyricWordDto>()
+            SPAN.findAll(inner).forEach { span ->
                 val sattrs = span.groupValues[1]
                 val srole = ROLE.find(sattrs)?.groupValues?.get(1).orEmpty()
-                if (srole == "x-translation" || srole == "x-roman") return@mapNotNull null
-                val begin = time(BEGIN.find(sattrs)?.groupValues?.get(1)) ?: return@mapNotNull null
+                if (srole == "x-translation" || srole == "x-roman") return@forEach
+                val begin = time(BEGIN.find(sattrs)?.groupValues?.get(1)) ?: return@forEach
                 val end = time(END.find(sattrs)?.groupValues?.get(1)) ?: begin + 200
                 val text = span.groupValues[2].replace(Regex("<[^>]+>"), "").trim()
-                if (text.isEmpty()) null else LyricWordDto(begin, end, decode(text))
-            }.toList()
+                if (text.isEmpty()) return@forEach
+                val word = LyricWordDto(begin, end, decode(text))
+                if (srole == "x-bg") backing += word else lead += word
+            }
             val pBegin = time(BEGIN.find(attrs)?.groupValues?.get(1))
-            if (words.isNotEmpty()) {
+            val pEnd = time(END.find(attrs)?.groupValues?.get(1))
+            val background = backing.takeIf { it.isNotEmpty() }?.let {
                 LyricLineDto(
-                    timeMs = minOf(pBegin ?: words.first().startMs, words.first().startMs),
-                    text = words.joinToString(" ") { it.text },
-                    words = words,
+                    timeMs = it.first().startMs,
+                    text = it.joinToString(" ") { w -> w.text },
+                    words = it,
+                )
+            }
+            if (lead.isNotEmpty()) {
+                LyricLineDto(
+                    timeMs = minOf(pBegin ?: lead.first().startMs, lead.first().startMs),
+                    text = lead.joinToString(" ") { it.text },
+                    words = lead,
+                    background = background,
                 )
             } else {
                 val text = decode(inner.replace(Regex("<[^>]+>"), "").trim())
                 if (text.isEmpty() || pBegin == null) null
-                else LyricLineDto(pBegin, text)
+                else LyricLineDto(pBegin, text, sungUntilMs = pEnd?.takeIf { it > pBegin }, background = background)
             }
-        }.sortedBy { it.timeMs }.toList()
+        }.sortedBy { it.timeMs }.toList().withInstrumentalGaps()
     }
 
     internal fun time(value: String?): Long? {

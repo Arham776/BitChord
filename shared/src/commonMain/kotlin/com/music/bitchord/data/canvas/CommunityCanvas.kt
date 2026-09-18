@@ -40,6 +40,27 @@ object CommunityCanvas {
         )
     }
 
+    /** First clip on this release — the index is keyed by song, the loop is usually the same. */
+    suspend fun searchAlbum(album: String, artist: String): CanvasArtworkDto? {
+        val index = manifest()
+        val wantAlbum = album.normalize()
+        val wantArtist = artist.normalize()
+        if (wantAlbum.isBlank()) return null
+        val hit = index.firstOrNull { entry ->
+            val listed = entry.album.normalize()
+            val credited = entry.artist.normalize()
+            listed == wantAlbum && credited.isNotBlank() &&
+                (wantArtist.contains(credited) || credited.contains(wantArtist))
+        } ?: return null
+        return CanvasArtworkDto(
+            url = hit.url,
+            title = hit.album,
+            artist = hit.artist,
+            album = hit.album,
+            source = "community",
+        )
+    }
+
     private suspend fun manifest(): List<Entry> {
         if (cached.isNotEmpty()) return cached
         val body = runCatching { Http.getText(MANIFEST, timeoutMillis = 8_000) }.getOrNull() ?: return emptyList()

@@ -147,6 +147,16 @@ final class DownloadStore {
             album: entry.albumName ?? "",
             artwork: entry.artworkData ?? Data()
         )
+        let durationMs = Swift.Int64((entry.durationSeconds > 0 ? entry.durationSeconds : 0) * 1000)
+        LyricsTagBridge.shared.embedSidecar(
+            audioPath: dest.path,
+            videoId: entry.videoId ?? entry.id,
+            title: entry.title,
+            artist: entry.artist,
+            durationMs: durationMs,
+            album: entry.albumName,
+            callback: EmbedSidecarAdapter { _, _ in }
+        )
         refresh()
     }
 
@@ -173,4 +183,10 @@ private final class DoneAdapter: StreamDownloadBridgeDownloadCallback {
     let handler: (String?, String?) -> Void
     init(_ handler: @escaping (String?, String?) -> Void) { self.handler = handler }
     func onResult(path: String?, message: String?) { handler(path, message) }
+}
+
+private final class EmbedSidecarAdapter: LyricsTagBridgeEmbedCallback {
+    let handler: (String?, String?) -> Void
+    init(_ handler: @escaping (String?, String?) -> Void) { self.handler = handler }
+    func onResult(plain: String?, enhanced: String?) { handler(plain, enhanced) }
 }

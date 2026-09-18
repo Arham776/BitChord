@@ -1,17 +1,14 @@
 package com.music.bitchord.data.lyrics
 
-import com.music.bitchord.data.http.Http
 import kotlinx.coroutines.async
 import kotlinx.coroutines.coroutineScope
-import kotlinx.coroutines.withTimeoutOrNull
-import kotlinx.serialization.json.Json
-import kotlinx.serialization.json.JsonObject
-import kotlinx.serialization.json.contentOrNull
-import kotlinx.serialization.json.jsonArray
-import kotlinx.serialization.json.jsonObject
-import kotlinx.serialization.json.jsonPrimitive
+import kotlinx.coroutines.selects.select
+import kotlinx.serialization.SerialName
+import kotlinx.serialization.Serializable
 
-/** Syllable-timed lyrics from LyricsPlus volunteer mirrors. */
+/**
+ * Syllable-timed lyrics from LyricsPlus volunteer mirrors.
+ */
 object LyricsPlus {
     private val MIRRORS = listOf(
         "https://lyricsplus.prjktla.my.id",
@@ -21,64 +18,119 @@ object LyricsPlus {
         "https://lyricsplus-seven.vercel.app",
         "https://lyrics-plus-backend.vercel.app",
     )
-    private val json = Json { ignoreUnknownKeys = true; isLenient = true }
 
-    suspend fun lyrics(title: String, artist: String, album: String?): List<LyricLineDto>? = coroutineScope {
-        val jobs = MIRRORS.map { host ->
-            async {
-                runCatching {
-                    val url = "$host/v2/lyrics"
-                    val body = withTimeoutOrNull(4_000) {
-                        Http.getText(
-                            url,
-                            query = buildMap {
-                                put("title", title)
-                                put("artist", artist)
-                                if (!album.isNullOrBlank()) put("album", album)
-                            },
-                            timeoutMillis = 4_000,
-                        )
-                    } ?: return@runCatching null
-                    parse(body)
-                }.getOrNull()
+    @kotlin.concurrent.Volatile private var lastGood: String? = null
+
+    suspend fun lyrics(
+        title: String,
+        artist: String,
+        durationMs: Long,
+        album: String? = null,
+    ): List<LyricLineDto>? = coroutineScope {
+        val hosts = lastGood
+            ?.let { listOf(it) + MIRRORS.filterNot { mirror -> mirror == it } }
+            ?: MIRRORS
+
+        val pending = hosts.map { host ->
+            host to async { fetch(host, title, artist, durationMs, album) }
+        }.toMutableList()
+
+        try {
+            while (pending.isNotEmpty()) {
+                val (host, lines) = select {
+                    pending.forEach { (host, job) -> job.onAwait { host to it } }
+                }
+                pending.removeAll { it.first == host }
+                if (!lines.isNullOrEmpty()) {
+                    lastGood = host
+                    return@coroutineScope lines
+                }
             }
+            null
+        } finally {
+            pending.forEach { it.second.cancel() }
         }
-        jobs.firstNotNullOfOrNull { it.await()?.takeIf { lines -> lines.isNotEmpty() } }
     }
 
-    private fun parse(body: String): List<LyricLineDto>? {
-        val root = json.parseToJsonElement(body) as? JsonObject ?: return null
-        val ttml = root["ttml"]?.jsonPrimitive?.contentOrNull
-            ?: root["lyrics"]?.jsonPrimitive?.contentOrNull
-        if (!ttml.isNullOrBlank() && ttml.contains("<p")) {
-            return TtmlLyrics.parse(ttml)
+    private suspend fun fetch(
+        host: String,
+        title: String,
+        artist: String,
+        durationMs: Long,
+        album: String?,
+    ): List<LyricLineDto>? {
+        val query = buildMap {
+            put("title", title)
+            put("artist", artist)
+            val seconds = durationMs / 1000
+            if (seconds > 0) put("duration", seconds.toString())
+            if (!album.isNullOrBlank()) put("album", album)
         }
-        val synced = root["syncedLyrics"]?.jsonPrimitive?.contentOrNull
-            ?: root["lrc"]?.jsonPrimitive?.contentOrNull
-        if (!synced.isNullOrBlank()) {
-            return EnhancedLrc.parse(synced).ifEmpty { LrcLib.parseLrc(synced) }
-        }
-        val data = root["data"]?.jsonArray
-        if (data != null) {
-            val words = data.mapNotNull { el ->
-                val o = el.jsonObject
-                val text = o["text"]?.jsonPrimitive?.contentOrNull?.trim().orEmpty()
-                val start = o["start"]?.jsonPrimitive?.contentOrNull?.toDoubleOrNull()
-                    ?: o["time"]?.jsonPrimitive?.contentOrNull?.toDoubleOrNull()
-                    ?: return@mapNotNull null
-                if (text.isEmpty()) null
-                else LyricWordDto((start * 1000).toLong(), (start * 1000).toLong() + 300, text)
-            }
-            if (words.isNotEmpty()) {
-                return listOf(
-                    LyricLineDto(
-                        timeMs = words.first().startMs,
-                        text = words.joinToString(" ") { it.text },
-                        words = words,
-                    ),
+        val body = lyricsGet("$host/v2/lyrics/get", query = query) ?: return null
+        val response = runCatching { lyricsJson.decodeFromString(Response.serializer(), body) }.getOrNull()
+            ?: return null
+        return parse(response).takeIf { it.isNotEmpty() }
+    }
+
+    internal fun parse(response: Response): List<LyricLineDto> =
+        response.lyrics.orEmpty().mapNotNull { line ->
+            val start = line.time ?: return@mapNotNull null
+            val words = mergeSyllables(line.syllabus.orEmpty())
+            when {
+                words.isNotEmpty() -> LyricLineDto(
+                    timeMs = minOf(start, words.first().startMs),
+                    text = words.joinToString(" ") { it.text },
+                    words = words,
                 )
+                !line.text.isNullOrBlank() -> LyricLineDto(
+                    timeMs = start,
+                    text = line.text.trim(),
+                    sungUntilMs = line.duration?.takeIf { it > 0 }?.let { start + it },
+                )
+                else -> null
+            }
+        }.sortedBy { it.timeMs }.withInstrumentalGaps()
+
+    private fun mergeSyllables(syllables: List<Syllable>): List<LyricWordDto> {
+        val words = mutableListOf<LyricWordDto>()
+        val current = StringBuilder()
+        var start = 0L
+        var end = 0L
+
+        syllables.forEach { syllable ->
+            val text = syllable.text ?: return@forEach
+            if (text.isBlank()) return@forEach
+            val time = syllable.time ?: return@forEach
+            if (current.isEmpty()) start = time
+            current.append(text.trim())
+            end = time + (syllable.duration ?: 0L)
+            if (text.last().isWhitespace()) {
+                words += LyricWordDto(start, end, current.toString())
+                current.setLength(0)
             }
         }
-        return null
+        if (current.isNotEmpty()) words += LyricWordDto(start, end, current.toString())
+        return words
     }
+
+    @Serializable
+    internal data class Response(
+        val type: String? = null,
+        val lyrics: List<Line>? = null,
+    )
+
+    @Serializable
+    internal data class Line(
+        val time: Long? = null,
+        val duration: Long? = null,
+        val text: String? = null,
+        @SerialName("syllabus") val syllabus: List<Syllable>? = null,
+    )
+
+    @Serializable
+    internal data class Syllable(
+        val time: Long? = null,
+        val duration: Long? = null,
+        val text: String? = null,
+    )
 }

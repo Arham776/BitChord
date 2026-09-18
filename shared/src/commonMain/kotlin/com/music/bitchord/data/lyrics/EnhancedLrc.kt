@@ -42,7 +42,7 @@ object EnhancedLrc {
                     words = words,
                 )
             }
-        }
+        }.withInstrumentalGaps()
     }
 
     private fun stamp(match: MatchResult): Long =

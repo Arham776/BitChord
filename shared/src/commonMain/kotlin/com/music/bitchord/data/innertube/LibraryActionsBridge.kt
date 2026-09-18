@@ -125,6 +125,33 @@ object LibraryActionsBridge {
         }
     }
 
+    fun setPlaylistPrivacy(playlistId: String, privacy: String, callback: DoneCallback) {
+        scope.launch {
+            try {
+                Innertube.setPlaylistPrivacy(playlistId, privacy)
+                callback.onResult(true, null)
+            } catch (e: Throwable) {
+                callback.onResult(false, e.message ?: e.toString())
+            }
+        }
+    }
+
+    fun movePlaylistItem(
+        playlistId: String,
+        setVideoId: String,
+        successorSetVideoId: String?,
+        callback: DoneCallback,
+    ) {
+        scope.launch {
+            try {
+                Innertube.movePlaylistItem(playlistId, setVideoId, successorSetVideoId)
+                callback.onResult(true, null)
+            } catch (e: Throwable) {
+                callback.onResult(false, e.message ?: e.toString())
+            }
+        }
+    }
+
     fun userPlaylists(callback: JsonCallback) {
         scope.launch {
             try {

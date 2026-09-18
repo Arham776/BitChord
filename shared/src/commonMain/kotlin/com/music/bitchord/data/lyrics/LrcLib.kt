@@ -82,10 +82,11 @@ object LrcLib {
                 3 -> fraction.toLong()
                 else -> 0L
             }
-            val body = line.substring(match.range.last + 1).replace(WORD_STAMP, "").trim()
+            val body = line.substring(match.range.last + 1)
             LyricLineDto(
                 timeMs = minutes.toLong() * 60_000 + seconds.toLong() * 1_000 + fractionMs,
-                text = body,
+                text = body.replace(WORD_STAMP, "").trim(),
+                words = parseWordRuns(body),
             )
         }.sortedBy { it.timeMs }.toList()
 
@@ -100,6 +101,30 @@ object LrcLib {
         } else {
             kept
         }
+    }
+
+    private fun parseWordRuns(body: String): List<LyricWordDto> {
+        val marks = WORD_STAMP.findAll(body).toList()
+        if (marks.isEmpty()) return emptyList()
+        val runs = marks.mapIndexed { index, mark ->
+            val until = marks.getOrNull(index + 1)?.range?.first ?: body.length
+            msOf(mark) to body.substring(mark.range.last + 1, until)
+        }
+        return runs.mapIndexedNotNull { index, (startMs, text) ->
+            if (text.isBlank()) return@mapIndexedNotNull null
+            val endMs = runs.getOrNull(index + 1)?.first ?: startMs
+            LyricWordDto(startMs = startMs, endMs = maxOf(endMs, startMs), text = text.trim())
+        }
+    }
+
+    private fun msOf(mark: MatchResult): Long {
+        val (minutes, seconds, fraction) = mark.destructured
+        val fractionMs = when (fraction.length) {
+            2 -> fraction.toLong() * 10
+            3 -> fraction.toLong()
+            else -> 0L
+        }
+        return minutes.toLong() * 60_000 + seconds.toLong() * 1_000 + fractionMs
     }
 
     private fun String.clean(): String = this

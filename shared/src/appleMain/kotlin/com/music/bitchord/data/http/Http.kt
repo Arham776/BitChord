@@ -58,10 +58,19 @@ actual object Http {
     }
 
     /**
-     * Media client: a separate Darwin session with no cookie jar. Built
-     * once — never via per-call `client.config {}`, which would inherit
-     * the API session's cookies.
+     * Lenient client: cookies from [apiCookies], does not throw on non-2xx.
+     * Used by Spotify canvas/token and status-aware GETs.
      */
+    private val lenientClient: HttpClient = HttpClient(Darwin) {
+        engine {
+            configureSession {
+                HTTPShouldSetCookies = true
+                HTTPCookieStorage = apiCookies
+            }
+        }
+        install(HttpTimeout)
+        expectSuccess = false
+    }
     private val mediaClient: HttpClient = HttpClient(Darwin) {
         engine {
             configureSession {
@@ -197,6 +206,67 @@ actual object Http {
             fields.forEach { (k, v) -> append(k, v) }
         }))
     }.bodyAsText()
+
+    actual suspend fun getRaw(
+        url: String,
+        headers: Map<String, String>,
+        query: Map<String, String>,
+        timeoutMillis: Long,
+    ): RawHttpText {
+        val response = lenientClient.get(url) {
+            timeout {
+                requestTimeoutMillis = timeoutMillis
+                connectTimeoutMillis = 8_000
+            }
+            headers.forEach { (key, value) -> header(key, value) }
+            query.forEach { (key, value) -> parameter(key, value) }
+        }
+        val body = runCatching { response.bodyAsText() }.getOrNull()
+        return RawHttpText(status = response.status.value, body = body)
+    }
+
+    actual suspend fun postBytes(
+        url: String,
+        body: ByteArray,
+        contentType: String,
+        headers: Map<String, String>,
+        timeoutMillis: Long,
+    ): RawHttpBytes {
+        val response = lenientClient.post(url) {
+            timeout {
+                requestTimeoutMillis = timeoutMillis
+                connectTimeoutMillis = 8_000
+            }
+            header("Content-Type", contentType)
+            headers.forEach { (key, value) ->
+                if (!key.equals("Content-Type", ignoreCase = true)) header(key, value)
+            }
+            setBody(body)
+        }
+        val bytes = runCatching { response.bodyAsBytes() }.getOrNull()
+        return RawHttpBytes(status = response.status.value, body = bytes)
+    }
+
+    actual fun setHostCookies(originUrl: String, cookies: Map<String, String>) {
+        val origin = NSURL(string = originUrl) ?: return
+        val host = origin.host ?: return
+        val domain = when {
+            host.endsWith("spotify.com") -> ".spotify.com"
+            host.startsWith(".") -> host
+            else -> ".$host"
+        }
+        cookies.forEach { (name, value) ->
+            if (name.isBlank() || value.isBlank()) return@forEach
+            val props: Map<Any?, Any> = mapOf(
+                NSHTTPCookieName to name,
+                NSHTTPCookieValue to value,
+                NSHTTPCookieDomain to domain,
+                NSHTTPCookiePath to "/",
+                NSHTTPCookieSecure to "TRUE",
+            )
+            NSHTTPCookie.cookieWithProperties(props)?.let { apiCookies.setCookie(it) }
+        }
+    }
 
     /**
      * A ranged GET with a short leash — upstream's stream `probe`.

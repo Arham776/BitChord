@@ -35,11 +35,16 @@ struct SettingsView: View {
     @State private var dontRepeat = PlatformSettings.shared.getBoolean(key: "dont_repeat_suggestions", default: false)
     @State private var hideVolume = PlatformSettings.shared.getBoolean(key: "hide_volume_bar", default: false)
     @State private var theme = PlatformSettings.shared.getString(key: "theme_mode", default: "dark")
-    @State private var lyricsSources = PlatformSettings.shared.getString(key: "lyrics_sources", default: "BETTER,PLUS,SIMP,LRCLIB")
+    @State private var lyricsSources = LyricsSourceNames.normalizeList(
+        PlatformSettings.shared.getString(key: "lyrics_sources", default: LyricsSourceNames.defaultEnabled)
+    )
+    @State private var lyricsSourceOrder = LyricsSourceNames.normalizeList(
+        PlatformSettings.shared.getString(key: "lyrics_source_order", default: LyricsSourceNames.defaultEnabled)
+    )
     @State private var playbackSpeed = Double(PlatformSettings.shared.getFloat(key: "playback_speed", default: 1))
     @State private var jiosaavn = PlatformSettings.shared.getBoolean(key: "jiosaavn_enabled", default: true)
     @State private var stopBackground = PlatformSettings.shared.getBoolean(key: "stop_when_backgrounded", default: false)
-    @State private var syllableSync = PlatformSettings.shared.getBoolean(key: "prioritize_syllable_sync", default: true)
+    @State private var syllableSync = PlatformSettings.shared.getBoolean(key: "prioritize_syllable_sync", default: false)
     @State private var language = PlatformSettings.shared.getString(key: "app_language", default: "")
     @State private var spotifyCookie = PlatformSettings.shared.getString(key: "spotify_spdc_token", default: "")
     @State private var replayGenres = PlatformSettings.shared.getBoolean(key: "replay_genres", default: true)
@@ -64,8 +69,8 @@ struct SettingsView: View {
                         Button("Done") { dismiss() }
                     }
                 }
-        #endif
-    }
+                #endif
+        }
         #if os(macOS)
         .frame(minWidth: 560, idealWidth: 620, minHeight: 720)
         #endif
@@ -105,6 +110,7 @@ struct SettingsView: View {
         ))
         .modifier(SettingsExtrasPersist(
             lyricsSources: $lyricsSources,
+            lyricsSourceOrder: $lyricsSourceOrder,
             jiosaavn: $jiosaavn,
             stopBackground: $stopBackground,
             syllableSync: $syllableSync,
@@ -230,20 +236,20 @@ struct SettingsView: View {
 
     private var playbackSection: some View {
         Section {
-            if !automix {
-                SettingsSliderRow(
-                    glyph: .crossfade,
-                    title: "Crossfade",
-                    subtitle: "Blends one track into the next",
-                    valueText: crossfade == 0 ? "Off" : "\(crossfade)s",
-                    value: Binding(
-                        get: { Double(crossfade) },
-                        set: { crossfade = Int($0.rounded()) }
-                    ),
-                    range: 0...12,
-                    step: 1
-                )
-            }
+            SettingsSliderRow(
+                glyph: .crossfade,
+                title: "Crossfade",
+                subtitle: automix
+                    ? "Fallback blend length when Automix uses a plain transition"
+                    : "Blends one track into the next",
+                valueText: crossfade == 0 ? "Off" : "\(crossfade)s",
+                value: Binding(
+                    get: { Double(crossfade) },
+                    set: { crossfade = Int($0.rounded()) }
+                ),
+                range: 0...12,
+                step: 1
+            )
             SettingsToggleLine(
                 glyph: .automix,
                 title: "Automix [Beta]",
@@ -259,7 +265,7 @@ struct SettingsView: View {
                 isOn: $skipSilence
             )
             SettingsSliderRow(
-                glyph: .crossfade,
+                glyph: .speed,
                 title: "Playback Speed",
                 subtitle: "Slows or speeds the mix without changing pitch on the engine",
                 valueText: String(format: "%.2fx", playbackSpeed),
@@ -302,7 +308,7 @@ struct SettingsView: View {
         } header: {
             Text("Playback")
         } footer: {
-            Text("Gapless stays on regardless. Automix replaces the crossfade slider with a pair-by-pair blend.")
+            Text("Gapless stays on at 0s. Automix picks timing per track; crossfade sets the manual blend length.")
         }
     }
 
@@ -363,7 +369,7 @@ struct SettingsView: View {
                     isOn: $syllableSync
                 )
                 NavigationLink {
-                    LyricsSourcesView(selection: $lyricsSources)
+                    LyricsSourcesView(selection: $lyricsSources, order: $lyricsSourceOrder, syllableSync: $syllableSync)
                 } label: {
                     SettingsLine(
                         glyph: .lyricsSources,
@@ -519,6 +525,17 @@ struct SettingsView: View {
                 subtitle: "Pauses playback when the app leaves the foreground",
                 isOn: $stopBackground
             )
+            NavigationLink {
+                SpotifyCanvasAuthView(cookie: $spotifyCookie)
+            } label: {
+                SettingsLine(
+                    glyph: .canvas,
+                    title: "Spotify Canvas",
+                    subtitle: spotifyCookie.isEmpty ? "Optional sp_dc cookie for motion art" : "Cookie saved"
+                ) {
+                    EmptyView()
+                }
+            }
             Picker(selection: $language) {
                 Text("System").tag("")
                 Text("English").tag("en")
@@ -649,6 +666,13 @@ private struct AccountIntegrationsView: View {
     @State private var discordActivity = PlatformSettings.shared.getString(key: "discord_activity_type", default: "listening")
     @State private var discordNameCustom = PlatformSettings.shared.getString(key: "discord_activity_name", default: "")
     @State private var discordSwap = PlatformSettings.shared.getBoolean(key: "discord_swap_title", default: false)
+    @State private var discordUseDetails = PlatformSettings.shared.getBoolean(key: "discord_use_details", default: false)
+    @State private var discordAdvanced = PlatformSettings.shared.getBoolean(key: "discord_advanced_mode", default: false)
+    @State private var discordButton1Text = PlatformSettings.shared.getString(key: "discord_button_1_text", default: "")
+    @State private var discordButton1Visible = PlatformSettings.shared.getBoolean(key: "discord_button_1_visible", default: true)
+    @State private var discordButton2Text = PlatformSettings.shared.getString(key: "discord_button_2_text", default: "")
+    @State private var discordButton2Visible = PlatformSettings.shared.getBoolean(key: "discord_button_2_visible", default: true)
+    @State private var discordInfoDismissed = PlatformSettings.shared.getBoolean(key: "discord_info_dismissed", default: false)
     @State private var scrobbleMin = Double(PlatformSettings.shared.getInt(key: "scrobble_min_duration", default: 30))
     @State private var scrobblePercent = Double(PlatformSettings.shared.getFloat(key: "scrobble_delay_percent", default: 0.5))
     @State private var scrobbleMax = Double(PlatformSettings.shared.getInt(key: "scrobble_delay_seconds", default: 180))
@@ -707,26 +731,49 @@ private struct AccountIntegrationsView: View {
                 }
                 .buttonStyle(.plain)
                 if !discordToken.isEmpty {
+                    if !discordInfoDismissed {
+                        VStack(alignment: .leading, spacing: 8) {
+                            Text("Discord has no API for an app to set your presence, so this signs in as your account and speaks its protocol. Your token is stored on this device and only ever sent to Discord — but it is your whole account, and automating one is against Discord's terms of service. Bans for presence alone aren't a thing anyone reports; it's still your call.")
+                                .font(.footnote)
+                                .foregroundStyle(.secondary)
+                            Button("Dismiss") { discordInfoDismissed = true }
+                                .font(.footnote.weight(.semibold))
+                        }
+                    }
                     Toggle("Rich Presence", isOn: $discordRpc)
-                    Picker("Status", selection: $discordStatus) {
-                        Text("Online").tag("online")
-                        Text("Idle").tag("idle")
-                        Text("Do Not Disturb").tag("dnd")
-                        Text("Invisible").tag("invisible")
+                    Toggle("Lead with the song", isOn: $discordUseDetails)
+                    Toggle("Customise the card", isOn: $discordAdvanced)
+                    if discordAdvanced {
+                        Picker("Status", selection: $discordStatus) {
+                            Text("Online").tag("online")
+                            Text("Idle").tag("idle")
+                            Text("Do Not Disturb").tag("dnd")
+                            Text("Invisible").tag("invisible")
+                        }
+                        Picker("Activity", selection: $discordActivity) {
+                            Text("Listening").tag("listening")
+                            Text("Playing").tag("playing")
+                            Text("Watching").tag("watching")
+                            Text("Competing").tag("competing")
+                        }
+                        TextField("Activity name", text: $discordNameCustom)
+                        Toggle("Swap title and artist", isOn: $discordSwap)
+                        Toggle("First button", isOn: $discordButton1Visible)
+                        TextField("First button text", text: $discordButton1Text)
+                            .disabled(!discordButton1Visible)
+                        Toggle("Second button", isOn: $discordButton2Visible)
+                        TextField("Second button text", text: $discordButton2Text)
+                            .disabled(!discordButton2Visible)
+                    } else {
+                        Toggle("Swap title and artist", isOn: $discordSwap)
                     }
-                    Picker("Activity", selection: $discordActivity) {
-                        Text("Listening").tag("listening")
-                        Text("Playing").tag("playing")
-                        Text("Watching").tag("watching")
-                        Text("Competing").tag("competing")
-                    }
-                    TextField("Activity name", text: $discordNameCustom)
-                    Toggle("Swap title and artist", isOn: $discordSwap)
                 }
             } header: {
                 Text("Rich Presence")
             } footer: {
-                Text("Show what you’re playing on your Discord profile, updating as the track does.")
+                Text(discordAdvanced
+                     ? "{song_name}, {artist_name} and {album_name} are replaced with the track. The first button opens the song on YouTube Music, the second this project."
+                     : "Show what you’re playing on your Discord profile, updating as the track does.")
             }
 
             Section {
@@ -825,6 +872,13 @@ private struct AccountIntegrationsView: View {
             discordActivity: $discordActivity,
             discordNameCustom: $discordNameCustom,
             discordSwap: $discordSwap,
+            discordUseDetails: $discordUseDetails,
+            discordAdvanced: $discordAdvanced,
+            discordButton1Text: $discordButton1Text,
+            discordButton1Visible: $discordButton1Visible,
+            discordButton2Text: $discordButton2Text,
+            discordButton2Visible: $discordButton2Visible,
+            discordInfoDismissed: $discordInfoDismissed,
             scrobbleMin: $scrobbleMin,
             scrobblePercent: $scrobblePercent,
             scrobbleMax: $scrobbleMax
@@ -865,6 +919,8 @@ private struct AccountIntegrationsView: View {
 
 private struct LyricsSourcesView: View {
     @Binding var selection: String
+    @Binding var order: String
+    @Binding var syllableSync: Bool
 
     var body: some View {
         List {
@@ -883,24 +939,38 @@ private struct LyricsSourcesView: View {
                 }
                 .onMove(perform: move)
             } footer: {
-                Text("BitChord races the sources you leave on and keeps the best match. Drag to change race order. Word-synced lyrics win when present.")
+                Text("Tried in this order — drag to reorder. The highest-priority source to answer at all wins, unless Prefer Word-Synced Lyrics says to keep looking for a word-synced one.")
+            }
+            Section {
+                Button("Reset to Default") {
+                    AppSettings.shared.resetLyricsSourceSettings()
+                    order = LyricsSourceNames.defaultEnabled
+                    selection = LyricsSourceNames.defaultEnabled
+                    syllableSync = false
+                }
             }
         }
         .navigationTitle("Lyrics Sources")
         #if os(iOS)
         .environment(\.editMode, .constant(.active))
         #endif
+        .onAppear {
+            order = LyricsSourceNames.normalizeList(order)
+            selection = LyricsSourceNames.normalizeList(selection)
+        }
     }
 
     private var orderedIds: [String] {
-        let current = selection.split(separator: ",").map(String.init)
+        let saved = LyricsSourceNames.normalizeList(order).split(separator: ",").map(String.init)
         let known = LyricsSourceOption.all.map(\.id)
-        return current.filter { known.contains($0) } + known.filter { !current.contains($0) }
+        let fromSaved = saved.filter { known.contains($0) }
+        return fromSaved + known.filter { !fromSaved.contains($0) }
     }
 
     private func move(from source: IndexSet, to dest: Int) {
         var ids = orderedIds
         ids.move(fromOffsets: source, toOffset: dest)
+        order = ids.joined(separator: ",")
         let enabled = Set(selection.split(separator: ",").map(String.init))
         selection = ids.filter { enabled.contains($0) }.joined(separator: ",")
     }
@@ -909,9 +979,13 @@ private struct LyricsSourcesView: View {
         Binding(
             get: { Set(selection.split(separator: ",").map(String.init)).contains(id) },
             set: { on in
-                var ids = orderedIds
+                let ids = orderedIds
                 var enabled = Set(selection.split(separator: ",").map(String.init))
-                if on { enabled.insert(id) } else { enabled.remove(id) }
+                if on {
+                    enabled.insert(id)
+                } else if enabled.count > 1 {
+                    enabled.remove(id)
+                }
                 selection = ids.filter { enabled.contains($0) }.joined(separator: ",")
             }
         )
@@ -948,6 +1022,25 @@ private struct QualityPickerPage: View {
             }
         }
         .navigationTitle(title)
+    }
+}
+
+private struct SpotifyCanvasAuthView: View {
+    @Binding var cookie: String
+
+    var body: some View {
+        Form {
+            Section {
+                SecureField("sp_dc cookie", text: $cookie)
+                    .textContentType(.password)
+            } header: {
+                Text("Spotify Canvas Setup")
+            } footer: {
+                Text("Paste the sp_dc cookie from an open Spotify web session. BitChord uses it only to look up looping motion art. Leave blank to skip.")
+            }
+        }
+        .formStyle(.grouped)
+        .navigationTitle("Spotify Canvas")
     }
 }
 
@@ -1055,7 +1148,7 @@ private struct SettingsSliderRow: View {
 private struct SettingsGlyph: View {
     enum Kind {
         case person, sources, wifi, cellular, download
-        case crossfade, automix, skipSilence, spatial, equalizer, nerd, video
+        case crossfade, automix, skipSilence, spatial, equalizer, nerd, video, speed
         case theme, reduceMotion, reduceBlur, fullBleed, canvas, lyrics, lyricsSources
         case storage, clearSongs, clearImages
         case swipe, dontRepeat, hideVolume
@@ -1085,6 +1178,7 @@ private struct SettingsGlyph: View {
         case .cellular: "antenna.radiowaves.left.and.right"
         case .download: "arrow.down.circle.fill"
         case .crossfade: "waveform"
+        case .speed: "gauge.with.dots.needle.67percent"
         case .automix: "sparkles"
         case .skipSilence: "speaker.slash.fill"
         case .spatial: "hifispeaker.2.fill"
@@ -1122,6 +1216,7 @@ private struct SettingsGlyph: View {
         case .cellular: .green
         case .download: Color(red: 0.20, green: 0.48, blue: 0.96)
         case .crossfade: .purple
+        case .speed: .blue
         case .automix: Color(red: 0.93, green: 0.27, blue: 0.48)
         case .skipSilence: .gray
         case .spatial: .teal
@@ -1178,14 +1273,17 @@ private struct LyricsSourceOption: Identifiable {
     let subtitle: String
 
     static let all: [LyricsSourceOption] = [
-        .init(id: "BETTER", title: "BetterLyrics", subtitle: "Word-synced lines from community timings"),
-        .init(id: "PLUS", title: "LyricsPlus", subtitle: "Enhanced LRC and Apple Music timings"),
-        .init(id: "SIMP", title: "SimpMusic", subtitle: "Community lyrics with syllable timings"),
-        .init(id: "LRCLIB", title: "LRCLIB", subtitle: "Open timed lyrics library"),
+        .init(id: "LYRICS_PLUS", title: "LyricsPlus", subtitle: "Syllable by syllable, on community mirrors"),
+        .init(id: "PAXSENIX", title: "PaxSenix", subtitle: "Apple Music timings again, on a second host"),
+        .init(id: "BETTER_LYRICS", title: "BetterLyrics", subtitle: "Apple Music timings, word by word"),
+        .init(id: "SIMP_MUSIC", title: "SimpMusic", subtitle: "Matched on the video, so never the wrong edit"),
+        .init(id: "KUGOU", title: "KuGou", subtitle: "Whole lines, strong outside the English catalogue"),
+        .init(id: "LRCLIB", title: "LRCLIB", subtitle: "Whole lines only, and always up"),
+        .init(id: "MUSIXMATCH", title: "Musixmatch", subtitle: "Whole lines, from the biggest lyrics database there is"),
     ]
 
     static func summary(_ raw: String) -> String {
-        let enabled = Set(raw.split(separator: ",").map(String.init))
+        let enabled = Set(LyricsSourceNames.normalizeList(raw).split(separator: ",").map(String.init))
         let names = all.filter { enabled.contains($0.id) }.map(\.title)
         if names.isEmpty { return "None — no lyrics will be fetched" }
         return names.joined(separator: ", ")
@@ -1210,7 +1308,10 @@ private struct SettingsPlaybackPersist: ViewModifier {
                 AppSettings.shared.setSpatialAudio(value: value)
                 controller.updateSpatial(enabled: value)
             }
-            .onChange(of: automix) { _, value in AppSettings.shared.setSmartFadeEnabled(value: value) }
+            .onChange(of: automix) { _, value in
+                AppSettings.shared.setSmartFadeEnabled(value: value)
+                controller.setAutomixEnabled(value)
+            }
             .onChange(of: skipSilence) { _, value in
                 AppSettings.shared.setSkipSilence(value: value)
                 controller.updateSkipSilence(enabled: value)
@@ -1283,6 +1384,7 @@ private struct SettingsExperiencePersist: ViewModifier {
 
 private struct SettingsExtrasPersist: ViewModifier {
     @Binding var lyricsSources: String
+    @Binding var lyricsSourceOrder: String
     @Binding var jiosaavn: Bool
     @Binding var stopBackground: Bool
     @Binding var syllableSync: Bool
@@ -1294,6 +1396,7 @@ private struct SettingsExtrasPersist: ViewModifier {
     func body(content: Content) -> some View {
         content
             .onChange(of: lyricsSources) { _, value in AppSettings.shared.setLyricsSources(value: value) }
+            .onChange(of: lyricsSourceOrder) { _, value in AppSettings.shared.setLyricsSourceOrder(value: value) }
             .onChange(of: jiosaavn) { _, value in AppSettings.shared.setJiosaavnEnabled(value: value) }
             .onChange(of: stopBackground) { _, value in AppSettings.shared.setStopWhenBackgrounded(value: value) }
             .onChange(of: syllableSync) { _, value in AppSettings.shared.setPrioritizeSyllableSync(value: value) }
@@ -1302,9 +1405,7 @@ private struct SettingsExtrasPersist: ViewModifier {
                 appModel.appLanguage = value
             }
             .onChange(of: spotifyCookie) { _, value in AppSettings.shared.setSpotifySpdc(value: value) }
-            .onChange(of: replayGenres) { _, value in
-                PlatformSettings.shared.putBoolean(key: "replay_genres", value: value)
-            }
+            .onChange(of: replayGenres) { _, value in AppSettings.shared.setReplayGenres(value: value) }
     }
 }
 
@@ -1342,9 +1443,49 @@ private struct AccountDiscordPersist: ViewModifier {
     @Binding var discordActivity: String
     @Binding var discordNameCustom: String
     @Binding var discordSwap: Bool
+    @Binding var discordUseDetails: Bool
+    @Binding var discordAdvanced: Bool
+    @Binding var discordButton1Text: String
+    @Binding var discordButton1Visible: Bool
+    @Binding var discordButton2Text: String
+    @Binding var discordButton2Visible: Bool
+    @Binding var discordInfoDismissed: Bool
     @Binding var scrobbleMin: Double
     @Binding var scrobblePercent: Double
     @Binding var scrobbleMax: Double
+
+    func body(content: Content) -> some View {
+        content
+            .modifier(AccountDiscordCardPersist(
+                discordRpc: $discordRpc,
+                discordStatus: $discordStatus,
+                discordActivity: $discordActivity,
+                discordNameCustom: $discordNameCustom,
+                discordSwap: $discordSwap,
+                discordUseDetails: $discordUseDetails,
+                discordAdvanced: $discordAdvanced
+            ))
+            .modifier(AccountDiscordButtonsPersist(
+                discordButton1Text: $discordButton1Text,
+                discordButton1Visible: $discordButton1Visible,
+                discordButton2Text: $discordButton2Text,
+                discordButton2Visible: $discordButton2Visible,
+                discordInfoDismissed: $discordInfoDismissed,
+                scrobbleMin: $scrobbleMin,
+                scrobblePercent: $scrobblePercent,
+                scrobbleMax: $scrobbleMax
+            ))
+    }
+}
+
+private struct AccountDiscordCardPersist: ViewModifier {
+    @Binding var discordRpc: Bool
+    @Binding var discordStatus: String
+    @Binding var discordActivity: String
+    @Binding var discordNameCustom: String
+    @Binding var discordSwap: Bool
+    @Binding var discordUseDetails: Bool
+    @Binding var discordAdvanced: Bool
 
     func body(content: Content) -> some View {
         content
@@ -1353,6 +1494,28 @@ private struct AccountDiscordPersist: ViewModifier {
             .onChange(of: discordActivity) { _, value in AppSettings.shared.setDiscordActivityType(value: value) }
             .onChange(of: discordNameCustom) { _, value in AppSettings.shared.setDiscordActivityName(value: value) }
             .onChange(of: discordSwap) { _, value in AppSettings.shared.setDiscordSwapTitle(value: value) }
+            .onChange(of: discordUseDetails) { _, value in AppSettings.shared.setDiscordUseDetails(value: value) }
+            .onChange(of: discordAdvanced) { _, value in AppSettings.shared.setDiscordAdvancedMode(value: value) }
+    }
+}
+
+private struct AccountDiscordButtonsPersist: ViewModifier {
+    @Binding var discordButton1Text: String
+    @Binding var discordButton1Visible: Bool
+    @Binding var discordButton2Text: String
+    @Binding var discordButton2Visible: Bool
+    @Binding var discordInfoDismissed: Bool
+    @Binding var scrobbleMin: Double
+    @Binding var scrobblePercent: Double
+    @Binding var scrobbleMax: Double
+
+    func body(content: Content) -> some View {
+        content
+            .onChange(of: discordButton1Text) { _, value in AppSettings.shared.setDiscordButton1Text(value: value) }
+            .onChange(of: discordButton1Visible) { _, value in AppSettings.shared.setDiscordButton1Visible(value: value) }
+            .onChange(of: discordButton2Text) { _, value in AppSettings.shared.setDiscordButton2Text(value: value) }
+            .onChange(of: discordButton2Visible) { _, value in AppSettings.shared.setDiscordButton2Visible(value: value) }
+            .onChange(of: discordInfoDismissed) { _, value in AppSettings.shared.setDiscordInfoDismissed(value: value) }
             .onChange(of: scrobbleMin) { _, value in AppSettings.shared.setScrobbleMinDuration(value: Swift.Int32(value)) }
             .onChange(of: scrobblePercent) { _, value in AppSettings.shared.setScrobbleDelayPercent(value: Float(value)) }
             .onChange(of: scrobbleMax) { _, value in AppSettings.shared.setScrobbleDelaySeconds(value: Swift.Int32(value)) }

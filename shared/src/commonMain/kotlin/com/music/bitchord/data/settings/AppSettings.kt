@@ -3,6 +3,7 @@ package com.music.bitchord.data.settings
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import com.music.bitchord.data.lyrics.LyricsSource
 
 enum class AudioQuality(val maxKbps: Int, val label: String) {
     LOW(64, "Low"),
@@ -201,13 +202,38 @@ object AppSettings {
         settings.putBoolean("hide_volume_bar", value)
     }
 
-    private     val _lyricsSources = MutableStateFlow(
-        settings.getString("lyrics_sources", "BETTER,PLUS,SIMP,LRCLIB"),
-    )
+    private val _lyricsSources = MutableStateFlow(readLyricsSourcesPref())
     val lyricsSources: StateFlow<String> = _lyricsSources.asStateFlow()
     fun setLyricsSources(value: String) {
-        _lyricsSources.value = value
-        settings.putString("lyrics_sources", value)
+        val stored = persistLyricsSources(value)
+        _lyricsSources.value = stored
+        settings.putString("lyrics_sources", stored)
+    }
+
+    private val _lyricsSourceOrder = MutableStateFlow(readLyricsSourceOrderPref())
+    val lyricsSourceOrder: StateFlow<String> = _lyricsSourceOrder.asStateFlow()
+    fun setLyricsSourceOrder(value: String) {
+        val stored = persistLyricsSourceOrder(value)
+        _lyricsSourceOrder.value = stored
+        settings.putString("lyrics_source_order", stored)
+    }
+
+    fun lyricsSourcesSet(): Set<LyricsSource> = parseLyricsSources(_lyricsSources.value)
+
+    fun lyricsSourceOrderList(): List<LyricsSource> = parseLyricsSourceOrder(_lyricsSourceOrder.value)
+
+    /** JSON array of sources in current order, for the Swift settings UI. */
+    fun lyricsSourceCatalogJson(): String {
+        val enabled = lyricsSourcesSet()
+        return lyricsSourceOrderList().joinToString(",", prefix = "[", postfix = "]") { src ->
+            """{"name":"${src.name}","label":${jsonString(src.label)},"detail":${jsonString(src.detail)},"wordSynced":${src.wordSynced},"enabled":${src in enabled}}"""
+        }
+    }
+
+    fun resetLyricsSourceSettings() {
+        setLyricsSources(defaultLyricsSourcesJoined())
+        setLyricsSourceOrder(defaultLyricsSourcesJoined())
+        setPrioritizeSyllableSync(false)
     }
 
     private val _audioCacheLimitBytes = MutableStateFlow(
@@ -364,6 +390,69 @@ object AppSettings {
         settings.putBoolean("discord_swap_title", value)
     }
 
+    private val _discordUseDetails = MutableStateFlow(settings.getBoolean("discord_use_details", false))
+    val discordUseDetails: StateFlow<Boolean> = _discordUseDetails.asStateFlow()
+    fun setDiscordUseDetails(value: Boolean) {
+        _discordUseDetails.value = value
+        settings.putBoolean("discord_use_details", value)
+    }
+
+    private val _discordAdvancedMode = MutableStateFlow(settings.getBoolean("discord_advanced_mode", false))
+    val discordAdvancedMode: StateFlow<Boolean> = _discordAdvancedMode.asStateFlow()
+    fun setDiscordAdvancedMode(value: Boolean) {
+        _discordAdvancedMode.value = value
+        settings.putBoolean("discord_advanced_mode", value)
+    }
+
+    private val _discordButton1Text = MutableStateFlow(settings.getString("discord_button_1_text", ""))
+    val discordButton1Text: StateFlow<String> = _discordButton1Text.asStateFlow()
+    fun setDiscordButton1Text(value: String) {
+        _discordButton1Text.value = value
+        settings.putString("discord_button_1_text", value)
+    }
+
+    private val _discordButton1Visible = MutableStateFlow(settings.getBoolean("discord_button_1_visible", true))
+    val discordButton1Visible: StateFlow<Boolean> = _discordButton1Visible.asStateFlow()
+    fun setDiscordButton1Visible(value: Boolean) {
+        _discordButton1Visible.value = value
+        settings.putBoolean("discord_button_1_visible", value)
+    }
+
+    private val _discordButton2Text = MutableStateFlow(settings.getString("discord_button_2_text", ""))
+    val discordButton2Text: StateFlow<String> = _discordButton2Text.asStateFlow()
+    fun setDiscordButton2Text(value: String) {
+        _discordButton2Text.value = value
+        settings.putString("discord_button_2_text", value)
+    }
+
+    private val _discordButton2Visible = MutableStateFlow(settings.getBoolean("discord_button_2_visible", true))
+    val discordButton2Visible: StateFlow<Boolean> = _discordButton2Visible.asStateFlow()
+    fun setDiscordButton2Visible(value: Boolean) {
+        _discordButton2Visible.value = value
+        settings.putBoolean("discord_button_2_visible", value)
+    }
+
+    private val _discordInfoDismissed = MutableStateFlow(settings.getBoolean("discord_info_dismissed", false))
+    val discordInfoDismissed: StateFlow<Boolean> = _discordInfoDismissed.asStateFlow()
+    fun setDiscordInfoDismissed(value: Boolean) {
+        _discordInfoDismissed.value = value
+        settings.putBoolean("discord_info_dismissed", value)
+    }
+
+    private val _discordName = MutableStateFlow(settings.getString("discord_name", ""))
+    val discordName: StateFlow<String> = _discordName.asStateFlow()
+    fun setDiscordName(value: String) {
+        _discordName.value = value.trim()
+        settings.putString("discord_name", _discordName.value)
+    }
+
+    private val _discordAvatar = MutableStateFlow(settings.getString("discord_avatar", ""))
+    val discordAvatar: StateFlow<String> = _discordAvatar.asStateFlow()
+    fun setDiscordAvatar(value: String) {
+        _discordAvatar.value = value.trim()
+        settings.putString("discord_avatar", _discordAvatar.value)
+    }
+
     private val _scrobbleMinDuration = MutableStateFlow(settings.getInt("scrobble_min_duration", 30))
     val scrobbleMinDuration: StateFlow<Int> = _scrobbleMinDuration.asStateFlow()
     fun setScrobbleMinDuration(value: Int) {
@@ -392,13 +481,19 @@ object AppSettings {
         settings.putString("pinned_playlists", value)
     }
 
-    fun togglePinnedPlaylist(browseId: String) {
-        val ids = _pinnedPlaylists.value.split(',').map { it.trim() }.filter { it.isNotEmpty() }.toMutableList()
-        if (browseId in ids) ids.remove(browseId) else {
-            if (ids.size >= 5) ids.removeAt(ids.lastIndex)
-            ids.add(0, browseId)
+    /**
+     * Pins or unpins [browseId], returning whether it is pinned afterwards.
+     * Pinning past [MAX_PINNED_PLAYLISTS] is refused rather than evicting.
+     */
+    fun togglePinnedPlaylist(browseId: String): Boolean {
+        val ids = _pinnedPlaylists.value.split(',').map { it.trim() }.filter { it.isNotEmpty() }
+        val updated = when {
+            browseId in ids -> ids - browseId
+            ids.size >= MAX_PINNED_PLAYLISTS -> return false
+            else -> ids + browseId
         }
-        setPinnedPlaylists(ids.joinToString(","))
+        setPinnedPlaylists(updated.joinToString(","))
+        return browseId in updated
     }
 
     private val _spotifySpdc = MutableStateFlow(settings.getString("spotify_spdc_token", ""))
@@ -422,7 +517,7 @@ object AppSettings {
         settings.putBoolean("stop_when_backgrounded", value)
     }
 
-    private val _prioritizeSyllableSync = MutableStateFlow(settings.getBoolean("prioritize_syllable_sync", true))
+    private val _prioritizeSyllableSync = MutableStateFlow(settings.getBoolean("prioritize_syllable_sync", false))
     val prioritizeSyllableSync: StateFlow<Boolean> = _prioritizeSyllableSync.asStateFlow()
     fun setPrioritizeSyllableSync(value: Boolean) {
         _prioritizeSyllableSync.value = value
@@ -449,11 +544,15 @@ object AppSettings {
             "download_quality", "wifi_only_downloads", "show_nerd_stats", "animated_canvas",
             "canvas_over_cellular", "theme_mode", "reduce_dynamic_blur", "reduce_animation",
             "full_bleed_artwork", "synced_lyrics", "convert_video_to_audio", "swipe_to_play_next",
-            "dont_repeat_suggestions", "hide_volume_bar", "lyrics_sources", "audio_cache_limit_bytes",
+            "dont_repeat_suggestions", "hide_volume_bar", "lyrics_sources", "lyrics_source_order",
+            "audio_cache_limit_bytes",
             "eq_gains", "pinned_playlists", "jiosaavn_enabled", "stop_when_backgrounded",
             "prioritize_syllable_sync", "replay_genres", "scrobble_min_duration", "scrobble_delay_percent",
             "scrobble_delay_seconds", "discord_rpc_enabled", "discord_status",
             "discord_activity_type", "discord_activity_name", "discord_swap_title",
+            "discord_use_details", "discord_advanced_mode", "discord_button_1_text",
+            "discord_button_1_visible", "discord_button_2_text", "discord_button_2_visible",
+            "discord_info_dismissed", "discord_name", "discord_avatar",
         )
         val parts = keys.map { key ->
             val value = when (key) {
@@ -467,7 +566,13 @@ object AppSettings {
                 "convert_video_to_audio", "swipe_to_play_next", "dont_repeat_suggestions",
                 "hide_volume_bar", "jiosaavn_enabled", "stop_when_backgrounded",
                 "prioritize_syllable_sync", "replay_genres", "discord_rpc_enabled", "discord_swap_title",
-                -> settings.getBoolean(key, false).toString()
+                "discord_use_details", "discord_advanced_mode", "discord_info_dismissed",
+                "discord_button_1_visible", "discord_button_2_visible",
+                -> when (key) {
+                    "discord_button_1_visible", "discord_button_2_visible" ->
+                        settings.getBoolean(key, true).toString()
+                    else -> settings.getBoolean(key, false).toString()
+                }
                 else -> settings.getString(key, "")
             }
             "\"$key\":${jsonString(value)}"
@@ -509,6 +614,7 @@ object AppSettings {
                 "dont_repeat_suggestions" -> setDontRepeatSuggestions(value.toBoolean())
                 "hide_volume_bar" -> setHideVolumeBar(value.toBoolean())
                 "lyrics_sources" -> setLyricsSources(value)
+                "lyrics_source_order" -> setLyricsSourceOrder(value)
                 "audio_cache_limit_bytes" -> setAudioCacheLimitBytes(value.toLongOrNull() ?: DEFAULT_CACHE_LIMIT_BYTES)
                 "eq_gains" -> setEqGains(value)
                 "pinned_playlists" -> setPinnedPlaylists(value)
@@ -524,6 +630,15 @@ object AppSettings {
                 "discord_activity_type" -> setDiscordActivityType(value)
                 "discord_activity_name" -> setDiscordActivityName(value)
                 "discord_swap_title" -> setDiscordSwapTitle(value.toBoolean())
+                "discord_use_details" -> setDiscordUseDetails(value.toBoolean())
+                "discord_advanced_mode" -> setDiscordAdvancedMode(value.toBoolean())
+                "discord_button_1_text" -> setDiscordButton1Text(value)
+                "discord_button_1_visible" -> setDiscordButton1Visible(value.toBoolean())
+                "discord_button_2_text" -> setDiscordButton2Text(value)
+                "discord_button_2_visible" -> setDiscordButton2Visible(value.toBoolean())
+                "discord_info_dismissed" -> setDiscordInfoDismissed(value.toBoolean())
+                "discord_name" -> setDiscordName(value)
+                "discord_avatar" -> setDiscordAvatar(value)
             }
         }
     }
@@ -536,4 +651,47 @@ object AppSettings {
 
     const val DEFAULT_CACHE_LIMIT_BYTES = 512L * 1024 * 1024
     const val MAX_CACHE_LIMIT_BYTES = 10L * 1024 * 1024 * 1024
+    const val MAX_PINNED_PLAYLISTS = 5
+
+    private const val OLD_LYRICS_DEFAULT = "BETTER,PLUS,SIMP,LRCLIB"
+
+    private fun defaultLyricsSourcesJoined(): String =
+        LyricsSource.entries.joinToString(",") { it.name }
+
+    private fun readLyricsSourcesPref(): String {
+        val stored = settings.getString("lyrics_sources", defaultLyricsSourcesJoined())
+        if (stored == OLD_LYRICS_DEFAULT) {
+            val all = defaultLyricsSourcesJoined()
+            settings.putString("lyrics_sources", all)
+            return all
+        }
+        val migrated = persistLyricsSources(stored)
+        if (migrated != stored && stored.isNotEmpty()) settings.putString("lyrics_sources", migrated)
+        return migrated.ifEmpty { stored }
+    }
+
+    private fun readLyricsSourceOrderPref(): String {
+        val stored = settings.getString("lyrics_source_order", defaultLyricsSourcesJoined())
+        val migrated = persistLyricsSourceOrder(stored)
+        if (migrated != stored) settings.putString("lyrics_source_order", migrated)
+        return migrated
+    }
+
+    private fun persistLyricsSources(raw: String): String =
+        parseLyricsSources(raw).joinToString(",") { it.name }
+
+    private fun persistLyricsSourceOrder(raw: String): String =
+        parseLyricsSourceOrder(raw).joinToString(",") { it.name }
+
+    private fun parseLyricsSources(raw: String): Set<LyricsSource> {
+        if (raw.isBlank()) return emptySet()
+        if (raw == OLD_LYRICS_DEFAULT) return LyricsSource.entries.toSet()
+        return raw.split(",").mapNotNull { LyricsSource.fromName(it) }.toSet()
+    }
+
+    private fun parseLyricsSourceOrder(raw: String): List<LyricsSource> {
+        if (raw.isBlank() || raw == OLD_LYRICS_DEFAULT) return LyricsSource.entries
+        val saved = raw.split(",").mapNotNull { LyricsSource.fromName(it) }
+        return saved + LyricsSource.entries.filter { it !in saved }
+    }
 }

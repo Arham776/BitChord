@@ -13,7 +13,9 @@ import BitChordShared
 @MainActor
 final class NowPlayingController {
     private var artwork: MPMediaItemArtwork?
-    private var lastURL: String?
+    /// URL that `artwork` was built from — not the in-flight request.
+    private var artworkURL: String?
+    private var lastRequestedURL: String?
     private var handlers: [Any] = []
 
     init() {
@@ -62,10 +64,21 @@ final class NowPlayingController {
             MPMediaItemPropertyPlaybackDuration: duration,
             MPNowPlayingInfoPropertyPlaybackRate: isPlaying ? Double(PlatformSettings.shared.getFloat(key: "playback_speed", default: 1)) : 0.0,
         ]
-        if let artwork = resolvedArtwork(data: artworkData, url: thumbnailUrl) {
+        if let item = artworkFromBytes(artworkData) {
+            info[MPMediaItemPropertyArtwork] = item
+            artworkURL = thumbnailUrl
+            lastRequestedURL = thumbnailUrl
+        } else if let artwork, artworkURL == thumbnailUrl {
             info[MPMediaItemPropertyArtwork] = artwork
         }
         MPNowPlayingInfoCenter.default().nowPlayingInfo = info
+        if let thumbnailUrl, !thumbnailUrl.isEmpty, artworkData == nil,
+           artworkURL != thumbnailUrl, lastRequestedURL != thumbnailUrl {
+            fetchArtwork(
+                url: thumbnailUrl, title: title, artist: artist,
+                duration: duration, isPlaying: isPlaying
+            )
+        }
     }
 
     func update(position: Double) {
@@ -80,21 +93,17 @@ final class NowPlayingController {
         MPNowPlayingInfoCenter.default().nowPlayingInfo = info
     }
 
-    private func resolvedArtwork(data: Data?, url: String?) -> MPMediaItemArtwork? {
-        // Never fetch remote URLs here — `Data(contentsOf:)` on the main thread
-        // triggers the sync-loading warning. Embedded bytes or a prior cache hit
-        // only; ArtworkView loads thumbnails asynchronously for the UI.
+    private func artworkFromBytes(_ data: Data?) -> MPMediaItemArtwork? {
+        guard let data else { return nil }
 #if os(iOS)
-        guard let data, let image = UIImage(data: data) else { return artwork }
+        guard let image = UIImage(data: data) else { return nil }
         let size = image.size
-        lastURL = url
         let item = MPMediaItemArtwork(boundsSize: size) { _ in image }
         artwork = item
         return item
 #else
-        guard let data, let image = NSImage(data: data) else { return artwork }
+        guard let image = NSImage(data: data) else { return nil }
         let size = image.size
-        lastURL = url
         let item = MPMediaItemArtwork(boundsSize: size) { requested in
             let canvas = NSImage(size: requested)
             canvas.lockFocus()
@@ -105,6 +114,34 @@ final class NowPlayingController {
         artwork = item
         return item
 #endif
+    }
+
+    /// Fetch the thumbnail off-main, then publish it. `lastRequestedURL` is
+    /// the in-flight cache key so a later track cannot land artwork on this one.
+    private func fetchArtwork(
+        url: String, title: String, artist: String, duration: Double, isPlaying: Bool
+    ) {
+        lastRequestedURL = url
+        let sized = SharedArtwork.sized(url, 544) ?? url
+        Task.detached(priority: .utility) { [weak self] in
+            guard let remote = URL(string: sized),
+                  let (data, _) = try? await URLSession.shared.data(from: remote),
+                  !data.isEmpty else { return }
+            await MainActor.run { [weak self] in
+                guard let self, self.lastRequestedURL == url else { return }
+                guard let item = self.artworkFromBytes(data) else { return }
+                self.artworkURL = url
+                var info = MPNowPlayingInfoCenter.default().nowPlayingInfo ?? [:]
+                info[MPMediaItemPropertyTitle] = title
+                info[MPMediaItemPropertyArtist] = artist
+                info[MPMediaItemPropertyPlaybackDuration] = duration
+                info[MPMediaItemPropertyArtwork] = item
+                info[MPNowPlayingInfoPropertyPlaybackRate] = isPlaying
+                    ? Double(PlatformSettings.shared.getFloat(key: "playback_speed", default: 1))
+                    : 0.0
+                MPNowPlayingInfoCenter.default().nowPlayingInfo = info
+            }
+        }
     }
 }
 
@@ -118,20 +155,18 @@ final class NowPlayingController {
 final class WidgetStatePublisher {
     func publish(entry: QueueEntry?, isPlaying: Bool, canNext: Bool, canPrevious: Bool) {
         guard let entry else { return }
-        #if DEBUG
-        // Dev builds carry no provisioning for the App Group, and cfprefsd
-        // hangs indefinitely on writes to an unprovisioned suite — skip
-        // publishing entirely (the widget renders its placeholder).
-        return
-        #else
+        let group = "group.com.example.bitchord"
+        // Unprovisioned App Groups hang cfprefsd on write — skip when the
+        // container is missing rather than compiling DEBUG out entirely.
+        guard FileManager.default.containerURL(
+            forSecurityApplicationGroupIdentifier: group
+        ) != nil else { return }
         let title = entry.title
         let artist = entry.artist
         let artwork = entry.artworkData
         let artworkURL = Self.artworkFileURL()
         DispatchQueue.global(qos: .utility).async {
-            guard let defaults = UserDefaults(suiteName: "group.com.example.bitchord") else {
-                return
-            }
+            guard let defaults = UserDefaults(suiteName: group) else { return }
             defaults.set(title, forKey: "widget.title")
             defaults.set(artist, forKey: "widget.artist")
             defaults.set(isPlaying, forKey: "widget.playing")
@@ -146,7 +181,6 @@ final class WidgetStatePublisher {
                 defaults.removeObject(forKey: "widget.artworkPath")
             }
         }
-        #endif
     }
 
     nonisolated private static func artworkFileURL() -> URL? {

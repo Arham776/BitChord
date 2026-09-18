@@ -51,10 +51,12 @@ struct NowPlayingView: View {
                         .allowsHitTesting(false)
                     HStack(spacing: 8) {
                         GlassCircleButton(icon: .bchLyrics, selected: pane == .lyrics) {
+                            Haptics.play(.expand)
                             pane = .lyrics
                         }
                         .help("Lyrics")
                         GlassCircleButton(system: "list.bullet", selected: pane == .queue) {
+                            Haptics.play(.expand)
                             pane = .queue
                         }
                         .help("Up Next")
@@ -157,11 +159,16 @@ struct NowPlayingView: View {
 
             positionControls
             playerTransport
-            if PlatformSettings.shared.getBoolean(key: "show_nerd_stats", default: false),
-               let nerd = controller.nerd, !nerd.codec.isEmpty {
-                Text(nerdLine(nerd))
-                    .font(.caption2.monospaced())
-                    .foregroundStyle(.white.opacity(0.7))
+            if PlatformSettings.shared.getBoolean(key: "show_nerd_stats", default: false) {
+                if let nerd = controller.nerd, !nerd.codec.isEmpty {
+                    Text(nerdLine(nerd))
+                        .font(.caption2.monospaced())
+                        .foregroundStyle(.white.opacity(0.7))
+                } else if controller.racingLossless {
+                    Text("Upgrading Quality")
+                        .font(.caption2.monospaced())
+                        .foregroundStyle(.white.opacity(0.7))
+                }
             }
             Spacer(minLength: 12)
             }
@@ -179,6 +186,7 @@ struct NowPlayingView: View {
                     loading: controller.lyricsLoading,
                     position: controller.position,
                     hasTrack: controller.current != nil,
+                    sourceLabel: controller.lyricsSourceLabel,
                     onSeek: { controller.seek(to: $0) }
                 )
             case .queue:
@@ -229,11 +237,16 @@ struct NowPlayingView: View {
                         }
                         positionControls
                             .padding(.horizontal, 32)
-                        if PlatformSettings.shared.getBoolean(key: "show_nerd_stats", default: false),
-                           let nerd = controller.nerd, !nerd.codec.isEmpty {
-                            Text(nerdLine(nerd))
-                                .font(.caption2.monospaced())
-                                .foregroundStyle(.white.opacity(0.7))
+                        if PlatformSettings.shared.getBoolean(key: "show_nerd_stats", default: false) {
+                            if let nerd = controller.nerd, !nerd.codec.isEmpty {
+                                Text(nerdLine(nerd))
+                                    .font(.caption2.monospaced())
+                                    .foregroundStyle(.white.opacity(0.7))
+                            } else if controller.racingLossless {
+                                Text("Upgrading Quality")
+                                    .font(.caption2.monospaced())
+                                    .foregroundStyle(.white.opacity(0.7))
+                            }
                         }
                         playerTransport
                         Group {
@@ -244,6 +257,7 @@ struct NowPlayingView: View {
                                     loading: controller.lyricsLoading,
                                     position: controller.position,
                                     hasTrack: controller.current != nil,
+                                    sourceLabel: controller.lyricsSourceLabel,
                                     onSeek: { controller.seek(to: $0) }
                                 )
                             case .queue:
@@ -263,9 +277,11 @@ struct NowPlayingView: View {
                             }
                         }
                         GlassCircleButton(icon: .bchLyrics, selected: pane == .lyrics) {
+                            Haptics.play(.expand)
                             pane = .lyrics
                         }
                         GlassCircleButton(system: "list.bullet", selected: pane == .queue) {
+                            Haptics.play(.expand)
                             pane = .queue
                         }
                         moreMenu
@@ -303,7 +319,11 @@ struct NowPlayingView: View {
         VStack(spacing: 6) {
             ThinSlider(
                 value: controller.position,
-                maximum: controller.duration
+                maximum: controller.duration,
+                mixing: controller.smartMixInProgress,
+                transitionWindow: controller.smartTransitionWindow.flatMap { w in
+                    w.end > w.start ? w.start...w.end : nil
+                }
             ) { controller.seek(to: $0) }
             .tint(.white)
 
@@ -328,6 +348,7 @@ struct NowPlayingView: View {
     private var playerTransport: some View {
         HStack(spacing: 28) {
             Button {
+                Haptics.play(controller.shuffleEnabled ? .toggleOff : .toggleOn)
                 controller.toggleShuffle()
             } label: {
                 Image(.bchShuffle)
@@ -341,6 +362,7 @@ struct NowPlayingView: View {
             .help(controller.shuffleEnabled ? "Shuffle on" : "Shuffle off")
 
             Button {
+                Haptics.play(.skipPrevious)
                 controller.previous()
             } label: {
                 Image(systemName: "backward.fill")
@@ -351,6 +373,7 @@ struct NowPlayingView: View {
             .disabled(!controller.canPlayPrevious)
 
             Button {
+                Haptics.play(controller.isPlaying ? .pause : .resume)
                 controller.togglePlayPause()
             } label: {
                 ZStack {
@@ -375,6 +398,7 @@ struct NowPlayingView: View {
             .help(controller.isPlaying ? "Pause" : "Play")
 
             Button {
+                Haptics.play(.skipNext)
                 controller.next()
             } label: {
                 Image(systemName: "forward.fill")
@@ -385,6 +409,7 @@ struct NowPlayingView: View {
             .disabled(!controller.canPlayNext)
 
             Button {
+                Haptics.play(.select)
                 controller.cycleRepeat()
             } label: {
                 RepeatGlyph(mode: controller.repeatMode, size: 18)
@@ -400,18 +425,9 @@ struct NowPlayingView: View {
     private var moreMenu: some View {
         Menu {
             if let current = controller.current {
-                SongActionButtons(entry: current)
+                SongActionButtons(entry: current, showSleepTimer: true, showDebugLog: true)
                 Divider()
             }
-            Button("Sleep 15 min") { controller.startSleep(minutes: 15) }
-            Button("Sleep 30 min") { controller.startSleep(minutes: 30) }
-            Button("Sleep 45 min") { controller.startSleep(minutes: 45) }
-            Button("Sleep 60 min") { controller.startSleep(minutes: 60) }
-            Button("Stop after this track") { controller.startSleepAfterTrack() }
-            if controller.sleepUntil != nil || controller.sleepAfterTrack {
-                Button("Cancel timer", role: .destructive) { controller.cancelSleep() }
-            }
-            Divider()
             Button("Download") { controller.downloadCurrent() }
         } label: {
             Image(systemName: "ellipsis")
@@ -441,6 +457,19 @@ struct NowPlayingView: View {
         if nerd.bitDepth > 0 { parts.append("\(nerd.bitDepth)-bit") }
         if nerd.sampleRate > 0 { parts.append("\(nerd.sampleRate) Hz") }
         if nerd.channels > 0 { parts.append("\(nerd.channels) ch") }
+        if let current = controller.current {
+            if current.isLocal {
+                parts.append("Local")
+            } else if current.source.hasPrefix("yt:") {
+                parts.append("YouTube")
+            } else if !current.source.isEmpty {
+                parts.append(current.source)
+            }
+        }
+        if controller.racingLossless { parts.append("Upgrading Quality") }
+        if let tier = controller.analysisTier, !tier.isEmpty { parts.append(tier) }
+        if let conf = controller.analysisConfidence { parts.append(String(format: "%.0f%% mix", conf * 100)) }
+        if controller.smartMixInProgress { parts.append("Automix") }
         return parts.joined(separator: " · ")
     }
 }
@@ -480,21 +509,28 @@ private extension View {
     }
 }
 
-/// Music's Up Next column: AutoPlay / AutoMix pills, then the remaining queue.
+/// Music's Up Next column: AutoPlay / AutoMix pills, then upcoming rows split
+/// into manual vs AutoPlay — a drag never crosses that boundary.
 private struct UpNextPane: View {
     @Environment(PlaybackController.self) private var controller
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 16) {
+        VStack(alignment: .leading, spacing: 12) {
             HStack(spacing: 8) {
                 autoPill(
                     title: "AutoPlay",
                     on: controller.autoplayEnabled
-                ) { controller.toggleAutoplay() }
+                ) {
+                    Haptics.play(controller.autoplayEnabled ? .toggleOff : .toggleOn)
+                    controller.toggleAutoplay()
+                }
                 autoPill(
                     title: "AutoMix",
                     on: controller.automixEnabled
-                ) { controller.toggleAutomix() }
+                ) {
+                    Haptics.play(controller.automixEnabled ? .toggleOff : .toggleOn)
+                    controller.toggleAutomix()
+                }
                 Spacer(minLength: 0)
             }
 
@@ -508,7 +544,7 @@ private struct UpNextPane: View {
                         .foregroundStyle(.white.opacity(0.6))
                 }
                 Spacer()
-                if upcoming.count > 0 {
+                if !manualUpcoming.isEmpty || !autoplayUpcoming.isEmpty {
                     Button("Clear") { controller.clearUpcoming() }
                         .buttonStyle(.plain)
                         .font(.callout.weight(.semibold))
@@ -516,65 +552,156 @@ private struct UpNextPane: View {
                 }
             }
 
-            if upcoming.isEmpty {
+            if manualUpcoming.isEmpty && autoplayUpcoming.isEmpty {
                 Text("Nothing else queued. Turn on AutoPlay to keep the music going.")
                     .font(.callout)
                     .foregroundStyle(.white.opacity(0.55))
                     .padding(.top, 8)
                 Spacer()
             } else {
-                ScrollView {
-                    LazyVStack(spacing: 2) {
-                        ForEach(upcoming, id: \.entry.id) { item in
-                            Button {
-                                controller.playQueueItem(at: item.index)
-                            } label: {
-                                HStack(spacing: 12) {
-                                    ArtworkView(entry: item.entry, side: 40)
-                                        .clipShape(.rect(cornerRadius: 6, style: .continuous))
-                                    VStack(alignment: .leading, spacing: 2) {
-                                        Text(item.entry.title)
-                                            .font(.body.weight(.medium))
-                                            .foregroundStyle(.white)
-                                            .lineLimit(1)
-                                        Text(item.entry.artist)
-                                            .font(.caption)
-                                            .foregroundStyle(.white.opacity(0.65))
-                                            .lineLimit(1)
-                                    }
-                                    Spacer(minLength: 0)
+                List {
+                    if !manualUpcoming.isEmpty {
+                        ForEach(manualUpcoming) { item in
+                            queueRow(item)
+                        }
+                        .onMove { source, dest in
+                            move(source, dest, rows: manualUpcoming)
+                        }
+                        .onDelete { offsets in
+                            remove(offsets, rows: manualUpcoming)
+                        }
+                    }
+                    if showAutoplayHeading {
+                        Section {
+                            if autoplayUpcoming.isEmpty {
+                                Text("Similar music will keep playing")
+                                    .font(.caption)
+                                    .foregroundStyle(.white.opacity(0.55))
+                                    .listRowBackground(Color.clear)
+                                    .listRowSeparator(.hidden)
+                            } else {
+                                ForEach(autoplayUpcoming) { item in
+                                    queueRow(item)
                                 }
-                                .padding(.vertical, 6)
-                                .padding(.horizontal, 6)
-                                .contentShape(.rect)
+                                .onMove { source, dest in
+                                    move(source, dest, rows: autoplayUpcoming)
+                                }
+                                .onDelete { offsets in
+                                    remove(offsets, rows: autoplayUpcoming)
+                                }
                             }
-                            .buttonStyle(.plain)
-                            .contextMenu {
-                                Button("Play") { controller.playQueueItem(at: item.index) }
-                                Button("Remove from Queue") {
-                                    controller.removeFromQueue(at: IndexSet(integer: item.index))
+                        } header: {
+                            HStack(spacing: 8) {
+                                Image(.bchInfinity)
+                                    .resizable()
+                                    .scaledToFit()
+                                    .frame(width: 14, height: 14)
+                                    .foregroundStyle(.white.opacity(0.75))
+                                VStack(alignment: .leading, spacing: 1) {
+                                    Text("AutoPlay")
+                                        .font(.subheadline.weight(.semibold))
+                                        .foregroundStyle(.white)
+                                    Text(autoplayUpcoming.isEmpty
+                                         ? "Similar music will keep playing"
+                                         : "Similar music, picked to follow on")
+                                        .font(.caption)
+                                        .foregroundStyle(.white.opacity(0.55))
                                 }
                             }
                         }
                     }
                 }
+                .listStyle(.plain)
+                .scrollContentBackground(.hidden)
+                #if os(iOS)
+                .environment(\.editMode, .constant(.active))
+                #endif
             }
         }
         .padding(.top, 8)
     }
 
-    private var upcoming: [(index: Int, entry: QueueEntry)] {
-        controller.queue.enumerated().dropFirst(controller.playingIndex + 1).map { ($0.offset, $0.element) }
+    private var autoplayStart: Int { controller.autoplaySectionStart }
+
+    /// Upcoming manual rows — never includes AutoPlay, never the playing track.
+    private var manualUpcoming: [QueueRow] {
+        rows(in: controller.firstMovableQueueIndex..<autoplayStart)
+    }
+
+    private var autoplayUpcoming: [QueueRow] {
+        rows(in: autoplayStart..<controller.queue.count)
+    }
+
+    private var showAutoplayHeading: Bool {
+        controller.autoplayEnabled || !autoplayUpcoming.isEmpty
+    }
+
+    private func rows(in range: Range<Int>) -> [QueueRow] {
+        guard range.lowerBound < range.upperBound else { return [] }
+        return range.compactMap { index in
+            guard controller.queue.indices.contains(index) else { return nil }
+            return QueueRow(index: index, entry: controller.queue[index])
+        }
     }
 
     private var subtitle: String {
         let artist = controller.current?.artist ?? ""
-        if upcoming.contains(where: { $0.entry.fromAutoplay }) {
+        if !autoplayUpcoming.isEmpty {
             return artist.isEmpty ? "Similar artists" : "From \(artist) & Similar Artists"
         }
-        let n = upcoming.count
+        let n = manualUpcoming.count
         if n == 0 { return "Nothing queued" }
         return n == 1 ? "1 song" : "\(n) songs"
+    }
+
+    private func queueRow(_ item: QueueRow) -> some View {
+        Button {
+            controller.playQueueItem(at: item.index)
+        } label: {
+            HStack(spacing: 12) {
+                ArtworkView(entry: item.entry, side: 40)
+                    .clipShape(.rect(cornerRadius: 6, style: .continuous))
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(item.entry.title)
+                        .font(.body.weight(.medium))
+                        .foregroundStyle(.white)
+                        .lineLimit(1)
+                    Text(item.entry.artist)
+                        .font(.caption)
+                        .foregroundStyle(.white.opacity(0.65))
+                        .lineLimit(1)
+                }
+                Spacer(minLength: 0)
+            }
+            .contentShape(.rect)
+        }
+        .buttonStyle(.plain)
+        .listRowBackground(Color.white.opacity(0.04))
+        .listRowSeparator(.hidden)
+        .contextMenu {
+            Button("Play") { controller.playQueueItem(at: item.index) }
+            Button("Remove from Queue", role: .destructive) {
+                controller.removeFromQueue(at: IndexSet(integer: item.index))
+            }
+        }
+    }
+
+    private func move(_ source: IndexSet, _ dest: Int, rows: [QueueRow]) {
+        guard let fromLocal = source.first, rows.indices.contains(fromLocal) else { return }
+        let fromQueue = rows[fromLocal].index
+        let clampedDest = min(max(dest, 0), rows.count)
+        let toQueue: Int
+        if clampedDest >= rows.count {
+            toQueue = (rows.last?.index ?? fromQueue) + 1
+        } else {
+            toQueue = rows[clampedDest].index
+        }
+        controller.moveQueue(from: IndexSet(integer: fromQueue), to: toQueue)
+    }
+
+    private func remove(_ offsets: IndexSet, rows: [QueueRow]) {
+        let indices = IndexSet(offsets.compactMap { rows.indices.contains($0) ? rows[$0].index : nil })
+        controller.removeFromQueue(at: indices)
     }
 
     private func autoPill(title: String, on: Bool, action: @escaping () -> Void) -> some View {
@@ -595,6 +722,12 @@ private struct UpNextPane: View {
         .buttonStyle(.plain)
         .help(on ? "\(title) on" : "\(title) off")
     }
+}
+
+private struct QueueRow: Identifiable {
+    let index: Int
+    let entry: QueueEntry
+    var id: String { "\(index)-\(entry.id)" }
 }
 
 /// Square sleeve: still art, motion canvas cropped to fill, Apple Music pause
@@ -760,6 +893,7 @@ struct LyricsPane: View {
     var loading: Bool
     var position: Double
     var hasTrack: Bool
+    var sourceLabel: String? = nil
     var onSeek: ((Double) -> Void)? = nil
 
     private var activeIndex: Int {
@@ -782,37 +916,53 @@ struct LyricsPane: View {
                     .font(.title3)
                     .foregroundStyle(.white.opacity(0.6))
             } else {
-                ScrollViewReader { proxy in
-                    ScrollView {
-                        VStack(alignment: .leading, spacing: 18) {
-                            ForEach(Array(lines.enumerated()), id: \.offset) { index, line in
-                                WordSyncedLine(
-                                    line: line,
-                                    active: index == activeIndex,
-                                    distance: abs(index - activeIndex),
-                                    position: position
-                                )
-                                .id(index)
-                                .contentShape(.rect)
-                                .onTapGesture {
-                                    onSeek?(Double(line.timeMs) / 1000.0)
+                VStack(alignment: .leading, spacing: 10) {
+                    if let credit = attribution {
+                        Text(credit)
+                            .font(.caption.weight(.semibold))
+                            .foregroundStyle(.white.opacity(0.7))
+                            .padding(.horizontal, 14)
+                            .padding(.vertical, 6)
+                            .background(.white.opacity(0.10), in: Capsule())
+                            .padding(.horizontal, 12)
+                    }
+                    ScrollViewReader { proxy in
+                        ScrollView {
+                            VStack(alignment: .leading, spacing: 18) {
+                                ForEach(Array(lines.enumerated()), id: \.offset) { index, line in
+                                    WordSyncedLine(
+                                        line: line,
+                                        active: index == activeIndex,
+                                        distance: abs(index - activeIndex),
+                                        position: position
+                                    )
+                                    .id(index)
+                                    .contentShape(.rect)
+                                    .onTapGesture {
+                                        onSeek?(Double(line.timeMs) / 1000.0)
+                                    }
                                 }
                             }
+                            .padding(.horizontal, 12)
+                            .padding(.vertical, 20)
+                            .frame(maxWidth: .infinity, alignment: .leading)
                         }
-                        .padding(.horizontal, 12)
-                        .padding(.vertical, 20)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                    }
-                    .scrollIndicators(.never)
-                    .onChange(of: activeIndex) { _, index in
-                        withAnimation(.easeInOut(duration: 0.28)) {
-                            proxy.scrollTo(index, anchor: .center)
+                        .scrollIndicators(.never)
+                        .onChange(of: activeIndex) { _, index in
+                            withAnimation(.easeInOut(duration: 0.28)) {
+                                proxy.scrollTo(index, anchor: .center)
+                            }
                         }
                     }
                 }
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+
+    private var attribution: String? {
+        guard let sourceLabel, !sourceLabel.isEmpty else { return nil }
+        return "Lyrics by \(sourceLabel)"
     }
 }
 
@@ -823,37 +973,99 @@ private struct WordSyncedLine: View {
     let position: Double
 
     var body: some View {
-        Text(rendered)
-            .font(.title)
-            .multilineTextAlignment(.leading)
-            .fixedSize(horizontal: false, vertical: true)
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .shadow(color: active ? .black.opacity(0.35) : .clear, radius: 6, y: 1)
-            .animation(.easeInOut(duration: 0.2), value: active)
-            .animation(.easeInOut(duration: 0.12), value: Int(position * 10))
+        VStack(alignment: .leading, spacing: 4) {
+            Text(leadRendered)
+                .font(.title)
+                .multilineTextAlignment(.leading)
+                .fixedSize(horizontal: false, vertical: true)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .shadow(color: active ? .white.opacity(0.35) : .clear, radius: active ? 8 : 0, y: 0)
+                .scaleEffect(active ? 1.04 : 1, anchor: .leading)
+            if let backing = backingRendered {
+                Text(backing)
+                    .font(.title3)
+                    .multilineTextAlignment(.leading)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .opacity(0.45)
+            }
+        }
+        .animation(.easeInOut(duration: 0.2), value: active)
+        .animation(.easeInOut(duration: 0.12), value: Int(position * 10))
     }
 
-    private var rendered: AttributedString {
-        if line.words.isEmpty {
-            var s = AttributedString(line.text.isEmpty ? "♪" : line.text)
+    private var split: (lead: String, backing: String?) {
+        if let background = line.background, !background.text.isEmpty {
+            return (line.text, background.text)
+        }
+        return Self.splitBackground(line.text)
+    }
+
+    private var leadRendered: AttributedString {
+        render(text: split.lead, words: leadWords, glowing: active)
+    }
+
+    private var backingRendered: AttributedString? {
+        if let background = line.background, !background.text.isEmpty {
+            return render(text: background.text, words: background.words, glowing: false)
+        }
+        guard let backing = split.backing, !backing.isEmpty else { return nil }
+        return render(text: backing, words: backingWords, glowing: false)
+    }
+
+    private var leadWords: [LyricWordDto] {
+        if line.background != nil { return line.words }
+        return line.words.filter { !Self.isBackingToken($0.text) }
+    }
+
+    private var backingWords: [LyricWordDto] {
+        line.words.filter { Self.isBackingToken($0.text) }
+    }
+
+    private func render(text: String, words: [LyricWordDto], glowing: Bool) -> AttributedString {
+        if words.isEmpty {
+            var s = AttributedString(text.isEmpty ? "♪" : text)
             s.font = .title.weight(active ? .bold : .regular)
             s.foregroundColor = Color.white.opacity(active ? 1 : max(0.22, 0.55 - Double(distance) * 0.12))
             return s
         }
         let ms = Swift.Int64(position * 1000)
         var result = AttributedString()
-        for (i, word) in line.words.enumerated() {
-            var run = AttributedString(word.text)
+        for (i, word) in words.enumerated() {
+            var run = AttributedString(word.text.replacingOccurrences(of: "(", with: "").replacingOccurrences(of: ")", with: ""))
             let sung = ms >= word.startMs
             let current = sung && ms < word.endMs
             run.font = .title.weight(current ? .bold : .regular)
-            run.foregroundColor = Color.white.opacity(sung ? 1 : 0.38)
+            if glowing && current {
+                run.foregroundColor = Color.white
+                run.underlineStyle = .single
+            } else {
+                run.foregroundColor = Color.white.opacity(sung ? 1 : 0.38)
+            }
             result.append(run)
-            if i < line.words.count - 1 {
+            if i < words.count - 1 {
                 result.append(AttributedString(" "))
             }
         }
         return result
+    }
+
+    private static func isBackingToken(_ text: String) -> Bool {
+        let trimmed = text.trimmingCharacters(in: .whitespaces)
+        return trimmed.hasPrefix("(") || trimmed.hasSuffix(")")
+    }
+
+    /// Display-only split matching upstream `withBackgroundVocals`.
+    static func splitBackground(_ text: String) -> (lead: String, backing: String?) {
+        guard let open = text.firstIndex(of: "("), let close = text.lastIndex(of: ")"), close > open else {
+            return (text, nil)
+        }
+        let inner = text[text.index(after: open)..<close]
+            .trimmingCharacters(in: .whitespaces)
+        guard !inner.isEmpty else { return (text, nil) }
+        let lead = (text[..<open] + text[text.index(after: close)...])
+            .trimmingCharacters(in: .whitespaces)
+        return (lead.isEmpty ? "♪" : String(lead), String(inner))
     }
 }
 

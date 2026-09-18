@@ -1,4 +1,5 @@
 import SwiftUI
+import BitChordShared
 
 /// Detail page for an album / artist / playlist browseId.
 ///
@@ -25,6 +26,11 @@ struct DetailView: View {
     @Environment(AppModel.self) private var appModel
     @State private var renameTitle = ""
     @State private var renamePresented = false
+    @State private var privacy = "PRIVATE"
+    @State private var privacyPresented = false
+    @State private var canvasURL: URL?
+    @State private var canvasFallbackURL: URL?
+    @State private var pinned = false
 
     var body: some View {
         Group {
@@ -48,7 +54,16 @@ struct DetailView: View {
             }
             Button("Cancel", role: .cancel) {}
         }
-        .task { await load() }
+        .confirmationDialog("Playlist privacy", isPresented: $privacyPresented, titleVisibility: .visible) {
+            Button("Private") { Task { await setPrivacy("PRIVATE") } }
+            Button("Unlisted") { Task { await setPrivacy("UNLISTED") } }
+            Button("Public") { Task { await setPrivacy("PUBLIC") } }
+            Button("Cancel", role: .cancel) {}
+        }
+        .task {
+            pinned = PlaylistPinning.pinnedIds().contains(browseId)
+            await load()
+        }
     }
 
     private func loadedPage(_ page: DetailPageModel) -> some View {
@@ -112,6 +127,7 @@ struct DetailView: View {
         }
         .task(id: page.thumbnailUrl) {
             headerArt = await loadHeaderArt(page.thumbnailUrl)
+            await loadCanvas(page)
         }
     }
 
@@ -133,9 +149,15 @@ struct DetailView: View {
         let lines = headerLines(page)
         let artSide: CGFloat = kind(of: page) == .artist ? 180 : 200
         return HStack(alignment: .bottom, spacing: 24) {
-            ArtworkView(url: page.thumbnailUrl, data: headerArt, side: artSide)
-                .clipShape(.rect(cornerRadius: kind(of: page) == .artist ? artSide / 2 : 12, style: .continuous))
-                .shadow(color: .black.opacity(0.38), radius: 22, y: 10)
+            ZStack {
+                ArtworkView(url: page.thumbnailUrl, data: headerArt, side: artSide)
+                if let canvasURL {
+                    CanvasPlayer(url: canvasURL, fallbackURL: canvasFallbackURL, isPlaying: true)
+                }
+            }
+            .frame(width: artSide, height: artSide)
+            .clipShape(.rect(cornerRadius: kind(of: page) == .artist ? artSide / 2 : 12, style: .continuous))
+            .shadow(color: .black.opacity(0.38), radius: 22, y: 10)
 
             VStack(alignment: .leading, spacing: 6) {
                 Text(page.title.isEmpty ? initialTitle : page.title)
@@ -208,11 +230,27 @@ struct DetailView: View {
                         }
                         .buttonStyle(.bordered)
                         .disabled(saving)
+                        Button(pinned ? "Unpin" : "Pin") {
+                            if PlaylistPinning.toggle(browseId: browseId) {
+                                pinned.toggle()
+                            } else {
+                                appModel.pinLimitAlert = true
+                            }
+                        }
+                        .buttonStyle(.bordered)
                     }
                     if kind(of: page) == .playlist, page.playlistOwned == true {
                         Button("Rename Playlist…") {
                             renameTitle = page.title
                             renamePresented = true
+                        }
+                        .buttonStyle(.bordered)
+                        Button("Privacy: \(privacy.capitalized)") {
+                            privacyPresented = true
+                        }
+                        .buttonStyle(.bordered)
+                        Button("Remove Duplicates") {
+                            Task { await removeDuplicates(page) }
                         }
                         .buttonStyle(.bordered)
                     }
@@ -231,19 +269,54 @@ struct DetailView: View {
         let songs = page.songs.filter {
             filter.isEmpty || $0.title.localizedCaseInsensitiveContains(filter) || $0.artist.localizedCaseInsensitiveContains(filter)
         }
-        return LazyVStack(spacing: 0) {
-            ForEach(Array(songs.enumerated()), id: \.element.videoId) { index, song in
-                SongRow(
-                    entry: toEntry(song, fallbackArt: fallback),
-                    play: { controller.play(page.songs.map { toEntry($0, fallbackArt: fallback) }, at: page.songs.firstIndex(where: { $0.videoId == song.videoId }) ?? index) },
-                    playNext: { controller.playNext(toEntry(song, fallbackArt: fallback)) },
-                    addToQueue: { controller.addToQueue(toEntry(song, fallbackArt: fallback)) },
-                    playlistBrowseId: browseId,
-                    playlistOwned: page.playlistOwned == true
-                )
-                .onAppear {
-                    if song.videoId == songs.last?.videoId {
-                        Task { await loadMore() }
+        let owned = page.playlistOwned == true && filter.isEmpty
+        return Group {
+            if owned {
+                List {
+                    ForEach(Array(songs.enumerated()), id: \.offset) { index, song in
+                        SongRow(
+                            entry: toEntry(song, fallbackArt: fallback),
+                            play: { controller.play(page.songs.map { toEntry($0, fallbackArt: fallback) }, at: page.songs.firstIndex(where: { $0.videoId == song.videoId }) ?? index) },
+                            playNext: { controller.playNext(toEntry(song, fallbackArt: fallback)) },
+                            addToQueue: { controller.addToQueue(toEntry(song, fallbackArt: fallback)) },
+                            playlistBrowseId: browseId,
+                            playlistOwned: true
+                        )
+                        .listRowInsets(EdgeInsets(top: 2, leading: 0, bottom: 2, trailing: 0))
+                        .listRowBackground(Color.clear)
+                        .onAppear {
+                            if song.videoId == songs.last?.videoId {
+                                Task { await loadMore() }
+                            }
+                        }
+                    }
+                    .onMove { source, dest in
+                        Task { await reorder(from: source, to: dest) }
+                    }
+                }
+                .listStyle(.plain)
+                .scrollContentBackground(.hidden)
+                .scrollDisabled(true)
+                .frame(minHeight: CGFloat(max(songs.count, 1)) * 58)
+                #if os(iOS)
+                .environment(\.editMode, .constant(.active))
+                #endif
+            } else {
+                LazyVStack(spacing: 0) {
+                    ForEach(Array(songs.enumerated()), id: \.element.videoId) { index, song in
+                        SongRow(
+                            entry: toEntry(song, fallbackArt: fallback),
+                            play: { controller.play(page.songs.map { toEntry($0, fallbackArt: fallback) }, at: page.songs.firstIndex(where: { $0.videoId == song.videoId }) ?? index) },
+                            playNext: { controller.playNext(toEntry(song, fallbackArt: fallback)) },
+                            addToQueue: { controller.addToQueue(toEntry(song, fallbackArt: fallback)) },
+                            playlistBrowseId: browseId,
+                            playlistOwned: page.playlistOwned == true
+                        )
+                        .onAppear {
+                            if song.videoId == songs.last?.videoId {
+                                Task { await loadMore() }
+                            }
+                        }
                     }
                 }
             }
@@ -344,4 +417,67 @@ struct DetailView: View {
         }
         saving = false
     }
+
+    private func setPrivacy(_ value: String) async {
+        privacy = value
+        _ = await LibraryActions.setPlaylistPrivacy(playlistId: browseId, privacy: value)
+    }
+
+    private func removeDuplicates(_ page: DetailPageModel) async {
+        let pairs = page.songs.compactMap { song -> (setVideoId: String, videoId: String)? in
+            guard let setVideoId = song.setVideoId else { return nil }
+            return (setVideoId, song.videoId)
+        }
+        _ = await LibraryActions.removeDuplicates(playlistId: browseId, songs: pairs)
+        var seen = Set<String>()
+        var kept: [DetailPageModel.SongPayload] = []
+        for song in page.songs {
+            if seen.insert(song.videoId).inserted { kept.append(song) }
+        }
+        var next = page
+        next.songs = kept
+        self.page = next
+    }
+
+    private func reorder(from source: IndexSet, to dest: Int) async {
+        guard var page else { return }
+        page.songs.move(fromOffsets: source, toOffset: dest)
+        self.page = page
+        guard let from = source.first else { return }
+        let movedIndex = dest > from ? dest - 1 : dest
+        guard page.songs.indices.contains(movedIndex), let setVideoId = page.songs[movedIndex].setVideoId else { return }
+        let successor = page.songs.indices.contains(movedIndex + 1) ? page.songs[movedIndex + 1].setVideoId : nil
+        _ = await LibraryActions.movePlaylistItem(playlistId: browseId, setVideoId: setVideoId, successorSetVideoId: successor)
+    }
+
+    private func loadCanvas(_ page: DetailPageModel) async {
+        guard kind(of: page) == .album,
+              PlatformSettings.shared.getBoolean(key: "animated_canvas", default: true) else {
+            canvasURL = nil
+            canvasFallbackURL = nil
+            return
+        }
+        let credit = headerLines(page).credit.ifBlank { page.songs.first?.artist ?? "" }
+        let title = page.title
+        let json: String? = await withCheckedContinuation { cont in
+            CanvasBridge.shared.lookupAlbum(album: title, artist: credit, callback: DetailCanvasCB { cont.resume(returning: $0) })
+        }
+        guard let json, let data = json.data(using: .utf8),
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let url = (obj["url"] as? String).flatMap(URL.init(string:)) else { return }
+        canvasURL = url
+        canvasFallbackURL = (obj["fallbackUrl"] as? String).flatMap(URL.init(string:))
+    }
+}
+
+private extension String {
+    func ifBlank(_ fallback: () -> String) -> String {
+        trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? fallback() : self
+    }
+}
+
+private final class DetailCanvasCB: CanvasBridgeCanvasCallback {
+    let handler: (String?) -> Void
+    init(_ handler: @escaping (String?) -> Void) { self.handler = handler }
+    func onResult(json: String?) { handler(json) }
 }

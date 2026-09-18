@@ -129,6 +129,7 @@ struct ExploreView: View {
 struct LibraryView: View {
     @Environment(PlaybackController.self) private var controller
     @Environment(AuthController.self) private var auth
+    @Environment(AppModel.self) private var appModel
     @State private var local = LocalLibrary.shared
     @State private var section: Section = .songs
     /// When set (macOS sidebar `TabSection` rows), the picker is hidden and
@@ -272,12 +273,19 @@ struct LibraryView: View {
     private var songsList: some View {
         Group {
             if !local.scanned {
-                EmptyStateView(
-                    icon: Image(.bchLibrary),
-                    title: "Scan your music",
-                    subtitle: "Pick a folder — BitChord reads its tags, artwork and plays it with gapless and crossfade.",
-                    buttonTitle: "Choose Folder"
-                ) { pickFolder() }
+                VStack(spacing: 16) {
+                    if lockedSection == nil {
+                        ReplayBanner { appModel.replayPresented = true }
+                            .padding(.horizontal, 24)
+                    }
+                    EmptyStateView(
+                        icon: Image(.bchLibrary),
+                        title: "Scan your music",
+                        subtitle: "Pick a folder — BitChord reads its tags, artwork and plays it with gapless and crossfade.",
+                        buttonTitle: "Choose Folder"
+                    ) { pickFolder() }
+                }
+            } else if local.tracks.isEmpty {
             } else if local.tracks.isEmpty {
                 EmptyStateView(
                     icon: Image(.bchMusicNote),
@@ -522,25 +530,7 @@ private struct YoutubeLibraryView: View {
             } else {
                 ScrollView {
                     VStack(alignment: .leading, spacing: 28) {
-                        Button {
-                            appModel.replayPresented = true
-                        } label: {
-                            HStack {
-                                VStack(alignment: .leading) {
-                                    Text("Replay")
-                                        .font(.headline)
-                                    Text("Top songs, artists, albums and genres — counted on this device")
-                                        .font(.caption)
-                                        .foregroundStyle(.secondary)
-                                }
-                                Spacer()
-                                Image(systemName: "chevron.right")
-                                    .foregroundStyle(.tertiary)
-                            }
-                            .padding()
-                            .background(.quaternary.opacity(0.5), in: .rect(cornerRadius: 14, style: .continuous))
-                        }
-                        .buttonStyle(.plain)
+                        ReplayBanner { appModel.replayPresented = true }
                         Button("New Playlist") {
                             appModel.playlistPicker = PlaylistPickerRequest(videoId: "", title: "")
                         }

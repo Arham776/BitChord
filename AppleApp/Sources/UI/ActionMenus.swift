@@ -8,6 +8,8 @@ struct SongActionButtons: View {
     var playlistBrowseId: String? = nil
     var setVideoId: String? = nil
     var playlistOwned: Bool = false
+    var showSleepTimer: Bool = true
+    var showDebugLog: Bool = false
     @Environment(PlaybackController.self) private var controller
     @Environment(AuthController.self) private var auth
     @Environment(AppModel.self) private var appModel
@@ -54,6 +56,14 @@ struct SongActionButtons: View {
         }
         ShareLink(item: shareURL) {
             Label("Share", systemImage: "square.and.arrow.up")
+        }
+        if showSleepTimer {
+            SleepTimerMenu()
+        }
+        if showDebugLog {
+            Button("Copy Log") {
+                PlayerParity.copyToPasteboard(PlayerParity.debugLog(controller))
+            }
         }
     }
 
@@ -104,7 +114,14 @@ struct BrowseActionButtons: View {
                 let pinned = PlatformSettings.shared.getString(key: "pinned_playlists", default: "")
                     .split(separator: ",").map(String.init)
                 Button(pinned.contains(browseId) ? "Unpin" : "Pin") {
-                    AppSettings.shared.togglePinnedPlaylist(browseId: browseId)
+                    if !PlaylistPinning.toggle(browseId: browseId) {
+                        appModel.pinLimitAlert = true
+                    }
+                }
+                if browseId.hasPrefix("VL") || browseId.hasPrefix("PL") {
+                    Button("Rename Playlist…") {
+                        appModel.playlistRename = PlaylistRenameRequest(browseId: browseId, title: card.title)
+                    }
                 }
                 if browseId.hasPrefix("VL") || browseId.hasPrefix("MPRE") || browseId.hasPrefix("OLAK") {
                     Button("Save to Library") {
@@ -198,5 +215,52 @@ struct PlaylistPickerView: View {
         #if os(macOS)
         .frame(minWidth: 420, minHeight: 480)
         #endif
+    }
+}
+
+struct SleepTimerMenu: View {
+    @Environment(PlaybackController.self) private var controller
+
+    var body: some View {
+        Menu {
+            Button("Sleep 15 min") { controller.startSleep(minutes: 15) }
+            Button("Sleep 30 min") { controller.startSleep(minutes: 30) }
+            Button("Sleep 45 min") { controller.startSleep(minutes: 45) }
+            Button("Sleep 60 min") { controller.startSleep(minutes: 60) }
+            Button("Stop after this track") { controller.startSleepAfterTrack() }
+            if controller.sleepUntil != nil || controller.sleepAfterTrack {
+                Button("Cancel timer", role: .destructive) { controller.cancelSleep() }
+            }
+        } label: {
+            if let status = controller.sleepTimerStatus {
+                Label("Sleep timer · \(status)", systemImage: "moon.zzz")
+            } else {
+                Label("Sleep timer", systemImage: "moon.zzz")
+            }
+        }
+    }
+}
+
+struct PlaylistRenameRequest: Identifiable {
+    let id = UUID()
+    let browseId: String
+    let title: String
+}
+
+struct RenamePlaylistAlert: View {
+    @Environment(AppModel.self) private var appModel
+    @State private var title = ""
+
+    var body: some View {
+        TextField("Title", text: $title)
+            .onAppear { title = appModel.playlistRename?.title ?? "" }
+        Button("Save") {
+            if let req = appModel.playlistRename {
+                let name = title
+                Task { _ = await LibraryActions.renamePlaylist(playlistId: req.browseId, title: name) }
+            }
+            appModel.playlistRename = nil
+        }
+        Button("Cancel", role: .cancel) { appModel.playlistRename = nil }
     }
 }

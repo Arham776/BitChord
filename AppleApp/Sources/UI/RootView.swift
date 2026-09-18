@@ -10,6 +10,9 @@ struct RootView: View {
     @Environment(PlaybackController.self) private var controller
     @Environment(AppModel.self) private var appModel
     @Environment(AuthController.self) private var auth
+    #if os(macOS)
+    @Environment(\.openSettings) private var openSettings
+    #endif
     @State private var homeFeed = FeedLoader(.home)
     @State private var exploreFeed = FeedLoader(.explore)
     #if os(iOS)
@@ -78,6 +81,18 @@ struct RootView: View {
             .frame(minWidth: 720, minHeight: 640)
             #endif
         }
+        .alert("Only 5 playlists can be pinned", isPresented: Binding(
+            get: { appModel.pinLimitAlert },
+            set: { appModel.pinLimitAlert = $0 }
+        )) {
+            Button("OK", role: .cancel) {}
+        }
+        .alert("Rename Playlist", isPresented: Binding(
+            get: { appModel.playlistRename != nil },
+            set: { if !$0 { appModel.playlistRename = nil } }
+        )) {
+            RenamePlaylistAlert()
+        }
         .onChange(of: tabBinding.wrappedValue) { old, new in
             if new == .search { appModel.focusSearch = true }
             _ = old
@@ -85,6 +100,9 @@ struct RootView: View {
         #if os(iOS)
         .sheet(isPresented: $settingsPresented) {
             SettingsView()
+                .environment(controller)
+                .environment(appModel)
+                .environment(auth)
                 .id(settingsSession)
         }
         .onChange(of: settingsPresented) { _, presented in
@@ -227,6 +245,14 @@ struct RootView: View {
                         Image(systemName: "arrow.down.circle")
                     }
                     .help("Downloads")
+                }
+                ToolbarItem {
+                    Button {
+                        openSettings()
+                    } label: {
+                        Image(systemName: "gearshape")
+                    }
+                    .help("Settings")
                 }
             }
         }

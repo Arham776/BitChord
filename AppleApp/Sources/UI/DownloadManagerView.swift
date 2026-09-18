@@ -18,11 +18,19 @@ struct DownloadManagerView: View {
                                     Text(job.title)
                                     Text(label(job.status))
                                         .font(.caption)
-                                        .foregroundStyle(.secondary)
+                                        .foregroundStyle(job.status == .failed ? .red : .secondary)
+                                    if let message = job.message, job.status == .failed {
+                                        Text(message).font(.caption2).foregroundStyle(.red)
+                                    }
                                 }
                                 Spacer()
-                                if job.status == .failed {
+                                switch job.status {
+                                case .queued, .running:
+                                    Button("Cancel") { store.cancel(job.id) }
+                                case .failed:
                                     Button("Retry") { store.retry(job.id) }
+                                case .done:
+                                    EmptyView()
                                 }
                             }
                         }
@@ -40,6 +48,30 @@ struct DownloadManagerView: View {
                 }
             }
             .navigationTitle("Downloads")
+            .toolbar {
+                ToolbarItem(placement: .primaryAction) {
+                    if store.activeCount > 0 {
+                        Button("Cancel All") {
+                            for job in store.jobs where job.status == .queued || job.status == .running {
+                                store.cancel(job.id)
+                            }
+                        }
+                    } else if store.jobs.contains(where: { $0.status == .done || $0.status == .failed }) || !store.items.isEmpty {
+                        Menu("Clear") {
+                            if store.jobs.contains(where: { $0.status == .done || $0.status == .failed }) {
+                                Button("Clear finished & failed") {
+                                    store.jobs.removeAll { $0.status == .done || $0.status == .failed }
+                                }
+                            }
+                            if !store.items.isEmpty {
+                                Button("Clear downloads on this device", role: .destructive) {
+                                    store.clearDownloads()
+                                }
+                            }
+                        }
+                    }
+                }
+            }
             .onAppear { store.refresh() }
         }
         #if os(macOS)

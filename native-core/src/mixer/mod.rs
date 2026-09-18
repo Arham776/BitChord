@@ -87,9 +87,8 @@ pub struct TransitionPlan {
     /// Explicit fade length for this pair; 0 = engine's crossfade window.
     pub fade_seconds: f64,
     pub cue_seconds: f64,
-    /// Tempo stretch — applied upstream via `setPlaybackSpeed`. The engine has
-    /// no time-stretcher yet; reported so the UI can reflect it, playback-rate
-    /// matching lands with the analyzer milestone.
+    /// Tempo stretch — multiplied into the incoming voice's `speed_resampler`
+    /// at open (and kept across later `set_playback_speed` calls).
     pub playback_rate: f64,
 }
 
@@ -315,6 +314,8 @@ struct Voice {
     /// `MIN_SILENCE_US` to avoid.
     silent_dev_frames: u64,
     effective_speed: f32,
+    /// Automix tempo stretch; multiplied into `effective_speed`.
+    plan_rate: f64,
 }
 
 impl Voice {
@@ -379,17 +380,18 @@ impl Voice {
             skip_silence,
             silent_dev_frames: 0,
             effective_speed: effective,
+            plan_rate,
         })
     }
 
     fn set_playback_speed(&mut self, speed: f32, device_rate: u32) {
-        let speed = speed.clamp(0.5, 2.0);
-        if (speed - self.effective_speed).abs() < 0.001 {
+        let effective = (speed as f64 * self.plan_rate).clamp(0.5, 2.0) as f32;
+        if (effective - self.effective_speed).abs() < 0.001 {
             return;
         }
-        self.effective_speed = speed;
-        self.speed_l = speed_resampler(device_rate, speed);
-        self.speed_r = speed_resampler(device_rate, speed);
+        self.effective_speed = effective;
+        self.speed_l = speed_resampler(device_rate, effective);
+        self.speed_r = speed_resampler(device_rate, effective);
     }
 
     /// Rebuild post-decode DSP for a new DAC rate (AirPods connect/disconnect).

@@ -72,7 +72,8 @@ pub struct TransitionPlanRec {
     pub fade_seconds: f64,
     /// Where the incoming track is cued (Automix mix-in point). 0 = top.
     pub cue_seconds: f64,
-    /// Tempo stretch — reflected but not yet applied (no time-stretch engine).
+    /// Tempo stretch — applied by the mixer via `speed_resampler`
+    /// (ExoPlayer `setPlaybackSpeed` parity).
     pub playback_rate: f64,
 }
 

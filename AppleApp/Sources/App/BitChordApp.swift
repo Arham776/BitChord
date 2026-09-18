@@ -86,6 +86,8 @@ final class AppModel {
     var pendingSearchQuery: String?
     var themeMode = PlatformSettings.shared.getString(key: "theme_mode", default: "dark")
     var appLanguage = PlatformSettings.shared.getString(key: "app_language", default: "")
+    var pinLimitAlert = false
+    var playlistRename: PlaylistRenameRequest?
 
     var preferredScheme: ColorScheme? {
         switch themeMode {
