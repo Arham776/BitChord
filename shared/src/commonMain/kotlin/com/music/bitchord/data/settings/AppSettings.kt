@@ -1,15 +1,48 @@
 package com.music.bitchord.data.settings
 
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.stateIn
 import com.music.bitchord.data.lyrics.LyricsSource
 
+/**
+ * The stream ceiling for a connection, and — via [permits] — which sources that
+ * ceiling is willing to pay for.
+ *
+ * [LOSSLESS] is a rung rather than a boolean because it is a *stream* ceiling,
+ * distinct from [DownloadQuality]'s: a file saved to the device is paid for once
+ * and kept forever, whereas a stream is bytes spent again on every replay. The
+ * two therefore have independent settings, and conflating them is what made the
+ * port unable to express "lossless when I'm on Wi-Fi" at all.
+ */
 enum class AudioQuality(val maxKbps: Int, val label: String) {
     LOW(64, "Low"),
     MEDIUM(128, "Medium"),
     HIGH(Int.MAX_VALUE, "High"),
+    LOSSLESS(Int.MAX_VALUE, "Lossless"),
     ;
+
+    /**
+     * Whether a source of this kind is worth asking at this ceiling.
+     *
+     * The mechanism that decides which sources may answer before YouTube on a
+     * given connection, and it is a property of the *ceiling* rather than of the
+     * source: at [LOW] and [MEDIUM] there is no point asking an addon to search
+     * its catalogue for a FLAC, because the answer would be transcoded down to
+     * something JioSaavn already has, and the search is the expensive part. At
+     * [HIGH] the addon is worth a look; at [LOSSLESS] it is the only thing that
+     * can answer at all.
+     */
+    fun permits(kind: com.music.bitchord.data.sources.SourceKind): Boolean = when (this) {
+        LOW, MEDIUM -> !kind.canServeLossless
+        HIGH, LOSSLESS -> true
+    }
 
     companion object {
         fun fromName(raw: String): AudioQuality =
@@ -648,6 +681,45 @@ object AppSettings {
 
     fun effectiveAudioQuality(metered: Boolean): AudioQuality =
         if (metered) audioQualityCellular.value else audioQualityWifi.value
+
+    /**
+     * Whether the connection in hand is metered, or null when that is not known.
+     *
+     * A `StateFlow` rather than a parameter because it changes under the app's
+     * feet — someone walks out of Wi-Fi range mid-album — and every source walk
+     * has to answer against the connection as it is *now*, not as it was when the
+     * queue was built.
+     *
+     * Null is meaningfully different from `false`: "not known yet" must not be
+     * read as unmetered, or a phone that has not finished its first path
+     * evaluation would start streaming lossless over cellular. Until it is known,
+     * callers fall back to the Wi-Fi setting, which is the conservative reading
+     * for the common case of an app that starts on Wi-Fi.
+     */
+    private val _meteredConnection = MutableStateFlow<Boolean?>(null)
+    val meteredConnection: StateFlow<Boolean?> = _meteredConnection.asStateFlow()
+
+    fun setMeteredConnection(value: Boolean?) {
+        _meteredConnection.value = value
+    }
+
+    /**
+     * [effectiveAudioQuality] against the live connection, as an observable.
+     *
+     * Derived from [meteredConnection] and the two per-network settings, so a
+     * settings change or a network change both re-evaluate it without anything
+     * having to remember to ask again. "Not known yet" reads as the Wi-Fi
+     * setting, which is the conservative reading for an app that starts on
+     * Wi-Fi.
+     */
+    val effectiveAudioQualityFlow: StateFlow<AudioQuality> =
+        combine(_meteredConnection, _audioQualityWifi, _audioQualityCellular) { metered, wifi, cellular ->
+            if (metered == true) cellular else wifi
+        }.stateIn(
+            CoroutineScope(SupervisorJob() + Dispatchers.Default),
+            SharingStarted.Eagerly,
+            effectiveAudioQuality(_meteredConnection.value == true),
+        )
 
     const val DEFAULT_CACHE_LIMIT_BYTES = 512L * 1024 * 1024
     const val MAX_CACHE_LIMIT_BYTES = 10L * 1024 * 1024 * 1024

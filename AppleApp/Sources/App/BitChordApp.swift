@@ -18,6 +18,7 @@ struct BitChordApp: App {
                 .environment(toast)
                 .task {
                     CipherUnlockWiring.install()
+                    SecretStoreWiring.install()
                     installAutomixModels()
                     controller.startEngineIfNeeded()
                     LocalLibrary.shared.restore()
