@@ -1,6 +1,9 @@
 package com.music.bitchord.data.lyrics
 
+import kotlinx.serialization.Serializable
+
 /** One word/syllable inside a line. */
+@Serializable
 data class LyricWordDto(
     val startMs: Long,
     val endMs: Long,
@@ -12,7 +15,12 @@ data class LyricWordDto(
  *
  * [background] is the answering vocal drawn under the lead — see
  * [withBackgroundVocals]. [sungUntilMs] is a line-synced provider's own end.
+ *
+ * Serializable because a translated lyric crosses to the host as a document: the
+ * host needs the whole line back, timings and background included, or the
+ * translation would not stay in step with the music.
  */
+@Serializable
 data class LyricLineDto(
     val timeMs: Long,
     val text: String,

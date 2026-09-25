@@ -183,12 +183,14 @@ struct NowPlayingView: View {
             switch pane {
             case .lyrics:
                 LyricsPane(
-                    lines: controller.lyrics,
+                    lines: controller.displayedLyrics,
                     loading: controller.lyricsLoading,
                     position: controller.position,
                     hasTrack: controller.current != nil,
                     sourceLabel: controller.lyricsSourceLabel,
-                    onSeek: { controller.seek(to: $0) }
+                    onSeek: { controller.seek(to: $0) },
+                    translator: controller.lyricsTranslator,
+                    trackId: controller.current?.id ?? ""
                 )
             case .queue:
                 UpNextPane()
@@ -254,12 +256,14 @@ struct NowPlayingView: View {
                             switch pane {
                             case .lyrics:
                                 LyricsPane(
-                                    lines: controller.lyrics,
+                                    lines: controller.displayedLyrics,
                                     loading: controller.lyricsLoading,
                                     position: controller.position,
                                     hasTrack: controller.current != nil,
                                     sourceLabel: controller.lyricsSourceLabel,
-                                    onSeek: { controller.seek(to: $0) }
+                                    onSeek: { controller.seek(to: $0) },
+                                    translator: controller.lyricsTranslator,
+                                    trackId: controller.current?.id ?? ""
                                 )
                             case .queue:
                                 UpNextPane()
@@ -952,6 +956,11 @@ struct LyricsPane: View {
     var hasTrack: Bool
     var sourceLabel: String? = nil
     var onSeek: ((Double) -> Void)? = nil
+    /// Absent where the caller has no track to translate, which is the case that
+    /// matters: an empty lyric has nothing to translate and offering the control
+    /// anyway is an invitation to a request that cannot succeed.
+    var translator: LyricsTranslator?
+    var trackId: String = ""
 
     private var activeIndex: Int {
         let ms = Swift.Int64(position * 1000)
@@ -981,6 +990,10 @@ struct LyricsPane: View {
                             .padding(.horizontal, 14)
                             .padding(.vertical, 6)
                             .background(.white.opacity(0.10), in: Capsule())
+                            .padding(.horizontal, 12)
+                    }
+                    if let translator {
+                        LyricsTranslationNote(outcome: translator.outcome)
                             .padding(.horizontal, 12)
                     }
                     ScrollViewReader { proxy in

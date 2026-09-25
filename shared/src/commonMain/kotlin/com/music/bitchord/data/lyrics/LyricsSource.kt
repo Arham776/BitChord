@@ -39,6 +39,18 @@ enum class LyricsSource(
         detail = "Apple Music timings, word by word",
         wordSynced = true,
     ),
+    /**
+     * QQ Music's catalogue through the same host's other endpoint.
+     *
+     * Separate because it is a different catalogue, not a second attempt at the
+     * same one: a track BetterLyrics has and Portato does not is the normal
+     * case, and which is worth asking depends on what the track is.
+     */
+    BETTER_LYRICS_PORTATO(
+        label = "BetterLyrics Portato",
+        detail = "QQ Music karaoke timings, on a second endpoint",
+        wordSynced = true,
+    ),
     SIMP_MUSIC(
         label = "SimpMusic",
         detail = "Matched on the video, so never the wrong edit",

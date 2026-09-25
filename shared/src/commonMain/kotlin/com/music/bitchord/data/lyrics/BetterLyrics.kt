@@ -1,28 +1,48 @@
 package com.music.bitchord.data.lyrics
 
-import com.music.bitchord.data.http.Http
-import kotlinx.serialization.json.Json
-import kotlinx.serialization.json.JsonObject
-import kotlinx.serialization.json.contentOrNull
-import kotlinx.serialization.json.jsonPrimitive
-
-/** Word-timed TTML from BetterLyrics (no API key). */
+/**
+ * Word-timed TTML from BetterLyrics (no API key).
+ *
+ * Two endpoints, one host, and they are not the same catalogue: the main one
+ * serves Apple Music's timings and Portato serves QQ Music's karaoke timings.
+ * Separate entries in the settings because they fail independently — a track
+ * one has and the other does not is common, and which of them is worth asking
+ * depends on the catalogue rather than on anything the listener sets.
+ */
 object BetterLyrics {
     private const val BASE = "https://lyrics-api.boidu.dev/getLyrics"
-    private val json = Json { ignoreUnknownKeys = true; isLenient = true }
+    private const val PORTATO = "https://lyrics-api.boidu.dev/getLyricsPortato"
 
-    suspend fun lyrics(title: String, artist: String, durationMs: Long, album: String?): List<LyricLineDto>? {
+    suspend fun lyrics(
+        title: String,
+        artist: String,
+        durationMs: Long,
+        album: String? = null,
+    ): List<LyricLineDto>? = fetch(BASE, title, artist, durationMs, album)
+
+    /** QQ Music's karaoke timings through BetterLyrics' Portato endpoint. */
+    suspend fun portato(
+        title: String,
+        artist: String,
+        durationMs: Long,
+        album: String? = null,
+    ): List<LyricLineDto>? = fetch(PORTATO, title, artist, durationMs, album)
+
+    private suspend fun fetch(
+        endpoint: String,
+        title: String,
+        artist: String,
+        durationMs: Long,
+        album: String?,
+    ): List<LyricLineDto>? {
         val query = buildMap {
             put("s", title)
             put("a", artist)
-            if (durationMs > 0) put("d", (durationMs / 1000).toString())
+            val seconds = durationMs / 1000
+            if (seconds > 0) put("d", seconds.toString())
             if (!album.isNullOrBlank()) put("al", album)
         }
-        val body = runCatching { Http.getText(BASE, query = query) }.getOrNull() ?: return null
-        val ttml = runCatching {
-            (json.parseToJsonElement(body) as? JsonObject)
-                ?.get("ttml")?.jsonPrimitive?.contentOrNull
-        }.getOrNull() ?: return null
-        return TtmlLyrics.parse(ttml).takeIf { it.isNotEmpty() }
+        val body = lyricsGet(endpoint, query = query) ?: return null
+        return ProviderLyrics.parse(body)
     }
 }

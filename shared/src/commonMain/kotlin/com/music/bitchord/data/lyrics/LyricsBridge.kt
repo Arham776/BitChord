@@ -5,6 +5,7 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.launch
+import kotlinx.serialization.Serializable
 
 /**
  * Races every enabled lyrics source in the user's order.
@@ -111,4 +112,157 @@ object LyricsBridge {
         )
         return found?.source to found?.lines.orEmpty()
     }
+
+    // ---- Translation -------------------------------------------------------
+
+    /**
+     * Translate the lyric into [targetLanguageTag].
+     *
+     * One call rather than an exposed [LyricsTranslation], because the answer is
+     * three-valued and the host should not have to re-derive which: a
+     * translation, "these are already in that language", or nothing. The last of
+     * those is a normal outcome — an empty lyric, a failure, a language the
+     * endpoint does not carry — and must not be reported as an error.
+     */
+    fun translate(
+        trackId: String,
+        linesJson: String,
+        targetLanguageTag: String,
+        callback: TranslationCallback,
+    ) {
+        scope.launch {
+            val lines = decodeLines(linesJson)
+            val result = if (lines.isEmpty()) {
+                LyricsTranslation.Result.Unavailable
+            } else {
+                runCatching { LyricsTranslation.translate(trackId, lines, targetLanguageTag) }
+                    .getOrElse { LyricsTranslation.Result.Unavailable }
+            }
+            when (result) {
+                is LyricsTranslation.Result.Translated -> callback.onResult(
+                    status = "translated",
+                    document = encodeLines(result.lines),
+                    sourceLanguage = result.sourceLanguage,
+                    fromCache = result.fromCache,
+                )
+                is LyricsTranslation.Result.SameLanguage -> callback.onResult(
+                    status = "same",
+                    document = linesJson,
+                    sourceLanguage = result.language,
+                    fromCache = true,
+                )
+                LyricsTranslation.Result.Unavailable -> callback.onResult(
+                    status = "unavailable", document = "", sourceLanguage = "", fromCache = false,
+                )
+            }
+        }
+    }
+
+    /**
+     * Put the lyric into Latin script.
+     *
+     * Distinct from translating, and reported distinctly: a Japanese lyric asked
+     * for in English is a translation, and the same lyric asked for as romaji is
+     * a pronunciation. Conflating the two produced requests nothing could answer.
+     */
+    fun romanize(
+        trackId: String,
+        linesJson: String,
+        targetLanguageTag: String,
+        callback: TranslationCallback,
+    ) {
+        scope.launch {
+            val lines = decodeLines(linesJson)
+            val result = if (lines.isEmpty()) {
+                LyricsTranslation.RomanizationResult.Unavailable
+            } else {
+                runCatching { LyricsTranslation.romanize(trackId, lines, targetLanguageTag) }
+                    .getOrElse { LyricsTranslation.RomanizationResult.Unavailable }
+            }
+            when (result) {
+                is LyricsTranslation.RomanizationResult.Romanized -> callback.onResult(
+                    status = "translated",
+                    document = encodeLines(result.lines),
+                    sourceLanguage = result.sourceLanguage,
+                    fromCache = result.fromCache,
+                )
+                // Already Latin: not a failure, and not a translation either. The
+                // host shows the original and says there was nothing to do.
+                LyricsTranslation.RomanizationResult.AlreadyRomanized -> callback.onResult(
+                    status = "same", document = linesJson, sourceLanguage = "", fromCache = true,
+                )
+                LyricsTranslation.RomanizationResult.Unavailable -> callback.onResult(
+                    status = "unavailable", document = "", sourceLanguage = "", fromCache = false,
+                )
+            }
+        }
+    }
+
+    /**
+     * Every language the translate and romanise buttons offer.
+     *
+     * One document rather than two calls, because the host draws one picker and
+     * the two lists differ; making it ask twice would mean it could render a
+     * half-loaded list.
+     */
+    fun languagesJson(): String {
+        val translate = TRANSLATION_LANGUAGES.joinToString(",", prefix = "[", postfix = "]") {
+            """{"code":${quote(it.code)},"name":${quote(it.fallbackName)},"romanizable":false}"""
+        }
+        val romanize = ROMANIZATION_LANGUAGES.joinToString(",", prefix = "[", postfix = "]") {
+            """{"code":${quote(it.code)},"name":${quote(it.fallbackName)},"romanizable":true}"""
+        }
+        return """{"translate":$translate,"romanize":$romanize}"""
+    }
+
+    fun clearTranslationCache() = TranslationCache.clear()
+
+    private fun decodeLines(document: String): List<LyricLineDto> = runCatching {
+        lyricsJson.decodeFromString(LyricLineList.serializer(), document).lines
+    }.getOrDefault(emptyList())
+
+    private fun encodeLines(lines: List<LyricLineDto>): String = runCatching {
+        lyricsJson.encodeToString(LyricLineList.serializer(), LyricLineList(lines))
+    }.getOrDefault(EMPTY_LINES)
+
+    private fun quote(value: String): String = buildString {
+        append('"')
+        value.forEach { ch ->
+            when {
+                ch == '"' -> append("\\\"")
+                ch == '\\' -> append("\\\\")
+                ch == '\n' -> append("\\n")
+                ch == '\r' -> append("\\r")
+                ch == '\t' -> append("\\t")
+                ch.code < 0x20 -> append("\\u").append(ch.code.toString(16).padStart(4, '0'))
+                else -> append(ch)
+            }
+        }
+        append('"')
+    }
+}
+
+/** A lyric as it crosses the bridge. */
+@Serializable
+internal data class LyricLineList(val lines: List<LyricLineDto> = emptyList())
+
+private const val EMPTY_LINES = """{"lines":[]}"""
+
+/** The host-facing shape of a translation or a romanisation. */
+interface TranslationCallback {
+    /**
+     * @param status `translated`, `same` (already in that language or already
+     *   Latin) or `unavailable`. None of the three is an error.
+     * @param document the lyric as a [LyricLineList]; empty when unavailable.
+     * @param sourceLanguage what it was translated from, when known.
+     * @param fromCache whether this came off disk rather than off the network —
+     *   exposed so the host can say "already translated" rather than showing a
+     *   spinner for something that is about to appear instantly.
+     */
+    fun onResult(
+        status: String,
+        document: String,
+        sourceLanguage: String,
+        fromCache: Boolean,
+    )
 }

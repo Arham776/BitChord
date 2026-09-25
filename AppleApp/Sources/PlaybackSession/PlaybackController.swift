@@ -198,6 +198,18 @@ final class PlaybackController {
     /// Empty when lyrics came from the file itself (EmbeddedLyrics).
     private(set) var lyricsSourceLabel: String?
     private(set) var lyricsLoading = false
+
+    /// Translation and romanisation, and the state the panel's controls read.
+    let lyricsTranslator = LyricsTranslator()
+
+    /// The lyric as it should be shown: the translation when there is one.
+    ///
+    /// Kept beside `lyrics` rather than replacing it, so "Show Original" is
+    /// instant and so a track change cannot leave a translation on screen for
+    /// whatever is playing now.
+    var displayedLyrics: [LyricLineDto] {
+        lyricsTranslator.translatedLines ?? lyrics
+    }
     private(set) var canvasURL: URL?
     private(set) var canvasFallbackURL: URL?
     private(set) var nerd: NerdStatsRec?
@@ -1317,6 +1329,10 @@ final class PlaybackController {
     private func fetchLyrics(for entry: QueueEntry) {
         lyrics = []
         lyricsSourceLabel = nil
+        // A translation belongs to the lyric it was made from. Carrying it across
+        // a track change would show one song's words over another's music, which is
+        // worse than having no translation at all.
+        lyricsTranslator.reset()
         let localPath = entry.isLocal && !entry.source.isEmpty ? entry.source : nil
         let allowNetwork = PlatformSettings.shared.getBoolean(key: "synced_lyrics", default: true)
         if !allowNetwork, localPath == nil {
