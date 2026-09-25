@@ -12,6 +12,14 @@ struct LocalTrack: Identifiable, Hashable {
     var album: String
     var durationSeconds: Double
     var artwork: Data?
+    /// The file's creation and modification dates, from the file system.
+    ///
+    /// There is no better source. A tag does not record when *you* added a file to
+    /// this machine, and inventing a date from the scan would make the order a
+    /// function of when the last scan ran — so "Date Added" would silently change
+    /// every time the library was rescanned.
+    let dateAdded: Date?
+    let dateModified: Date?
 
     var id: String { path }
 }
@@ -105,6 +113,7 @@ final class LocalLibrary {
         var found: [LocalTrack] = []
         for path in audioPaths {
             let fileName = URL(fileURLWithPath: path).deletingPathExtension().lastPathComponent
+            let dates = fileDates(at: path)
             if let meta = readTrackMetadata(path: path) {
                 // Untagged files parse fine but carry empty strings; give them
                 // the same fallbacks as the unreadable path so rows never
@@ -115,7 +124,9 @@ final class LocalLibrary {
                     artist: meta.artist.isEmpty ? "Unknown artist" : meta.artist,
                     album: meta.album,
                     durationSeconds: meta.durationSeconds,
-                    artwork: meta.artwork.isEmpty ? nil : meta.artwork
+                    artwork: meta.artwork.isEmpty ? nil : meta.artwork,
+                    dateAdded: dates.added,
+                    dateModified: dates.modified
                 ))
             } else {
                 found.append(LocalTrack(
@@ -124,18 +135,107 @@ final class LocalLibrary {
                     artist: "Unknown artist",
                     album: "",
                     durationSeconds: 0,
-                    artwork: nil
+                    artwork: nil,
+                    dateAdded: dates.added,
+                    dateModified: dates.modified
                 ))
             }
         }
-        tracks = found.sorted { lhs, rhs in
-            if lhs.artist != rhs.artist { return lhs.artist < rhs.artist }
-            if lhs.album != rhs.album { return lhs.album < rhs.album }
-            return lhs.title < rhs.title
-        }
+        // No ordering here. The scan's job is to find the files; the order they are
+        // shown in is the sort menu's, and sorting twice meant two different
+        // answers to "what order is this" depending on which one you had looked at.
+        // Alphabetical by path keeps the list stable between scans, which is what
+        // the ordering's tie-breakers assume.
+        tracks = found.sorted { $0.path.localizedStandardCompare($1.path) == .orderedAscending }
         scanned = true
         onChange?()
     }
+
+    /// The file's own dates, read once per file during the scan.
+    ///
+    /// Not on a background queue of its own: the scan is already off the main
+    /// thread's critical path and a stat per file is cheap next to the tag read
+    /// that follows it.
+    private func fileDates(at path: String) -> (added: Date?, modified: Date?) {
+        let url = URL(fileURLWithPath: path)
+        let keys: Set<URLResourceKey> = [.creationDateKey, .contentModificationDateKey]
+        guard let values = try? url.resourceValues(forKeys: keys) else { return (nil, nil) }
+        return (values.creationDate, values.contentModificationDate)
+    }
+    // ---- Ordering and filtering, delegated -------------------------------
+
+    /// What the listener has the list sorted by.
+    var sort: LocalMusicSort = .titleAscending
+    /// List or grid.
+    var viewType: LocalViewType = .list
+    /// The live search box's contents.
+    var query: String = ""
+
+    /// [tracks] narrowed and ordered, by the shared policy.
+    ///
+    /// Delegated rather than reimplemented: the host sorting with its own
+    /// comparators is how the order on screen ends up subtly different from the
+    /// one the sort menu names.
+    var visibleTracks: [LocalTrack] {
+        let rows = tracks.map { track -> [String: Any] in
+            var row: [String: Any] = [
+                "path": track.path,
+                "title": track.title,
+                "artist": track.artist,
+                "album": track.album,
+                "durationSeconds": track.durationSeconds,
+            ]
+            // Null rather than omitted: "this file has no creation date" is a real
+            // answer, and the ordering sorts it last because of it. An omitted
+            // field would read as absent from the document entirely.
+            if let added = track.dateAdded { row["dateAddedSeconds"] = added.timeIntervalSince1970 }
+            if let modified = track.dateModified {
+                row["dateModifiedSeconds"] = modified.timeIntervalSince1970
+            }
+            return row
+        }
+        guard let data = try? JSONSerialization.data(withJSONObject: rows),
+              let json = String(data: data, encoding: .utf8)
+        else { return tracks }
+        let document = LocalLibraryBridge.shared.view(
+            tracksJson: json, order: sort.rawValue, query: query
+        )
+        guard let answer = document.data(using: .utf8),
+              let ordered = try? JSONSerialization.jsonObject(with: answer) as? [[String: Any]]
+        else { return tracks }
+        let byPath = Dictionary(tracks.map { ($0.path, $0) }, uniquingKeysWith: { first, _ in first })
+        return ordered.compactMap { row in
+            guard let path = row["path"] as? String else { return nil }
+            return byPath[path]
+        }
+    }
+
+    /// Every sort order with its name, from the shared module.
+    var sortOptions: [LocalMusicSort] { LocalMusicSort.allCases }
+
+    func setSort(_ next: LocalMusicSort) {
+        sort = next
+        LocalLibraryBridge.shared.setSort(order: next.rawValue, callback: SortAck { _ in })
+    }
+
+    func setViewType(_ next: LocalViewType) {
+        viewType = next
+        LocalLibraryBridge.shared.setViewType(viewType: next.rawValue, callback: SortAck { _ in })
+    }
+
+    /// Load the saved sort and view type, once, when the library first appears.
+    func restoreViewPreferences() {
+        guard !restoredViewPreferences else { return }
+        restoredViewPreferences = true
+        LocalLibraryBridge.shared.currentSort(callback: CurrentSort { order, view in
+            Task { @MainActor in
+                self.sort = LocalMusicSort(rawValue: order) ?? .titleAscending
+                self.viewType = LocalViewType(rawValue: view) ?? .list
+            }
+        })
+    }
+
+    private var restoredViewPreferences = false
 
     var albumGroups: [(name: String, artist: String, tracks: [LocalTrack])] {
         Dictionary(grouping: tracks) { "\($0.artist)|\($0.album.isEmpty ? "—" : $0.album)" }
@@ -151,4 +251,66 @@ final class LocalLibrary {
             .map { (name: $0.key, tracks: $0.value) }
             .sorted { $0.name < $1.name }
     }
+}
+
+/// The shared sort orders, by name.
+///
+/// A mirror of the shared enum, and deliberately one that can be wrong: an order
+/// this build does not have simply does not appear in the menu, and one it has
+/// but the shared module does not resolves to nil and is ignored. Neither is worth
+/// a crash on a preference.
+enum LocalMusicSort: String, CaseIterable, Identifiable {
+    case titleAscending = "TITLE_ASC"
+    case titleDescending = "TITLE_DESC"
+    case dateAdded = "DATE_ADDED"
+    case dateModified = "DATE_MODIFIED"
+
+    var id: String { rawValue }
+
+    var label: String {
+        switch self {
+        case .titleAscending: return "Title"
+        case .titleDescending: return "Title (Reverse)"
+        case .dateAdded: return "Date Added"
+        case .dateModified: return "Date Modified"
+        }
+    }
+}
+
+/// List or grid.
+///
+/// Both are offered: a list for browsing and its row affordances, a grid for the
+/// case where the point is to *see* the collection. Offering only one makes the
+/// other somebody's habit rather than their choice.
+enum LocalViewType: String, CaseIterable, Identifiable {
+    case list = "LIST"
+    case grid = "GRID"
+
+    var id: String { rawValue }
+
+    var symbol: String {
+        switch self {
+        case .list: return "list.bullet"
+        case .grid: return "square.grid.2x2"
+        }
+    }
+
+    var label: String {
+        switch self {
+        case .list: return "List"
+        case .grid: return "Grid"
+        }
+    }
+}
+
+private final class SortAck: LocalLibraryBridgeSetSortCallback {
+    private let handler: (Bool) -> Void
+    init(_ handler: @escaping (Bool) -> Void) { self.handler = handler }
+    func onResult(ok: Bool) { handler(ok) }
+}
+
+private final class CurrentSort: LocalLibraryBridgeSortCallback {
+    private let handler: (String, String) -> Void
+    init(_ handler: @escaping (String, String) -> Void) { self.handler = handler }
+    func onResult(order: String, viewType: String) { handler(order, viewType) }
 }

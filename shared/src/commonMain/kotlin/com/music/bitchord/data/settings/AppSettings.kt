@@ -9,6 +9,8 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.stateIn
+import com.music.bitchord.data.library.LocalMusicSort
+import com.music.bitchord.data.library.LocalViewType
 import com.music.bitchord.data.lyrics.LyricsSource
 import com.music.bitchord.data.lyrics.normalizePaxSenixApiKey
 
@@ -287,6 +289,44 @@ object AppSettings {
         _localLibraryPath.value = value
         settings.putString("local_library_path", value)
     }
+
+    /**
+     * How a scanned local library is ordered.
+     *
+     * Defaults to [LocalMusicSort.TITLE_ASC] because a scan arrives in whatever
+     * order the file system enumerated it, and that order is not something anyone
+     * chose. Persisted app-wide rather than per screen: one choice, kept until
+     * another is made.
+     */
+    private val _localLibrarySort = MutableStateFlow(
+        parseLocalSort(settings.getString("local_library_sort", "")),
+    )
+    val localLibrarySort: StateFlow<LocalMusicSort> = _localLibrarySort.asStateFlow()
+
+    fun setLocalLibrarySort(value: LocalMusicSort) {
+        _localLibrarySort.value = value
+        settings.putString("local_library_sort", value.name)
+    }
+
+    /** List or grid. Defaults to [LocalViewType.LIST]. */
+    private val _localLibraryViewType = MutableStateFlow(
+        parseLocalViewType(settings.getString("local_library_view_type", "")),
+    )
+    val localLibraryViewType: StateFlow<LocalViewType> = _localLibraryViewType.asStateFlow()
+
+    fun setLocalLibraryViewType(value: LocalViewType) {
+        _localLibraryViewType.value = value
+        settings.putString("local_library_view_type", value.name)
+    }
+
+    // An unreadable stored value falls back rather than throwing: these are
+    // preferences, and a preference that cannot be parsed is a preference that
+    // was never worth failing a launch over.
+    private fun parseLocalSort(name: String): LocalMusicSort =
+        LocalMusicSort.entries.firstOrNull { it.name == name } ?: LocalMusicSort.TITLE_ASC
+
+    private fun parseLocalViewType(name: String): LocalViewType =
+        LocalViewType.entries.firstOrNull { it.name == name } ?: LocalViewType.LIST
 
     // ---- PaxSenix ----------------------------------------------------------
 

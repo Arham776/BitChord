@@ -1,4 +1,9 @@
 import SwiftUI
+#if os(macOS)
+import AppKit
+#else
+import UIKit
+#endif
 import BitChordShared
 import UniformTypeIdentifiers
 
@@ -151,6 +156,7 @@ struct LibraryView: View {
                     }
                 }
                 .onAppear {
+                    local.restoreViewPreferences()
                     if lockedSection != nil { return }
                     if auth.signedIn, section == .songs {
                         section = .youtube
@@ -276,24 +282,128 @@ struct LibraryView: View {
                     subtitle: "The folder you selected didn't contain any supported audio files.",
                     buttonTitle: "Choose Another Folder"
                 ) { pickFolder() }
+            } else if local.visibleTracks.isEmpty {
+                // A search that matched nothing is not the same as a library with
+                // nothing in it, and the empty state says which.
+                EmptyStateView(
+                    icon: Image(.bchSearch),
+                    title: local.query.isEmpty ? "No audio files here" : "Nothing matches",
+                    subtitle: local.query.isEmpty
+                        ? "The folder you selected didn't contain any supported audio files."
+                        : "No track in this library matches \u{201C}\(local.query)\u{201D}.",
+                    buttonTitle: local.query.isEmpty ? "Choose Another Folder" : nil,
+                    action: local.query.isEmpty ? { pickFolder() } : nil
+                )
             } else {
-                ScrollView {
-                    LazyVStack(spacing: 2) {
-                        ForEach(Array(local.tracks.enumerated()), id: \.element.id) { index, track in
-                            SongRow(
-                                entry: QueueEntry.from(track),
-                                play: { controller.play(local.tracks.map(QueueEntry.from), at: index) },
-                                playNext: { controller.playNext(QueueEntry.from(track)) },
-                                addToQueue: { controller.addToQueue(QueueEntry.from(track)) }
-                            )
-                        }
-                    }
-                    .padding(.horizontal, 16)
-                    .padding(.vertical, 8)
-                }
+                songsContent
             }
         }
-        .safeAreaInset(edge: .top, spacing: 0) { if showsPicker { picker } }
+        .safeAreaInset(edge: .top, spacing: 0) {
+            VStack(spacing: 0) {
+                if showsPicker { picker }
+                if local.scanned { songsToolbar }
+            }
+        }
+    }
+
+    /// The search field, the sort menu and the list/grid toggle.
+    ///
+    /// In a `safeAreaInset` rather than inside the scroll view, so it stays put
+    /// while a long library moves under it — the same place a Mac user expects a
+    /// filter to be, and the only arrangement where it is reachable without
+    /// scrolling back to the top.
+    private var songsToolbar: some View {
+        HStack(spacing: 10) {
+            HStack(spacing: 6) {
+                Image(systemName: "magnifyingglass")
+                    .foregroundStyle(.secondary)
+                    .accessibilityHidden(true)
+                TextField("Filter this library", text: Bindable(local).query)
+                    .textFieldStyle(.plain)
+                    .accessibilityLabel("Filter this library")
+                if !local.query.isEmpty {
+                    Button {
+                        local.query = ""
+                    } label: {
+                        Image(systemName: "xmark.circle.fill")
+                            .foregroundStyle(.secondary)
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel("Clear the filter")
+                }
+            }
+            .padding(.horizontal, 10)
+            .padding(.vertical, 6)
+            .background(.quaternary, in: Capsule())
+
+            Spacer(minLength: 8)
+
+            Menu {
+                Picker("Sort By", selection: Bindable(local).sort) {
+                    ForEach(local.sortOptions) { Text($0.label).tag($0) }
+                }
+                .pickerStyle(.inline)
+            } label: {
+                Label(local.sort.label, systemImage: "arrow.up.arrow.down")
+                    .labelStyle(.titleAndIcon)
+            }
+            .menuStyle(.borderlessButton)
+            .fixedSize()
+            .help("Sort this library")
+
+            Picker("View", selection: Bindable(local).viewType) {
+                ForEach(LocalViewType.allCases) { type in
+                    Image(systemName: type.symbol).tag(type)
+                }
+            }
+            .pickerStyle(.segmented)
+            .labelsHidden()
+            .frame(width: 92)
+            .help("List or grid")
+        }
+        .padding(.horizontal, 24)
+        .padding(.vertical, 8)
+    }
+
+    @ViewBuilder
+    private var songsContent: some View {
+        switch local.viewType {
+        case .list:
+            List {
+                ForEach(Array(local.visibleTracks.enumerated()), id: \.element.id) { index, track in
+                    SongRow(
+                        entry: QueueEntry.from(track),
+                        play: {
+                            // The queue is what is on screen, in the order on
+                            // screen — playing from `tracks` instead would start at
+                            // whichever track the sort put first rather than the one
+                            // tapped.
+                            let shown = local.visibleTracks
+                            controller.play(shown.map(QueueEntry.from), at: index)
+                        },
+                        playNext: { controller.playNext(QueueEntry.from(track)) },
+                        addToQueue: { controller.addToQueue(QueueEntry.from(track)) }
+                    )
+                    .listRowInsets(EdgeInsets(top: 2, leading: 24, bottom: 2, trailing: 24))
+                }
+            }
+            .listStyle(.plain)
+        case .grid:
+            ScrollView {
+                LazyVGrid(
+                    columns: [GridItem(.adaptive(minimum: 150, maximum: 220), spacing: 16)],
+                    spacing: 20
+                ) {
+                    ForEach(local.visibleTracks) { track in
+                        LocalTrackCard(track: track) {
+                            controller.play(local.visibleTracks.map(QueueEntry.from))
+                        }
+                    }
+                }
+                .padding(.horizontal, 24)
+                .padding(.vertical, 12)
+            }
+        }
     }
 
     private var albumGrid: some View {
@@ -588,5 +698,100 @@ struct LibraryGridView: View {
             .padding(24)
         }
         .navigationTitle(title)
+    }
+}
+
+/// One local track as a card, for the grid.
+///
+/// Artwork first because that is the point of a grid: the reason to look at a
+/// collection rather than search it. A file with no embedded artwork gets a
+/// generated tile from its own initials rather than a blank square, so a library
+/// of untagged files is still recognisable at a glance.
+private struct LocalTrackCard: View {
+    let track: LocalTrack
+    let play: () -> Void
+
+    var body: some View {
+        Button(action: play) {
+            VStack(alignment: .leading, spacing: 8) {
+                artwork
+                    .aspectRatio(1, contentMode: .fit)
+                    .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 8, style: .continuous)
+                            .strokeBorder(.separator, lineWidth: 0.5)
+                    )
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(track.title)
+                        .font(.subheadline.weight(.medium))
+                        .lineLimit(1)
+                    Text(track.artist)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .help("\(track.title) — \(track.artist)")
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel("\(track.title), \(track.artist)")
+        .accessibilityHint("Plays this track")
+    }
+
+    @ViewBuilder
+    private var artwork: some View {
+        if let data = track.artwork, hasArtwork(data) {
+            decoded(data)
+        } else {
+            ZStack {
+                Rectangle().fill(.quaternary)
+                Text(initials)
+                    .font(.title2.weight(.semibold))
+                    .foregroundStyle(.secondary)
+            }
+        }
+    }
+
+    /// Whether this data decodes to an image at all.
+    ///
+    /// Separate from [decoded] because the card body is a `ViewBuilder`, and a
+    /// guard around a view-building call cannot be expressed without either
+    /// decoding twice or letting a bad image through.
+    private func hasArtwork(_ data: Data) -> Bool {
+        #if os(macOS)
+        return NSImage(data: data) != nil
+        #else
+        return UIImage(data: data) != nil
+        #endif
+    }
+
+    /// The embedded artwork.
+    ///
+    /// Two spellings because the type is genuinely two types — `UIImage` on iOS,
+    /// `NSImage` on macOS — and `Image` initialises from each under a different
+    /// label. Wrapped so the card body above reads as one thing rather than as a
+    /// platform conditional.
+    @ViewBuilder
+    private func decoded(_ data: Data) -> some View {
+        #if os(macOS)
+        if let image = NSImage(data: data) {
+            Image(nsImage: image).resizable().aspectRatio(contentMode: .fill)
+        }
+        #else
+        if let image = UIImage(data: data) {
+            Image(uiImage: image).resizable().aspectRatio(contentMode: .fill)
+        }
+        #endif
+    }
+
+    /// Up to two initials from the title, falling back to the artist.
+    private var initials: String {
+        let source = track.title.isEmpty ? track.artist : track.title
+        let words = source.split(separator: " ").prefix(2)
+        let letters = words.compactMap { $0.first }.map(String.init)
+        return letters.isEmpty ? "♪" : letters.joined().uppercased()
     }
 }
