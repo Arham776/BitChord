@@ -22,6 +22,19 @@ data class Song(
     val isVideo: Boolean = false,
     val setVideoId: String? = null,
     val fromAutoplay: Boolean = false,
+    /**
+     * Clean or uncensored edition, or null when the originating catalogue did not
+     * say.
+     *
+     * Tri-state rather than a `Boolean = false`, and that is the whole point:
+     * "not stated" and "stated as clean" are different claims, and
+     * [com.music.bitchord.data.sources.TrackMatcher] has to treat them differently
+     * — a source that has made no claim must not be rejected for it, while two
+     * sources that both stated it and disagree are describing different masters.
+     * Defaulting to `false` would make every silent source look like it had
+     * declared itself clean.
+     */
+    val isExplicit: Boolean? = null,
     /** File path for local device tracks (Apple: a plain path or bookmark-resolved URL). */
     val localPath: String? = null,
     val sourceQuality: String? = null,
