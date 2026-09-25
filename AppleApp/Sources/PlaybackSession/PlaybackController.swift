@@ -23,6 +23,22 @@ struct QueueEntry: Identifiable, Hashable, Sendable {
     var albumId: String? = nil
     var setVideoId: String? = nil
 
+    /// Clean or uncensored edition, or nil when the originating catalogue did not
+    /// say.
+    ///
+    /// Tri-state on purpose, for the same reason it is one in the shared `Song`:
+    /// "not stated" and "stated as clean" are different claims, and the cross-source
+    /// matcher rejects a candidate whose stated edition contradicts the target's
+    /// while refusing to reject one that has simply made no claim.
+    var isExplicit: Bool? = nil
+
+    /// Whether this row is a music video rather than catalogue audio.
+    ///
+    /// Load-bearing beyond the badge: a video's runtime includes a visual intro or
+    /// outro, so the matcher must not treat it as evidence about the audio's length,
+    /// and a source match is another recording and can be a wrong song altogether.
+    var isVideo: Bool = false
+
     var videoId: String? {
         if source.hasPrefix("yt:") { return String(source.dropFirst(3)) }
         if isLocal { return nil }
@@ -68,7 +84,11 @@ struct QueueEntry: Identifiable, Hashable, Sendable {
             durationText: song.durationText,
             albumName: song.albumName,
             artworkData: nil,
-            isLocal: song.localPath != nil
+            isLocal: song.localPath != nil,
+            // Carried through so the cross-source matcher can tell a clean edition
+            // from an unstated one, and a video from catalogue audio.
+            isExplicit: song.isExplicit?.boolValue,
+            isVideo: song.isVideo
         )
     }
 
@@ -921,56 +941,49 @@ final class PlaybackController {
     }
 
     /// Catalogues ranked above YouTube — first match that is the same recording.
+    /// The cross-source race, delegated to the shared resolver.
+    ///
+    /// This used to be a hand-rolled `withTaskGroup` over the custom HTTP source,
+    /// the JS module host and JioSaavn, with "JioSaavn must beat 256 kbps" as the
+    /// only quality bar, no notion of the user's ranking, and no recording check at
+    /// all beyond a runtime comparison the caller had to remember to apply. It could
+    /// not be made correct without the parts that are judgement, which now live in
+    /// the shared module's `SourceResolver`:
+    ///
+    ///  - The track is matched by `TrackMatcher` before anything is opened, so a
+    ///    cover cannot be substituted for the recording the listener picked.
+    ///  - Rank decides who is asked; the race decides who answers first. The two
+    ///    are not the same thing, and only the first one is a list.
+    ///  - `playingDurationSec` set routes this through the *upgrade* path, whose bar
+    ///    is "beats what is actually playing" rather than "satisfies the request",
+    ///    and which waits for every source so a slow one holding the FLAC still
+    ///    gets to serve it mid-track rather than being dropped for a fast 320.
     private static func resolveSubstitute(
         _ entry: QueueEntry, prefs: ResolvePrefs, waitForAll: Bool = false,
         playingDurationSec: Int? = nil
     ) async -> ResolvedSource? {
-        await withTaskGroup(of: ResolvedSource?.self) { group in
-            if prefs.wantLossless || waitForAll {
-                group.addTask { await Self.resolveCustom(title: entry.title, artist: entry.artist) }
-                group.addTask {
-                    guard let module = await ModuleJsHost.shared.stream(
-                        for: entry.title, artist: entry.artist, quality: "LOSSLESS"
-                    ) else { return nil }
-                    return ResolvedSource(
-                        source: module.url, headers: [:], kbps: module.kbps,
-                        lossless: module.lossless, origin: .substitute
-                    )
-                }
-            }
-            if prefs.jiosaavn {
-                group.addTask {
-                    guard let matched = await JioSaavn.matchedStream(
-                        for: entry, playingDurationSec: playingDurationSec
-                    ), matched.kbps > 256 else { return nil }
-                    return ResolvedSource(
-                        source: matched.url, headers: [:], kbps: matched.kbps,
-                        durationSec: matched.durationSec, origin: .substitute
-                    )
-                }
-            }
-            if waitForAll {
-                var best: ResolvedSource?
-                for await hit in group {
-                    guard let hit else { continue }
-                    if hit.lossless {
-                        group.cancelAll()
-                        return hit
-                    }
-                    if best == nil || hit.kbps > (best?.kbps ?? 0) { best = hit }
-                }
-                return best
-            }
-            var first: ResolvedSource?
-            for await hit in group {
-                if let hit {
-                    group.cancelAll()
-                    first = hit
-                    break
-                }
-            }
-            return first
-        }
+        // Nothing configured outranks YouTube, so the race cannot be won and asking
+        // would be pure latency. Answerable from the source list alone, with no
+        // search, which is why it is safe to call before the track is resolved.
+        guard prefs.canSubstitute else { return nil }
+
+        let stream = await SourceSubstitution.substitute(
+            title: entry.title,
+            artist: entry.artist,
+            durationSec: playingDurationSec,
+            album: entry.albumName,
+            isExplicit: entry.isExplicit.map { KotlinBoolean(value: $0) },
+            isVideo: entry.isVideo
+        )
+        guard let stream else { return nil }
+        return ResolvedSource(
+            source: stream.url,
+            headers: stream.headers,
+            kbps: stream.kbps ?? 0,
+            lossless: stream.lossless,
+            durationSec: stream.durationSec,
+            origin: .substitute
+        )
     }
 
     private static func resolveCustom(title: String, artist: String) async -> ResolvedSource? {

@@ -276,20 +276,61 @@ enum QualityUpgrade {
     }
 
     static func worthSwapping(_ candidate: Format, playing: Format?) -> Bool {
-        if candidate.lossless { return true }
-        guard let cand = candidate.kbps, let floor = playing?.kbps else { return false }
-        return cand - floor >= minGainKbps
+        // The judgement itself lives in the shared module, so the host cannot
+        // drift from it. This used to be a second copy here, and the copies
+        // disagreed in two ways that both mattered: this one had no Dolby-Atmos rule
+        // (so a lossless FLAC could be cut over an immersive mix the listener had
+        // chosen), and an unknown candidate bitrate was treated as no rather than
+        // as a source that declined to describe itself.
+        guard let candidateJson = formatJSON(candidate) else { return false }
+        return SourceResolverBridge.shared.worthSwapping(
+            candidateJson: candidateJson,
+            playingJson: playing.flatMap(formatJSON)
+        )
     }
 
     static func sameRecordingAs(_ candidateSec: Int?, _ playingSec: Int?) -> Bool {
-        guard let candidateSec, let playingSec else { return false }
-        return abs(candidateSec - playingSec) <= driftSec
+        // The shared signature is `Int?` (a nullable boxed `Int32`), so the bridge
+        // takes an optional boxed integer and Swift will not silently widen a nil
+        // into a zero — which would read as "both runtimes are 0s, so they agree".
+        SourceResolverBridge.shared.sameRecordingAs(
+            candidateSec: candidateSec.map { KotlinInt(value: Int32($0)) },
+            playingSec: playingSec.map { KotlinInt(value: Int32($0)) }
+        )
     }
 
+    /**
+     * Whether a source ranked above YouTube is enabled — the real check.
+     *
+     * This used to read three settings keys and answer true if *any* of them was
+     * set, including a source ranked below YouTube. So every queued YouTube track
+     * paid a pointless cross-source race for a source that could not have won it,
+     * and a user with only YouTube enabled was asked the question as though they
+     * had configured something.
+     *
+     * Answerable from the source list alone, with no search, which is what lets the
+     * read-ahead ask it before anyone has looked anything up.
+     */
     static func canSubstituteForYouTube() -> Bool {
-        let jio = PlatformSettings.shared.getBoolean(key: "jiosaavn_enabled", default: true)
-        let modules = PlatformSettings.shared.getString(key: "module_index_url", default: "")
-        let custom = PlatformSettings.shared.getString(key: "custom_source_url", default: "")
-        return jio || !modules.isEmpty || !custom.isEmpty
+        SourceResolverBridge.shared.canSubstituteForYouTube()
     }
+
+    /// A [Format] as the shared module's `FormatDocument`.
+    private static func formatJSON(_ format: Format) -> String? {
+        guard let data = try? JSONEncoder().encode(
+            FormatDocument(
+                codec: format.codec,
+                kbps: format.kbps,
+                isLossless: format.lossless ? true : nil
+            )
+        ) else { return nil }
+        return String(data: data, encoding: .utf8)
+    }
+}
+
+/// The subset of the shared module's `FormatDocument` the host sends back.
+private struct FormatDocument: Encodable {
+    var codec: String?
+    var kbps: Int?
+    var isLossless: Bool?
 }
