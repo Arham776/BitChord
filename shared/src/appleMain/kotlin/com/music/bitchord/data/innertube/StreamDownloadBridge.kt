@@ -59,11 +59,18 @@ object StreamDownloadBridge {
      * Progressive fetch. [ready] fires once the first chunk is on disk, so play can
      * start; [done] fires when the last chunk is written, or on error.
      *
-     * The chunk size is [CHUNK_BYTES] — the same figure [Http.probe] asks for, and
-     * deliberately so: a probe smaller than the real fetch cannot see a refusal the
-     * real fetch would meet. This was 1 MiB against a 16 KiB probe, which meant a
-     * URL willing to serve a token range sailed through the probe and then died on
-     * the playback path.
+     * The chunk size is [PlayerClient.rangeBytesFor] — the most this URL's own
+     * client will serve in one range, and deliberately the same figure
+     * [Http.probe] asks for. A probe smaller than the real fetch cannot see a
+     * refusal the real fetch would meet, which is what "it loads and then doesn't
+     * play" is made of.
+     *
+     * It was a fixed 2 MiB, which was wrong in both directions. Against most
+     * clients that is twice what they will serve in one range, so every chunk
+     * past the first was asking for a refusal; and against `ANDROID_VR` and
+     * `TVHTML5_SIMPLY` — which cap at half a megabyte — it was asking for four
+     * times too much, so a working client produced a track that died one megabyte
+     * in. The figure is a property of the URL's client, not a constant.
      *
      * A 403 on a chunk is reported to [StreamResolver.onPlaybackRefused] rather
      * than retried blindly. Retrying the same URL against the same client is how a
@@ -84,7 +91,7 @@ object StreamDownloadBridge {
             try {
                 DebugLog.d("stream starting: ${url.take(120)}")
 
-                val chunkSize = CHUNK_BYTES
+                val chunkSize = PlayerClient.rangeBytesFor(url)
                 val tmpDir = NSTemporaryDirectory()
                 val ext = when {
                     url.contains("mime=video", ignoreCase = true) ||
@@ -96,7 +103,7 @@ object StreamDownloadBridge {
 
                 // Upstream reads the total out of the URL's own `clen` rather than
                 // making a request to find out, so read-ahead knows when it is done.
-                clenFromUrl(url)?.let { clen ->
+                PlayerClient.lengthFromUrl(url)?.let { clen ->
                     val lenPath = "$path.len"
                     val digits = clen.toString().encodeToByteArray()
                     val lenFile = fopen(lenPath, "wb")
@@ -187,7 +194,18 @@ object StreamDownloadBridge {
                 // Marked complete either way: a half-written file left looking
                 // unfinished would be re-read forever by the growing-file reader.
                 tmpPath?.let { NSMutableData().writeToFile("$it.complete", atomically = true) }
-                done.onResult(null, e.message ?: e.toString())
+                // A refusal and a transport failure call for opposite responses
+                // at the call site: one means "this URL is dead, go and get another",
+                // the other means "that attempt failed, here is the same URL to try
+                // with better networking". Tagging it here, rather than leaving the
+                // host to read the message, is the point of [isRefusal].
+                val code = httpCodeOf(e)
+                val detail = e.message ?: e.toString()
+                done.onResult(
+                    null,
+                    if (code != null && code in REFUSAL_CODES) "$REFUSED_PREFIX$code $detail"
+                    else detail,
+                )
             } finally {
                 file?.let { fclose(it) }
             }
@@ -200,27 +218,26 @@ object StreamDownloadBridge {
             Regex("HTTP (\\d{3})").find(message)?.groupValues?.get(1)?.toIntOrNull()
         }
 
-    private val REFUSAL_CODES = setOf(403, 404, 410)
 
     /**
-     * Two megabytes, matching [Http.probe]. Upstream's `ChunkedDataSource` and
-     * `AudioCache` both fetch ranges of this size, and the probe has to test the
-     * request that matters rather than a smaller, more forgiving one.
+     * Whether a [DownloadCallback] message means the server *refused* the range,
+     * rather than the attempt failing for some other reason.
+     *
+     * Asked by the host rather than answered by pattern-matching the message over
+     * there: the tag and the question belong to whoever produces the message, so
+     * the two cannot drift.
      */
-    private const val CHUNK_BYTES = 2L * 1024 * 1024
+    fun isRefusal(message: String?): Boolean = message?.startsWith(REFUSED_PREFIX) == true
+
+    /** The status code a refusal carried, when [isRefusal]. */
+    fun refusalCode(message: String?): Int? =
+        if (message == null || !isRefusal(message)) null
+        else message.removePrefix(REFUSED_PREFIX).takeWhile { it.isDigit() }.toIntOrNull()
+
+    private const val REFUSED_PREFIX = "refused: "
+    private val REFUSAL_CODES = setOf(403, 404, 410)
+
 
     /** A ceiling so a URL that never stops returning data cannot fill the disk. */
     private const val MAX_BYTES = 200L * 1024 * 1024
-}
-
-private fun clenFromUrl(url: String): Long? {
-    val query = url.substringAfter('?', missingDelimiterValue = "")
-    if (query.isEmpty()) return null
-    for (part in query.split('&')) {
-        val eq = part.indexOf('=')
-        if (eq > 0 && part.substring(0, eq) == "clen") {
-            return part.substring(eq + 1).substringBefore('&').toLongOrNull()
-        }
-    }
-    return null
 }

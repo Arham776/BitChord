@@ -239,6 +239,56 @@ data class PlayerClient(
         }
 
         /**
+         * The largest single range googlevideo reliably serves for [url].
+         *
+         * Mirrors InnerTubeX's `mediaRangeChunkSize`, and it is *not* one number.
+         * Two clients cap out at half what the others do: asking `ANDROID_VR` or a
+         * `TVHTML5_SIMPLY` URL for a full megabyte range is answered with a 403,
+         * because that is more than they will ever serve. Both the probe and the
+         * real read have to respect it, and a probe that ignores it condemns a
+         * working client on every single track — the probe asks for more than the
+         * client will give, takes the refusal as evidence about the client, and
+         * stands down something that was working.
+         *
+         * [Long.MAX_VALUE] for a non-googlevideo host: the limit is Google's, and
+         * a module's or addon's own CDN is free to serve whatever it likes.
+         */
+        fun rangeBytesFor(url: String): Long {
+            if (!url.contains("googlevideo.com")) return Long.MAX_VALUE
+            val name = url.queryParam("c")?.uppercase() ?: return RANGE_BYTES
+            return if (name == "ANDROID_VR" || name.startsWith("TVHTML5_SIMPLY")) {
+                NARROW_RANGE_BYTES
+            } else {
+                RANGE_BYTES
+            }
+        }
+
+        /**
+         * How long [url] says the file is, which costs no request to read.
+         *
+         * Every progressive googlevideo URL carries it as `clen`. Null for the
+         * URLs that do not — the extraction failsafe can produce one — and the
+         * probe treats that as "unknown", asking its normal range rather than
+         * assuming a length it has not been told.
+         */
+        fun lengthFromUrl(url: String): Long? = url.queryParamAsLong("clen")
+
+        /**
+         * A numeric query parameter of a googlevideo URL.
+         *
+         * No percent-decoding: these are bare digits, and the client and version
+         * tokens are the ones that need it.
+         */
+        private fun String.queryParamAsLong(key: String): Long? {
+            val query = substringAfter('?', "").takeIf { it.isNotEmpty() } ?: return null
+            return query.split('&').firstNotNullOfOrNull { part ->
+                val eq = part.indexOf('=')
+                if (eq <= 0 || part.substring(0, eq) != key) return@firstNotNullOfOrNull null
+                part.substring(eq + 1).toLongOrNull()
+            }
+        }
+
+        /**
          * A query parameter of a googlevideo URL, percent-decoded.
          *
          * Hand-rolled because the alternative is a URL parser in common code, and
@@ -274,5 +324,11 @@ data class PlayerClient(
             }
             return out.toString()
         }
+
+        /** What a full-width client will serve in one range. */
+        const val RANGE_BYTES = 1024L * 1024
+
+        /** What `ANDROID_VR` and `TVHTML5_SIMPLY` will serve — half as much. */
+        const val NARROW_RANGE_BYTES = 512L * 1024
     }
 }

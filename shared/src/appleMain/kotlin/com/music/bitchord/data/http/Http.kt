@@ -14,6 +14,7 @@ import io.ktor.client.statement.HttpResponse
 import io.ktor.client.statement.bodyAsBytes
 import io.ktor.client.statement.bodyAsChannel
 import io.ktor.client.statement.bodyAsText
+import com.music.bitchord.data.innertube.PlayerClient
 import io.ktor.http.ContentType
 import io.ktor.http.Parameters
 import io.ktor.http.contentType
@@ -251,23 +252,38 @@ actual object Http {
      *
      * A 16 KiB probe therefore passed URLs that died on the playback path,
      * which is what "it loads and then doesn't play" is made of. This asks for
-     * [PROBE_RANGE_BYTES], matching the chunk size the real read uses, and
-     * insists on [PROBE_READ_BYTES] actually arriving so a response that stalls
-     * after its headers is a failure too.
+     * [PlayerClient.rangeBytesFor] — the most the URL's own client will serve in
+     * one range — and insists on [PROBE_READ_BYTES] actually arriving so a
+     * response that stalls after its headers is a failure too.
      *
      * The headers are the ones the media fetch will really use
      * ([PlayerClient.mediaHeaders]), so this tests the request that matters.
      *
-     * Unlocked ANDROID URLs are expected to serve full multi-chunk downloads;
-     * adaptive URLs that only serve the first megabyte fail here, which is the
-     * point of asking for two.
+     * The range *starts* past [AUTH_BOUNDARY_BYTES] when the file is that long,
+     * which is the part that catches the nastiest case. Some clients' URLs serve
+     * the opening megabyte to anybody and 403 everything after it, so a probe of
+     * the start passes and playback dies fifty seconds in — after the listener
+     * has heard a bar of music and formed an opinion. Reading from just past the
+     * boundary asks the question that actually decides whether the track will
+     * finish.
      */
     actual suspend fun probe(
         url: String,
         headers: Map<String, String>,
     ): ProbeResult {
         return try {
-            val response = rangedGet(url, headers, from = 0, length = PROBE_RANGE_BYTES)
+            val length = PlayerClient.lengthFromUrl(url)
+            val range = PlayerClient.rangeBytesFor(url)
+            val start = if (length != null && length > AUTH_BOUNDARY_BYTES + PROBE_READ_BYTES) {
+                AUTH_BOUNDARY_BYTES
+            } else {
+                0L
+            }
+            val response = rangedGet(
+                url, headers,
+                from = start,
+                length = if (length != null) minOf(range, length - start) else range,
+            )
             val ct = response.contentType()?.toString()
             val status = response.status.value
             if (status in REFUSAL_CODES || status !in 200..299 && status != 416) {
@@ -327,11 +343,13 @@ actual object Http {
     private const val PROBE_TIMEOUT_MS = 6_000L
 
     /**
-     * Two megabytes, matching the range the engine and the read-ahead actually
-     * request. A probe smaller than the real fetch cannot see a refusal the
-     * real fetch would meet.
+     * Where googlevideo stops authorising some clients' URLs.
+     *
+     * Upstream cites InnerTubeX's "CDN 403 after 1 MiB" for this: such a URL
+     * serves the first megabyte to anyone and refuses the rest, so a probe that
+     * only reads the opening cannot tell a good URL from a dead one.
      */
-    private const val PROBE_RANGE_BYTES = 2L * 1024 * 1024
+    private const val AUTH_BOUNDARY_BYTES = 1024L * 1024
 
     /** Enough of the answer to have to actually arrive, to catch a stalled body. */
     private const val PROBE_READ_BYTES = 16L * 1024

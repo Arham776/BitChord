@@ -273,7 +273,7 @@ final class PlaybackController {
         AudioSessionManager.activate()
         QualityUpgrade.forgetLastSession()
         restoreSession()
-        let token = PlatformSettings.shared.getString(key: "discord_token", default: "")
+        let token = PlatformSettings.shared.getSecret(key: "discord_token") ?? ""
         if !token.isEmpty { DiscordGateway.shared.connect(token: token) }
     }
 
@@ -918,12 +918,29 @@ final class PlaybackController {
 
     /// Innertube URL + growing local file, the path that starts playback earliest.
     ///
-    /// No retry loop here on purpose. A refusal at this point means the URL really
-    /// is dead — the resolver probed it with a 2 MiB range and the same headers
-    /// before handing it over — and asking again for the same URL from the same
-    /// client is the one thing that reliably provokes a throttle. The bridge
-    /// reports the refusal back to the resolver instead, which forgets the URL and
-    /// stands the client down so the *next* attempt starts somewhere else.
+    /// ## Why there is no retry loop, and what replaces it
+    ///
+    /// There used to be one: on a 403, ask for the same URL again. That is the
+    /// worst available response, because the URL is not stale data — a googlevideo
+    /// URL is *bound to the session that minted it*, and re-fetching the same one
+    /// with the same headers is the single most reliable way to talk a session
+    /// into being throttled. It also cannot succeed: the reason the first fetch
+    /// was refused is the same reason the second will be.
+    ///
+    /// What replaces it is a *fresh player request*, which is a different thing:
+    ///
+    ///  - The bridge has already reported the refusal to the resolver, which forgot
+    ///    the URL and stood the client that minted it down. So the second attempt
+    ///    asks `player` again and gets a **new URL, usually from a different
+    ///    client** — the variable that actually changed is the one that matters.
+    ///  - It happens **once**. A second refusal means the problem is not this
+    ///    track's URL, and a third attempt would be a session hammering itself.
+    ///
+    /// A *transport* failure is the opposite case and deliberately does not
+    /// re-resolve: the URL was served once, so it is alive, and handing it to the
+    /// engine — which has its own connection management and its own retries — is a
+    /// better second chance than minting a new URL for a problem the new URL would
+    /// not fix.
     private static func resolveYouTube(videoId: String, prefs: ResolvePrefs) async throws -> ResolvedSource {
         let stream = try await InnertubeStreamResolver.shared.resolve(videoId: videoId, maxKbps: prefs.maxKbps)
         do {
@@ -933,7 +950,33 @@ final class PlaybackController {
                 source: localPath, headers: [:], kbps: stream.kbps, origin: .youtube
             )
         } catch {
-            print("[Playback] stream failed for \(videoId): \(error)")
+            let reason = (error as? InnertubeStreamResolver.StreamError)?.message
+            if StreamDownloadBridge.shared.isRefusal(message: reason),
+               let code = StreamDownloadBridge.shared.refusalCode(message: reason) {
+                DebugLog.shared.d(
+                    message: "\(videoId): refused with \(code); the URL is dead, "
+                        + "so asking for a new one"
+                )
+                // The stand-down above already happened inside the bridge.
+                let fresh = try await InnertubeStreamResolver.shared.resolve(
+                    videoId: videoId, maxKbps: prefs.maxKbps
+                )
+                do {
+                    let localPath = try await streamViaKtor(
+                        videoId: videoId, url: fresh.url, headers: fresh.headers)
+                    return ResolvedSource(
+                        source: localPath, headers: [:], kbps: fresh.kbps, origin: .youtube
+                    )
+                } catch {
+                    // Refused again, or never served. Say so rather than handing
+                    // on a URL already known to be refused — the engine would
+                    // retry it internally for as long as it liked.
+                    throw InnertubeStreamResolver.StreamError(
+                        message: "Refused (\(code)) and refused again on a fresh URL"
+                    )
+                }
+            }
+            DebugLog.shared.d(message: "\(videoId): stream failed: \(reason ?? "\(error)")")
             return ResolvedSource(
                 source: stream.url, headers: stream.headers, kbps: stream.kbps, origin: .youtube
             )
@@ -1008,9 +1051,10 @@ final class PlaybackController {
         let lossless: Bool?
     }
 
-    /// Starts playback as soon as the first 1 MiB is on disk. Remaining
-    /// ranges keep appending; [StreamFileCache] is filled when the last
-    /// range lands so a re-tap does not fetch again.
+    /// Starts playback as soon as the first range is on disk — up to a megabyte,
+    /// or half that for a client that caps lower. Remaining ranges keep
+    /// appending; [StreamFileCache] is filled when the last one lands so a
+    /// re-tap does not fetch again.
     private static func streamViaKtor(
         videoId: String, url: String, headers: [String: String]
     ) async throws -> String {

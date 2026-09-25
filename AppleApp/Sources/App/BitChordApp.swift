@@ -19,12 +19,13 @@ struct BitChordApp: App {
                 .task {
                     CipherUnlockWiring.install()
                     SecretStoreWiring.install()
+                    ModuleEngineWiring.install()
                     installAutomixModels()
                     controller.startEngineIfNeeded()
                     LocalLibrary.shared.restore()
                     DownloadStore.shared.refresh()
                     Task { await StreamFileCache.shared.trim() }
-                    let token = PlatformSettings.shared.getString(key: "discord_token", default: "")
+                    let token = PlatformSettings.shared.getSecret(key: "discord_token") ?? ""
                     if !token.isEmpty { DiscordGateway.shared.connect(token: token) }
                 }
                 .onChange(of: scenePhase) { _, phase in
