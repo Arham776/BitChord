@@ -2,9 +2,38 @@ package com.music.bitchord.data.http
 
 /**
  * One HTTP seam for the whole app (port of upstream `data/Http.kt` per spec
- * §1.2): a single client instance so innertube and any media fetch share the
- * connection context. Apple actual = Ktor Darwin engine; an androidMain
- * actual reappears when the Android reunification milestone lands.
+ * §1.2). The point of it being *one* seam is upstream's, and it is load-bearing:
+ *
+ *  > googlevideo binds a stream URL to the connection context of the `player`
+ *  > request that minted it. If Innertube and the media fetch used separate
+ *  > HTTP stacks they could resolve to different addresses (v4 vs v6) and the
+ *  > media fetch would come back 403.
+ *
+ * So the Darwin actual runs one client on one `URLSession` and every caller —
+ * innertube, the media fetch, the range probe, the lyrics and canvas providers
+ * — goes through it.
+ *
+ * ## How the session cookie travels
+ *
+ * As a request **header**, exactly as upstream sends it (`Innertube.authHeaders`
+ * puts `Cookie` in the header map and nothing writes it to a jar). That is the
+ * whole mechanism, and it is the correct one:
+ *
+ *  - An `HTTPCookieStorage` is domain-scoped, so a session written to one for
+ *    `.youtube.com` could never reach `*.googlevideo.com` anyway. Isolating
+ *    the media client from the session was buying nothing.
+ *  - The only way that isolation *could* have worked — mirroring the header
+ *    into a jar — is a duplicate. A `URLSession` configured with
+ *    `httpShouldSetCookies` sends the jar's cookies *and* the explicit header,
+ *    so every signed-in request went out with two `Cookie` headers.
+ *  - The jar version had to re-derive each cookie's domain by string surgery on
+ *    the header, with a `__Host-` special case and no handling for the
+ *    `__Secure-` forms Google actually sets, and it cleared the entire jar on
+ *    every sign-in — taking unrelated provider cookies with it.
+ *
+ * [setHostCookies] below is the one place a jar is written, and it is for
+ * cookies a *provider* needs on a later request to a host we already know
+ * (Spotify's `sp_dc`). It is never used for the account session.
  */
 expect object Http {
     /** POST JSON, return the response body as text. */
@@ -55,14 +84,8 @@ expect object Http {
     ): Int
 
     /**
-     * Darwin URLSession ignores a `Cookie` header on the request (OkHttp
-     * does not). Session cookies are therefore also written into an isolated
-     * `HTTPCookieStorage` the API client actually sends. No-op on engines
-     * that honour the header. Never used for googlevideo.
+     * POST application/x-www-form-urlencoded. Non-2xx still returns the body.
      */
-    fun installSessionCookies(header: String?)
-
-    /** POST application/x-www-form-urlencoded. Non-2xx still returns the body. */
     suspend fun postForm(
         url: String,
         fields: Map<String, String>,
@@ -91,8 +114,13 @@ expect object Http {
     ): RawHttpBytes
 
     /**
-     * Write cookies for [originUrl] into the Darwin cookie jar so a subsequent
-     * [getRaw] actually sends them (URLSession ignores a `Cookie` header).
+     * Write cookies for [originUrl] into the jar so a subsequent [getRaw]
+     * actually sends them. For a provider that handed us a cookie to reuse on
+     * a later request to a host we already know — never for the account
+     * session, which travels as a header (see the type-level note).
+     *
+     * Replaces any cookie of the same name for that host, so a rotated
+     * credential does not leave the previous one behind to be sent first.
      */
     fun setHostCookies(originUrl: String, cookies: Map<String, String>)
 }

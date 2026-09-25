@@ -35,6 +35,10 @@ kotlin {
             // sqldelight: add only if upstream Room usage is confirmed (spec §1.1).
         }
 
+        commonTest.dependencies {
+            implementation(kotlin("test"))
+        }
+
         // The Darwin Ktor engine only resolves for Apple targets, so it lives in
         // appleMain — the common ancestor of every configured Apple target.
         appleMain.dependencies {

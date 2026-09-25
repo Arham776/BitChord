@@ -6,6 +6,7 @@ struct BitChordApp: App {
     @State private var controller = PlaybackController()
     @State private var appModel = AppModel()
     @State private var auth = AuthController()
+    @State private var toast = ToastCenter()
     @Environment(\.scenePhase) private var scenePhase
 
     var body: some Scene {
@@ -14,6 +15,7 @@ struct BitChordApp: App {
                 .environment(controller)
                 .environment(appModel)
                 .environment(auth)
+                .environment(toast)
                 .task {
                     CipherUnlockWiring.install()
                     installAutomixModels()
@@ -34,6 +36,12 @@ struct BitChordApp: App {
                     }
                 }
                 .onOpenURL { url in
+                    // Handling lives here, on the scene, rather than on `RootView`.
+                    // It was installed in both places, so whichever ran second
+                    // consumed the link and the other was dead — a `bitchord://`
+                    // link reached the player only by accident of ordering. On the
+                    // scene it runs before the view hierarchy exists, which is what
+                    // a cold launch from a link actually needs.
                     if url.absoluteString.contains("open-player") {
                         appModel.nowPlayingPresented = true
                     }
@@ -45,6 +53,7 @@ struct BitChordApp: App {
         .defaultSize(width: 1280, height: 820)
         .windowResizability(.contentMinSize)
         .windowStyle(.automatic)
+        .commands { PlaybackCommands(controller: controller, appModel: appModel) }
 #endif
 #if os(macOS)
         Settings {
@@ -84,6 +93,11 @@ final class AppModel {
     var replayPresented = false
     var focusSearch = false
     var pendingSearchQuery: String?
+    /// Set by the macOS menu commands to ask the player to reveal a pane that is
+    /// otherwise behind a toggle. One-shot: the player consumes it and clears it,
+    /// so holding ⌘U does not keep re-toggling.
+    var queueRevealRequested = false
+    var lyricsRevealRequested = false
     var themeMode = PlatformSettings.shared.getString(key: "theme_mode", default: "dark")
     var appLanguage = PlatformSettings.shared.getString(key: "app_language", default: "")
     var pinLimitAlert = false

@@ -167,8 +167,9 @@ struct SignInBanner: View {
     var body: some View {
         HStack(spacing: 14) {
             Image(systemName: "person.crop.circle")
-                .font(.system(size: 26))
+                .font(.title2)
                 .foregroundStyle(.secondary)
+                .decorative()
             VStack(alignment: .leading, spacing: 2) {
                 Text("Sign in to YouTube Music")
                     .font(.headline)

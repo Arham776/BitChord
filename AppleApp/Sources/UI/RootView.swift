@@ -10,6 +10,7 @@ struct RootView: View {
     @Environment(PlaybackController.self) private var controller
     @Environment(AppModel.self) private var appModel
     @Environment(AuthController.self) private var auth
+    @Environment(ToastCenter.self) private var toast
     #if os(macOS)
     @Environment(\.openSettings) private var openSettings
     #endif
@@ -131,12 +132,21 @@ struct RootView: View {
         #endif
         .preferredColorScheme(appModel.preferredScheme)
         .environment(\.locale, appModel.appLanguage.isEmpty ? .autoupdatingCurrent : Locale(identifier: appModel.appLanguage))
-        .onOpenURL { url in
-            if url.absoluteString.contains("open-player") {
-                appModel.nowPlayingPresented = true
-            }
-            _ = MusicLink.shared.submitUrl(url: url.absoluteString)
-            consumeMusicLink(appModel: appModel, controller: controller)
+        .overlay {
+            // One host, at the top of the tree, so a notice raised from a sheet or
+            // a context menu is never clipped by the view that raised it. Same
+            // reason upstream puts `QueueActionNoticeHost` above everything else.
+            ToastHost()
+        }
+        // Playback failures are reported here rather than as a banner inside each
+        // feed. `lastError` is a *playback* error — "Audio engine failed to start"
+        // has nothing to do with a feed that happened to be on screen — and it
+        // used to be rendered as a hard-coded red bar at the top of Home,
+        // Explore and Search results, which is both the wrong place and the wrong
+        // severity for a transient failure.
+        .onChange(of: controller.lastError) { _, message in
+            guard let message, !message.isEmpty else { return }
+            toast.show(message, kind: .failure)
         }
     }
 
@@ -174,7 +184,10 @@ struct RootView: View {
             Tab(value: AppModel.Tab.home) {
                 HomeView(feed: homeFeed).modifier(MacPlaybackChrome())
             } label: {
-                sidebarLabel("Home", image: .bchPlay)
+                // Upstream's own Home glyph, not the play triangle the UI spec
+                // §6 claimed. `MainActivity.kt` puts `BitChordIcons.Home` on that
+                // tab; the spec's inventory was wrong about it.
+                sidebarLabel("Home", image: .bchHome)
             }
             Tab(value: AppModel.Tab.explore) {
                 ExploreView(feed: exploreFeed).modifier(MacPlaybackChrome())
@@ -195,12 +208,15 @@ struct RootView: View {
                 Tab(value: AppModel.Tab.libraryAlbums) {
                     LibraryView(lockedSection: .albums).modifier(MacPlaybackChrome())
                 } label: {
-                    Label("Albums", systemImage: "square.stack")
+                    // Upstream glyphs throughout, per UI spec §6 — these two were
+                    // SF Symbols sitting next to `.bchLibrary` and `.bchMusicNote`
+                    // in the same sidebar, which read as a mistake.
+                    sidebarLabel("Albums", image: .bchLibrary)
                 }
                 Tab(value: AppModel.Tab.libraryArtists) {
                     LibraryView(lockedSection: .artists).modifier(MacPlaybackChrome())
                 } label: {
-                    Label("Artists", systemImage: "person.2")
+                    sidebarLabel("Artists", image: .bchMusicNote)
                 }
                 Tab(value: AppModel.Tab.libraryDownloads) {
                     LibraryView(lockedSection: .downloads).modifier(MacPlaybackChrome())
@@ -219,7 +235,7 @@ struct RootView: View {
                 sidebarLabel("Search", image: .bchSearch)
             }
             #else
-            Tab("Home", image: "bch-play", value: AppModel.Tab.home) {
+            Tab("Home", image: "bch-home", value: AppModel.Tab.home) {
                 HomeView(feed: homeFeed)
             }
             Tab("Explore", image: "bch-explore", value: AppModel.Tab.explore) {

@@ -1,7 +1,11 @@
 package com.music.bitchord.data.innertube
 
+import com.music.bitchord.data.DebugLog
 import com.music.bitchord.data.http.Http
 import com.music.bitchord.data.http.ProbeResult
+import io.ktor.client.plugins.HttpRequestTimeoutException
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.delay
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonElement
@@ -24,6 +28,7 @@ import kotlinx.serialization.json.putJsonObject
 import kotlinx.serialization.json.JsonArrayBuilder
 import kotlin.concurrent.Volatile
 import kotlin.time.Clock
+import kotlinx.io.IOException
 
 /**
  * Port of upstream `data/innertube/Innertube.kt` — the guest-browse subset
@@ -50,6 +55,7 @@ object Innertube {
     private const val MUSIC_BASE = "https://music.youtube.com/youtubei/v1"
     private const val YT_BASE = "https://www.youtube.com/youtubei/v1"
     private const val MUSIC_ORIGIN = "https://music.youtube.com"
+    private const val YOUTUBE_ORIGIN = "https://www.youtube.com"
 
     /** Fallback WEB_REMIX version — [ensureSessionScope] replaces this with
      *  the live one from the signed-in music.youtube.com shell. */
@@ -199,7 +205,7 @@ object Innertube {
         val signedIn = CONFIG_LOGGED_IN.find(html)?.groupValues?.get(1) == "true"
         val clientVersion = CONFIG_CLIENT_VERSION.find(html)?.groupValues?.get(1)
         if (!signedIn) {
-            println("[Innertube] music.youtube.com served a signed-out shell; not scoping requests")
+            DebugLog.w("music.youtube.com served a signed-out shell; not scoping requests")
             return clientVersion?.let { SessionScope(null, null, "0", it) }
         }
         val dataSyncId = CONFIG_DATASYNC_ID.find(html)?.groupValues?.get(1)
@@ -284,6 +290,14 @@ object Innertube {
      *
      * @param signatureTimestamp sts from base.js; required when
      *   [PlayerClient.needsSignatureTimestamp] is true.
+     * @param authenticated whether to carry the session cookie. Unauthenticated
+     *   by default, which is right for the device clients — they are answered
+     *   *because* they look like anonymous devices. It is the deliberate
+     *   exception for [PlayerClient.WEB_REMIX], a browser identity that is
+     *   suspicious without a session rather than with one, and for a device
+     *   client that has just answered an age gate, where the anonymous request
+     *   has already been refused so there is nothing left to protect. See
+     *   [postPlayer] and [StreamResolver].
      * @throws UnplayableException when the track is refused rather than
      *   missing — a region block, a takedown, or the client being turned
      *   away. Callers walk on to the next client on that distinction.
@@ -292,8 +306,9 @@ object Innertube {
         videoId: String,
         client: PlayerClient,
         signatureTimestamp: Int? = null,
+        authenticated: Boolean = false,
     ): JsonObject {
-        val response = postPlayer(videoId, client, signatureTimestamp)
+        val response = postPlayer(videoId, client, signatureTimestamp, authenticated)
         val playability = response["playabilityStatus"] as? JsonObject
         val status = (playability?.get("status") as? JsonPrimitive)?.contentOrNull
         if (status != null && status != "OK") {
@@ -661,6 +676,82 @@ object Innertube {
 
     // ---- Request plumbing ---------------------------------------------------
 
+    /**
+     * Runs [block], giving a transport failure another go before letting it
+     * reach the caller.
+     *
+     * A connection reset on mobile data is weather, not information: the request
+     * was fine and asking again generally answers. It matters more than usual
+     * here, because everything goes through one client — which is the point of
+     * [Http] and also what makes a socket torn down under one request surface
+     * as an error on whichever request picks that connection up next, having
+     * nothing to do with it. Without this, one stale socket reads as a refused
+     * client, which then costs a whole extra identity on the walk, which is the
+     * churn that gets the network throttled.
+     *
+     * Only transport failures. An HTTP error status is an *answer*, and
+     * repeating the question will not change it. A timeout is not weather
+     * either — it is this app's own decision that the request had long enough —
+     * and because a timeout is also a transport failure, retrying one silently
+     * multiplied a 6-second `player` ceiling into 18 and turned a walk of seven
+     * clients into a walk of well over a minute. Cancellation is never caught:
+     * a resolve whose caller has walked away must stop, not retry on behalf of
+     * nobody.
+     */
+    private suspend fun <T> withRetry(what: String, attempts: Int = 3, block: suspend () -> T): T {
+        var backoff = 500L
+        repeat(attempts - 1) {
+            try {
+                return block()
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                if (!e.isTransport()) throw e
+                DebugLog.d("retrying $what: ${e.message}")
+            }
+            delay(backoff)
+            backoff *= 2
+        }
+        return block()
+    }
+
+    /**
+     * Whether [this] is a failure of the connection rather than of the request.
+     *
+     * The distinction cannot be read off the exception hierarchy across engines,
+     * so it is read off what the failures have in common: the request never
+     * completed, so there is nothing to be an answer *about*. A refused status
+     * is an answer and must not be repeated; a body that failed to parse, or a
+     * contract this app got wrong, will not parse or conform the second time
+     * either and is worth surfacing.
+     */
+    private fun Throwable.isTransport(): Boolean {
+        if (this is HttpRequestTimeoutException) return false
+        var current: Throwable? = this
+        val seen = HashSet<Throwable>()
+        while (current != null && seen.add(current)) {
+            if (current is HttpRequestTimeoutException) return false
+            if (current is UnplayableException || current is NotSignedInException) return false
+            if (current is IOException) return true
+            val text = current.message?.lowercase().orEmpty()
+            if (TRANSPORT_MARKERS.any { it in text }) return true
+            current = current.cause
+        }
+        return false
+    }
+
+    /**
+     * Wording the Darwin engine uses for a connection that failed before a
+     * response, which it reports as an `NSError` rather than as an
+     * `IOException` the way the JVM engine does.
+     */
+    private val TRANSPORT_MARKERS = listOf(
+        "connection reset", "connection lost", "software caused connection abort",
+        "connection refused", "network connection lost", "timed out", "broken pipe",
+        "nodata", "cannot connect to host", "the network connection was lost",
+        "unsatisfiable constraints", "could not connect",
+    )
+
     private suspend fun postMusic(
         endpoint: String,
         query: Map<String, String> = emptyMap(),
@@ -696,12 +787,14 @@ object Innertube {
             visitorData?.let { put("X-Goog-Visitor-Id", it) }
             putAll(authHeaders(MUSIC_ORIGIN))
         }
-        val text = Http.postJson(
-            url = "$MUSIC_BASE/$endpoint",
-            body = json.encodeToString(JsonObject.serializer(), body),
-            headers = headers,
-            query = query + ("prettyPrint" to "false"),
-        )
+        val text = withRetry("postMusic/$endpoint") {
+            Http.postJson(
+                url = "$MUSIC_BASE/$endpoint",
+                body = json.encodeToString(JsonObject.serializer(), body),
+                headers = headers,
+                query = query + ("prettyPrint" to "false"),
+            )
+        }
         val response = json.parseToJsonElement(text) as? JsonObject
             ?: error("innertube $endpoint: unexpected response shape")
         // Browse responses carry one; a session that never happened to see
@@ -715,14 +808,21 @@ object Innertube {
 
     /**
      * Unauthenticated by default — the device clients are answered *because*
-     * they look like anonymous devices; attaching a session cookie is what
-     * gets one turned away with `LOGIN_REQUIRED`. The cookie joins a request
-     * only when present (signed-in browse/account calls).
+     * they look like anonymous devices; attaching a session cookie to one of
+     * those is what gets it turned away with `LOGIN_REQUIRED`.
+     *
+     * [authenticated] is the deliberate exception, and it is the whole reason a
+     * signed-in listener is not treated as a stranger. There are two callers:
+     * [PlayerClient.WEB_REMIX], a browser identity that reads as suspicious
+     * *without* a session; and a device client that has just answered an age
+     * gate, which the same client will answer OK for once it carries the
+     * cookie. See [StreamResolver].
      */
     private suspend fun postPlayer(
         videoId: String,
         playerClient: PlayerClient,
         signatureTimestamp: Int? = null,
+        authenticated: Boolean = false,
     ): JsonObject {
         val body = buildJsonObject {
             putJsonObject("context") {
@@ -757,17 +857,36 @@ object Innertube {
             playerClient.origin?.let { put("Origin", it) }
             playerClient.referer?.let { put("Referer", it) }
             visitorData?.let { put("X-Goog-Visitor-Id", it) }
+            if (authenticated) putAll(authHeaders(playerClient.apiOrigin))
         }
-        val text = Http.postJson(
-            url = "$YT_BASE/player",
-            body = json.encodeToString(JsonObject.serializer(), body),
-            headers = headers,
-            query = mapOf("prettyPrint" to "false"),
-            timeoutMillis = PLAYER_TIMEOUT_MS,
-        )
+        val text = withRetry("player/${playerClient.clientName}") {
+            Http.postJson(
+                // Browser-shaped clients are served from the Music host, app
+                // clients from YouTube proper. Posting WEB_REMIX at the wrong one
+                // is a refused request, not a weaker one.
+                url = "${playerClient.apiBase}/player",
+                body = json.encodeToString(JsonObject.serializer(), body),
+                headers = headers,
+                query = mapOf("prettyPrint" to "false"),
+                timeoutMillis = PLAYER_TIMEOUT_MS,
+            )
+        }
         return json.parseToJsonElement(text) as? JsonObject
             ?: error("innertube player: unexpected response shape")
     }
+
+    /**
+     * The origin a signed-in [player] call for this client has to be signed
+     * for.
+     *
+     * Google recomputes the SAPISIDHASH digest over the origin it sees and
+     * rejects a mismatch with 401, so an app client posting to
+     * `www.youtube.com` signed for the music origin is not a weaker request —
+     * it is a refused one. That would have made the signed-in retries look like
+     * dead ends for every client that is not browser-shaped.
+     */
+    private val PlayerClient.apiOrigin: String
+        get() = origin ?: if (usesMusicHost) MUSIC_ORIGIN else YOUTUBE_ORIGIN
 
     /** See [Http.postJson]'s timeout — upstream's per-player-call ceiling. */
     private const val PLAYER_TIMEOUT_MS = 6_000L
@@ -830,16 +949,12 @@ object Innertube {
 internal fun ProbeResult.classify(): ProbeVerdict = when {
     status in setOf(403, 404, 410) -> ProbeVerdict.REFUSED
     status !in 200..299 && status != 416 -> ProbeVerdict.UNREACHABLE
-    !isMediaContentType(contentType) -> ProbeVerdict.REFUSED
+    // Audio only — the engine plays audio, and a muxed `video/mp4` answer is not
+    // something it can be handed. [Http.probe] applies the same test, so a URL
+    // that clears here cleared the same test there.
+    !contentType.orEmpty().startsWith("audio/") -> ProbeVerdict.REFUSED
     !bodyArrived -> ProbeVerdict.UNREACHABLE
     else -> ProbeVerdict.OK
-}
-
-private fun isMediaContentType(ct: String?): Boolean {
-    if (ct == null) return false
-    return ct.startsWith("audio/") ||
-        ct.startsWith("video/mp4") ||
-        ct.startsWith("video/3gpp")
 }
 
 internal enum class ProbeVerdict {

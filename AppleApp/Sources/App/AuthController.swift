@@ -21,10 +21,28 @@ final class AuthController {
         restore()
     }
 
+    /// Why the session could not be read even though one is stored, if so.
+    ///
+    /// Only set when [AuthStore.isLocked] — the Keychain will not answer before
+    /// first unlock. Worth surfacing rather than treating as signed-out, because
+    /// "your session is saved but this device has not been unlocked yet" and "you
+    /// are not signed in" call for opposite actions.
+    var sessionUnavailableReason: String?
+
     func restore() {
-        guard let cookie = AuthStore.cookie else { return }
+        sessionUnavailableReason = nil
+        guard let cookie = AuthStore.cookie else {
+            if AuthStore.isLocked {
+                sessionUnavailableReason =
+                    "Your session is saved but this device has not been unlocked yet."
+            }
+            return
+        }
         guard AuthBridge.shared.applyCookie(cookieHeader: cookie) else {
-            AuthStore.cookie = nil
+            // A stored cookie with no signing secret in it is worse than none: it
+            // would have every request go out unsigned while the UI claimed
+            // otherwise. Drop it rather than keep re-applying it.
+            AuthStore.clear()
             return
         }
         signedIn = true
@@ -42,12 +60,13 @@ final class AuthController {
     }
 
     func signOut() {
-        AuthStore.cookie = nil
+        AuthStore.clear()
         _ = AuthBridge.shared.applyCookie(cookieHeader: nil)
         signedIn = false
         accountName = nil
         accountEmail = nil
         accountPhotoUrl = nil
+        sessionUnavailableReason = nil
         sessionEpoch += 1
     }
 

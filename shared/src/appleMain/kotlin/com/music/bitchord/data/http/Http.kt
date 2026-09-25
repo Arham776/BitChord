@@ -23,7 +23,6 @@ import kotlinx.io.readByteArray
 import platform.Foundation.NSHTTPCookie
 import platform.Foundation.NSHTTPCookieDomain
 import platform.Foundation.NSHTTPCookieName
-import platform.Foundation.NSHTTPCookieOriginURL
 import platform.Foundation.NSHTTPCookiePath
 import platform.Foundation.NSHTTPCookieSecure
 import platform.Foundation.NSHTTPCookieStorage
@@ -31,101 +30,71 @@ import platform.Foundation.NSHTTPCookieValue
 import platform.Foundation.NSURL
 
 /**
- * Port of upstream `data/Http.kt`, Swift-flavoured per spec §1.2.
+ * Apple actual of [Http] — Ktor's Darwin engine, **one** client.
  *
- * Darwin URLSession strips a `Cookie` header the way OkHttp does not, so
- * WEB_REMIX cookies live in an isolated [NSHTTPCookieStorage] the API
- * client actually sends. The media client keeps storage off so googlevideo
- * never sees the session (LOGIN_REQUIRED).
+ * ## Why exactly one
+ *
+ * Upstream's `data/Http.kt` is a single OkHttp client and its header comment is
+ * entirely about why the *innertube* calls and the *media* fetch must not be
+ * separate stacks: googlevideo binds a stream URL to the connection context
+ * that minted it, so a media fetch that resolves to a different address family
+ * than the `player` request comes back 403. `Innertube` then wires itself
+ * straight into it (`engine { preconfigured = Http.client }`).
+ *
+ * This used to be three clients — an API one, a lenient one, and a `mediaClient`
+ * with `HTTPCookieStorage = null` — kept separate on the theory that googlevideo
+ * must never see the account session. That theory does not survive contact with
+ * how cookies work: a cookie jar is domain-scoped, so `.youtube.com` cookies
+ * cannot reach `*.googlevideo.com` in the first place, and the separation bought
+ * nothing while giving up the shared connection context. The comment it replaced
+ * is the one this file's is modelled on.
+ *
+ * `expectSuccess` is off for the shared client and strictness is applied
+ * explicitly by the few calls that need it ([postJson], [getText], [getBytes]),
+ * so one client can serve both the calls that treat a 4xx as an error and the
+ * ones that need to read a status — [getRaw], [postBytes], [getStatus] and
+ * [probe], where a 403 is the answer rather than an error.
+ *
+ * ## The session cookie
+ *
+ * Sent as a request header, like upstream. Nothing mirrors it into
+ * `cookieJar` — see the note on [Http]. [cookieJar] holds provider cookies
+ * only, and is scoped to the app group so it is not shared with the rest of the
+ * process.
  */
 actual object Http {
 
     private const val COOKIE_GROUP = "group.com.example.bitchord"
 
-    private val apiCookies: NSHTTPCookieStorage =
+    private val cookieJar: NSHTTPCookieStorage =
         NSHTTPCookieStorage.sharedCookieStorageForGroupContainerIdentifier(COOKIE_GROUP)
 
-    /** API client — non-2xx is an error for innertube POSTs/GETs. */
+    /**
+     * The one client. `httpShouldSetCookies` stays on so provider cookies
+     * written by [setHostCookies] are sent, and so a provider's own `Set-Cookie`
+     * rotations are honoured across requests. Neither reaches the account
+     * session: nothing writes that here, and the youtube.com cookies Google sets
+     * in response to an innertube call are not credentials.
+     */
     private val client: HttpClient = HttpClient(Darwin) {
         engine {
             configureSession {
                 HTTPShouldSetCookies = true
-                HTTPCookieStorage = apiCookies
-            }
-        }
-        install(HttpTimeout)
-        expectSuccess = true
-    }
-
-    /**
-     * Lenient client: cookies from [apiCookies], does not throw on non-2xx.
-     * Used by Spotify canvas/token and status-aware GETs.
-     */
-    private val lenientClient: HttpClient = HttpClient(Darwin) {
-        engine {
-            configureSession {
-                HTTPShouldSetCookies = true
-                HTTPCookieStorage = apiCookies
-            }
-        }
-        install(HttpTimeout)
-        expectSuccess = false
-    }
-    private val mediaClient: HttpClient = HttpClient(Darwin) {
-        engine {
-            configureSession {
-                HTTPShouldSetCookies = false
-                HTTPCookieStorage = null
+                HTTPCookieStorage = cookieJar
             }
         }
         install(HttpTimeout)
         expectSuccess = false
     }
 
-    actual fun installSessionCookies(header: String?) {
-        apiCookies.cookies?.let { list ->
-            (list as List<*>).filterIsInstance<NSHTTPCookie>().forEach { cookie ->
-                apiCookies.deleteCookie(cookie)
-            }
+    /** Throws for a non-2xx, standing in for what `expectSuccess = true` would. */
+    private fun HttpResponse.requireSuccess(what: String) {
+        val code = status.value
+        if (code !in 200..299) {
+            error("$what: HTTP $code ${status.description}")
         }
-        if (header.isNullOrBlank()) return
-        var installed = 0
-        header.split(';').forEach { entry ->
-            val name = entry.substringBefore('=').trim()
-            val value = entry.substringAfter('=', "").trim()
-            if (name.isEmpty() || value.isEmpty()) return@forEach
-            cookieWith(name, value)?.let {
-                apiCookies.setCookie(it)
-                installed++
-            }
-        }
-        println("[Http] installed $installed session cookies for WEB_REMIX")
     }
 
-    private fun cookieWith(name: String, value: String): NSHTTPCookie? {
-        val props: Map<Any?, Any> = if (name.startsWith("__Host-")) {
-            mapOf(
-                NSHTTPCookieName to name,
-                NSHTTPCookieValue to value,
-                NSHTTPCookiePath to "/",
-                NSHTTPCookieSecure to "TRUE",
-                NSHTTPCookieOriginURL to (NSURL(string = "https://music.youtube.com/") ?: return null),
-            )
-        } else {
-            mapOf(
-                NSHTTPCookieName to name,
-                NSHTTPCookieValue to value,
-                NSHTTPCookieDomain to ".youtube.com",
-                NSHTTPCookiePath to "/",
-                NSHTTPCookieSecure to "TRUE",
-            )
-        }
-        return NSHTTPCookie.cookieWithProperties(props)
-    }
-
-    /** POST JSON, return the response body as text — the shape every
-     *  innertube call takes. Timeouts mirror upstream's 20 s connect /
-     *  30 s read budget. */
     actual suspend fun postJson(
         url: String,
         body: String,
@@ -141,9 +110,8 @@ actual object Http {
         }
         headers.forEach { (key, value) -> header(key, value) }
         query.forEach { (key, value) -> parameter(key, value) }
-    }.bodyAsText()
+    }.also { it.requireSuccess("POST $url") }.bodyAsText()
 
-    /** GET, return the response body as text. */
     actual suspend fun getText(
         url: String,
         headers: Map<String, String>,
@@ -156,7 +124,7 @@ actual object Http {
         }
         headers.forEach { (key, value) -> header(key, value) }
         query.forEach { (key, value) -> parameter(key, value) }
-    }.bodyAsText()
+    }.also { it.requireSuccess("GET $url") }.bodyAsText()
 
     actual suspend fun getStatus(
         url: String,
@@ -172,31 +140,24 @@ actual object Http {
         query.forEach { (key, value) -> parameter(key, value) }
     }.status.value
 
-    /** GET, return the response body as raw bytes. */
     actual suspend fun getBytes(
         url: String,
         headers: Map<String, String>,
         timeoutMillis: Long,
-    ): ByteArray {
-        val response = mediaClient.get(url) {
-            timeout {
-                requestTimeoutMillis = timeoutMillis
-                connectTimeoutMillis = 20_000
-            }
-            headers.forEach { (key, value) -> header(key, value) }
+    ): ByteArray = client.get(url) {
+        timeout {
+            requestTimeoutMillis = timeoutMillis
+            connectTimeoutMillis = 20_000
         }
-        if (response.status.value !in 200..299) {
-            throw IllegalStateException("HTTP ${response.status.value}: ${response.status.description}")
-        }
-        return response.bodyAsBytes()
-    }
+        headers.forEach { (key, value) -> header(key, value) }
+    }.also { it.requireSuccess("GET $url") }.bodyAsBytes()
 
     actual suspend fun postForm(
         url: String,
         fields: Map<String, String>,
         headers: Map<String, String>,
         timeoutMillis: Long,
-    ): String = mediaClient.post(url) {
+    ): String = client.post(url) {
         timeout {
             requestTimeoutMillis = timeoutMillis
             connectTimeoutMillis = 20_000
@@ -213,7 +174,7 @@ actual object Http {
         query: Map<String, String>,
         timeoutMillis: Long,
     ): RawHttpText {
-        val response = lenientClient.get(url) {
+        val response = client.get(url) {
             timeout {
                 requestTimeoutMillis = timeoutMillis
                 connectTimeoutMillis = 8_000
@@ -232,7 +193,7 @@ actual object Http {
         headers: Map<String, String>,
         timeoutMillis: Long,
     ): RawHttpBytes {
-        val response = lenientClient.post(url) {
+        val response = client.post(url) {
             timeout {
                 requestTimeoutMillis = timeoutMillis
                 connectTimeoutMillis = 8_000
@@ -248,8 +209,7 @@ actual object Http {
     }
 
     actual fun setHostCookies(originUrl: String, cookies: Map<String, String>) {
-        val origin = NSURL(string = originUrl) ?: return
-        val host = origin.host ?: return
+        val host = NSURL(string = originUrl)?.host ?: return
         val domain = when {
             host.endsWith("spotify.com") -> ".spotify.com"
             host.startsWith(".") -> host
@@ -264,18 +224,43 @@ actual object Http {
                 NSHTTPCookiePath to "/",
                 NSHTTPCookieSecure to "TRUE",
             )
-            NSHTTPCookie.cookieWithProperties(props)?.let { apiCookies.setCookie(it) }
+            val cookie = NSHTTPCookie.cookieWithProperties(props) ?: return@forEach
+            // Replace rather than accumulate. A jar is keyed by name/domain/path,
+            // but a `Set-Cookie` with a different path would otherwise leave the
+            // stale copy eligible to be sent first, and the provider would see
+            // the credential we meant to replace.
+            cookieJar.cookies?.let { existing ->
+                (existing as List<*>).filterIsInstance<NSHTTPCookie>()
+                    .filter { it.name == cookie.name && it.domain == cookie.domain }
+                    .forEach { cookieJar.deleteCookie(it) }
+            }
+            cookieJar.setCookie(cookie)
         }
     }
 
     /**
      * A ranged GET with a short leash — upstream's stream `probe`.
      *
-     * Asks for [PROBE_RANGE_BYTES] (matching StreamDownload chunk size) and
-     * reads only [PROBE_READ_BYTES], then cancels. A single ask: the dual
-     * second-range check false-positived on Darwin after a mid-body cancel.
+     * The range has to be as large as the real fetch will ask for, not a token
+     * one. Upstream's reasoning, which this used to get wrong by two orders of
+     * magnitude:
+     *
+     *  > A URL minted for a session Google has reservations about serves small
+     *  > ranges to anybody — enough to pass a small probe — and then refuses
+     *  > the multi-megabyte ranges actual listening is made of with a 403.
+     *
+     * A 16 KiB probe therefore passed URLs that died on the playback path,
+     * which is what "it loads and then doesn't play" is made of. This asks for
+     * [PROBE_RANGE_BYTES], matching the chunk size the real read uses, and
+     * insists on [PROBE_READ_BYTES] actually arriving so a response that stalls
+     * after its headers is a failure too.
+     *
+     * The headers are the ones the media fetch will really use
+     * ([PlayerClient.mediaHeaders]), so this tests the request that matters.
+     *
      * Unlocked ANDROID URLs are expected to serve full multi-chunk downloads;
-     * ANDROID_VR adaptive honeypots still fail mid-download and are last resort.
+     * adaptive URLs that only serve the first megabyte fail here, which is the
+     * point of asking for two.
      */
     actual suspend fun probe(
         url: String,
@@ -285,20 +270,14 @@ actual object Http {
             val response = rangedGet(url, headers, from = 0, length = PROBE_RANGE_BYTES)
             val ct = response.contentType()?.toString()
             val status = response.status.value
-            if (status in REFUSAL_CODES) {
+            if (status in REFUSAL_CODES || status !in 200..299 && status != 416) {
                 response.discardBody()
                 return ProbeResult(status = status, contentType = ct, bodyArrived = false)
             }
-            if (status !in 200..299 && status != 416) {
-                response.discardBody()
-                return ProbeResult(status = status, contentType = ct, bodyArrived = false)
-            }
-            val media = ct != null && (
-                ct.startsWith("audio/") ||
-                    ct.startsWith("video/mp4") ||
-                    ct.startsWith("video/3gpp")
-            )
-            if (!media) {
+            // Audio only. Upstream requires this and a muxed `video/mp4` answer
+            // is not something this engine can play, so accepting it here would
+            // pass a URL the caller then has to reject.
+            if (!isAudioContentType(ct)) {
                 response.discardBody()
                 return ProbeResult(status = status, contentType = ct, bodyArrived = false)
             }
@@ -317,7 +296,7 @@ actual object Http {
         headers: Map<String, String>,
         from: Long,
         length: Long,
-    ): HttpResponse = mediaClient.get(url) {
+    ): HttpResponse = client.get(url) {
         header("Range", "bytes=$from-${from + length - 1}")
         timeout { requestTimeoutMillis = PROBE_TIMEOUT_MS }
         headers.forEach { (key, value) -> header(key, value) }
@@ -341,10 +320,19 @@ actual object Http {
         }
     }
 
+    private fun isAudioContentType(ct: String?): Boolean = ct?.startsWith("audio/") == true
+
     private val REFUSAL_CODES = setOf(403, 404, 410)
 
     private const val PROBE_TIMEOUT_MS = 6_000L
-    /** 16 KiB Range — enough to see audio/mp4, not a full megabyte before play. */
-    private const val PROBE_RANGE_BYTES = 16_384L
-    private const val PROBE_READ_BYTES = 16_384L
+
+    /**
+     * Two megabytes, matching the range the engine and the read-ahead actually
+     * request. A probe smaller than the real fetch cannot see a refusal the
+     * real fetch would meet.
+     */
+    private const val PROBE_RANGE_BYTES = 2L * 1024 * 1024
+
+    /** Enough of the answer to have to actually arrive, to catch a stalled body. */
+    private const val PROBE_READ_BYTES = 16L * 1024
 }

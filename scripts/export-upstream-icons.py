@@ -77,6 +77,33 @@ ICONS = [
      None,
      "M 4.6 4.8 L 4.6 19.2 M 9.2 4.8 L 9.2 19.2 M 13.8 4.8 L 13.8 19.2 "
      "M 17.2 5.6 L 20.6 18.9"),
+    # `Home` — the Home tab's own glyph upstream. The port was using the *play*
+    # triangle there, which UI spec §6 asserted was correct; it is not, and this
+    # is the glyph upstream's `MainActivity.kt` actually puts on that tab. Roof
+    # flush with the walls rather than overhanging: an eave narrower than the pen
+    # it is drawn with comes out as a blob on the corner.
+    ("bch-home",
+     "M 12 4.05 L 19.75 11.35 L 19.75 19.65 L 14.95 19.65 L 14.95 15.6 "
+     "L 9.05 15.6 L 9.05 19.65 L 4.25 19.65 L 4.25 11.35 Z", None),
+    # `Queue` — three rules with a dot, for the Up Next toggle. The port was
+    # using SF Symbol `list.bullet` there while this existed unexported.
+    ("bch-queue",
+     "M 4.35 6 a 1.25 1.25 0 1 1 -2.5 0 a 1.25 1.25 0 1 1 2.5 0 Z "
+     "M 4.35 12 a 1.25 1.25 0 1 1 -2.5 0 a 1.25 1.25 0 1 1 2.5 0 Z "
+     "M 4.35 18 a 1.25 1.25 0 1 1 -2.5 0 a 1.25 1.25 0 1 1 2.5 0 Z",
+     "M 8 6 L 21 6 M 8 12 L 21 12 M 8 18 L 21 18"),
+    # `GridView` / `ListView` — the list/grid toggle upstream's Home and Local
+    # Music screens use. Unported because that toggle is itself missing; both are
+    # here so it has no excuse when it gets built.
+    ("bch-grid-view",
+     None,
+     "M 4 4.6 L 9.2 4.6 L 9.2 9.8 L 4 9.8 Z "
+     "M 14.8 4.6 L 20 4.6 L 20 9.8 L 14.8 9.8 Z "
+     "M 4 14.2 L 9.2 14.2 L 9.2 19.4 L 4 19.4 Z "
+     "M 14.8 14.2 L 20 14.2 L 20 19.4 L 14.8 19.4 Z"),
+    ("bch-list-view",
+     None,
+     "M 4 6.2 L 20 6.2 M 4 12 L 20 12 M 4 17.8 L 20 17.8"),
 ]
 
 SVG_TEMPLATE = '''<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none">

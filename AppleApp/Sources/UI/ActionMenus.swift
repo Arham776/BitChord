@@ -13,12 +13,19 @@ struct SongActionButtons: View {
     @Environment(PlaybackController.self) private var controller
     @Environment(AuthController.self) private var auth
     @Environment(AppModel.self) private var appModel
+    @Environment(ToastCenter.self) private var toast
 
     var body: some View {
         let _ = LikeStore.shared.epoch
         Button("Play") { controller.play([entry], at: 0) }
-        Button("Play Next") { controller.playNext(entry) }
-        Button("Add to Queue") { controller.addToQueue(entry) }
+        Button("Play Next") {
+            controller.playNext(entry)
+            toast.show("Playing next: \(entry.title)")
+        }
+        Button("Add to Queue") {
+            controller.addToQueue(entry)
+            toast.show("Added to queue")
+        }
         Button("Start Radio") { controller.playRadio(entry) }
         if auth.signedIn, let vid = entry.videoId {
             Divider()
@@ -34,15 +41,25 @@ struct SongActionButtons: View {
             if playlistOwned, let setVideoId, let playlistBrowseId {
                 Button("Remove from Playlist", role: .destructive) {
                     Task {
-                        _ = await LibraryActions.removeFromPlaylist(
+                        // These wrappers return nil on success and the failure
+                        // message otherwise, so the toast reports whichever came
+                        // back rather than assuming the write landed.
+                        if let failure = await LibraryActions.removeFromPlaylist(
                             playlistId: playlistBrowseId, setVideoId: setVideoId, videoId: vid
-                        )
+                        ) {
+                            toast.show("Couldn't remove it — \(failure)", kind: .failure)
+                        } else {
+                            toast.show("Removed from playlist")
+                        }
                     }
                 }
             }
         }
         if !entry.isLocal {
-            Button("Download") { DownloadStore.shared.download(entry) }
+            Button("Download") {
+                DownloadStore.shared.download(entry)
+                toast.show("Downloading \(entry.title)")
+            }
         }
         if let albumId = entry.albumId {
             Button("Open Album") {

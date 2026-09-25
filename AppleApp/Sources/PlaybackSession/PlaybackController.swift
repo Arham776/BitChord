@@ -731,13 +731,18 @@ final class PlaybackController {
 
     /// Resolves the entry's source to an engine-loadable string. Local paths
     /// pass through unchanged; `"yt:<videoId>"` sources go through the
-    /// PlayerBridge to get a real HTTP URL, then stream via the Ktor Darwin
-    /// engine (same TLS fingerprint as the probe that succeeds — URLSession
-    /// gets 403 from googlevideo due to different TLS fingerprint).
+    /// `StreamResolver` to get a real HTTP URL, which has already been probed
+    /// and proven to serve audio.
     ///
-    /// Upstream's ExoPlayer starts on the first bounded range. We do the same:
-    /// the first 1 MiB is written and we return that path while later ranges
-    /// keep appending. The engine's GrowingFile waits at EOF until `.complete`.
+    /// The fetch goes through the shared `Http` client, so it shares a connection
+    /// context with both the `player` request that minted the URL and the probe
+    /// that cleared it — upstream's rule about why that has to be one stack. An
+    /// earlier version ran a separate fetch here "because URLSession has a
+    /// different TLS fingerprint"; that was a symptom of the split, not a cause.
+    ///
+    /// Upstream's ExoPlayer starts on the first bounded range. So do we: the first
+    /// chunk is written and we return that path while later chunks keep appending.
+    /// The engine's GrowingFile waits at EOF until `.complete`.
     private struct ResolvedSource: Sendable {
         let source: String
         let headers: [String: String]
@@ -891,32 +896,28 @@ final class PlaybackController {
         throw InnertubeStreamResolver.StreamError(message: "No stream")
     }
 
-    /// Innertube URL + first-megabyte file, the path that used to start playback alone.
+    /// Innertube URL + growing local file, the path that starts playback earliest.
+    ///
+    /// No retry loop here on purpose. A refusal at this point means the URL really
+    /// is dead — the resolver probed it with a 2 MiB range and the same headers
+    /// before handing it over — and asking again for the same URL from the same
+    /// client is the one thing that reliably provokes a throttle. The bridge
+    /// reports the refusal back to the resolver instead, which forgets the URL and
+    /// stands the client down so the *next* attempt starts somewhere else.
     private static func resolveYouTube(videoId: String, prefs: ResolvePrefs) async throws -> ResolvedSource {
-        var lastError: Error?
-        for attempt in 0..<2 {
-            let stream = try await InnertubeStreamResolver.shared.resolve(videoId: videoId, maxKbps: prefs.maxKbps)
-            do {
-                let localPath = try await streamViaKtor(
-                    videoId: videoId, url: stream.url, headers: stream.headers)
-                return ResolvedSource(
-                    source: localPath, headers: [:], kbps: stream.kbps, origin: .youtube
-                )
-            } catch {
-                lastError = error
-                let is403 = "\(error)".contains("403")
-                print("[Playback] Ktor stream failed for \(videoId) attempt \(attempt+1): \(error)")
-                if is403 && attempt == 0 {
-                    try? await Task.sleep(nanoseconds: 700_000_000)
-                    continue
-                }
-                print("[Playback] falling back to direct stream for \(videoId)")
-                return ResolvedSource(
-                    source: stream.url, headers: stream.headers, kbps: stream.kbps, origin: .youtube
-                )
-            }
+        let stream = try await InnertubeStreamResolver.shared.resolve(videoId: videoId, maxKbps: prefs.maxKbps)
+        do {
+            let localPath = try await streamViaKtor(
+                videoId: videoId, url: stream.url, headers: stream.headers)
+            return ResolvedSource(
+                source: localPath, headers: [:], kbps: stream.kbps, origin: .youtube
+            )
+        } catch {
+            print("[Playback] stream failed for \(videoId): \(error)")
+            return ResolvedSource(
+                source: stream.url, headers: stream.headers, kbps: stream.kbps, origin: .youtube
+            )
         }
-        throw lastError ?? InnertubeStreamResolver.StreamError(message: "YouTube stream failed")
     }
 
     /// Catalogues ranked above YouTube — first match that is the same recording.

@@ -18,7 +18,12 @@ struct ArtworkView: View {
     }
 
     init(url: String?, data: Data?, side: CGFloat? = nil) {
-        self.url = url.flatMap { SharedArtwork.sized($0, Int((side ?? 300) * 2)) }
+        // Ask for the size the screen will actually draw at, on the screen's
+        // actual scale. The old fixed `× 2` under-sampled every Retina row — a
+        // 160pt card on a @3x display needs 480px and was being sent 320.
+        let points = side ?? 300
+        let scale = Double(PlatformScale.current)
+        self.url = url.flatMap { SharedArtwork.sized($0, Int((points * scale).rounded())) }
         self.data = data
         self.side = side
     }
@@ -59,7 +64,11 @@ struct ArtworkView: View {
         .aspectRatio(1, contentMode: .fit)
         .background(.quaternary)
         .clipped()
-        .id("\(url ?? "")-\(data?.count ?? 0)")
+        // No `.id()` here. Keying the subtree on the URL and byte count made
+        // SwiftUI tear down and rebuild the whole image on every artwork change,
+        // which showed up as a one-frame flicker on every track change. The
+        // identity that matters is the row's, and the parent already has it.
+        .accessibilityHidden(true)
     }
 
     private var placeholder: some View {
@@ -116,24 +125,78 @@ typealias PlatformImage = UIImage
 typealias PlatformImage = NSImage
 #endif
 
+/// The backing scale of the screen being drawn on, so artwork is requested at
+/// the pixel size it will actually be drawn at.
+///
+/// macOS windows move between displays of different scale factors — a window
+/// dragged from a Retina laptop panel to an external 1x monitor would otherwise
+/// keep asking the CDN for 2× artwork it no longer needs, and would look soft on
+/// the way back if the request had been cached at the smaller size.
+enum PlatformScale {
+    static var current: CGFloat {
+        #if os(iOS)
+        return UIScreen.main.scale
+        #else
+        return NSScreen.main?.backingScaleFactor ?? 2
+        #endif
+    }
+}
+
 /// Memory + disk artwork cache — Apple stand-in for Coil's LRU.
-@MainActor
-final class ArtworkCache {
+///
+/// ## Why the disk read is off the main thread
+///
+/// This used to be `@MainActor` with a synchronous `get(_:)` that did
+/// `Data(contentsOf:)` plus an image decode inline, and it was called straight
+/// from `ArtworkView.body` for every visible row. On a cold cache, scrolling a
+/// 500-row library meant hundreds of file reads and image decodes on the main
+/// thread — dropped frames, with the scroll gesture stuttering under it.
+///
+/// So the cache itself is no longer actor-isolated: the memory tier is an
+/// `NSCache`, which is thread-safe by contract, and the disk tier is read on a
+/// background executor. `get(_:)` still returns synchronously for the common
+/// warm case (a memory hit) and returns nil for a cold one, which drops straight
+/// through to [RemoteArtwork]'s async path — so the first paint of a cold row is
+/// no slower than before, and every subsequent one is a memory hit.
+final class ArtworkCache: @unchecked Sendable {
     static let shared = ArtworkCache()
+
     private let memory = NSCache<NSString, PlatformImage>()
     private let folder = DiskCache.cachesSubfolder("images")
     private static let diskLimit: Int64 = 128 * 1024 * 1024
+    /// Serialises cold disk reads so a fast scroll does not queue hundreds of
+    /// concurrent file reads for images that have already scrolled away.
+    private let readQueue = DispatchQueue(
+        label: "com.example.bitchord.artwork-disk",
+        qos: .userInitiated,
+        attributes: .concurrent
+    )
 
     init() {
         memory.totalCostLimit = 48 * 1024 * 1024
         memory.countLimit = 400
     }
 
+    /// The warm path. A memory hit returns immediately; a miss returns nil and
+    /// the caller falls back to its async load, which populates both tiers.
     func get(_ url: String) -> PlatformImage? {
-        if let hit = memory.object(forKey: url as NSString) { return hit }
+        memory.object(forKey: url as NSString)
+    }
+
+    /// Synchronous disk read, for the rare caller that genuinely needs the bytes
+    /// before it can lay out. Off the main thread by construction.
+    func getBlocking(_ url: String) -> PlatformImage? {
+        if let hit = get(url) { return hit }
+        var resolved: PlatformImage?
+        readQueue.sync {
+            resolved = readFromDisk(url)
+        }
+        return resolved
+    }
+
+    private func readFromDisk(_ url: String) -> PlatformImage? {
         let file = diskURL(url)
-        guard FileManager.default.fileExists(atPath: file.path),
-              let data = try? Data(contentsOf: file),
+        guard let data = try? Data(contentsOf: file),
               let image = PlatformImage(data: data) else { return nil }
         memory.setObject(image, forKey: url as NSString, cost: data.count)
         DiskCache.touch(file)
@@ -142,6 +205,15 @@ final class ArtworkCache {
 
     func load(_ url: String) async -> PlatformImage? {
         if let hit = get(url) { return hit }
+        // The disk is checked off the main actor: a warm disk cache should be
+        // nearly as fast as memory, and should not cost a frame of scroll.
+        let onDisk = await withCheckedContinuation { (cont: CheckedContinuation<PlatformImage?, Never>) in
+            readQueue.async { [weak self] in
+                cont.resume(returning: self?.readFromDisk(url))
+            }
+        }
+        if let onDisk { return onDisk }
+
         guard let endpoint = URL(string: url) else { return nil }
         guard let (data, _) = try? await URLSession.shared.data(from: endpoint),
               let image = PlatformImage(data: data) else { return nil }
@@ -175,16 +247,23 @@ enum SharedArtwork {
 /// Upstream `Skeletons.kt`'s shimmer — the loading look on every feed.
 struct SkeletonBlock: View {
     var height: CGFloat
-    var cornerRadius: CGFloat = 8
+    var cornerRadius: CGFloat = Theme.Metrics.rowRadius
     @State private var phase: Bool = false
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     var body: some View {
         RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
             .fill(.quaternary)
             .frame(height: height)
-            .opacity(phase ? 0.5 : 0.9)
-            .animation(.easeInOut(duration: 0.9).repeatForever(autoreverses: true), value: phase)
+            // A skeleton that still pulses is still motion. With Reduce Motion on
+            // it is a static placeholder, which is what the setting is asking for.
+            .opacity(reduceMotion ? 0.75 : (phase ? 0.5 : 0.9))
+            .animation(
+                reduceMotion ? nil : .easeInOut(duration: 0.9).repeatForever(autoreverses: true),
+                value: phase
+            )
             .onAppear { phase = true }
+            .accessibilityHidden(true)
     }
 }
 
@@ -274,6 +353,7 @@ struct SongRow: View {
                     .frame(width: 12)
                     .foregroundStyle(.tertiary)
                     .opacity(hovering ? 1 : 0)
+                    .decorative()
             }
             .padding(.vertical, 4)
             .padding(.horizontal, 8)
@@ -281,10 +361,17 @@ struct SongRow: View {
         }
         .buttonStyle(.plain)
         .background {
-            RoundedRectangle(cornerRadius: 8, style: .continuous)
+            RoundedRectangle(cornerRadius: Theme.Metrics.rowRadius, style: .continuous)
                 .fill(rowFill)
         }
         .onHover { hovering = $0 }
+        // One stop per row, not four. Title, artist, duration and chevron read as
+        // separate elements otherwise, so a screen-reader user had to swipe four
+        // times to hear one track — and the artwork announced its asset name on
+        // top of that.
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(accessibilityLabel)
+        .accessibilityAddTraits(active ? [.isButton, .isSelected] : .isButton)
         .contextMenu {
             SongActionButtons(entry: entry, playlistBrowseId: playlistBrowseId, setVideoId: entry.setVideoId, playlistOwned: playlistOwned)
         }
@@ -325,6 +412,15 @@ struct SongRow: View {
         if hovering { return Color.primary.opacity(0.05) }
         return .clear
     }
+
+    /// One sentence for the whole row, in the order a person would say it.
+    private var accessibilityLabel: String {
+        var parts = [entry.title]
+        if !entry.artist.isEmpty { parts.append(entry.artist) }
+        if let duration = entry.durationText, !duration.isEmpty { parts.append(duration) }
+        if buffering { parts.append("Buffering") }
+        return parts.joined(separator: ", ")
+    }
 }
 
 /// Repeat glyph with a centred "1" when only the current track is looping —
@@ -350,9 +446,16 @@ struct RepeatGlyph: View {
 }
 
 /// Upstream `ThinSlider.kt` — hairline capsule, Automix window marker, mix sheen.
+///
+/// Hand-drawn rather than a `Slider` because a native one cannot show the Automix
+/// transition window or the mix sheen behind the playhead. That is a fair trade
+/// only if the control then behaves like a slider to assistive technology, which
+/// it did not: it published an `accessibilityValue` with no label and no
+/// adjustable action, so a VoiceOver user could not seek at all.
 struct ThinSlider: View {
     let value: Double
     let maximum: Double
+    var label: String = "Playback position"
     var mixing: Bool = false
     var transitionWindow: ClosedRange<Double>? = nil
     var onEditingChanged: (Double) -> Void
@@ -360,8 +463,9 @@ struct ThinSlider: View {
     @State private var dragging = false
     @State private var dragValue: Double?
 
+    private var current: Double { dragging ? (dragValue ?? value) : value }
+
     private var fraction: Double {
-        let current = dragging ? (dragValue ?? value) : value
         guard maximum > 0 else { return 0 }
         return min(max(current / maximum, 0), 1)
     }
@@ -404,38 +508,62 @@ struct ThinSlider: View {
                         dragValue = nil
                     }
             )
-            .animation(.spring(response: 0.28, dampingFraction: 0.72), value: dragging)
+            .animation(Motion.once(reduceMotion, duration: 0.28, curve: .spring(response: 0.28, dampingFraction: 0.72)), value: dragging)
         }
         .frame(height: 34)
-        .accessibilityValue(Text(NowPlayingView.timestamp(dragging ? (dragValue ?? value) : value)))
+        .accessibilityElement()
+        .accessibilityLabel(label)
+        .accessibilityValue(NowPlayingView.timestamp(current))
+        // One second per increment, five seconds per decrement, matching what
+        // Music does and what a seek bar is expected to feel like when driven from
+        // a screen reader rather than a drag.
+        .accessibilityAdjustableAction { direction in
+            switch direction {
+            case .increment: onEditingChanged(min(maximum, current + 1))
+            case .decrement: onEditingChanged(max(0, current - 5))
+            @unknown default: break
+            }
+        }
     }
+
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 }
 
 private struct MixSheenBar: View {
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
     var body: some View {
-        TimelineView(.animation(minimumInterval: 1.0 / 30.0)) { timeline in
-            Canvas { context, size in
-                let period = 0.5
-                let t = timeline.date.timeIntervalSinceReferenceDate
-                let phase = t.truncatingRemainder(dividingBy: period) / period
-                let band = size.width * 0.7
-                let centre = -band + (size.width + band * 2) * phase
-                let gradient = Gradient(stops: [
-                    .init(color: .clear, location: 0),
-                    .init(color: .white.opacity(0.95), location: 0.5),
-                    .init(color: .clear, location: 1),
-                ])
-                context.fill(
-                    Path(roundedRect: CGRect(origin: .zero, size: size), cornerRadius: size.height / 2),
-                    with: .linearGradient(
-                        gradient,
-                        startPoint: CGPoint(x: centre - band / 2, y: 0),
-                        endPoint: CGPoint(x: centre + band / 2, y: 0)
+        // The sheen is a 30fps animated band crossing the playhead to show an
+        // Automix transition in progress. With Reduce Motion on it would be the
+        // single most active thing on screen, so it is replaced by a static tint
+        // that still reads as "something is happening here".
+        if reduceMotion {
+            Capsule().fill(Color.white.opacity(0.22))
+        } else {
+            TimelineView(.animation(minimumInterval: 1.0 / 30.0)) { timeline in
+                Canvas { context, size in
+                    let period = 0.5
+                    let t = timeline.date.timeIntervalSinceReferenceDate
+                    let phase = t.truncatingRemainder(dividingBy: period) / period
+                    let band = size.width * 0.7
+                    let centre = -band + (size.width + band * 2) * phase
+                    let gradient = Gradient(stops: [
+                        .init(color: .clear, location: 0),
+                        .init(color: .white.opacity(0.95), location: 0.5),
+                        .init(color: .clear, location: 1),
+                    ])
+                    context.fill(
+                        Path(roundedRect: CGRect(origin: .zero, size: size), cornerRadius: size.height / 2),
+                        with: .linearGradient(
+                            gradient,
+                            startPoint: CGPoint(x: centre - band / 2, y: 0),
+                            endPoint: CGPoint(x: centre + band / 2, y: 0)
+                        )
                     )
-                )
+                }
             }
+            .allowsHitTesting(false)
         }
-        .allowsHitTesting(false)
     }
 }
 

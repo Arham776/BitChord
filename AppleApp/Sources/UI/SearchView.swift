@@ -12,6 +12,12 @@ struct SearchView: View {
     @State private var searchError: String?
     @State private var attempted = false
     @FocusState private var fieldFocused: Bool
+    /// macOS. The `.searchable` field lives in the window's toolbar on that
+    /// platform, so the iOS `fieldFocused` above never reached it — ⌘F and
+    /// re-selecting the Search tab did nothing. A second `FocusState` bound
+    /// through `searchFocused(_:)` is what addresses the toolbar field; the
+    /// modifier exists from iOS 18 / macOS 15, which is the project's floor.
+    @FocusState private var searchFieldFocused: Bool
     @State private var suggestTask: Task<Void, Never>?
 
     enum Scope: String, CaseIterable, Identifiable {
@@ -27,6 +33,7 @@ struct SearchView: View {
                 #if os(macOS)
                 .toolbarTitleDisplayMode(.inline)
                 .searchable(text: $query, prompt: "Search")
+                .searchFocused($searchFieldFocused)
                 .onSubmit(of: .search) { Task { await performSearch() } }
                 .toolbar {
                     ToolbarItem(placement: .primaryAction) {
@@ -46,10 +53,9 @@ struct SearchView: View {
                     scheduleSuggestions(value)
                 }
                 .onChange(of: appModel.focusSearch) { _, focus in
-                    if focus {
-                        fieldFocused = true
-                        appModel.focusSearch = false
-                    }
+                    guard focus else { return }
+                    focusTheField()
+                    appModel.focusSearch = false
                 }
                 .onChange(of: appModel.pendingSearchQuery) { _, pending in
                     guard let pending, !pending.isEmpty else { return }
@@ -57,7 +63,32 @@ struct SearchView: View {
                     appModel.pendingSearchQuery = nil
                     Task { await performSearch() }
                 }
+                .onDisappear { cancelSuggestions() }
         }
+    }
+
+    /// Focus the field on whichever platform this is.
+    ///
+    /// Two mechanisms because the field is in a different place on each: a real
+    /// `TextField` in the content column on iOS, the window toolbar's
+    /// `.searchable` field on macOS. Only the iOS one is reachable by
+    /// `@FocusState`.
+    private func focusTheField() {
+        #if os(macOS)
+        searchFieldFocused = true
+        #else
+        fieldFocused = true
+        #endif
+    }
+
+    /// Cancels an in-flight typeahead request.
+    ///
+    /// The task used to be cancelled only on the *next* keystroke, so leaving the
+    /// screen mid-request left it running and able to write results into a view
+    /// that was gone.
+    private func cancelSuggestions() {
+        suggestTask?.cancel()
+        suggestTask = nil
     }
 
     private var resultsColumn: some View {
@@ -74,16 +105,6 @@ struct SearchView: View {
             .padding(.vertical, 12)
             #endif
 
-            if let playError = controller.lastError, !playError.isEmpty {
-                Text(playError)
-                    .font(.caption)
-                    .foregroundStyle(.white)
-                    .padding(8)
-                    .frame(maxWidth: .infinity)
-                    .background(.red.opacity(0.85), in: .rect(cornerRadius: 8))
-                    .padding(.horizontal, 28)
-                    .padding(.vertical, 6)
-            }
             if searching {
                 ScrollView {
                     VStack(spacing: 10) {

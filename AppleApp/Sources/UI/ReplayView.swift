@@ -214,14 +214,20 @@ struct ReplayView: View {
                         }
                     }
                     chart("Top artists", rows: model.summary.artists.prefix(10).enumerated().map {
-                        ReplayChartRow(id: $0.element.id, rank: $0.offset, title: $0.element.name, subtitle: nil, art: nil, ms: $0.element.ms)
+                        ReplayChartRow(
+                            id: $0.element.id, rank: $0.offset, title: $0.element.name,
+                            subtitle: $0.element.sub, art: $0.element.art, ms: $0.element.ms
+                        )
                     }, circular: true) { row in
                         if let artist = model.summary.artists.first(where: { $0.id == row.id }), let id = artist.browseId {
                             appModel.pendingDetail = .detail(browseId: id, title: artist.name)
                         }
                     }
                     chart("Top albums", rows: model.summary.albums.prefix(10).enumerated().map {
-                        ReplayChartRow(id: $0.element.id, rank: $0.offset, title: $0.element.name, subtitle: nil, art: nil, ms: $0.element.ms)
+                        ReplayChartRow(
+                            id: $0.element.id, rank: $0.offset, title: $0.element.name,
+                            subtitle: $0.element.sub, art: $0.element.art, ms: $0.element.ms
+                        )
                     }) { row in
                         if let album = model.summary.albums.first(where: { $0.id == row.id }), let id = album.browseId {
                             appModel.pendingDetail = .detail(browseId: id, title: album.name)
@@ -229,7 +235,10 @@ struct ReplayView: View {
                     }
                     if !model.summary.genres.isEmpty {
                         chart("Top genres", rows: model.summary.genres.prefix(10).enumerated().map {
-                            ReplayChartRow(id: $0.element.id, rank: $0.offset, title: $0.element.name, subtitle: nil, art: nil, ms: $0.element.ms)
+                            ReplayChartRow(
+                                id: $0.element.id, rank: $0.offset, title: $0.element.name,
+                                subtitle: nil, art: nil, ms: $0.element.ms
+                            )
                         }) { _ in }
                     }
 
@@ -504,7 +513,9 @@ private struct ReplayStoriesView: View {
     @Environment(\.dismiss) private var dismiss
     @State private var index = 0
     @State private var held = false
-    @State private var progress: Double = 0
+    /// When the current page's countdown began. The progress bars derive their
+    /// width from this against the display clock, so nothing has to poll.
+    @State private var pageStartedAt: Date?
 
     private var pages: [ReplayStoryPage] {
         ReplayStoryPage.allCases.filter { page in
@@ -526,19 +537,30 @@ private struct ReplayStoriesView: View {
                     .clipShape(.rect(cornerRadius: 18, style: .continuous))
             }
             .overlay(alignment: .top) {
-                HStack(spacing: 4) {
-                    ForEach(pages.indices, id: \.self) { i in
-                        GeometryReader { bar in
-                            Capsule().fill(.white.opacity(0.28))
-                            Capsule()
-                                .fill(.white)
-                                .frame(width: bar.size.width * (i < index ? 1 : i == index ? progress : 0))
+                // Driven off the display's own clock rather than by a 20Hz `Task`
+                // mutating `@State` every 50ms. Same animation, one fewer wake-up
+                // per second, and the bars are smooth because they are redrawn
+                // with the display instead of when SwiftUI re-evaluates.
+                TimelineView(.animation(minimumInterval: 1.0 / 30.0, paused: held)) { timeline in
+                    let elapsed = pageStartedAt.map { timeline.date.timeIntervalSince($0) } ?? 0
+                    let live = min(max(elapsed / Self.pageDurationSeconds, 0), 1)
+                    HStack(spacing: 4) {
+                        ForEach(pages.indices, id: \.self) { i in
+                            GeometryReader { bar in
+                                Capsule().fill(.white.opacity(0.28))
+                                Capsule()
+                                    .fill(.white)
+                                    .frame(
+                                        width: bar.size.width
+                                            * (i < index ? 1 : i == index ? live : 0)
+                                    )
+                            }
+                            .frame(height: 3)
                         }
-                        .frame(height: 3)
                     }
+                    .padding(.horizontal, 16)
+                    .padding(.top, 12)
                 }
-                .padding(.horizontal, 16)
-                .padding(.top, 12)
             }
             .overlay(alignment: .topTrailing) {
                 Button { dismiss() } label: {
@@ -564,24 +586,31 @@ private struct ReplayStoriesView: View {
         }
         .onAppear {
             index = pages.firstIndex(of: start) ?? 0
+            pageStartedAt = Date()
         }
         .task(id: "\(index)-\(held)") {
-            progress = 0
-            guard !held, index < pages.count - 1 else { return }
-            let startDate = Date()
-            while !Task.isCancelled {
-                try? await Task.sleep(for: .milliseconds(50))
-                if held { continue }
-                let t = Date().timeIntervalSince(startDate) / 4.2
-                progress = min(1, t)
-                if t >= 1 {
-                    step(true)
-                    return
-                }
-            }
+            guard !held else { return }
+            // One sleep for the page, not a 20Hz poll. The bars read the clock
+            // themselves; this task only has to notice when the page is over.
+            guard index < pages.count - 1 else { return }
+            try? await Task.sleep(for: Self.pageDuration)
+            guard !Task.isCancelled, !held else { return }
+            step(true)
         }
+        .onChange(of: held) { _, isHeld in
+            // Holding pauses the countdown. The clock restarts from zero when the
+            // finger lifts, which is what the bar shows.
+            if !isHeld { pageStartedAt = Date() }
+        }
+        .onChange(of: index) { _, _ in pageStartedAt = Date() }
         .environment(\.colorScheme, .dark)
     }
+
+    /// How long one story page holds before advancing.
+    private static let pageDuration: Duration = .seconds(4.2)
+
+    /// The same figure in seconds, for the progress bars' arithmetic.
+    private static let pageDurationSeconds: Double = 4.2
 
     private var current: ReplayStoryPage {
         pages.indices.contains(index) ? pages[index] : .intro
@@ -693,7 +722,8 @@ private struct ReplayStoriesView: View {
     }
 
     private func step(_ forward: Bool) {
-        progress = 0
+        // The new page restarts its own countdown; `.onChange(of: index)` resets
+        // the clock the bars read from.
         if forward {
             if index < pages.count - 1 { index += 1 }
         } else if index > 0 {
@@ -754,6 +784,9 @@ private struct ReplayShareSheet: View {
 
     @MainActor
     private func renderPoster() -> URL? {
+        // Authored at 1080×1920 and rendered at scale 1. The view is
+        // resolution-independent, so this and the share sheet's preview are the
+        // same layout rather than one being a crop of the other.
         let poster = ReplayPosterView(model: item.model, page: item.page)
             .frame(width: 1080, height: 1920)
         let renderer = ImageRenderer(content: poster)
@@ -774,39 +807,62 @@ private struct ReplayShareSheet: View {
     }
 }
 
+/// The shareable poster, laid out relative to whatever size it is given.
+///
+/// Deliberately not a fixed 1080×1920 frame. A fixed-size child ignores its
+/// parent's proposal, so the share sheet's 270×480 preview was showing a centre
+/// crop of a 1080×1920 render — the listener never saw the poster they were
+/// about to share. Every dimension is now a multiple of the width it is given,
+/// which makes the preview and the export the same layout at two resolutions.
 private struct ReplayPosterView: View {
     var model: ReplayModel
     var page: ReplayStoryPage?
 
+    /// The one authored size; everything else scales from it.
+    private static let referenceWidth: CGFloat = 1080
+
     var body: some View {
-        ZStack {
-            MeshBackdrop(seed: model.summary.songs.first?.title.hashValue ?? 0)
-            LinearGradient(colors: [.black.opacity(0.25), .black.opacity(0.8)], startPoint: .top, endPoint: .bottom)
-            VStack(alignment: .leading, spacing: 16) {
-                Text("BITCHORD REPLAY")
-                    .font(.caption.weight(.bold))
-                    .tracking(2)
-                    .foregroundStyle(.white.opacity(0.7))
-                Text(model.holder)
-                    .font(.title.weight(.bold))
-                    .foregroundStyle(.white)
-                Text(model.summary.label)
-                    .foregroundStyle(.white.opacity(0.7))
-                Text("\(ReplayModel.grouped(model.summary.minutes)) minutes")
-                    .font(.largeTitle.weight(.heavy))
-                    .foregroundStyle(.white)
-                VStack(alignment: .leading, spacing: 8) {
-                    ForEach(Array(model.summary.songs.prefix(5).enumerated()), id: \.element.id) { index, song in
-                        HStack {
-                            Text("\(index + 1).").foregroundStyle(.white.opacity(0.5))
-                            Text(song.title).foregroundStyle(.white).lineLimit(1)
+        GeometryReader { geo in
+            let k = geo.size.width / Self.referenceWidth
+            ZStack {
+                MeshBackdrop(seed: model.summary.songs.first?.title.hashValue ?? 0)
+                LinearGradient(
+                    colors: [.black.opacity(0.25), .black.opacity(0.8)],
+                    startPoint: .top,
+                    endPoint: .bottom
+                )
+                VStack(alignment: .leading, spacing: 16 * k) {
+                    Text("BITCHORD REPLAY")
+                        .font(.system(size: 30 * k, weight: .bold))
+                        .tracking(2 * k)
+                        .foregroundStyle(.white.opacity(0.7))
+                    Text(model.holder)
+                        .font(.system(size: 68 * k, weight: .bold))
+                        .foregroundStyle(.white)
+                    Text(model.summary.label)
+                        .font(.system(size: 40 * k))
+                        .foregroundStyle(.white.opacity(0.7))
+                    Text("\(ReplayModel.grouped(model.summary.minutes)) minutes")
+                        .font(.system(size: 128 * k, weight: .heavy))
+                        .foregroundStyle(.white)
+                    VStack(alignment: .leading, spacing: 8 * k) {
+                        ForEach(Array(model.summary.songs.prefix(5).enumerated()), id: \.element.id) { index, song in
+                            HStack(spacing: 24 * k) {
+                                Text("\(index + 1).")
+                                    .font(.system(size: 44 * k))
+                                    .foregroundStyle(.white.opacity(0.5))
+                                Text(song.title)
+                                    .font(.system(size: 44 * k))
+                                    .foregroundStyle(.white)
+                                    .lineLimit(1)
+                            }
                         }
                     }
+                    Spacer(minLength: 0)
                 }
-                Spacer()
+                .padding(28 * k)
             }
-            .padding(28)
         }
-        .frame(width: 1080, height: 1920)
+        .aspectRatio(9.0 / 16.0, contentMode: .fit)
     }
 }

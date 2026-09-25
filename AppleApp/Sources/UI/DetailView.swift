@@ -18,6 +18,14 @@ struct DetailView: View {
     @State private var loading = true
     @State private var headerArt: Data?
     @State private var filter = ""
+    /// Owned-playlist reordering. A real mode with a control, not a forced
+    /// `.active` — see `NowPlayingView.UpNextPane`.
+    ///
+    /// iOS-only, like `EditMode` itself. On macOS the list is reordered by
+    /// click-to-move instead, which is the platform's own idiom.
+    #if os(iOS)
+    @State private var editMode: EditMode = .inactive
+    #endif
     @State private var saved = false
     @State private var saving = false
     @State private var continuation: String?
@@ -161,7 +169,12 @@ struct DetailView: View {
 
             VStack(alignment: .leading, spacing: 6) {
                 Text(page.title.isEmpty ? initialTitle : page.title)
-                    .font(.system(size: 32, weight: .bold))
+                    // A semantic large title rather than a fixed 32pt, so this
+                    // grows with the reader's text size. The clamp is the same one
+                    // Music applies to an artwork-page title: past `accessibility3`
+                    // it stops competing with the artwork for the page.
+                    .font(.largeTitle.weight(.bold))
+                    .dynamicTypeSize(...DynamicTypeSize.accessibility2)
                     .lineLimit(2)
                     .minimumScaleFactor(0.7)
 
@@ -299,7 +312,25 @@ struct DetailView: View {
                 .scrollDisabled(true)
                 .frame(minHeight: CGFloat(max(songs.count, 1)) * 58)
                 #if os(iOS)
-                .environment(\.editMode, .constant(.active))
+                // Owned playlists are reorderable, so they get a real edit mode
+                // with an explicit Reorder control rather than being permanently
+                // in one — see the note in `NowPlayingView.UpNextPane`.
+                .environment(\.editMode, $editMode)
+                .safeAreaInset(edge: .top, spacing: 0) {
+                    if songs.count > 1 {
+                        HStack {
+                            Spacer()
+                            Button(editMode == .active ? "Done" : "Reorder") {
+                                withAnimation {
+                                    editMode = editMode == .active ? .inactive : .active
+                                }
+                            }
+                            .font(.callout)
+                            .padding(.trailing, 16)
+                            .padding(.bottom, 4)
+                        }
+                    }
+                }
                 #endif
             } else {
                 LazyVStack(spacing: 0) {

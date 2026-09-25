@@ -50,12 +50,12 @@ struct NowPlayingView: View {
                     Spacer()
                         .allowsHitTesting(false)
                     HStack(spacing: 8) {
-                        GlassCircleButton(icon: .bchLyrics, selected: pane == .lyrics) {
+                        GlassCircleButton(icon: .bchLyrics, selected: pane == .lyrics, label: "Lyrics") {
                             Haptics.play(.expand)
                             pane = .lyrics
                         }
                         .help("Lyrics")
-                        GlassCircleButton(system: "list.bullet", selected: pane == .queue) {
+                        GlassCircleButton(icon: .bchQueue, selected: pane == .queue, label: "Up Next") {
                             Haptics.play(.expand)
                             pane = .queue
                         }
@@ -149,7 +149,8 @@ struct NowPlayingView: View {
                 }
                 Spacer(minLength: 8)
                 if auth.signedIn, controller.current?.videoId != nil {
-                    GlassCircleButton(system: controller.isLiked ? "heart.fill" : "heart") {
+                    GlassCircleButton(icon: controller.isLiked ? .bchHeartFilled : .bchHeart,
+                                      label: controller.isLiked ? "Remove Like" : "Like") {
                         controller.toggleLike()
                     }
                     .help(controller.isLiked ? "Remove from Liked Music" : "Like")
@@ -272,15 +273,16 @@ struct NowPlayingView: View {
                     HStack {
                         Spacer()
                         if auth.signedIn, controller.current?.videoId != nil {
-                            GlassCircleButton(system: controller.isLiked ? "heart.fill" : "heart") {
+                            GlassCircleButton(icon: controller.isLiked ? .bchHeartFilled : .bchHeart,
+                                      label: controller.isLiked ? "Remove Like" : "Like") {
                                 controller.toggleLike()
                             }
                         }
-                        GlassCircleButton(icon: .bchLyrics, selected: pane == .lyrics) {
+                        GlassCircleButton(icon: .bchLyrics, selected: pane == .lyrics, label: "Lyrics") {
                             Haptics.play(.expand)
                             pane = .lyrics
                         }
-                        GlassCircleButton(system: "list.bullet", selected: pane == .queue) {
+                        GlassCircleButton(icon: .bchQueue, selected: pane == .queue, label: "Up Next") {
                             Haptics.play(.expand)
                             pane = .queue
                         }
@@ -345,6 +347,13 @@ struct NowPlayingView: View {
 
     /// Music's order: shuffle · previous · play-in-circle · next · repeat.
     /// Play sits on a white disc so it never disappears into a bright wash.
+    /// The transport row.
+    ///
+    /// Every control carries an explicit `accessibilityLabel` as well as a
+    /// `.help()`. The help text is macOS-only, so on iOS these were unlabelled
+    /// template images and VoiceOver announced the asset name — "bch shuffle,
+    /// button" — rather than what the button does. The labels are the same
+    /// strings, so the two platforms say the same thing.
     private var playerTransport: some View {
         HStack(spacing: 28) {
             Button {
@@ -360,6 +369,7 @@ struct NowPlayingView: View {
             .buttonStyle(.plain)
             .foregroundStyle(controller.shuffleEnabled ? .white : .white.opacity(0.72))
             .help(controller.shuffleEnabled ? "Shuffle on" : "Shuffle off")
+            .accessibilityLabel(controller.shuffleEnabled ? "Shuffle on" : "Shuffle off")
 
             Button {
                 Haptics.play(.skipPrevious)
@@ -371,6 +381,8 @@ struct NowPlayingView: View {
             }
             .buttonStyle(.plain)
             .disabled(!controller.canPlayPrevious)
+            .help("Previous")
+            .accessibilityLabel("Previous track")
 
             Button {
                 Haptics.play(controller.isPlaying ? .pause : .resume)
@@ -396,6 +408,7 @@ struct NowPlayingView: View {
             .buttonStyle(.plain)
             .disabled(controller.current == nil && !controller.isBuffering)
             .help(controller.isPlaying ? "Pause" : "Play")
+            .accessibilityLabel(controller.isBuffering ? "Buffering" : (controller.isPlaying ? "Pause" : "Play"))
 
             Button {
                 Haptics.play(.skipNext)
@@ -407,6 +420,8 @@ struct NowPlayingView: View {
             }
             .buttonStyle(.plain)
             .disabled(!controller.canPlayNext)
+            .help("Next")
+            .accessibilityLabel("Next track")
 
             Button {
                 Haptics.play(.select)
@@ -418,8 +433,17 @@ struct NowPlayingView: View {
             .buttonStyle(.plain)
             .foregroundStyle(controller.repeatMode == .off ? .white.opacity(0.72) : .white)
             .help(controller.repeatMode == .one ? "Repeat one" : controller.repeatMode == .all ? "Repeat all" : "Repeat off")
+            .accessibilityLabel(repeatLabel)
         }
         .foregroundStyle(.white)
+    }
+
+    private var repeatLabel: String {
+        switch controller.repeatMode {
+        case .one: "Repeat one"
+        case .all: "Repeat all"
+        case .off: "Repeat off"
+        }
     }
 
     private var moreMenu: some View {
@@ -479,10 +503,16 @@ private enum PlayerPane {
 }
 
 /// Frosted circular chrome used for dismiss / lyrics / queue.
+/// A round, material-backed icon button for the player's secondary controls.
+///
+/// [label] is required rather than optional: every one of these is an
+/// icon-only button, and without it VoiceOver announced the asset name. The
+/// glyphs are upstream's own, per UI spec §6.
 struct GlassCircleButton: View {
     var system: String? = nil
     var icon: ImageResource? = nil
     var selected: Bool = false
+    var label: String
     var action: () -> Void
 
     var body: some View {
@@ -499,6 +529,8 @@ struct GlassCircleButton: View {
             .background(.white.opacity(selected ? 0.28 : 0.14), in: Circle())
         }
         .buttonStyle(.plain)
+        .accessibilityLabel(label)
+        .accessibilityAddTraits(selected ? [.isButton, .isSelected] : .isButton)
     }
 }
 
@@ -614,12 +646,37 @@ private struct UpNextPane: View {
                 .listStyle(.plain)
                 .scrollContentBackground(.hidden)
                 #if os(iOS)
-                .environment(\.editMode, .constant(.active))
+                // A real edit mode with an explicit control, rather than
+                // `.constant(.active)`. Forcing it active showed a red delete
+                // circle on every row permanently and suppressed the system
+                // Edit/Done toggle, so there was no way back out of it — and it
+                // fought the one gesture people already expect here, which is
+                // swipe-to-delete. Reordering is still available from the Reorder
+                // state; deletion is available at all times by swiping.
+                //
+                // iOS-only because `EditMode` is. On macOS the queue is reordered
+                // by click-to-move, which is the platform's own idiom.
+                .environment(\.editMode, $editMode)
+                .toolbar {
+                    if manualUpcoming.count > 1 {
+                        ToolbarItem(placement: .automatic) {
+                            Button(editMode == .active ? "Done" : "Reorder") {
+                                withAnimation {
+                                    editMode = editMode == .active ? .inactive : .active
+                                }
+                            }
+                        }
+                    }
+                }
                 #endif
             }
         }
         .padding(.top, 8)
     }
+
+    #if os(iOS)
+    @State private var editMode: EditMode = .inactive
+    #endif
 
     private var autoplayStart: Int { controller.autoplaySectionStart }
 

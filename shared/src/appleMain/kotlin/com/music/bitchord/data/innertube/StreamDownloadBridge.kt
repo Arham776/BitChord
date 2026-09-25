@@ -1,5 +1,6 @@
 package com.music.bitchord.data.innertube
 
+import com.music.bitchord.data.DebugLog
 import com.music.bitchord.data.http.Http
 import kotlinx.cinterop.CPointer
 import kotlinx.cinterop.ExperimentalForeignApi
@@ -21,13 +22,25 @@ import platform.posix.fopen
 import platform.posix.fwrite
 
 /**
- * Swift-facing bridge for downloading audio streams via Ktor's Darwin engine.
- * URLSession gets 403 from googlevideo (different TLS fingerprint), but Ktor's
- * Darwin engine has the same fingerprint as the probe that succeeds.
+ * Swift-facing bridge for downloading audio streams.
  *
- * Upstream ExoPlayer starts as soon as the first bounded range arrives.
- * [streamToFile] matches that: the first 1 MiB is on disk and [ready] fires
- * so the engine can probe/play while later ranges keep appending.
+ * Goes through [Http.getBytes], so the media fetch shares its connection context
+ * with the `player` request that minted the URL and with the probe that cleared
+ * it. That is upstream's rule and the reason [Http] is one client:
+ *
+ *  > googlevideo binds a stream URL to the connection context of the `player`
+ *  > request that minted it. If Innertube and the media fetch used separate HTTP
+ *  > stacks they could resolve to different addresses (v4 vs v6) and the media
+ *  > fetch would come back 403.
+ *
+ * (An earlier version ran a client of its own, on the theory that URLSession has
+ * a different TLS fingerprint from Ktor's Darwin engine. That was a symptom of
+ * the split, not a cause of it — and with one client there is no longer a second
+ * fingerprint to differ.)
+ *
+ * Upstream's ExoPlayer starts as soon as the first bounded range arrives, and
+ * [streamToFile] matches that: the first chunk is on disk and [ready] fires so
+ * the engine can play while later chunks keep appending.
  */
 object StreamDownloadBridge {
 
@@ -37,19 +50,26 @@ object StreamDownloadBridge {
         fun onResult(path: String?, message: String?)
     }
 
-    /**
-     * Wait for the whole file, then [callback]. Prefetch / cache path.
-     */
+    /** Wait for the whole file, then [callback]. Prefetch / cache path. */
     fun download(url: String, headers: Map<String, String>, callback: DownloadCallback) {
         streamToFile(url, headers, ready = DownloadCallback { _, _ -> }, done = callback)
     }
 
     /**
-     * Progressive fetch. [ready] fires once the first range is on disk (play
-     * can start). [done] fires when the last range is written, or on error.
+     * Progressive fetch. [ready] fires once the first chunk is on disk, so play can
+     * start; [done] fires when the last chunk is written, or on error.
      *
-     * Chunk size is 1 MiB (not upstream's 2 MiB) because some networks refuse
-     * a first range larger than 1 MiB.
+     * The chunk size is [CHUNK_BYTES] — the same figure [Http.probe] asks for, and
+     * deliberately so: a probe smaller than the real fetch cannot see a refusal the
+     * real fetch would meet. This was 1 MiB against a 16 KiB probe, which meant a
+     * URL willing to serve a token range sailed through the probe and then died on
+     * the playback path.
+     *
+     * A 403 on a chunk is reported to [StreamResolver.onPlaybackRefused] rather
+     * than retried blindly. Retrying the same URL against the same client is how a
+     * session talks itself into being throttled, and the resolver already knows how
+     * to forget the URL and stand the client down — which is the response that
+     * actually changes the next attempt.
      */
     @OptIn(ExperimentalForeignApi::class)
     fun streamToFile(
@@ -62,9 +82,9 @@ object StreamDownloadBridge {
             var tmpPath: String? = null
             var file: CPointer<FILE>? = null
             try {
-                println("[StreamDownload] Starting download: ${url.take(120)}...")
+                DebugLog.d("stream starting: ${url.take(120)}")
 
-                val chunkSize = 1 * 1024 * 1024L
+                val chunkSize = CHUNK_BYTES
                 val tmpDir = NSTemporaryDirectory()
                 val ext = when {
                     url.contains("mime=video", ignoreCase = true) ||
@@ -74,6 +94,8 @@ object StreamDownloadBridge {
                 val path = "$tmpDir/bitchord-${NSUUID().UUIDString}.$ext"
                 tmpPath = path
 
+                // Upstream reads the total out of the URL's own `clen` rather than
+                // making a request to find out, so read-ahead knows when it is done.
                 clenFromUrl(url)?.let { clen ->
                     val lenPath = "$path.len"
                     val digits = clen.toString().encodeToByteArray()
@@ -100,30 +122,22 @@ object StreamDownloadBridge {
                     val rangeEnd = offset + chunkSize - 1
                     val rangeHeaders = headers + ("Range" to "bytes=$offset-$rangeEnd")
 
-                    println("[StreamDownload] Fetching chunk: bytes=$offset-$rangeEnd")
-                    var chunkData: ByteArray? = null
-                    var lastErr: Throwable? = null
-                    for (attempt in 0..1) {
-                        try {
-                            chunkData = Http.getBytes(url, rangeHeaders)
-                            lastErr = null
-                            break
-                        } catch (e: Throwable) {
-                            lastErr = e
-                            println("[StreamDownload] getBytes attempt ${attempt + 1} failed: ${e.message}")
-                            if (e.message?.contains("403") == true && attempt == 0) {
-                                kotlinx.coroutines.delay(800)
-                                continue
-                            } else break
+                    val data = try {
+                        Http.getBytes(url, rangeHeaders)
+                    } catch (e: Throwable) {
+                        val code = httpCodeOf(e)
+                        if (code != null && code in REFUSAL_CODES) {
+                            DebugLog.w("stream refused with $code at offset $offset")
+                            StreamResolver.onPlaybackRefused(url, code)
+                        } else {
+                            DebugLog.w("stream chunk failed at offset $offset: ${e.message}")
                         }
+                        throw e
                     }
-                    if (lastErr != null) throw lastErr
-                    val data = chunkData!!
-                    println("[StreamDownload] Got chunk: ${data.size} bytes status ok")
 
                     if (data.isEmpty()) {
                         consecutiveEmpty++
-                        println("[StreamDownload] Empty chunk $consecutiveEmpty, stopping")
+                        DebugLog.d("stream returned an empty chunk ($consecutiveEmpty), stopping")
                         if (consecutiveEmpty >= 2) break
                         continue
                     }
@@ -149,43 +163,54 @@ object StreamDownloadBridge {
 
                     if (!readyFired) {
                         readyFired = true
-                        println("[StreamDownload] First chunk ready: $path ($offset bytes)")
+                        DebugLog.d("first chunk ready: $path ($offset bytes)")
                         ready.onResult(path, null)
                     }
 
-                    if (data.size < chunkSize) {
-                        println("[StreamDownload] Last chunk received (total $offset)")
-                        break
-                    }
-                    if (offset > 200 * 1024 * 1024) {
-                        println("[StreamDownload] Safety cap hit")
-                        break
-                    }
+                    if (data.size < chunkSize) break
+                    if (offset > MAX_BYTES) break
                 }
 
                 file?.let { fflush(it); fclose(it) }
                 file = null
 
                 if (!readyFired) {
-                    done.onResult(null, "Download returned no bytes (googlevideo 403? n-param?)")
+                    done.onResult(null, "Download returned no bytes")
                     return@launch
                 }
 
                 NSMutableData().writeToFile("$path.complete", atomically = true)
-                println("[StreamDownload] Download complete: $path ($offset bytes)")
+                DebugLog.d("stream complete: $path ($offset bytes)")
                 done.onResult(path, null)
             } catch (e: Throwable) {
-                println("[StreamDownload] Error: ${e.message}")
-                e.printStackTrace()
-                tmpPath?.let { p ->
-                    NSMutableData().writeToFile("$p.complete", atomically = true)
-                }
+                DebugLog.e("stream failed", e)
+                // Marked complete either way: a half-written file left looking
+                // unfinished would be re-read forever by the growing-file reader.
+                tmpPath?.let { NSMutableData().writeToFile("$it.complete", atomically = true) }
                 done.onResult(null, e.message ?: e.toString())
             } finally {
                 file?.let { fclose(it) }
             }
         }
     }
+
+    /** The status code out of [Http]'s refusal message, if it was a refusal. */
+    private fun httpCodeOf(e: Throwable): Int? =
+        e.message?.let { message ->
+            Regex("HTTP (\\d{3})").find(message)?.groupValues?.get(1)?.toIntOrNull()
+        }
+
+    private val REFUSAL_CODES = setOf(403, 404, 410)
+
+    /**
+     * Two megabytes, matching [Http.probe]. Upstream's `ChunkedDataSource` and
+     * `AudioCache` both fetch ranges of this size, and the probe has to test the
+     * request that matters rather than a smaller, more forgiving one.
+     */
+    private const val CHUNK_BYTES = 2L * 1024 * 1024
+
+    /** A ceiling so a URL that never stops returning data cannot fill the disk. */
+    private const val MAX_BYTES = 200L * 1024 * 1024
 }
 
 private fun clenFromUrl(url: String): Long? {

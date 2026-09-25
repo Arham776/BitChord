@@ -34,14 +34,6 @@ struct HomeView: View {
         case .loaded(let shelves):
             ScrollView {
                 VStack(alignment: .leading, spacing: 28) {
-                    if let err = controller.lastError, !err.isEmpty {
-                        Text(err)
-                            .font(.caption)
-                            .foregroundStyle(.white)
-                            .padding(8)
-                            .frame(maxWidth: .infinity)
-                            .background(.red.opacity(0.85), in: .rect(cornerRadius: 8))
-                    }
                     if !auth.signedIn {
                         SignInBanner { auth.loginPresented = true }
                     }
@@ -99,14 +91,6 @@ struct ExploreView: View {
         case .loaded(let shelves):
             ScrollView {
                 VStack(alignment: .leading, spacing: 28) {
-                    if let err = controller.lastError, !err.isEmpty {
-                        Text(err)
-                            .font(.caption)
-                            .foregroundStyle(.white)
-                            .padding(8)
-                            .frame(maxWidth: .infinity)
-                            .background(.red.opacity(0.85), in: .rect(cornerRadius: 8))
-                    }
                     ForEach(shelves) { shelf in
                         ShelfCarousel(shelf: shelf)
                             .onAppear {
@@ -285,7 +269,6 @@ struct LibraryView: View {
                         buttonTitle: "Choose Folder"
                     ) { pickFolder() }
                 }
-            } else if local.tracks.isEmpty {
             } else if local.tracks.isEmpty {
                 EmptyStateView(
                     icon: Image(.bchMusicNote),

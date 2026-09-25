@@ -341,9 +341,15 @@ final class ListeningStore {
             totalMs: tracks.values.reduce(0) { $0 + $1.ms },
             totalPlays: tracks.values.reduce(0) { $0 + $1.plays },
             songs: Array(songs.prefix(10)),
-            artists: artists.values.map { Ranked(name: $0.name, ms: $0.ms, browseId: $0.id, plays: $0.plays) }
+            artists: artists.values.map {
+                Ranked(name: $0.name, ms: $0.ms, browseId: $0.id, plays: $0.plays,
+                       sub: $0.sub, art: $0.art)
+            }
                 .sorted { $0.ms > $1.ms }.prefix(10).map { $0 },
-            albums: albums.values.map { Ranked(name: $0.name, ms: $0.ms, browseId: $0.id, plays: $0.plays) }
+            albums: albums.values.map {
+                Ranked(name: $0.name, ms: $0.ms, browseId: $0.id, plays: $0.plays,
+                       sub: $0.sub, art: $0.art)
+            }
                 .sorted { $0.ms > $1.ms }.prefix(10).map { $0 },
             genres: genres,
             busiestDay: busiest.map { $0.key },
@@ -617,6 +623,13 @@ struct Ranked: Identifiable {
     var ms: Double
     var browseId: String?
     var plays: Int = 0
+    /// Secondary line — the album's artist, for an album row; unused for an
+    /// artist or genre.
+    var sub: String?
+    /// Artwork. Collected and persisted all the way from the sample, and
+    /// previously dropped when the summary was built, which is why the Replay
+    /// artist and album charts rendered as empty circles.
+    var art: String?
     var id: String { name }
 }
 

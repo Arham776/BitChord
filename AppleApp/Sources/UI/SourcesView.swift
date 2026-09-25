@@ -7,6 +7,11 @@ struct SourcesView: View {
     @State private var health = "Not checked"
     @State private var modules: [ModuleRow] = []
     @State private var busy = false
+    /// iOS-only: `EditMode` does not exist on macOS, where the list is reordered
+    /// by click-to-move instead.
+    #if os(iOS)
+    @State private var editMode: EditMode = .inactive
+    #endif
 
     struct ModuleRow: Identifiable {
         let id: String
@@ -63,7 +68,18 @@ struct SourcesView: View {
         .formStyle(.grouped)
         .navigationTitle("Sources")
         #if os(iOS)
-        .environment(\.editMode, .constant(.active))
+        // Module priority order is drag-reorderable, so edit mode is needed — but
+        // an explicit Reorder control rather than a mode the user cannot leave.
+        .environment(\.editMode, $editMode)
+        .toolbar {
+            if modules.count > 1 {
+                ToolbarItem(placement: .automatic) {
+                    Button(editMode == .active ? "Done" : "Reorder") {
+                        withAnimation { editMode = editMode == .active ? .inactive : .active }
+                    }
+                }
+            }
+        }
         #endif
         .overlay { if busy { ProgressView() } }
         .onChange(of: indexUrl) { _, value in AppSettings.shared.setModuleIndexUrl(value: value) }

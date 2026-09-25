@@ -921,6 +921,11 @@ private struct LyricsSourcesView: View {
     @Binding var selection: String
     @Binding var order: String
     @Binding var syllableSync: Bool
+    /// iOS-only: `EditMode` does not exist on macOS, where the list is reordered
+    /// by click-to-move instead.
+    #if os(iOS)
+    @State private var editMode: EditMode = .inactive
+    #endif
 
     var body: some View {
         List {
@@ -952,7 +957,17 @@ private struct LyricsSourcesView: View {
         }
         .navigationTitle("Lyrics Sources")
         #if os(iOS)
-        .environment(\.editMode, .constant(.active))
+        // Reordering the provider list needs edit mode, but forcing it active
+        // left the user with no way out of it. An explicit control is what
+        // Music does for exactly this.
+        .environment(\.editMode, $editMode)
+        .toolbar {
+            ToolbarItem(placement: .automatic) {
+                Button(editMode == .active ? "Done" : "Reorder") {
+                    withAnimation { editMode = editMode == .active ? .inactive : .active }
+                }
+            }
+        }
         #endif
         .onAppear {
             order = LyricsSourceNames.normalizeList(order)

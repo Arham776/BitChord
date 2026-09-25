@@ -1,5 +1,7 @@
 package com.music.bitchord.data.innertube
 
+import com.music.bitchord.data.DebugLog
+
 import com.music.bitchord.data.model.HomeFeed
 import com.music.bitchord.data.model.HomeShelf
 import com.music.bitchord.data.model.ShelfItem
@@ -54,8 +56,8 @@ object HomeBridge {
                     )
                 }
                 check(feed.shelves.isNotEmpty()) { "No results from YouTube Music" }
-                println(
-                    "[Home] cookie=${Innertube.cookie != null} " +
+                DebugLog.d(
+                    "home: signedIn=${Innertube.cookie != null} " +
                         "shelves=${feed.shelves.size} " +
                         "titles=${feed.shelves.joinToString { it.title }}",
                 )
