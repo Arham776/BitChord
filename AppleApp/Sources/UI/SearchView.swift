@@ -5,7 +5,10 @@ struct SearchView: View {
     @Environment(PlaybackController.self) private var controller
     @Environment(AppModel.self) private var appModel
     @State private var query = ""
-    @State private var scope: Scope = .songs
+    /// Starts on the mixed page, which is what YouTube Music opens on and the only
+    /// one that promotes a card. A first search should answer the question rather
+    /// than hand back a list.
+    @State private var scope: Scope = .all
     @State private var searching = false
     @State private var hits: [SearchHitDTO] = []
     @State private var suggestions: [String] = []
@@ -21,9 +24,25 @@ struct SearchView: View {
     @State private var suggestTask: Task<Void, Never>?
 
     enum Scope: String, CaseIterable, Identifiable {
-        case songs, albums, artists, playlists
+        /// YouTube Music's mixed page — the only one with a promoted card, and so
+        /// the only one a top result is shown for.
+        case all, songs, videos, albums, artists, playlists
+
         var id: String { rawValue }
-        var label: String { rawValue.capitalized }
+
+        var label: String {
+            switch self {
+            case .all: return "All"
+            case .videos: return "Videos"
+            default: return rawValue.capitalized
+            }
+        }
+
+        /// Whether a promoted card is worth looking for on this tab.
+        ///
+        /// A "Songs" search is already entirely songs, and a heading above a list
+        /// of the same rows adds nothing.
+        var showsTopResult: Bool { self == .all }
     }
 
     var body: some View {
@@ -122,7 +141,12 @@ struct SearchView: View {
             } else if !query.isEmpty {
                 ScrollView {
                     LazyVStack(spacing: 0) {
-                        ForEach(Array(hits.enumerated()), id: \.element.id) { index, hit in
+                        if let top = topResult {
+                            TopResultSection(hit: top, scope: scope) { query in
+                                self.query = query
+                            }
+                        }
+                        ForEach(Array(listHits.enumerated()), id: \.element.id) { _, hit in
                             if hit.isBrowse, let browseId = hit.browseId {
                                 NavigationLink(destination: DetailView(browseId: browseId, initialTitle: hit.title)) {
                                     browseRow(hit)
@@ -138,7 +162,7 @@ struct SearchView: View {
                                 SongRow(
                                     entry: hit.asEntry(),
                                     play: {
-                                        let tracks = hits.filter { !$0.isBrowse }.map { $0.asEntry() }
+                                        let tracks = listHits.filter(\.isTrack).map { $0.asEntry() }
                                         let at = tracks.firstIndex(where: { $0.id == hit.videoId }) ?? 0
                                         if scope == .songs {
                                             controller.playRadio(hit.asEntry())
@@ -291,6 +315,22 @@ struct SearchView: View {
             let list = await InnertubeSearch.shared.suggestions(term)
             await MainActor.run { suggestions = list }
         }
+    }
+
+    /// The promoted row, when this tab has one and the search found it.
+    ///
+    /// Read from the response rather than chosen from the list: it is Google's own
+    /// promotion, and a card's track is frequently absent from the results entirely.
+    private var topResult: SearchHitDTO? {
+        guard scope.showsTopResult else { return nil }
+        return hits.first { $0.isTopResult }
+    }
+
+    /// Everything that is not the promoted row — the promoted one is not repeated
+    /// in the list, so showing both would put the same track on screen twice.
+    private var listHits: [SearchHitDTO] {
+        guard scope.showsTopResult else { return hits }
+        return hits.filter { !$0.isTopResult }
     }
 
     private func performSearch() async {

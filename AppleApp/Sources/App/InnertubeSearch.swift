@@ -20,6 +20,17 @@ struct SearchHitDTO: Codable, Identifiable, Hashable {
 
     var isBrowse: Bool { kind == "browse" && browseId != nil }
 
+    /// The row YouTube Music itself promoted, rather than one that merely sorted
+    /// well.
+    ///
+    /// A separate case rather than a sort, because a promotion is Google's answer
+    /// to "what did they mean" and re-deriving it by ranking would be showing our
+    /// guess at one. It is also the only row that gets a heading above it.
+    var isTopResult: Bool { kind == "top" }
+
+    /// Whether this is a playable track, promoted or not.
+    var isTrack: Bool { !isBrowse && videoId != nil }
+
     func asEntry() -> QueueEntry {
         if let videoId, videoId.hasPrefix("saavn:") {
             return QueueEntry(

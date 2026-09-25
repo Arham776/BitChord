@@ -30,9 +30,51 @@ object InnertubeParser {
     fun parseSearchSongs(response: JsonObject): List<Song> =
         parseSearch(response).filterIsInstance<SearchResult.Track>().map { it.song }
 
-    fun parseSearch(response: JsonObject): List<SearchResult> {
-        val rows = collectRenderers(response, "musicResponsiveListItemRenderer")
+    /**
+     * A whole search page: the promoted card first, then the ordinary rows.
+     *
+     * Split from [parseSearch] because only the unfiltered "All" tab has a card,
+     * and because the card has to be read *before* the rows rather than picked out
+     * of them — its song is often absent from the list entirely, and when it is
+     * present it is the same object the walk below will find, so it has to be
+     * claimed first or it appears twice.
+     *
+     * @param includeVideos whether this is the Videos tab. The mixed page is
+     *   music-only, and a music-video upload belongs exclusively to Videos — so
+     *   the card is not even read there, rather than read and then filtered.
+     */
+    fun parseSearchPage(
+        response: JsonObject,
+        includeVideos: Boolean = false,
+    ): List<SearchResult> {
+        val cards: List<SearchResult> = if (includeVideos) emptyList() else {
+            collectRenderers(response, "musicCardShelfRenderer").mapNotNull { card ->
+                parseCardShelfSong(card)?.let { SearchResult.TopTrack(it) }
+                    ?: parseCardShelfBrowse(card)?.let { SearchResult.Browse(it) }
+            }
+        }
         val seen = HashSet<String>()
+        val claimed = buildList {
+            for (result in cards) {
+                when (result) {
+                    is SearchResult.TopTrack ->
+                        if (!result.song.isVideo && seen.add("v:${result.song.videoId}")) {
+                            add(result)
+                        }
+                    is SearchResult.Browse ->
+                        if (seen.add("b:${result.item.browseId}")) add(result)
+                    is SearchResult.Track -> Unit
+                }
+            }
+        }
+        return claimed + parseSearch(response, seen)
+    }
+
+    fun parseSearch(response: JsonObject): List<SearchResult> =
+        parseSearch(response, HashSet())
+
+    private fun parseSearch(response: JsonObject, seen: HashSet<String>): List<SearchResult> {
+        val rows = collectRenderers(response, "musicResponsiveListItemRenderer")
         return rows.mapNotNull { renderer ->
             // Browse rows first: an album row also carries a "play album"
             // videoId in its overlay, so a track-first test misreads every
@@ -779,14 +821,148 @@ object InnertubeParser {
     // ---- Filter scope -------------------------------------------------------
 
     /** Serialized params for a search scope, from the shared model's table. */
+    /**
+     * The search parameters for one filter, or null for the mixed page.
+     *
+     * Null is meaningful rather than a fallback: it is what asks for YouTube
+     * Music's unfiltered page, which is the only page that promotes a card and the
+     * only one that carries artists and playlists at all. Defaulting an unknown
+     * name to Songs would quietly turn a "Videos" search into a Songs one, which
+     * looks like the filter having no effect.
+     */
     fun paramsFor(scope: String): String? = when (scope.lowercase()) {
+        "all" -> SearchFilter.ALL.params
         "albums" -> SearchFilter.ALBUMS.params
         "artists" -> SearchFilter.ARTISTS.params
         "playlists" -> SearchFilter.PLAYLISTS.params
-        else -> SearchFilter.SONGS.params
+        "videos" -> SearchFilter.VIDEOS.params
+        "songs" -> SearchFilter.SONGS.params
+        else -> SearchFilter.ALL.params
     }
 
     private val DURATION = Regex("""\d+:\d{2}""")
+
+    // ---- Promoted search cards ---------------------------------------------
+
+    /**
+     * A promoted card that is a track.
+     *
+     * Reads the same fields as [parseResponsiveListItem] but from a different
+     * shape, because a card is a header with its own title rather than a
+     * two-column row. The two cannot be one function: the card's title is a bare
+     * `title` and its credits hang off the subtitle's runs, where a row's are in
+     * `flexColumns`.
+     */
+    private fun parseCardShelfSong(renderer: JsonObject): Song? {
+        val videoId = renderer.o("onTap").o("watchEndpoint").s("videoId") ?: return null
+        val title = renderer.o("title").runs()
+        if (title.isBlank()) return null
+
+        val subtitleRuns = renderer.o("subtitle").a("runs").orEmpty()
+        val subtitle = subtitleRuns.joinToString("") { it.s("text").orEmpty() }
+        val parts = subtitle.split(" • ").filter { it.isNotBlank() }
+        val duration = parts.lastOrNull()?.takeIf { it.matches(DURATION) }
+        val rowType = parts.firstOrNull { it.lowercase() in TYPE_WORDS }?.lowercase()
+        val credits = creditsOf(subtitleRuns)
+        val creditedArtists = artistNamesFromRuns(subtitleRuns)
+        val artist = parts.firstOrNull {
+            !it.matches(DURATION) && it.lowercase() !in TYPE_WORDS && !it.matches(TALLY)
+        }
+        val thumbnails = renderer.o("thumbnail").o("musicThumbnailRenderer")
+            .o("thumbnail").a("thumbnails")
+
+        return Song(
+            videoId = videoId,
+            title = title,
+            artist = creditedArtists
+                ?: credits.artistName?.takeIf { it.isNotBlank() }
+                ?: artist
+                ?: "Unknown artist",
+            thumbnailUrl = thumbnails.best(),
+            durationText = duration,
+            artistId = credits.artistId,
+            albumId = credits.albumId,
+            albumName = credits.albumName,
+            // A card whose artwork is not square is a video's, and the mixed page
+            // is music-only.
+            isVideo = rowType == "video" || thumbnails.isNotSquare(),
+            isExplicit = renderer["subtitleBadges"].hasExplicitBadge(),
+        )
+    }
+
+    /**
+     * Who the rows inside a promoted card are by, or null when the card is not one
+     * that bills them.
+     *
+     * An artist card is a header with a track list under it: searching "mc stan"
+     * promotes the artist and hangs three of their songs off the card, and those
+     * rows say only "Song • 3:16" — the credit is on the card, stated once, so
+     * every row read on its own came back as "Unknown artist".
+     *
+     * Only artist cards, which is why this reads `onTap` rather than the subtitle.
+     * A song or video card's rows are *related* uploads rather than its own —
+     * "Shape of You" promotes the track and lists a dance cover and a
+     * choreography video under it, by other people entirely — so lending them the
+     * card's credit would put the wrong name on rows that were not missing one.
+     */
+    private fun cardShelfCredit(card: JsonObject): Credits? {
+        val endpoint = card.o("onTap").o("browseEndpoint") ?: return null
+        val pageType = endpoint.o("browseEndpointContextSupportedConfigs")
+            .o("browseEndpointContextMusicConfig").s("pageType").orEmpty()
+        if ("ARTIST" !in pageType) return null
+        val name = card.o("title").runs().takeIf { it.isNotBlank() } ?: return null
+        // Deliberately no album: the card says who the song is by and nothing about
+        // which release it came off, and a guess there would show up as a wrong
+        // "go to album" in the row's own long-press menu.
+        return Credits(artistId = endpoint.s("browseId"), artistName = name)
+    }
+
+    /**
+     * An artist, album or playlist card, which uses the same promoted-search
+     * container as a song.
+     */
+    private fun parseCardShelfBrowse(renderer: JsonObject): BrowseItem? {
+        val endpoint = renderer.o("onTap").o("browseEndpoint") ?: return null
+        val browseId = endpoint.s("browseId") ?: return null
+        val pageType = endpoint.o("browseEndpointContextSupportedConfigs")
+            .o("browseEndpointContextMusicConfig").s("pageType").orEmpty()
+        val title = renderer.o("title").runs()
+        if (title.isBlank()) return null
+        val subtitle = renderer.o("subtitle").runs()
+        // A card whose own title or subtitle says "video" is a video, and the
+        // mixed page is music-only.
+        if (VIDEO_WORD.containsMatchIn(title) || VIDEO_WORD.containsMatchIn(subtitle)) return null
+        return BrowseItem(
+            browseId = browseId,
+            title = title,
+            subtitle = subtitle,
+            thumbnailUrl = renderer.o("thumbnail").o("musicThumbnailRenderer")
+                .o("thumbnail").a("thumbnails").best(),
+            type = browseTypeOf(pageType),
+        )
+    }
+
+    /** The artist names among a card's subtitle runs, in order. */
+    private fun artistNamesFromRuns(runs: List<JsonElement>): String? {
+        val names = runs.mapNotNull { run ->
+            val endpoint = run.o("navigationEndpoint").o("browseEndpoint") ?: return@mapNotNull null
+            val pageType = endpoint.o("browseEndpointContextSupportedConfigs")
+                .o("browseEndpointContextMusicConfig").s("pageType").orEmpty()
+            if ("ARTIST" !in pageType) return@mapNotNull null
+            run.s("text")
+        }
+        return names.filter { it.isNotBlank() }
+            .joinToString(", ")
+            .takeIf { it.isNotBlank() }
+    }
+
+    private fun browseTypeOf(pageType: String): BrowseType = when {
+        "ALBUM" in pageType -> BrowseType.ALBUM
+        "PLAYLIST" in pageType -> BrowseType.PLAYLIST
+        "ARTIST" in pageType -> BrowseType.ARTIST
+        else -> BrowseType.OTHER
+    }
+
     private val TALLY = Regex(
         """[\d.,]+\s*[KMB]?\s+(plays|views|likes|songs|tracks|subscribers|""" +
             """hours?|minutes?|seconds?)\b.*""",
@@ -797,6 +973,28 @@ object InnertubeParser {
         "playlist", "podcast", "episode",
     )
     private val VIDEO_WORD = Regex("""\bvideos?\b""", RegexOption.IGNORE_CASE)
+
+    /**
+     * Whether this element carries an explicit-content badge, or null if it says
+     * nothing either way.
+     *
+     * Tri-state, and null is the common answer: a promoted card often carries no
+     * badge row at all, which is not the same as a badge that says "clean". The
+     * cross-source matcher distinguishes the two — it rejects a candidate whose
+     * stated edition contradicts the target's and accepts one that has simply made
+     * no claim — so reading a missing badge as "clean" would have it refuse
+     * matches it should accept.
+     */
+    private fun JsonElement?.hasExplicitBadge(): Boolean? {
+        val element = this ?: return null
+        val badges = (element as? JsonObject)?.a("subtitleBadges").orEmpty()
+        if (badges.isEmpty()) return null
+        val explicit = badges.any { badge ->
+            val icon = badge.o("musicInlineBadgeRenderer").s("icon")
+            icon?.contains("EXPLICIT", ignoreCase = true) == true
+        }
+        return if (explicit) true else null
+    }
     private val YEAR = Regex("""\d{4}""")
     private val RELEASE_WORDS = setOf("album", "single", "ep")
     private val HEADER_RENDERERS = listOf(

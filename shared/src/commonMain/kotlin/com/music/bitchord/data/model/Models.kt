@@ -98,9 +98,22 @@ data class BrowseItem(
     val type: BrowseType,
 )
 
-/** Search rows are heterogeneous once filters other than "Songs" are used. */
+/**
+ * Search rows are heterogeneous once filters other than "Songs" are used.
+ *
+ * [TopTrack] is not a better-ranked track — it is *the* track YouTube Music
+ * itself promoted, read from the card at the head of an unfiltered search. Taking
+ * Google's own choice rather than scoring the results ourselves is the difference
+ * between showing the answer and showing our guess at one, and it is why this is a
+ * distinct case rather than a flag on [Track]: a promoted card can legitimately be
+ * a track with no place in the list at all, and a row that merely happened to sort
+ * well is not a promotion.
+ */
 @Serializable
 sealed interface SearchResult {
+    @Serializable
+    data class TopTrack(val song: Song) : SearchResult
+
     @Serializable
     data class Track(val song: Song) : SearchResult
 
@@ -109,7 +122,16 @@ sealed interface SearchResult {
 }
 
 enum class SearchFilter(val label: String, val params: String?) {
+    /**
+     * YouTube Music's mixed search page: songs, artists, albums and playlists.
+     *
+     * The only filter that carries a promoted card, and so the only one a top
+     * result is shown for — a "Songs" search is already entirely songs, and a
+     * heading above a list of the same rows adds nothing.
+     */
+    ALL("All", null),
     SONGS("Songs", "EgWKAQIIAWoKEAkQChAFEAMQBA=="),
+    VIDEOS("Videos", "EgWKAQIQAWoKEAkQChAFEAMQBA=="),
     ALBUMS("Albums", "EgWKAQIYAWoKEAkQChAFEAMQBA=="),
     ARTISTS("Artists", "EgWKAQIgAWoKEAkQChAFEAMQBA=="),
     PLAYLISTS("Playlists", "EgWKAQIoAWoKEAkQChAFEAMQBA=="),

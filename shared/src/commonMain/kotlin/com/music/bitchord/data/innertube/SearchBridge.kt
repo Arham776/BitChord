@@ -1,6 +1,7 @@
 package com.music.bitchord.data.innertube
 
 import com.music.bitchord.data.model.SearchHit
+import com.music.bitchord.data.model.SearchFilter
 import com.music.bitchord.data.model.SearchResult
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -26,35 +27,47 @@ object SearchBridge {
         bridgeScope.launch {
             try {
                 val response = Innertube.search(query, InnertubeParser.paramsFor(scope))
-                val hits = InnertubeParser.parseSearch(response).map { result ->
-                    when (result) {
-                        is SearchResult.Track -> SearchHit(
-                            kind = "track",
-                            videoId = result.song.videoId,
-                            title = result.song.title,
-                            subtitle = result.song.artist,
-                            thumbnailUrl = result.song.thumbnailUrl,
-                            durationText = result.song.durationText,
-                            albumName = result.song.albumName,
-                            artistId = result.song.artistId,
-                            albumId = result.song.albumId,
-                            isVideo = result.song.isVideo,
-                            setVideoId = result.song.setVideoId,
-                        )
-                        is SearchResult.Browse -> SearchHit(
-                            kind = "browse",
-                            title = result.item.title,
-                            subtitle = result.item.subtitle,
-                            thumbnailUrl = result.item.thumbnailUrl,
-                            browseId = result.item.browseId,
-                            browseType = result.item.type.name,
-                        )
-                    }
-                }
+                // The Videos tab is the one filter whose results are not music, so
+                // the promoted card is not read there at all.
+                val includeVideos = scope == SearchFilter.VIDEOS.name
+                val hits = InnertubeParser.parseSearchPage(response, includeVideos)
+                    .map { result -> hitOf(result) }
                 callback.onResult(json.encodeToString(ListSerializer(SearchHit.serializer()), hits), null)
             } catch (e: Throwable) {
                 callback.onResult(null, e.message ?: e.toString())
             }
         }
     }
+
+    /**
+     * The promoted card and an ordinary track are the same row on screen; what
+     * differs is the heading above them, and the host tells them apart by [kind].
+     */
+    private fun hitOf(result: SearchResult): SearchHit = when (result) {
+        is SearchResult.TopTrack -> trackHit(result.song, kind = "top")
+        is SearchResult.Track -> trackHit(result.song, kind = "track")
+        is SearchResult.Browse -> SearchHit(
+            kind = "browse",
+            title = result.item.title,
+            subtitle = result.item.subtitle,
+            thumbnailUrl = result.item.thumbnailUrl,
+            browseId = result.item.browseId,
+            browseType = result.item.type.name,
+        )
+    }
+
+    private fun trackHit(song: com.music.bitchord.data.model.Song, kind: String) = SearchHit(
+        kind = kind,
+        videoId = song.videoId,
+        title = song.title,
+        subtitle = song.artist,
+        thumbnailUrl = song.thumbnailUrl,
+        durationText = song.durationText,
+        albumName = song.albumName,
+        artistId = song.artistId,
+        albumId = song.albumId,
+        isVideo = song.isVideo,
+        setVideoId = song.setVideoId,
+    )
+
 }
