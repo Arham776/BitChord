@@ -651,15 +651,15 @@ private struct AccountIntegrationsView: View {
     @Binding var discordPresented: Bool
 
     @State private var lastFmUser = PlatformSettings.shared.getString(key: "lastfm_username", default: "")
-    @State private var lastFmSession = PlatformSettings.shared.getString(key: "lastfm_session", default: "")
+    @State private var lastFmSession = PlatformSettings.shared.getSecret(key: "lastfm_session") ?? ""
     @State private var lastFmEnabled = PlatformSettings.shared.getBoolean(key: "lastfm_enabled", default: false)
     @State private var lastFmScrobble = PlatformSettings.shared.getBoolean(key: "lastfm_scrobble", default: true)
     @State private var lastFmNowPlaying = PlatformSettings.shared.getBoolean(key: "lastfm_nowplaying", default: true)
-    @State private var lastFmKey = PlatformSettings.shared.getString(key: "lastfm_api_key", default: "")
-    @State private var lastFmSecret = PlatformSettings.shared.getString(key: "lastfm_secret", default: "")
-    @State private var listenToken = PlatformSettings.shared.getString(key: "listenbrainz_token", default: "")
+    @State private var lastFmKey = PlatformSettings.shared.getSecret(key: "lastfm_api_key") ?? ""
+    @State private var lastFmSecret = PlatformSettings.shared.getSecret(key: "lastfm_secret") ?? ""
+    @State private var listenToken = PlatformSettings.shared.getSecret(key: "listenbrainz_token") ?? ""
     @State private var listenEnabled = PlatformSettings.shared.getBoolean(key: "listenbrainz_enabled", default: false)
-    @State private var discordToken = PlatformSettings.shared.getString(key: "discord_token", default: "")
+    @State private var discordToken = PlatformSettings.shared.getSecret(key: "discord_token") ?? ""
     @State private var discordName = PlatformSettings.shared.getString(key: "discord_username", default: "")
     @State private var discordRpc = PlatformSettings.shared.getBoolean(key: "discord_rpc_enabled", default: true)
     @State private var discordStatus = PlatformSettings.shared.getString(key: "discord_status", default: "online")
@@ -885,8 +885,8 @@ private struct AccountIntegrationsView: View {
         ))
         .onAppear {
             lastFmUser = PlatformSettings.shared.getString(key: "lastfm_username", default: "")
-            lastFmSession = PlatformSettings.shared.getString(key: "lastfm_session", default: "")
-            discordToken = PlatformSettings.shared.getString(key: "discord_token", default: "")
+            lastFmSession = PlatformSettings.shared.getSecret(key: "lastfm_session") ?? ""
+            discordToken = PlatformSettings.shared.getSecret(key: "discord_token") ?? ""
             discordName = PlatformSettings.shared.getString(key: "discord_username", default: "")
         }
     }

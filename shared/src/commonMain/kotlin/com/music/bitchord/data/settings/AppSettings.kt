@@ -310,25 +310,25 @@ object AppSettings {
     }
 
     // ---- Scrobbling --------------------------------------------------------
-    private val _lastFmApiKey = MutableStateFlow(settings.getString("lastfm_api_key", ""))
+    private val _lastFmApiKey = MutableStateFlow(settings.getSecret("lastfm_api_key").orEmpty())
     val lastFmApiKey: StateFlow<String> = _lastFmApiKey.asStateFlow()
     fun setLastFmApiKey(value: String) {
         _lastFmApiKey.value = value.trim()
-        settings.putString("lastfm_api_key", _lastFmApiKey.value)
+        settings.putSecret("lastfm_api_key", _lastFmApiKey.value.ifEmpty { null })
     }
 
-    private val _lastFmSecret = MutableStateFlow(settings.getString("lastfm_secret", ""))
+    private val _lastFmSecret = MutableStateFlow(settings.getSecret("lastfm_secret").orEmpty())
     val lastFmSecret: StateFlow<String> = _lastFmSecret.asStateFlow()
     fun setLastFmSecret(value: String) {
         _lastFmSecret.value = value.trim()
-        settings.putString("lastfm_secret", _lastFmSecret.value)
+        settings.putSecret("lastfm_secret", _lastFmSecret.value.ifEmpty { null })
     }
 
-    private val _lastFmSession = MutableStateFlow(settings.getString("lastfm_session", ""))
+    private val _lastFmSession = MutableStateFlow(settings.getSecret("lastfm_session").orEmpty())
     val lastFmSession: StateFlow<String> = _lastFmSession.asStateFlow()
     fun setLastFmSession(value: String) {
         _lastFmSession.value = value.trim()
-        settings.putString("lastfm_session", _lastFmSession.value)
+        settings.putSecret("lastfm_session", _lastFmSession.value.ifEmpty { null })
     }
 
     private val _lastFmUsername = MutableStateFlow(settings.getString("lastfm_username", ""))
@@ -359,11 +359,11 @@ object AppSettings {
         settings.putBoolean("lastfm_nowplaying", value)
     }
 
-    private val _listenBrainzToken = MutableStateFlow(settings.getString("listenbrainz_token", ""))
+    private val _listenBrainzToken = MutableStateFlow(settings.getSecret("listenbrainz_token").orEmpty())
     val listenBrainzToken: StateFlow<String> = _listenBrainzToken.asStateFlow()
     fun setListenBrainzToken(value: String) {
         _listenBrainzToken.value = value.trim()
-        settings.putString("listenbrainz_token", _listenBrainzToken.value)
+        settings.putSecret("listenbrainz_token", _listenBrainzToken.value.ifEmpty { null })
     }
 
     private val _listenBrainzEnabled = MutableStateFlow(settings.getBoolean("listenbrainz_enabled", false))
@@ -374,11 +374,20 @@ object AppSettings {
     }
 
     // ---- Discord -----------------------------------------------------------
-    private val _discordToken = MutableStateFlow(settings.getString("discord_token", ""))
+    /**
+     * Read from the secret tier, not the settings list.
+     *
+     * A Discord token is a bearer credential: anything holding it can post as
+     * the listener. In the settings list it was plain text in `NSUserDefaults`,
+     * which means it travelled in every iCloud backup and sat in the preferences
+     * plist — where `exportPrefsJson` is careful to leave it out, but which is
+     * still readable by anything with the container.
+     */
+    private val _discordToken = MutableStateFlow(settings.getSecret("discord_token").orEmpty())
     val discordToken: StateFlow<String> = _discordToken.asStateFlow()
     fun setDiscordToken(value: String) {
         _discordToken.value = value.trim()
-        settings.putString("discord_token", _discordToken.value)
+        settings.putSecret("discord_token", _discordToken.value.ifEmpty { null })
     }
 
     private val _discordUsername = MutableStateFlow(settings.getString("discord_username", ""))
@@ -529,11 +538,11 @@ object AppSettings {
         return browseId in updated
     }
 
-    private val _spotifySpdc = MutableStateFlow(settings.getString("spotify_spdc_token", ""))
+    private val _spotifySpdc = MutableStateFlow(settings.getSecret("spotify_spdc_token").orEmpty())
     val spotifySpdc: StateFlow<String> = _spotifySpdc.asStateFlow()
     fun setSpotifySpdc(value: String) {
         _spotifySpdc.value = value.trim()
-        settings.putString("spotify_spdc_token", _spotifySpdc.value)
+        settings.putSecret("spotify_spdc_token", _spotifySpdc.value.ifEmpty { null })
     }
 
     private val _jiosaavnEnabled = MutableStateFlow(settings.getBoolean("jiosaavn_enabled", true))
