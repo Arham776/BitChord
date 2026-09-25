@@ -9,6 +9,8 @@ import kotlinx.coroutines.delay
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonElement
+import kotlin.io.encoding.Base64
+import kotlin.io.encoding.ExperimentalEncodingApi
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonObjectBuilder
 import kotlinx.serialization.json.JsonPrimitive
@@ -235,6 +237,24 @@ object Innertube {
      * Search YouTube Music. [params] is a filter chip's serialized params
      * (`SearchFilter` in the shared model); null = the "All" tab.
      */
+    /**
+     * The timed transcript YouTube holds for [videoId].
+     *
+     * `get_transcript` expects a tiny protobuf rather than JSON, and the field is
+     * field 1, length-delimited: one tag byte, the id's length, then the id. The
+     * id is always 11 characters, so the length never needs a varint — which is
+     * what makes this hand-rolled encoding safe rather than merely convenient.
+     */
+    @OptIn(ExperimentalEncodingApi::class)
+    suspend fun transcript(videoId: String): JsonObject = postMusic("get_transcript") {
+        val id = videoId.encodeToByteArray()
+        val bytes = ByteArray(2 + id.size)
+        bytes[0] = 10 // field 1, wire type 2
+        bytes[1] = id.size.toByte()
+        id.copyInto(bytes, destinationOffset = 2)
+        put("params", Base64.Default.encode(bytes))
+    }
+
     suspend fun search(query: String, params: String? = null): JsonObject =
         postMusic("search") {
             put("query", query)

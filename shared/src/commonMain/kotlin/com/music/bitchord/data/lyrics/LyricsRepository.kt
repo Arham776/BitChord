@@ -166,6 +166,8 @@ object LyricsRepository {
                 ?.also { remember(videoId, it.isrc) }
                 ?.lines
         LyricsSource.SIMP_MUSIC -> SimpMusicLyrics.lyrics(videoId, durationMs)
+        LyricsSource.YOUTUBE_TRANSCRIPT -> YouTubeTranscriptLyrics.lyrics(videoId)
+        LyricsSource.YOUTUBE_MUSIC -> YouTubeMusicLyrics.lyrics(videoId)
         LyricsSource.LRCLIB -> LrcLib.lyrics(title, artist, durationMs)
         LyricsSource.MUSIXMATCH -> Musixmatch.lyrics(title, artist, durationMs)
         LyricsSource.PAXSENIX -> PaxSenix.lyrics(title, artist, durationMs, album)
