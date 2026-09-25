@@ -2,6 +2,8 @@ package com.music.bitchord.data.sources
 
 import com.music.bitchord.data.DebugLog
 import com.music.bitchord.data.model.Song
+import com.music.bitchord.data.settings.AppSettings
+import com.music.bitchord.data.settings.AudioQuality
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -153,6 +155,60 @@ object SourceResolverBridge {
             ?: callback.onResult(null, null)
     }
 
+    /**
+     * The ceiling in force on the connection as it is right now.
+     *
+     * Answered here rather than in the host because the question is not "what is
+     * the setting" — it is "which of two settings applies to the connection that
+     * is up, and is that connection metered". That is derived state, it lives in
+     * [AppSettings], and a host that assembled it from the two settings itself
+     * would be one refactor away from making a mobile-data choice follow someone
+     * onto Wi-Fi.
+     */
+    fun activeCeiling(): String = ceiling(AppSettings.meteredConnection.value).name
+
+    /**
+     * Whether the connection up right now is the metered one.
+     *
+     * Asked alongside [activeCeiling] because the row's "not used on …" line has
+     * to name *which* connection, and a ceiling on its own cannot say that. It is
+     * derived from the OS rather than stored, so there is no key to read and this
+     * is the only honest place to get it.
+     */
+    fun activeConnectionIsMetered(): Boolean = AppSettings.meteredConnection.value == true
+
+    /** Whether a source of [kind] is worth asking on the connection as it is. */
+    fun activeCeilingPermits(kind: String): Boolean {
+        val name = ceiling(AppSettings.meteredConnection.value)
+        val sourceKind = SourceKind.entries.firstOrNull { it.name == kind } ?: return true
+        return name.permits(sourceKind)
+    }
+
+    private fun ceiling(metered: Boolean?): AudioQuality =
+        if (metered == true) AppSettings.audioQualityCellular.value
+        else AppSettings.audioQualityWifi.value
+
+    /**
+     * Whether a source of [kind] is worth asking at [quality].
+     *
+     * Exposed because the sources screen has to say "on, but not today" when the
+     * connection's ceiling is below what a source is for. The policy — which
+     * ceilings skip which kinds — is a property of the ceiling rather than of the
+     * source, so it belongs in one place; a copy in the host would drift from it
+     * and the screen would eventually claim a source is being used when it is
+     * not.
+     */
+    fun permits(quality: String, kind: String): Boolean {
+        val ceiling = when (quality) {
+            "LOW" -> AudioQuality.LOW
+            "MEDIUM" -> AudioQuality.MEDIUM
+            "HIGH" -> AudioQuality.HIGH
+            else -> AudioQuality.LOSSLESS
+        }
+        val sourceKind = SourceKind.entries.firstOrNull { it.name == kind } ?: return true
+        return ceiling.permits(sourceKind)
+    }
+
     // ── Registry, for the sources screen ────────────────────────────────────
 
     fun interface ConfigsCallback {
@@ -185,11 +241,42 @@ object SourceResolverBridge {
         }
     }
 
-    /** Health for a config that has not been saved — the editor's Test button. */
-    fun probeCandidate(config: SourceConfig, callback: HealthCallback) {
+    /**
+     * Health for a config that has not been saved — the editor's Test button.
+     *
+     * Takes the kind as a *name* rather than a [SourceConfig], so the editor can
+     * open for a kind it has no enum case for and a kind added to the registry
+     * becomes editable without a second list kept in step on the other side of
+     * the bridge.
+     */
+    fun probeCandidate(
+        kind: String,
+        baseUrl: String,
+        label: String,
+        callback: ActionCallback,
+    ) {
         scope.launch {
-            val health = SourceRegistry.probeCandidate(config)
-            callback.onResult(config.id, healthName(health), healthDetail(health))
+            val resolved = SourceKind.entries.firstOrNull { it.name == kind }
+            if (resolved == null) {
+                callback.onResult(false, "Unknown kind \"$kind\"")
+                return@launch
+            }
+            val health = SourceRegistry.probeCandidate(
+                SourceConfig(
+                    id = "candidate",
+                    kind = resolved,
+                    label = label,
+                    baseUrl = baseUrl,
+                    enabled = true,
+                ),
+            )
+            // Reported through the action channel because it is one question with
+            // one answer, and the editor wants a verdict rather than a name/detail
+            // pair it has to re-join.
+            callback.onResult(
+                health is com.music.bitchord.data.sources.SourceHealth.Ok,
+                healthDetail(health),
+            )
         }
     }
 
@@ -199,11 +286,30 @@ object SourceResolverBridge {
      * The URL goes to the secret tier rather than the settings list, so an addon
      * whose address carries a token does not end up in a preferences dump.
      */
-    fun save(config: SourceConfig, callback: ActionCallback) {
+    /** Save a source: add it when the id is new, update it otherwise. */
+    fun save(
+        id: String,
+        kind: String,
+        label: String,
+        baseUrl: String,
+        enabled: Boolean,
+        callback: ActionCallback,
+    ) {
         scope.launch {
             try {
-                val existing = SourceRegistry.config(config.id)
-                if (existing == null) {
+                val resolved = SourceKind.entries.firstOrNull { it.name == kind }
+                if (resolved == null) {
+                    callback.onResult(false, "Unknown kind \"$kind\"")
+                    return@launch
+                }
+                val config = SourceConfig(
+                    id = id,
+                    kind = resolved,
+                    label = label,
+                    baseUrl = baseUrl,
+                    enabled = enabled,
+                )
+                if (SourceRegistry.config(id) == null) {
                     SourceRegistry.add(config)
                 } else {
                     SourceRegistry.update(config)
@@ -215,6 +321,16 @@ object SourceResolverBridge {
             }
         }
     }
+
+    /**
+     * Where [kind] sits in the walk, low first.
+     *
+     * Asked by name so the sources screen does not have to hold a copy of the
+     * order — which is exactly the copy that would go stale the first time a kind
+     * was added.
+     */
+    fun rankOf(kind: String): Int =
+        SourceKind.entries.firstOrNull { it.name == kind }?.rank ?: Int.MAX_VALUE
 
     fun setEnabled(configId: String, enabled: Boolean, callback: ActionCallback) {
         SourceRegistry.setEnabled(configId, enabled)

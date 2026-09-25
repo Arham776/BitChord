@@ -64,7 +64,11 @@ object SourceRegistry {
         initialised = true
         val stored = readStored()
         val jioOptInDone = PlatformSettings.getBoolean(KEY_JIOSAAVN_OPT_IN_V1, false)
-        val after = sourcesForInit(stored, forceJioSaavnOff = !jioOptInDone)
+        val after = sourcesForInit(
+            stored,
+            forceJioSaavnOff = !jioOptInDone,
+            legacyModuleIndexUrl = AppSettings.moduleIndexUrl.value,
+        )
         // Publish and record the migration marker together. A process that died
         // after recording the marker but before the disabled source would
         // otherwise believe the forced opt-out had happened and silently restore
@@ -87,6 +91,7 @@ object SourceRegistry {
     internal fun sourcesForInit(
         stored: List<SourceConfig>,
         forceJioSaavnOff: Boolean,
+        legacyModuleIndexUrl: String = "",
     ): List<SourceConfig> {
         // Seeded rather than persisted-on-first-write, so a build adding a new
         // built-in kind picks it up for existing installs too. SourceConfig's
@@ -95,10 +100,31 @@ object SourceRegistry {
             .filter { kind -> stored.none { it.kind == kind } }
             .map { SourceConfig(kind = it) }
 
+        // A module index configured before sources became a list. The old
+        // settings screen kept it in one key, so an install that had one working
+        // would otherwise open the new screen to find it silently gone — which
+        // reads as the app losing a setting rather than as a migration.
+        //
+        // One shot: once a `CUSTOM_MODULE` config exists the key is no longer
+        // consulted, so a source added afterwards is never joined by a stale
+        // duplicate of whatever used to be in the key.
+        val withLegacy = if (
+            legacyModuleIndexUrl.isNotBlank() && seeded.none { it.kind == SourceKind.CUSTOM_MODULE }
+        ) {
+            seeded + SourceConfig(
+                id = "migrated-module-index",
+                kind = SourceKind.CUSTOM_MODULE,
+                label = "",
+                baseUrl = legacyModuleIndexUrl.trim().trimEnd('/'),
+            )
+        } else {
+            seeded
+        }
+
         // The retired built-in module is removed; a custom module the user entered
         // is preserved, because the two are different kinds for exactly this
         // reason.
-        return seeded
+        return withLegacy
             .filterNot { it.kind == SourceKind.MODULE }
             .map { config ->
                 when {
