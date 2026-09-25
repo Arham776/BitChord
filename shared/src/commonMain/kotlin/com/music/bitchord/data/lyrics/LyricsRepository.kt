@@ -171,11 +171,14 @@ object LyricsRepository {
         LyricsSource.LRCLIB -> LrcLib.lyrics(title, artist, durationMs)
         LyricsSource.MUSIXMATCH -> Musixmatch.lyrics(title, artist, durationMs)
         LyricsSource.PAXSENIX -> PaxSenix.lyrics(title, artist, durationMs, album)
+        LyricsSource.PAXSENIX_SPOTIFY -> PaxSenix.spotifyLyrics(title, artist, durationMs)
+        LyricsSource.PAXSENIX_MUSIXMATCH -> PaxSenix.musixmatchLyrics(title, artist, durationMs)
         LyricsSource.KUGOU -> KuGou.lyrics(title, artist, durationMs, album)
         LyricsSource.UNISON -> Unison.lyrics(title, artist, durationMs, album)
         // No album and no duration: it matches on a name and does its own
         // paging, and sending a length it cannot use only narrows the results.
         LyricsSource.MEGALOBIZ -> Megalobiz.lyrics(title, artist)
+        LyricsSource.GENIUS -> Genius.lyrics(title, artist)
     }
 
     /**

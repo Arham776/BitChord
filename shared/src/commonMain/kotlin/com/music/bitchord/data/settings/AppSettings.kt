@@ -10,6 +10,7 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.stateIn
 import com.music.bitchord.data.lyrics.LyricsSource
+import com.music.bitchord.data.lyrics.normalizePaxSenixApiKey
 
 /**
  * The stream ceiling for a connection, and — via [permits] — which sources that
@@ -285,6 +286,24 @@ object AppSettings {
     fun setLocalLibraryPath(value: String) {
         _localLibraryPath.value = value
         settings.putString("local_library_path", value)
+    }
+
+    // ---- PaxSenix ----------------------------------------------------------
+
+    /**
+     * The proxy key for the authenticated PaxSeniX routes.
+     *
+     * A bearer credential, so it goes to the secret tier — the same treatment as
+     * the scrobbling tokens. Readable from the settings *list* as well, so a value
+     * written before the split still works.
+     */
+    private val _paxSenixApiKey = MutableStateFlow(settings.getSecret("paxsenix_api_key").orEmpty())
+    val paxSenixApiKey: StateFlow<String> = _paxSenixApiKey.asStateFlow()
+
+    fun setPaxSenixApiKey(value: String) {
+        val normalized = normalizePaxSenixApiKey(value)
+        _paxSenixApiKey.value = normalized
+        settings.putSecret("paxsenix_api_key", normalized.ifEmpty { null })
     }
 
     // ---- Sources -----------------------------------------------------------
@@ -576,7 +595,7 @@ object AppSettings {
     /** Keys that must never leave the device in a backup. */
     private val SECRET_KEYS = setOf(
         "discord_token", "lastfm_session", "lastfm_secret", "lastfm_api_key",
-        "listenbrainz_token", "spotify_spdc_token",
+        "listenbrainz_token", "spotify_spdc_token", "paxsenix_api_key",
     )
 
     fun exportPrefsJson(): String {

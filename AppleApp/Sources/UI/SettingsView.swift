@@ -921,6 +921,12 @@ private struct LyricsSourcesView: View {
     @Binding var selection: String
     @Binding var order: String
     @Binding var syllableSync: Bool
+    /// The key for the two authenticated PaxSeniX routes.
+    ///
+    /// Held here rather than in the ordinary settings because it is a bearer
+    /// credential, and this is the only screen where it belongs: a source
+    /// configured from a list of names, not a row anybody types into.
+    @State private var paxSenixKey = PlatformSettings.shared.getSecret(key: "paxsenix_api_key") ?? ""
     /// iOS-only: `EditMode` does not exist on macOS, where the list is reordered
     /// by click-to-move instead.
     #if os(iOS)
@@ -945,6 +951,24 @@ private struct LyricsSourcesView: View {
                 .onMove(perform: move)
             } footer: {
                 Text("Tried in this order — drag to reorder. The highest-priority source to answer at all wins, unless Prefer Word-Synced Lyrics says to keep looking for a word-synced one.")
+            }
+            if usesAuthenticatedRoutes {
+                Section {
+                    SecureField("API key", text: $paxSenixKey)
+                        #if os(iOS)
+                        .textContentType(.password)
+                        #endif
+                    if !paxSenixKey.isEmpty {
+                        Button("Remove Key", role: .destructive) {
+                            paxSenixKey = ""
+                            AppSettings.shared.setPaxSenixApiKey(value: "")
+                        }
+                    }
+                } header: {
+                    Text("PaxSeniX Key")
+                } footer: {
+                    Text("PaxSeniX Spotify and PaxSeniX Musixmatch reach two catalogues Apple Music does not carry, and both need a key from paxsenix.org. Everything else on this list works without one. Stored in the Keychain, not in preferences.")
+                }
             }
             Section {
                 Button("Reset to Default") {
@@ -973,6 +997,9 @@ private struct LyricsSourcesView: View {
             order = LyricsSourceNames.normalizeList(order)
             selection = LyricsSourceNames.normalizeList(selection)
         }
+        .onChange(of: paxSenixKey) { _, value in
+            AppSettings.shared.setPaxSenixApiKey(value: value)
+        }
     }
 
     private var orderedIds: [String] {
@@ -980,6 +1007,17 @@ private struct LyricsSourcesView: View {
         let known = LyricsSourceOption.all.map(\.name)
         let fromSaved = saved.filter { known.contains($0) }
         return fromSaved + known.filter { !fromSaved.contains($0) }
+    }
+
+    /// Whether a key is worth asking about at all.
+    ///
+    /// Asked rather than always shown: with neither authenticated source enabled
+    /// the field is a credential box for a host this app is not contacting, and a
+    /// row that does nothing is worse than no row.
+    private var usesAuthenticatedRoutes: Bool {
+        let enabled = Set(LyricsSourceNames.normalizeList(selection)
+            .split(separator: ",").map(String.init))
+        return enabled.contains("PAXSENIX_SPOTIFY") || enabled.contains("PAXSENIX_MUSIXMATCH")
     }
 
     private func move(from source: IndexSet, to dest: Int) {

@@ -34,6 +34,31 @@ enum class LyricsSource(
         detail = "Apple Music timings again, on a second host",
         wordSynced = true,
     ),
+    /**
+     * Spotify's own lyrics, through the same proxy.
+     *
+     * Needs a key the listener supplies, and is a miss without one — see
+     * [PaxSenix]. Separate from [PAXSENIX] because it is a different catalogue,
+     * and because a key that works for one does not automatically make the other
+     * worth asking.
+     */
+    PAXSENIX_SPOTIFY(
+        label = "PaxSeniX Spotify",
+        detail = "Spotify's own lyrics, on a second catalogue · needs a key",
+        wordSynced = true,
+    ),
+    /**
+     * Musixmatch's own lyrics, through the same proxy.
+     *
+     * Distinct from [MUSIXMATCH]: that is Musixmatch's public API with its own
+     * signing, this is the same catalogue reached through a host this app already
+     * asks. They can disagree, and both being on means one of them has the track.
+     */
+    PAXSENIX_MUSIXMATCH(
+        label = "PaxSeniX Musixmatch",
+        detail = "Musixmatch again, through a different host · needs a key",
+        wordSynced = true,
+    ),
     BETTER_LYRICS(
         label = "BetterLyrics",
         detail = "Apple Music timings, word by word",
@@ -104,6 +129,20 @@ enum class LyricsSource(
         label = "Unison",
         detail = "Community submissions; can be word synced, line synced or plain",
         wordSynced = true,
+    ),
+    /**
+     * A community database scraped from its web pages, with no API at all.
+     *
+     * Last, and for coverage rather than quality: nothing it returns is
+     * synchronised, and a page scraper breaks without announcement. What it has is
+     * a long tail of community-contributed lyrics that no licensed source carries,
+     * and it is behind a Cloudflare that answers an honest agent and challenges a
+     * dishonest one.
+     */
+    GENIUS(
+        label = "Genius",
+        detail = "Community database, scraped; no timing, and the first to break",
+        wordSynced = false,
     ),
     /**
      * A page scraper with no API, so it breaks when the page changes and there
