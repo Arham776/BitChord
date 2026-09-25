@@ -931,11 +931,11 @@ private struct LyricsSourcesView: View {
         List {
             Section {
                 ForEach(orderedIds, id: \.self) { id in
-                    if let source = LyricsSourceOption.all.first(where: { $0.id == id }) {
+                    if let source = LyricsSourceOption.all.first(where: { $0.name == id }) {
                         Toggle(isOn: enabledBinding(source.id)) {
                             VStack(alignment: .leading, spacing: 2) {
-                                Text(source.title)
-                                Text(source.subtitle)
+                                Text(source.label)
+                                Text(source.detail)
                                     .font(.subheadline)
                                     .foregroundStyle(.secondary)
                             }
@@ -977,7 +977,7 @@ private struct LyricsSourcesView: View {
 
     private var orderedIds: [String] {
         let saved = LyricsSourceNames.normalizeList(order).split(separator: ",").map(String.init)
-        let known = LyricsSourceOption.all.map(\.id)
+        let known = LyricsSourceOption.all.map(\.name)
         let fromSaved = saved.filter { known.contains($0) }
         return fromSaved + known.filter { !fromSaved.contains($0) }
     }
@@ -1282,24 +1282,43 @@ private struct AudioQualityOption: Identifiable {
     }
 }
 
-private struct LyricsSourceOption: Identifiable {
-    let id: String
-    let title: String
-    let subtitle: String
+/// One lyrics source, as the shared module describes it.
+///
+/// The list, the labels, the subtitles and the order all come from
+/// `AppSettings.lyricsSourceCatalogJson()` rather than a copy held here. This
+/// screen used to keep its own, and the three sources added along with the ISRC
+/// pass did not appear in it — so the feature was on by default and had no row
+/// anywhere to be found, switched off, or read about.
+struct LyricsSourceOption: Identifiable, Decodable {
+    let name: String
+    let label: String
+    let detail: String
+    let wordSynced: Bool
+    let enabled: Bool
 
-    static let all: [LyricsSourceOption] = [
-        .init(id: "LYRICS_PLUS", title: "LyricsPlus", subtitle: "Syllable by syllable, on community mirrors"),
-        .init(id: "PAXSENIX", title: "PaxSenix", subtitle: "Apple Music timings again, on a second host"),
-        .init(id: "BETTER_LYRICS", title: "BetterLyrics", subtitle: "Apple Music timings, word by word"),
-        .init(id: "SIMP_MUSIC", title: "SimpMusic", subtitle: "Matched on the video, so never the wrong edit"),
-        .init(id: "KUGOU", title: "KuGou", subtitle: "Whole lines, strong outside the English catalogue"),
-        .init(id: "LRCLIB", title: "LRCLIB", subtitle: "Whole lines only, and always up"),
-        .init(id: "MUSIXMATCH", title: "Musixmatch", subtitle: "Whole lines, from the biggest lyrics database there is"),
-    ]
+    var id: String { name }
+
+    enum CodingKeys: String, CodingKey {
+        case name, label, detail, wordSynced, enabled
+    }
+
+    /// Every source, in the order the shared module puts them.
+    static var all: [LyricsSourceOption] {
+        let json = AppSettings.shared.lyricsSourceCatalogJson()
+        guard let data = json.data(using: .utf8),
+              let decoded = try? JSONDecoder().decode([LyricsSourceOption].self, from: data)
+        else {
+            // An empty list rather than a hard-coded fallback: a fallback here
+            // would be the stale copy all over again, and the symptom would be a
+            // settings screen that looks fine and controls nothing.
+            return []
+        }
+        return decoded
+    }
 
     static func summary(_ raw: String) -> String {
         let enabled = Set(LyricsSourceNames.normalizeList(raw).split(separator: ",").map(String.init))
-        let names = all.filter { enabled.contains($0.id) }.map(\.title)
+        let names = all.filter { enabled.contains($0.name) }.map(\.label)
         if names.isEmpty { return "None — no lyrics will be fetched" }
         return names.joined(separator: ", ")
     }

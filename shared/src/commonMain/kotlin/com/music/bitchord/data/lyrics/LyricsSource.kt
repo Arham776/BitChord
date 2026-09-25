@@ -16,6 +16,19 @@ enum class LyricsSource(
         detail = "Syllable by syllable, on community mirrors",
         wordSynced = true,
     ),
+    /**
+     * The one that hands out ISRCs.
+     *
+     * Declared second because enabling it also enables the identify pass that
+     * makes every *other* source's match better — see [LyricsRepository]. It is
+     * the only source this app contacts outside the race, and only when it is
+     * switched on.
+     */
+    BINI_LYRICS(
+        label = "BiniLyrics",
+        detail = "Apple Music timings, and the recording's ISRC for everything else",
+        wordSynced = true,
+    ),
     PAXSENIX(
         label = "PaxSenix",
         detail = "Apple Music timings again, on a second host",
@@ -44,6 +57,26 @@ enum class LyricsSource(
     MUSIXMATCH(
         label = "Musixmatch",
         detail = "Whole lines, from the biggest lyrics database there is",
+        wordSynced = false,
+    ),
+    /**
+     * Community-submitted rather than licensed, so it sometimes has a track none
+     * of the others do and is thin everywhere else. Low for that reason, not
+     * because its contents are worse.
+     */
+    UNISON(
+        label = "Unison",
+        detail = "Community submissions; can be word synced, line synced or plain",
+        wordSynced = true,
+    ),
+    /**
+     * A page scraper with no API, so it breaks when the page changes and there
+     * is nothing to tell that apart from a miss. Last, and here for the long tail
+     * of older catalogue none of the licensed sources carry.
+     */
+    MEGALOBIZ(
+        label = "Megalobiz",
+        detail = "Scraped community LRC; the long tail, and the first to break",
         wordSynced = false,
     ),
     ;

@@ -621,10 +621,18 @@ enum PlayerParity {
 }
 
 enum LyricsSourceNames {
-    static let defaultOrder = [
-        "LYRICS_PLUS", "PAXSENIX", "BETTER_LYRICS", "SIMP_MUSIC", "KUGOU", "LRCLIB", "MUSIXMATCH",
-    ]
-    static let defaultEnabled = defaultOrder.joined(separator: ",")
+    /// The order the shared module asks sources in, with the current enabled set.
+    ///
+    /// Read from `AppSettings` rather than listed here. The host used to carry
+    /// its own list of source names, and every source added since went into the
+    /// enum and not into it — so this default was quietly a different set from
+    /// the real one, and the *only* thing it was used for was the first read,
+    /// before the shared module had been asked.
+    static var defaultOrder: [String] {
+        LyricsSourceCatalog.names()
+    }
+
+    static var defaultEnabled: String { defaultOrder.joined(separator: ",") }
 
     static func canonical(_ id: String) -> String {
         switch id.trimmingCharacters(in: .whitespaces) {
@@ -639,16 +647,33 @@ enum LyricsSourceNames {
         raw.split(separator: ",").map { canonical(String($0)) }.filter { !$0.isEmpty }.joined(separator: ",")
     }
 
+    /// The display name, from the shared module.
+    ///
+    /// A table here was a third copy of the same fact, and the one place it
+    /// mattered most — what a source is called in the list — was the copy least
+    /// likely to be updated.
     static func label(_ id: String) -> String {
-        switch canonical(id) {
-        case "LYRICS_PLUS": "LyricsPlus"
-        case "PAXSENIX": "PaxSenix"
-        case "BETTER_LYRICS": "BetterLyrics"
-        case "SIMP_MUSIC": "SimpMusic"
-        case "KUGOU": "KuGou"
-        case "LRCLIB": "LRCLIB"
-        case "MUSIXMATCH": "Musixmatch"
-        default: id
-        }
+        LyricsSourceCatalog.label(for: canonical(id)) ?? canonical(id)
+    }
+}
+
+/// The shared lyrics catalogue, decoded once.
+enum LyricsSourceCatalog {
+    private struct Entry: Decodable {
+        let name: String
+        let label: String
+    }
+
+    private static let entries: [Entry] = {
+        guard let data = AppSettings.shared.lyricsSourceCatalogJson().data(using: .utf8),
+              let decoded = try? JSONDecoder().decode([Entry].self, from: data)
+        else { return [] }
+        return decoded
+    }()
+
+    static func names() -> [String] { entries.map(\.name) }
+
+    static func label(for name: String) -> String? {
+        entries.first { $0.name == name }?.label
     }
 }

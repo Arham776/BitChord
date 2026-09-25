@@ -26,13 +26,14 @@ object LyricsPlus {
         artist: String,
         durationMs: Long,
         album: String? = null,
+        isrc: String? = null,
     ): List<LyricLineDto>? = coroutineScope {
         val hosts = lastGood
             ?.let { listOf(it) + MIRRORS.filterNot { mirror -> mirror == it } }
             ?: MIRRORS
 
         val pending = hosts.map { host ->
-            host to async { fetch(host, title, artist, durationMs, album) }
+            host to async { fetch(host, title, artist, durationMs, album, isrc) }
         }.toMutableList()
 
         try {
@@ -58,6 +59,7 @@ object LyricsPlus {
         artist: String,
         durationMs: Long,
         album: String?,
+        isrc: String?,
     ): List<LyricLineDto>? {
         val query = buildMap {
             put("title", title)
@@ -65,6 +67,10 @@ object LyricsPlus {
             val seconds = durationMs / 1000
             if (seconds > 0) put("duration", seconds.toString())
             if (!album.isNullOrBlank()) put("album", album)
+            // Sent alongside the name rather than instead of it: unlike
+            // [BiniLyrics] this backend aggregates several catalogues, and the
+            // ones with no ISRC index still need something to match on.
+            if (!isrc.isNullOrBlank()) put("isrc", isrc)
         }
         val body = lyricsGet("$host/v2/lyrics/get", query = query) ?: return null
         val response = runCatching { lyricsJson.decodeFromString(Response.serializer(), body) }.getOrNull()

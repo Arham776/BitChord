@@ -736,6 +736,9 @@ object AppSettings {
 
     private const val OLD_LYRICS_DEFAULT = "BETTER,PLUS,SIMP,LRCLIB"
 
+    /** Every source name this build has offered; see [adoptNewLyricsSources]. */
+    private const val KEY_LYRICS_KNOWN_SOURCES = "lyrics_known_sources"
+
     private fun defaultLyricsSourcesJoined(): String =
         LyricsSource.entries.joinToString(",") { it.name }
 
@@ -744,11 +747,47 @@ object AppSettings {
         if (stored == OLD_LYRICS_DEFAULT) {
             val all = defaultLyricsSourcesJoined()
             settings.putString("lyrics_sources", all)
+            markLyricsSourcesKnown()
             return all
         }
         val migrated = persistLyricsSources(stored)
         if (migrated != stored && stored.isNotEmpty()) settings.putString("lyrics_sources", migrated)
-        return migrated.ifEmpty { stored }
+        return adoptNewLyricsSources(migrated.ifEmpty { stored })
+    }
+
+    /**
+     * Switch on sources an upgrade added, and leave switched-off ones off.
+     *
+     * The stored list is a record of what somebody decided about the sources that
+     * existed when they decided it. A source added by a later build was not one
+     * they ever had the chance to switch off, so reading the list literally left
+     * every new provider dark on every existing install — and with it the ISRC
+     * pass, which is run by [LyricsSource.BINI_LYRICS] and improves the match for
+     * the sources that *were* enabled. The feature would have shipped and done
+     * nothing for anyone who had ever opened these settings.
+     *
+     * The two cases are told apart by [KEY_LYRICS_KNOWN_SOURCES], the list of
+     * names this build has ever offered: a source absent from it is new, and one
+     * present in it that the user removed stays removed.
+     */
+    private fun adoptNewLyricsSources(current: String): String {
+        val known = settings.getString(KEY_LYRICS_KNOWN_SOURCES, "")
+            .split(",").mapNotNull { LyricsSource.fromName(it) }.toSet()
+        val everything = LyricsSource.entries.toSet()
+        if (known.containsAll(everything)) return current
+        val fresh = everything - known
+        val enabled = parseLyricsSources(current) + fresh
+        val joined = enabled.joinToString(",") { it.name }
+        settings.putString("lyrics_sources", joined)
+        markLyricsSourcesKnown()
+        return joined
+    }
+
+    private fun markLyricsSourcesKnown() {
+        settings.putString(
+            KEY_LYRICS_KNOWN_SOURCES,
+            LyricsSource.entries.joinToString(",") { it.name },
+        )
     }
 
     private fun readLyricsSourceOrderPref(): String {
@@ -770,6 +809,15 @@ object AppSettings {
         return raw.split(",").mapNotNull { LyricsSource.fromName(it) }.toSet()
     }
 
+    /**
+     * Saved order, with anything new appended.
+     *
+     * No migration needed, and deliberately so: the order is a preference about
+     * sources that already exist, so a source added later simply lands at the
+     * end. The *enabled set* is the one that needs [adoptNewLyricsSources],
+     * because there a missing name means "off" and a new source would never be
+     * switched on at all.
+     */
     private fun parseLyricsSourceOrder(raw: String): List<LyricsSource> {
         if (raw.isBlank() || raw == OLD_LYRICS_DEFAULT) return LyricsSource.entries
         val saved = raw.split(",").mapNotNull { LyricsSource.fromName(it) }
