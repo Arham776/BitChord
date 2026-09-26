@@ -18,6 +18,10 @@ struct NowPlayingView: View {
     @Environment(AuthController.self) private var auth
     @State private var pane: PlayerPane = .lyrics
     @State private var showPipeline = false
+    @State private var showLyricsOffset = false
+    /// The offset, held here so a change re-renders the lyrics without the sheet
+    /// being open. The notification is the signal; this is the value it carries.
+    @State private var lyricsOffsetMs: Int32 = LyricsOffsetBridge.offsetMs()
 
     var body: some View {
         // The platform split has to close *inside* a `Group`: a `#if` in a view
@@ -32,6 +36,16 @@ struct NowPlayingView: View {
         }
         .sheet(isPresented: $showPipeline) {
             AudioPipelineSheet()
+        }
+        .sheet(isPresented: $showLyricsOffset) {
+            LyricsOffsetSheet()
+                .environment(controller)
+        }
+        // The offset is adjusted *against the track playing*, so the effect has to
+        // be visible while the sheet is still open — a control that only took
+        // hold on the next track could not be aimed at anything.
+        .onReceive(NotificationCenter.default.publisher(for: .lyricsOffsetChanged)) { _ in
+            lyricsOffsetMs = LyricsOffsetBridge.offsetMs()
         }
     }
 
@@ -199,7 +213,8 @@ struct NowPlayingView: View {
                     sourceLabel: controller.lyricsSourceLabel,
                     onSeek: { controller.seek(to: $0) },
                     translator: controller.lyricsTranslator,
-                    trackId: controller.current?.id ?? ""
+                    trackId: controller.current?.id ?? "",
+                    offsetMs: lyricsOffsetMs
                 )
             case .queue:
                 UpNextPane()
@@ -272,7 +287,8 @@ struct NowPlayingView: View {
                                     sourceLabel: controller.lyricsSourceLabel,
                                     onSeek: { controller.seek(to: $0) },
                                     translator: controller.lyricsTranslator,
-                                    trackId: controller.current?.id ?? ""
+                                    trackId: controller.current?.id ?? "",
+                                    offsetMs: lyricsOffsetMs
                                 )
                             case .queue:
                                 UpNextPane()
@@ -469,6 +485,13 @@ struct NowPlayingView: View {
             // is the same place this row sits: it is a readout of what is playing
             // right now, not a setting.
             AudioOutputRow { showPipeline = true }
+            // Only with lyrics on screen. The control corrects *these* timings
+            // against what the listener is hearing, and offering it over a track
+            // with no lyrics is an invitation to a judgement that cannot be made.
+            if !controller.displayedLyrics.isEmpty {
+                Divider()
+                Button("Lyrics Offset…") { showLyricsOffset = true }
+            }
             Divider()
             Button("Download") { controller.downloadCurrent() }
         } label: {
@@ -975,10 +998,37 @@ struct LyricsPane: View {
     /// anyway is an invitation to a request that cannot succeed.
     var translator: LyricsTranslator?
     var trackId: String = ""
+    /// The listener's timing correction, in milliseconds. See [LyricsOffsetBridge].
+    var offsetMs: Int32 = 0
+
+    /// The clock the lyrics are judged against, which runs `offsetMs` behind the
+    /// transport.
+    ///
+    /// Upstream's `adjustedLyricsPosition`, and the offset is applied *here*
+    /// rather than by rewriting every line's timestamp on the way in. That is the
+    /// whole design: the timings a source supplied stay exactly as supplied, so
+    /// the transcript is the real one and a later fix to the offset is a change
+    /// to one number rather than a re-fetch. A positive offset makes the adjusted
+    /// clock smaller, so a line is reached later — which is what "positive shows
+    /// lyrics later" means.
+    private var adjustedPositionMs: Swift.Int64 {
+        max(0, Swift.Int64(position * 1000) - Swift.Int64(offsetMs))
+    }
 
     private var activeIndex: Int {
-        let ms = Swift.Int64(position * 1000)
+        let ms = adjustedPositionMs
         return lines.lastIndex { $0.timeMs <= ms } ?? 0
+    }
+
+    /// Where tapping a line should actually seek.
+    ///
+    /// The inverse of [adjustedPositionMs], and it has to be the inverse: a line
+    /// whose nominal time is `t` is shown when the adjusted clock reaches `t`,
+    /// which is transport position `t + offset`. Seeking to `t` instead would put
+    /// the listener a line behind every time they tapped one.
+    private func seekTarget(for line: LyricLineDto) -> Double {
+        let ms = max(0, line.timeMs + Swift.Int64(offsetMs))
+        return Double(ms) / 1000.0
     }
 
     var body: some View {
@@ -1023,7 +1073,7 @@ struct LyricsPane: View {
                                     .id(index)
                                     .contentShape(.rect)
                                     .onTapGesture {
-                                        onSeek?(Double(line.timeMs) / 1000.0)
+                                        onSeek?(seekTarget(for: line))
                                     }
                                 }
                             }

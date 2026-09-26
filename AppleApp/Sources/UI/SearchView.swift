@@ -14,14 +14,27 @@ struct SearchView: View {
     @State private var suggestions: [String] = []
     @State private var searchError: String?
     @State private var attempted = false
-    @FocusState private var fieldFocused: Bool
-    /// macOS. The `.searchable` field lives in the window's toolbar on that
-    /// platform, so the iOS `fieldFocused` above never reached it — ⌘F and
-    /// re-selecting the Search tab did nothing. A second `FocusState` bound
-    /// through `searchFocused(_:)` is what addresses the toolbar field; the
-    /// modifier exists from iOS 18 / macOS 15, which is the project's floor.
+    /// The platform search field's own focus, addressed through
+    /// `searchFocused(_:)`. The modifier exists from iOS 18 / macOS 15, which is
+    /// the project's floor.
     @FocusState private var searchFieldFocused: Bool
     @State private var suggestTask: Task<Void, Never>?
+    /// The in-flight search, so leaving the screen or starting a new one can
+    /// abandon it. Without a handle the late answer from an abandoned search
+    /// writes its results into whatever the screen is showing by then.
+    @State private var searchTask: Task<Void, Never>?
+    /// Bumped per request to give the results list a new identity, which is what
+    /// puts a new result set at the top instead of at the old one's offset.
+    @State private var requestToken = 0
+    /// The term the results on screen are actually for.
+    ///
+    /// Not the same as `query`, and the difference is load-bearing: `query` is
+    /// what the field says, and the moment it differs from this the results below
+    /// are for a search nobody asked for any more. Judging "is the user still
+    /// editing" off the suggestions alone got this wrong in two directions — a
+    /// one-character edit left the old results up under a shorter query, and
+    /// editing after a search never offered completions again.
+    @State private var searchedTerm = ""
 
     enum Scope: String, CaseIterable, Identifiable {
         /// YouTube Music's mixed page — the only one with a promoted card, and so
@@ -49,21 +62,20 @@ struct SearchView: View {
         NavigationStack {
             resultsColumn
                 .navigationTitle("Search")
-                #if os(macOS)
                 .toolbarTitleDisplayMode(.inline)
-                .searchable(text: $query, prompt: "Search")
+                // The platform's own search field, on both platforms.
+                //
+                // iOS used to get a hand-rolled `TextField` in a `Capsule` with a
+                // 13-point glyph in it, and that is what the port was missing: no
+                // Cancel, no native clear button, no "Search" return key, and
+                // nothing for VoiceOver to label. All of those come with the real
+                // control, and hand-rolling them again is exactly the kind of local
+                // hack this port is supposed to be removing. `always` rather than
+                // `automatic` because upstream's field is always on screen — a
+                // search that appears only after a pull is a different screen.
+                .searchable(text: $query, placement: searchPlacement, prompt: "Search")
                 .searchFocused($searchFieldFocused)
                 .onSubmit(of: .search) { Task { await performSearch() } }
-                .toolbar {
-                    ToolbarItem(placement: .primaryAction) {
-                        Picker("Kind", selection: $scope) {
-                            ForEach(Scope.allCases) { Text($0.label).tag($0) }
-                        }
-                        .pickerStyle(.segmented)
-                        .labelsHidden()
-                    }
-                }
-                #endif
                 // Upstream's `searchFocusTrigger`: re-tapping the tab that is
                 // already selected focuses the field instead of doing nothing.
                 // Bound to the counter rather than a flag so a second tap while
@@ -77,6 +89,15 @@ struct SearchView: View {
                 }
                 .onChange(of: query) { _, value in
                     scheduleSuggestions(value)
+                    // The field's own Cancel empties the text without telling the
+                    // results anything, so the screen would keep showing the last
+                    // search's hits under an empty field. Upstream reaches the
+                    // recent-searches view the same way — one tap on the clear
+                    // button — and here that tap is Cancel, so this is the
+                    // equivalent of the clear button's own reset.
+                    if value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                        resetToHistory()
+                    }
                 }
                 .onChange(of: appModel.focusSearch) { _, focus in
                     guard focus else { return }
@@ -93,26 +114,52 @@ struct SearchView: View {
         }
     }
 
-    /// Focus the field on whichever platform this is.
+    /// Where the platform puts the field.
     ///
-    /// Two mechanisms because the field is in a different place on each: a real
-    /// `TextField` in the content column on iOS, the window toolbar's
-    /// `.searchable` field on macOS. Only the iOS one is reachable by
-    /// `@FocusState`.
+    /// iOS's navigation-bar drawer, shown always rather than on pull, because
+    /// upstream's field is always on screen and a search that appears only after
+    /// a pull is a different screen. On macOS the field belongs in the window
+    /// toolbar. Stated on both rather than left to a default, so the two are not
+    /// left to a compiler that may choose differently on either.
+    private var searchPlacement: SearchFieldPlacement {
+        #if os(iOS)
+        .navigationBarDrawer(displayMode: .always)
+        #else
+        .toolbar
+        #endif
+    }
+
+    /// Back to the idle screen: no results, no error, no skeletons, and the
+    /// recent searches showing again. Not just clearing `hits` — an in-flight
+    /// search has to be abandoned too, or it would write its results into a
+    /// screen that has already decided it is showing history.
+    private func resetToHistory() {
+        searchTask?.cancel()
+        searchTask = nil
+        searching = false
+        attempted = false
+        hits = []
+        searchError = nil
+        suggestions = []
+        // Nothing on screen is for any term now, which is what stops the
+        // old results reappearing under a field that has been emptied.
+        searchedTerm = ""
+        // A fresh list identity, so the next search starts at the top rather than
+        // inheriting wherever the history view was scrolled to.
+        requestToken &+= 1
+    }
+
+    /// Focus the field.
     ///
-    /// The macOS one needs a turn of the run loop before the toolbar's field
-    /// exists to take focus: the search view is being re-selected at the moment
-    /// the tap arrives, and the modifier that addresses that field is applied on
-    /// the following update. Without the hop, ⌘F and re-tapping the tab both land
-    /// on a view that is not there yet.
+    /// One hop through a `Task` on both platforms: the field is part of the
+    /// navigation bar, and at the moment a re-tap arrives the view is being
+    /// re-selected — the modifier that addresses the field lands on the following
+    /// update, so setting focus in the same turn asks a view that is not there
+    /// yet.
     private func focusTheField() {
-        #if os(macOS)
         Task { @MainActor in
             searchFieldFocused = true
         }
-        #else
-        fieldFocused = true
-        #endif
     }
 
     /// Cancels an in-flight typeahead request.
@@ -127,17 +174,18 @@ struct SearchView: View {
 
     private var resultsColumn: some View {
         VStack(spacing: 0) {
-            #if os(iOS)
-            searchField
-                .padding(.horizontal, 24)
-                .padding(.top, 14)
-            HStack {
-                Spacer(minLength: 0)
+            // Upstream's rule for the filter tabs, and the reason it is a rule
+            // rather than a detail: they only mean something once there is a
+            // result set to narrow, and they stay hidden while suggestions are up
+            // because everything below them is for whatever was searched before
+            // this edit began. They also stay hidden for a search that failed —
+            // "pick a filter that finds nothing" would take away the control
+            // needed to leave it.
+            if showsFilters {
                 scopePicker
+                    .padding(.horizontal, 24)
+                    .padding(.bottom, 10)
             }
-            .padding(.horizontal, 24)
-            .padding(.vertical, 12)
-            #endif
 
             if searching {
                 ScrollView {
@@ -151,7 +199,7 @@ struct SearchView: View {
                 EmptyStateView(icon: Image(.bchSearch), title: "No results", subtitle: "Nothing found for “\(query)”.", buttonTitle: nil, action: nil)
             } else if let searchError {
                 EmptyStateView(icon: Image(.bchSearch), title: "Search unavailable", subtitle: searchError, buttonTitle: nil, action: nil)
-            } else if !query.isEmpty && !suggestions.isEmpty && !attempted {
+            } else if isEditing {
                 suggestionList
             } else if !query.isEmpty {
                 List {
@@ -203,23 +251,73 @@ struct SearchView: View {
                     }
                 }
                 .listStyle(.plain)
+                // Upstream's `scrollResetTrigger`: one list whose contents change,
+                // reset for each new request, so choosing a recent search cannot
+                // inherit the history's previous scroll position — or a previous
+                // result set's. A new identity per request is what puts it at the
+                // top; without it the same `List` keeps its offset and the new
+                // results open halfway down.
+                .id(requestToken)
             } else {
                 history
             }
         }
     }
 
+    /// The trimmed query, in one place. Everywhere below asks the same question
+    /// about the field's text and must get the same answer.
+    private var term: String {
+        query.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    /// Whether the field is mid-edit, so the results below are not the ones for
+    /// what it now says.
+    ///
+    /// Two signals, and either is enough. A non-empty suggestion list is
+    /// upstream's signal — a committed search clears the suggestions, so "there
+    /// are suggestions" and "the field is being edited" are the same statement.
+    /// The second is that the field no longer says what was searched, which
+    /// catches the edits too short to produce a suggestion list.
+    private var isEditing: Bool {
+        !term.isEmpty && (term != searchedTerm || !suggestions.isEmpty)
+    }
+
+    /// See [resultsColumn]. Hidden for an empty search, a failed one, and while
+    /// typing.
+    private var showsFilters: Bool {
+        attempted && !searching && searchError == nil && !hits.isEmpty && !isEditing
+    }
+
     private var suggestionList: some View {
         List {
-            Section("Suggestions") {
-                ForEach(suggestions, id: \.self) { term in
-                    Button(term) {
-                        query = term
-                        Task { await performSearch() }
+            if !suggestions.isEmpty {
+                Section("Suggestions") {
+                    ForEach(suggestions, id: \.self) { term in
+                        Button(term) {
+                            query = term
+                            Task { await performSearch() }
+                        }
+                    }
+                }
+            }
+            // Upstream keeps recent searches in the same column as the
+            // suggestions, so a query too short to produce any — or one the
+            // service has nothing for — leaves something to tap rather than an
+            // empty "Suggestions" header and no way onward.
+            let recent = Self.recentSearches()
+            if !suggestions.isEmpty || !recent.isEmpty {
+                if !suggestions.isEmpty { Divider() }
+                Section("Recent") {
+                    ForEach(recent, id: \.self) { term in
+                        Button(term) {
+                            query = term
+                            Task { await performSearch() }
+                        }
                     }
                 }
             }
         }
+        .listStyle(.plain)
     }
 
     private func browseRow(_ hit: SearchHitDTO) -> some View {
@@ -236,35 +334,6 @@ struct SearchView: View {
             Spacer()
         }
         .padding(.vertical, 6)
-    }
-
-    private var searchField: some View {
-        HStack(spacing: 7) {
-            Image(.bchSearch)
-                .resizable()
-                .scaledToFit()
-                .frame(width: 13, height: 13)
-                .foregroundStyle(.secondary)
-            TextField("Search", text: $query)
-                .textFieldStyle(.plain)
-                .focused($fieldFocused)
-                .font(.body)
-                .onSubmit { Task { await performSearch() } }
-            if !query.isEmpty {
-                Button {
-                    query = ""
-                    hits = []
-                    searchError = nil
-                    attempted = false
-                } label: {
-                    Image(systemName: "xmark.circle.fill").foregroundStyle(.secondary)
-                }
-                .buttonStyle(.plain)
-            }
-        }
-        .padding(.horizontal, 12)
-        .padding(.vertical, 8)
-        .background(.quaternary, in: Capsule())
     }
 
     private var scopePicker: some View {
@@ -360,21 +429,42 @@ struct SearchView: View {
     private func performSearch() async {
         let term = query.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !term.isEmpty else { return }
+        // A new request abandons the previous one. Two searches in flight meant
+        // the slower one could land last and overwrite the newer results, which
+        // is the bug a listener sees as "I searched for the right thing and got
+        // the wrong thing".
+        searchTask?.cancel()
         searching = true
         attempted = true
         searchError = nil
         suggestions = []
+        // A new list identity per request, so the results open at the top rather
+        // than at the previous set's offset.
+        requestToken &+= 1
         SearchHistory.shared.record(query: term)
-        defer { searching = false }
-        do {
-            hits = try await InnertubeSearch.shared.search(term, scope: scope.rawValue)
-            if PlatformSettings.shared.getBoolean(key: "jiosaavn_enabled", default: true), scope == .songs {
-                let extra = await JioSaavn.search(term)
-                hits.insert(contentsOf: extra, at: 0)
+        searchedTerm = term
+        let wanted = scope
+        let task = Task { @MainActor in
+            do {
+                var found = try await InnertubeSearch.shared.search(term, scope: wanted.rawValue)
+                if PlatformSettings.shared.getBoolean(key: "jiosaavn_enabled", default: true), wanted == .songs {
+                    let extra = await JioSaavn.search(term)
+                    found.insert(contentsOf: extra, at: 0)
+                }
+                // Cancellation can arrive while the network call is in flight, so
+                // the guard is checked again here rather than trusted to have been
+                // checked before the request.
+                guard !Task.isCancelled else { return }
+                hits = found
+            } catch {
+                guard !Task.isCancelled else { return }
+                searchError = "Couldn't reach the music service. Check your connection and try again."
+                hits = []
             }
-        } catch {
-            searchError = "Couldn't reach the music service. Check your connection and try again."
-            hits = []
+            searching = false
+            searchTask = nil
         }
+        searchTask = task
+        _ = await task.value
     }
 }
