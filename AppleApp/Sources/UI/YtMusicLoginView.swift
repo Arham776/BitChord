@@ -28,18 +28,33 @@ import BitChordShared
 /// ## Why the navigation is policed
 ///
 /// A music.youtube.com page carries links out to the YouTube Music app and to the
-/// App Store, and a redirect to `youtube://` or `itms-apps://` is handed to the
-/// system by the web view — which takes the listener out of the sign-in into
-/// another app mid-flow, and the session never comes back. Every navigation is
-/// decided here rather than followed. See [LoginWebCoordinator.navigationDecision].
+/// App Store, and WebKit hands a `youtube://` or `itms-apps://` navigation to the
+/// system by itself — which takes the listener out of the sign-in into another app
+/// mid-flow, and the session never comes back. So those are refused here, and
+/// *nothing* on this screen is ever opened anywhere else: see [SignInNavigation]
+/// for why the rest of the web loads in place instead.
 @Observable
 final class LoginFlow {
     /// The page has reached the Music origin, so there may be a session to take.
     var reachedMusicOrigin = false
     /// A capture is in flight.
     var taking = false
-    /// Why the last attempt was refused, if it was. Cleared on the next attempt.
-    var message: String?
+    /// The newest refusal, if the last thing that happened was a refused link.
+    var refusal: SignInNavigation.Refusal?
+    /// The host of a page that is not Google's sign-in, or nil while it is.
+    var offOriginHost: String?
+    /// A capture the listener asked for that had no session to take.
+    var captureNote: String?
+
+    /// Where the Continue button reaches the web view.
+    ///
+    /// A plain box rather than observable state on purpose. It is written from
+    /// `makeWebView`, which runs *during* the view update, and SwiftUI discards
+    /// observable mutations made there — which is how Continue ends up wired to a
+    /// web view the button cannot see, and pressing it does nothing at all. Held
+    /// outside observation the write survives, and the button reads it when it is
+    /// tapped rather than trusting a re-render to have happened in between.
+    let session = SignInSession()
 
     /// Whether the Continue button should be offered at all.
     ///
@@ -47,32 +62,45 @@ final class LoginFlow {
     /// Google page is worse than no button, because it looks like the sign-in is
     /// broken rather than incomplete.
     var canTake: Bool { reachedMusicOrigin && !taking }
+
+    /// The one line under the web view: the newest thing worth saying, or nothing.
+    ///
+    /// Derived rather than assigned, so a refusal cannot be left standing over a
+    /// message the listener needs, and the "you have wandered off the sign-in"
+    /// line cannot outlive the page that caused it. Ordered by freshness: what the
+    /// listener just did beats what they just pressed, and the standing "you are
+    /// off the sign-in" warning is the oldest of the three.
+    var message: String? {
+        if let captureNote { return captureNote }
+        if let refusal { return refusal.summary }
+        if let offOriginHost { return SignInNavigation.offSignInHostAdvice(host: offOriginHost) }
+        return nil
+    }
+}
+
+/// The one thing the Continue button has to be able to call. See [LoginFlow.session].
+final class SignInSession {
+    var take: (() -> Void)?
 }
 
 struct YtMusicLoginView: View {
     var onCookiesCaptured: (String) -> Void
 
     @State private var flow = LoginFlow()
-    @State private var webView: WKWebView?
 
     var body: some View {
         VStack(spacing: 0) {
             LoginWebView(
                 flow: flow,
-                onReady: { view in webView = view },
-                onCookiesCaptured: onCookiesCaptured
-            ) { reason in
-                // A refusal is not a failure and does not close anything: the
-                // button stays and the listener can try again once the page has
-                // settled.
-                flow.message = reason
-            }
+                onCookiesCaptured: onCookiesCaptured,
+                onUnavailable: { reason in flow.captureNote = reason }
+            )
 
             footer
         }
     }
 
-    /// The Continue control, and whatever the last refusal said.
+    /// The Continue control, and whatever is worth saying above it.
     ///
     /// A real button rather than a capture on navigation, because a capture on
     /// navigation is the race described above — and because "I signed in and it
@@ -90,9 +118,9 @@ struct YtMusicLoginView: View {
                     .transition(.opacity)
             }
             Button {
-                flow.message = nil
-                guard let webView else { return }
-                LoginWebCoordinator.takeSession(from: webView)
+                flow.captureNote = nil
+                flow.refusal = nil
+                flow.session.take?()
             } label: {
                 if flow.taking {
                     ProgressView().controlSize(.small)
@@ -119,7 +147,6 @@ struct YtMusicLoginView: View {
 #if os(macOS)
 private struct LoginWebView: NSViewRepresentable {
     let flow: LoginFlow
-    var onReady: (WKWebView) -> Void
     var onCookiesCaptured: (String) -> Void
     var onUnavailable: (String) -> Void
 
@@ -132,9 +159,7 @@ private struct LoginWebView: NSViewRepresentable {
     }
 
     func makeNSView(context: Context) -> WKWebView {
-        let view = context.coordinator.makeWebView()
-        onReady(view)
-        return view
+        context.coordinator.makeWebView()
     }
 
     func updateNSView(_ nsView: WKWebView, context: Context) {}
@@ -142,7 +167,6 @@ private struct LoginWebView: NSViewRepresentable {
 #else
 private struct LoginWebView: UIViewRepresentable {
     let flow: LoginFlow
-    var onReady: (WKWebView) -> Void
     var onCookiesCaptured: (String) -> Void
     var onUnavailable: (String) -> Void
 
@@ -155,9 +179,7 @@ private struct LoginWebView: UIViewRepresentable {
     }
 
     func makeUIView(context: Context) -> WKWebView {
-        let view = context.coordinator.makeWebView()
-        onReady(view)
-        return view
+        context.coordinator.makeWebView()
     }
 
     func updateUIView(_ uiView: WKWebView, context: Context) {}
@@ -168,12 +190,29 @@ private struct LoginWebView: UIViewRepresentable {
 /// unregistered; the observer callback is not used. Nothing is captured from it —
 /// the listener presses Continue — and it only matters that the store is
 /// registered, so that the jar is written to the store the harvest reads.
+///
+/// `@MainActor` because every navigation delegate callback WebKit makes is made on
+/// the main thread, and because [flow] is observed SwiftUI state: the cookie-store
+/// completion handlers are the only thing here that is not, and those hop to the
+/// main actor themselves rather than mutating observed state off it.
+@MainActor
 final class LoginWebCoordinator: NSObject, WKNavigationDelegate, WKUIDelegate, WKHTTPCookieStoreObserver {
     private let flow: LoginFlow
     private let onCookiesCaptured: (String) -> Void
     private let onUnavailable: (String) -> Void
-    private let store = WKWebsiteDataStore.nonPersistent()
+    /// `nonisolated` so `deinit` can reach it.
+    ///
+    /// `deinit` runs on whichever thread released the coordinator, so it cannot
+    /// touch main-actor state. Unregistering from the cookie store is the one
+    /// thing it has to do, and reaching it through
+    /// `MainActor.assumeIsolated` would *trap* rather than merely leave an
+    /// observer registered — a crash on the way out, over a leak that ends with
+    /// the store itself.
+    nonisolated private let store = WKWebsiteDataStore.nonPersistent()
     private var captured = false
+    /// Weak, because the coordinator is the navigation delegate the web view
+    /// retains, and a strong reference back would be a cycle.
+    private weak var webView: WKWebView?
 
     init(
         flow: LoginFlow,
@@ -186,6 +225,7 @@ final class LoginWebCoordinator: NSObject, WKNavigationDelegate, WKUIDelegate, W
     }
 
     deinit {
+        // Safe without an actor hop: see `store`.
         store.httpCookieStore.remove(self)
     }
 
@@ -220,9 +260,10 @@ final class LoginWebCoordinator: NSObject, WKNavigationDelegate, WKUIDelegate, W
         store.httpCookieStore.add(self)
         webView.navigationDelegate = self
         webView.uiDelegate = self
-        // Weak, because the coordinator is the navigation delegate the web view
-        // retains, and a strong reference back would be a cycle.
         self.webView = webView
+        // How the Continue button reaches the session. Set here rather than
+        // handed back to the view as state — see [LoginFlow.session].
+        flow.session.take = { [weak self] in self?.takeSession() }
         webView.load(URLRequest(url: Self.loginURL))
         return webView
     }
@@ -244,16 +285,22 @@ final class LoginWebCoordinator: NSObject, WKNavigationDelegate, WKUIDelegate, W
         decidePolicyFor navigationAction: WKNavigationAction,
         decisionHandler: @escaping (WKNavigationActionPolicy) -> Void
     ) {
-        switch Self.navigationDecision(for: navigationAction.request.url) {
-        case .allow:
+        let url = navigationAction.request.url
+        // A nil target frame is a new window, which is `createWebViewWith`'s to
+        // answer; only a real main frame is "where the sign-in is now".
+        let isMainFrame = navigationAction.targetFrame?.isMainFrame ?? false
+        switch Self.navigationDecision(for: url) {
+        case .load:
             decisionHandler(.allow)
-        case .openOutside:
+            announce(url, isMainFrame: isMainFrame)
+        case .refuse(let why):
+            // Cancelled, and *only* cancelled. There is no branch here that hands
+            // a URL to the system: following one is what opened the YouTube Music
+            // app and lost the sign-in, and the only way to be sure that cannot
+            // happen again is for the capability not to exist on this screen.
             decisionHandler(.cancel)
-            openOutside(navigationAction.request.url)
-        case .refuse:
-            // Cancelled and nothing else. Following it is what opened the YouTube
-            // Music app and lost the sign-in.
-            decisionHandler(.cancel)
+            NSLog("[BitChord] sign-in refused a navigation to \(url?.absoluteString ?? "?")")
+            flow.refusal = why
         }
     }
 
@@ -266,28 +313,30 @@ final class LoginWebCoordinator: NSObject, WKNavigationDelegate, WKUIDelegate, W
         // A `target="_blank"` link, decided exactly as any other navigation.
         // Loading it unconditionally is how a `youtube://` link in a new window
         // got followed.
-        switch Self.navigationDecision(for: navigationAction.request.url) {
-        case .allow:
-            if let url = navigationAction.request.url {
-                webView.load(URLRequest(url: url))
-            }
-        case .openOutside:
-            openOutside(navigationAction.request.url)
-        case .refuse:
-            break
+        let url = navigationAction.request.url
+        switch Self.navigationDecision(for: url) {
+        case .load:
+            if let url { webView.load(URLRequest(url: url)) }
+        case .refuse(let why):
+            NSLog("[BitChord] sign-in refused a new-window navigation to \(url?.absoluteString ?? "?")")
+            flow.refusal = why
         }
         return nil
     }
 
-    /// The only navigation this screen sends anywhere. Deliberate, and only ever
-    /// reached because the listener tapped a link.
-    private func openOutside(_ url: URL?) {
-        guard let url else { return }
-        #if os(macOS)
-        NSWorkspace.shared.open(url)
-        #else
-        UIApplication.shared.open(url)
-        #endif
+    /// Says where the listener is, whenever the main frame stops being the sign-in.
+    ///
+    /// Every `http(s)` page loads here, so the sign-in survives a hop to a host
+    /// nobody enumerated — but a listener who has genuinely left Google's sign-in
+    /// should be able to see that rather than infer it from a page they did not
+    /// ask for. Only the main frame counts: Google's own pages load iframes, and
+    /// a line of text about an ad server is noise.
+    private func announce(_ url: URL?, isMainFrame: Bool) {
+        guard isMainFrame else { return }
+        let onSignIn = SignInNavigation.isSignInHost(url)
+        flow.offOriginHost = onSignIn ? nil : url?.host?.lowercased()
+        // A refused link is newer news than the page it was on.
+        if onSignIn { flow.refusal = nil }
     }
 
     // ---- the state the button reads ----------------------------------------
@@ -297,10 +346,7 @@ final class LoginWebCoordinator: NSObject, WKNavigationDelegate, WKUIDelegate, W
         // wanders off the origin must lose the button, or they can press it
         // against a page that is no longer signed in.
         let onOrigin = webView.url?.absoluteString.hasPrefix(Self.musicOrigin) ?? false
-        Task { @MainActor in
-            flow.reachedMusicOrigin = onOrigin
-            if !onOrigin { flow.message = nil }
-        }
+        flow.reachedMusicOrigin = onOrigin
         // The cookie store commits after `didFinish`, so the first press would
         // otherwise race it. Warmed, not awaited — the listener decides when, and
         // by then the jar has long since settled.
@@ -308,12 +354,6 @@ final class LoginWebCoordinator: NSObject, WKNavigationDelegate, WKUIDelegate, W
     }
 
     // ---- taking the session -------------------------------------------------
-
-    /// Takes the session, if the page is genuinely signed in.
-    static func takeSession(from webView: WKWebView) {
-        guard let coordinator = webView.navigationDelegate as? LoginWebCoordinator else { return }
-        coordinator.takeSession()
-    }
 
     /// The `ytcfg` check is upstream's and it is not decoration. A login in
     /// progress has *already* been given a SAPISID by the time the password is
@@ -324,47 +364,49 @@ final class LoginWebCoordinator: NSObject, WKNavigationDelegate, WKUIDelegate, W
     private func takeSession() {
         guard !captured, !flow.taking else { return }
         guard flow.reachedMusicOrigin else {
-            flow.message = "Finish signing in on the Google page first."
+            flow.captureNote = "Finish signing in on the Google page first."
             return
         }
         flow.taking = true
-        flow.message = nil
+        flow.refusal = nil
+        flow.captureNote = nil
+        let view = webView
         store.httpCookieStore.getAllCookies { [weak self] cookies in
-            guard let self else { return }
             let header = Self.cookieHeader(cookies)
-            guard AuthBridge.shared.hasApiSid(cookieHeader: header) else {
-                self.finish(message: "Google has not issued a session yet.")
-                return
-            }
-            self.webView?.evaluateJavaScript(Self.ytcfgProbe) { raw, _ in
-                guard Self.isSignedInConfig(raw) else {
-                    // Upstream logs this and leaves the screen open. So does this:
-                    // the listener can press again once the page has settled.
-                    self.finish(message: "Still choosing an account on the Google page — try again in a moment.")
+            Task { @MainActor in
+                guard let self, let view else { return }
+                guard AuthBridge.shared.hasApiSid(cookieHeader: header) else {
+                    self.finish(message: "Google has not issued a session yet.")
                     return
                 }
-                self.finish(header: header)
+                view.evaluateJavaScript(Self.ytcfgProbe) { raw, _ in
+                    Task { @MainActor in
+                        guard Self.isSignedInConfig(raw) else {
+                            // Upstream logs this and leaves the screen open. So does
+                            // this: the listener can press again once the page has
+                            // settled.
+                            self.finish(message: "Still choosing an account on the Google page — try again in a moment.")
+                            return
+                        }
+                        self.finish(header: header)
+                    }
+                }
             }
         }
     }
 
-    private weak var webView: WKWebView?
-
     private func finish(header: String? = nil, message: String? = nil) {
-        let header = header, message = message
-        Task { @MainActor in
-            self.flow.taking = false
-            if let header {
-                // Flushed before the session is handed over, for the reason
-                // upstream gives: a cookie jar written after the screen closes is
-                // a jar the *next* sign-in reads instead of this one. It is the
-                // difference between signing in and appearing to.
-                self.store.httpCookieStore.getAllCookies { _ in }
-                self.captured = true
-                self.onCookiesCaptured(header)
-            } else if let message {
-                self.onUnavailable(message)
-            }
+        flow.taking = false
+        if let header {
+            // Flushed before the session is handed over, for the reason upstream
+            // gives: a cookie jar written after the screen closes is a jar the
+            // *next* sign-in reads instead of this one. It is the difference
+            // between signing in and appearing to.
+            store.httpCookieStore.getAllCookies { _ in }
+            captured = true
+            onCookiesCaptured(header)
+        } else if let message {
+            onUnavailable(message)
         }
     }
 

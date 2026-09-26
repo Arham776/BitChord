@@ -8,6 +8,13 @@
 # account rather than a broken rule — so the rule is compiled from the app's own
 # source and asked directly.
 #
+# The rule is "a sign-in has no exits": every web page loads in place, and only a
+# scheme that is not http(s) is refused. The harness also reads the sign-in view's
+# source and asserts it contains no call that can open anything outside the app,
+# because the bug was not "the wrong host was allowed" — it was "there was a
+# branch here that opened things elsewhere", and a host-level check passes happily
+# while that branch is still in the file.
+#
 # No web view, no window server session, no network, no human: it is a decision
 # about a URL, and is answered as one.
 set -uo pipefail
@@ -29,4 +36,6 @@ xcrun swiftc \
   "$ROOT/AppleApp/Sources/UI/SignInUserAgent.swift" \
   "$HERE/signin-verify/main.swift" || exit 2
 
-"$CHECK_DIR/check"
+# The repository root goes in so the harness can read the sign-in view's own
+# source and assert it holds no call that could hand a URL to another app.
+"$CHECK_DIR/check" "$ROOT"
