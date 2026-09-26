@@ -64,6 +64,13 @@ struct SearchView: View {
                     }
                 }
                 #endif
+                // Upstream's `searchFocusTrigger`: re-tapping the tab that is
+                // already selected focuses the field instead of doing nothing.
+                // Bound to the counter rather than a flag so a second tap while
+                // the first is still being handled is still a tap.
+                .onChange(of: appModel.searchFocusTrigger) { _, _ in
+                    focusTheField()
+                }
                 .onChange(of: scope) { _, _ in
                     guard !query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
                     Task { await performSearch() }
@@ -92,9 +99,17 @@ struct SearchView: View {
     /// `TextField` in the content column on iOS, the window toolbar's
     /// `.searchable` field on macOS. Only the iOS one is reachable by
     /// `@FocusState`.
+    ///
+    /// The macOS one needs a turn of the run loop before the toolbar's field
+    /// exists to take focus: the search view is being re-selected at the moment
+    /// the tap arrives, and the modifier that addresses that field is applied on
+    /// the following update. Without the hop, ⌘F and re-tapping the tab both land
+    /// on a view that is not there yet.
     private func focusTheField() {
         #if os(macOS)
-        searchFieldFocused = true
+        Task { @MainActor in
+            searchFieldFocused = true
+        }
         #else
         fieldFocused = true
         #endif

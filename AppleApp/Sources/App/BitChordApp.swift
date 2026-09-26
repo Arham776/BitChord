@@ -123,6 +123,14 @@ final class AppModel {
     var nowPlayingPresented = false
     /// Cross-tab navigation request — RootView observes and consumes it.
     var requestedTab: Tab?
+    /// Bumped when the already-selected Search tab is tapped again, so the field
+    /// can take focus. Upstream's `searchFocusTrigger`.
+    ///
+    /// A counter rather than a flag: a flag has to be cleared by whoever reads
+    /// it, and two taps in quick succession would otherwise be one tap's worth of
+    /// intent. Counting means the second tap is honoured even if the first is
+    /// still being handled.
+    var searchFocusTrigger = 0
     var pendingDetail: BrowseDestination?
     var playlistPicker: PlaylistPickerRequest?
     var downloadManagerPresented = false

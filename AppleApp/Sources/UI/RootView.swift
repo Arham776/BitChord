@@ -327,7 +327,22 @@ struct RootView: View {
     private var tabBinding: Binding<AppModel.Tab> {
         Binding(
             get: { resolvedTab(AppModel.Tab(rawValue: selection) ?? .home) },
-            set: { selection = $0.rawValue }
+            set: { newTab in
+                // Upstream's `searchFocusTrigger`: re-tapping the tab that is
+                // already selected focuses its search field rather than doing
+                // nothing. A `TabView` cannot tell a re-tap from a no-op tap on
+                // its own — the binding's setter only sees the value it is being
+                // set to — so the "same tab again" case is recognised here.
+                //
+                // Only Search, because a field is the only thing on any of the
+                // other tabs that a re-tap could reasonably mean. A re-tap that
+                // scrolled Home to the top or popped the Library back would be
+                // inventing behaviour nobody asked for.
+                if newTab == .search, newTab == resolvedTab(AppModel.Tab(rawValue: selection) ?? .home) {
+                    appModel.searchFocusTrigger &+= 1
+                }
+                selection = newTab.rawValue
+            }
         )
     }
 
