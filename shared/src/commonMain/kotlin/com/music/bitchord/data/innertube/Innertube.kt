@@ -171,6 +171,67 @@ object Innertube {
 
     private val scopeLock = Mutex()
 
+    /**
+     * The brand channel the listener chose to listen as, which outranks
+     * whatever the session shell says.
+     *
+     * A Google account can own more than one YouTube identity, and the shell
+     * can only ever report the one music.youtube.com serves by default. The
+     * whole reason the in-app browser exists is that the listener has just said,
+     * by hand, that they want a different one — so the answer is written down
+     * here and every request uses it in place of the shell's.
+     */
+    class ChannelSelection(
+        val pageId: String?,
+        val dataSyncId: String?,
+        /**
+         * Which account in the cookie jar the channel belongs to. Null leaves
+         * the shell's own answer alone: a brand channel sits under the account
+         * that owns it, so this only differs when the listener switched to a
+         * channel of a *different* signed-in Google account.
+         */
+        val authUser: String? = null,
+    )
+
+    @Volatile
+    private var channelOverride: ChannelSelection? = null
+
+    /** Adopts a page scope read out of a page the listener was actually looking at. */
+    fun adoptPageScope(pageId: String?, dataSyncId: String?, authUser: String?) {
+        channelOverride = if (pageId == null && dataSyncId == null) {
+            null
+        } else {
+            ChannelSelection(pageId, dataSyncId, authUser)
+        }
+    }
+
+    /**
+     * The brand channel to send, chosen one first.
+     *
+     * The shape is `override ?: shell` rather than "override, else shell" as a
+     * fallback chain, and the difference matters: once a channel has been chosen
+     * there is no falling back to the shell's value at all, because the shell's
+     * id names the *default* identity and pairing it with another channel's
+     * [ChannelSelection.pageId] describes an account/page combination that does
+     * not exist. A half-overridden identity is worse than an unsigned request.
+     */
+    private fun pageIdFor(session: SessionScope?): String? =
+        channelOverride?.pageId ?: session?.pageId
+
+    /** The account to send as `onBehalfOfUser`. No fallback, for the reason above. */
+    private fun dataSyncIdFor(session: SessionScope?): String? =
+        channelOverride?.dataSyncId ?: session?.dataSyncId
+
+    /**
+     * Which account in the cookie jar, chosen channel's first.
+     *
+     * This one *does* fall back: [ChannelSelection.authUser] is null for a
+     * channel belonging to the account that is already signed in, and there is
+     * nothing contradictory about the shell's answer in that case.
+     */
+    private fun authUserFor(session: SessionScope?): String =
+        channelOverride?.authUser ?: session?.authUser ?: "0"
+
     private val webRemixVersion: String
         get() = scope?.clientVersion ?: WEB_REMIX_VERSION
 
@@ -186,7 +247,31 @@ object Innertube {
             if (scope != null || cookie != session) return
             runCatching { fetchSessionScope(session) }
                 .getOrNull()
-                ?.let { scope = it }
+                ?.let { fresh ->
+                    // A login or profile switch can happen while the shell is in
+                    // flight. Never install the old cookie's answer under the
+                    // new one: that is a guaranteed 401, and worse, it can
+                    // credit a play to the profile that just left.
+                    if (cookie != session) {
+                        DebugLog.d("discarding a session scope from an account that is no longer active")
+                        return@let
+                    }
+                    scope = fresh
+                    // The shell can only ever report the identity
+                    // music.youtube.com serves by default, so it is kept and the
+                    // override outranks it — a disagreement here is expected
+                    // whenever the listener chose a different channel, and the
+                    // choice is theirs.
+                    val chosen = channelOverride
+                    if (chosen != null &&
+                        (chosen.pageId != fresh.pageId || chosen.dataSyncId != fresh.dataSyncId)
+                    ) {
+                        DebugLog.w(
+                            "server shell identity differs from the selected channel; " +
+                                "keeping the override (pageId=${chosen.pageId ?: "none"})",
+                        )
+                    }
+                }
         }
     }
 
@@ -791,7 +876,7 @@ object Innertube {
                 }
                 putJsonObject("user") {
                     put("lockedSafetyMode", false)
-                    session?.dataSyncId?.let { put("onBehalfOfUser", it) }
+                    dataSyncIdFor(session)?.let { put("onBehalfOfUser", it) }
                 }
                 putJsonObject("request") { put("useSsl", true) }
             }
@@ -920,8 +1005,8 @@ object Innertube {
     internal fun authHeaders(origin: String = MUSIC_ORIGIN): Map<String, String> = buildMap {
         val session = cookie ?: return@buildMap
         put("Cookie", session)
-        put("X-Goog-AuthUser", scope?.authUser ?: "0")
-        scope?.pageId?.let { put("X-Goog-PageId", it) }
+        put("X-Goog-AuthUser", authUserFor(scope))
+        pageIdFor(scope)?.let { put("X-Goog-PageId", it) }
         sapisidFrom(session)?.let { put("Authorization", sapisidHash(it, origin)) }
     }
 

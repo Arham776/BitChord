@@ -925,6 +925,29 @@ private struct AccountIntegrationsView: View {
                         Spacer(minLength: 0)
                     }
                     .padding(.vertical, 6)
+
+                    // Upstream's `listen_as`, and the reason the account avatar
+                    // is not just a picture: a Google account can own several
+                    // YouTube channels and they have separate libraries,
+                    // histories and scrobbles. Worth a row of its own even with
+                    // one channel, because it says which one is in effect —
+                    // and with one channel there is nothing to choose, so the
+                    // row is hidden rather than shown as a dead end.
+                    if (auth.listeningAs?.profiles.count ?? 0) > 1 {
+                        NavigationLink {
+                            AccountProfileSheet(scopedAccountId: auth.listeningAs?.id)
+                        } label: {
+                            SettingsLine(
+                                glyph: .listenAs,
+                                title: "Listen As",
+                                subtitle: auth.listeningAs?.activeProfile?.subtitle
+                                    ?? auth.listeningAs?.displayName
+                                    ?? "Signed in"
+                            ) {
+                                EmptyView()
+                            }
+                        }
+                    }
                 } else {
                     Button {
                         loginPresented = true
@@ -1430,7 +1453,7 @@ private struct SettingsSliderRow: View {
 
 private struct SettingsGlyph: View {
     enum Kind {
-        case person, sources, wifi, cellular, download
+        case person, listenAs, sources, wifi, cellular, download
         case crossfade, automix, skipSilence, spatial, equalizer, nerd, video, speed
         case theme, reduceMotion, reduceBlur, fullBleed, canvas, lyrics, lyricsSources
         case storage, clearSongs, clearImages
@@ -1457,6 +1480,7 @@ private struct SettingsGlyph: View {
     private var symbol: String {
         switch kind {
         case .person: "person.fill"
+        case .listenAs: "person.2.fill"
         case .sources: "square.stack.3d.up.fill"
         case .wifi: "wifi"
         case .cellular: "antenna.radiowaves.left.and.right"
@@ -1501,6 +1525,9 @@ private struct SettingsGlyph: View {
     private var fill: Color {
         switch kind {
         case .person: .blue
+        // Indigo rather than the account row's blue: the two are adjacent in the
+        // same section and the same colour would read as the same destination.
+        case .listenAs: .indigo
         case .sources: .orange
         case .wifi: .blue
         case .cellular: .green

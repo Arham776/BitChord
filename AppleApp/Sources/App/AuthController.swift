@@ -47,6 +47,7 @@ final class AuthController {
         }
         signedIn = true
         sessionEpoch += 1
+        refreshAccounts()
         Task { await refreshAccount() }
     }
 
@@ -79,6 +80,11 @@ final class AuthController {
     }
 
     func signOut() {
+        // Upstream's sign-out removes the *account*, not just the session: the
+        // credential is what the account is, so forgetting one is the same act.
+        // Leaving a stored account behind after "sign out" would let a later
+        // sign-in silently resume the old identity.
+        AccountStore.shared.forget(accountId: AccountStore.shared.activeAccount()?.accountId ?? "")
         AuthStore.clear()
         _ = AuthBridge.shared.applyCookie(cookieHeader: nil)
         signedIn = false
@@ -88,6 +94,76 @@ final class AuthController {
         sessionUnavailableReason = nil
         sessionEpoch += 1
         publishAccount()
+    }
+
+    // ---- Listening as --------------------------------------------------------
+
+    /// The stored accounts, in the order they were added. Bumped by
+    /// [sessionEpoch] rather than observed directly: the store is Kotlin and
+    /// this is an `@Observable` class, and a second source of truth for "who is
+    /// signed in" is precisely the thing that made this feature hard to get
+    /// right in the first place.
+    private(set) var accounts: [AccountSummary] = []
+
+    /// The YouTube identity currently in effect, if any. Null means the shell's
+    /// own default identity, which is the correct answer for a signed-out
+    /// listener and for a Google account whose channel list has not been read.
+    private(set) var listeningAs: AccountSummary?
+
+    /// Records a signed-in account and selects it.
+    func record(account: AccountSummary) {
+        // Built as the shared module's own records rather than passing the Swift
+        // value types across: the store persists exactly what it is handed, and
+        // a second shape would be a second thing that could disagree about a field.
+        let profiles = account.profiles.map { profile in
+            YouTubeProfile(
+                profileId: profile.id,
+                name: profile.name,
+                handle: profile.handle,
+                avatar: profile.avatar,
+                pageId: profile.pageId,
+                dataSyncId: profile.dataSyncId,
+                authUser: profile.authUser,
+                isBrandAccount: false
+            )
+        }
+        AccountStore.shared.record(
+            accountId: account.id,
+            cookie: account.cookie,
+            name: account.name,
+            email: account.email,
+            profiles: profiles
+        )
+        refreshAccounts()
+    }
+
+    /// Selects an identity, for the list UI and for the avatar's swipe.
+    ///
+    /// Both go through here rather than calling the store, so the account list,
+    /// the "listening as" label and the request headers cannot be updated by two
+    /// different paths and left disagreeing.
+    func select(accountId: String?, profileId: String?) {
+        AccountStore.shared.select(accountId: accountId, profileId: profileId)
+        refreshAccounts()
+    }
+
+    /// Moves to the next or previous identity. False at either end, so a swipe
+    /// past the last one does nothing visible rather than wrapping.
+    @discardableResult
+    func stepProfile(forward: Bool) -> Bool {
+        let moved = AccountStore.shared.step(forward: forward)
+        if moved { refreshAccounts() }
+        return moved
+    }
+
+    private func refreshAccounts() {
+        let summaries: [AccountSummary] = AccountStore.shared.accounts().map { AccountSummary($0) }
+        accounts = summaries
+        if let selection = AccountStore.shared.activeSelection() {
+            listeningAs = AccountSummary(selection.account, active: selection.profile)
+        } else {
+            listeningAs = summaries.first
+        }
     }
 
     private func refreshAccount() async {
@@ -125,4 +201,95 @@ private struct AccountInfo: Decodable {
     let name: String
     let email: String
     let photoUrl: String?
+}
+
+/// One signed-in Google account and the YouTube identities under it.
+///
+/// A Swift value rather than a view of the Kotlin record, because the UI needs
+/// to compare identities for equality to decide what is selected — and asking a
+/// Kotlin data class for that from Swift means two object graphs and an
+/// `isEqual` that may or may not be structural.
+struct AccountSummary: Identifiable, Hashable {
+    let id: String
+    let name: String
+    let email: String
+    let cookie: String
+    let profiles: [AccountProfile]
+
+    /// Only set on the summary that represents the current selection, so a list
+    /// row and the header avatar can be told apart by identity rather than by
+    /// each asking the store again.
+    var activeProfileId: String? = nil
+
+    init(_ session: GoogleAccountSession, active: YouTubeProfile? = nil) {
+        id = session.accountId
+        name = session.name
+        email = session.email
+        cookie = session.cookie
+        profiles = session.profiles.map(AccountProfile.init)
+        activeProfileId = (active ?? session.profiles.first)?.profileId
+    }
+
+    init(
+        id: String, name: String, email: String, cookie: String,
+        profiles: [AccountProfile], activeProfileId: String? = nil
+    ) {
+        self.id = id
+        self.name = name
+        self.email = email
+        self.cookie = cookie
+        self.profiles = profiles
+        self.activeProfileId = activeProfileId
+    }
+
+    /// What to show where a name is wanted. A Google account whose display name
+    /// has not been read yet still has an email, and an empty label in a
+    /// selector is worse than a rough one.
+    var displayName: String {
+        if !name.isEmpty { return name }
+        if !email.isEmpty { return email }
+        return String(id.prefix(8))
+    }
+
+    var activeProfile: AccountProfile? {
+        profiles.first { $0.id == activeProfileId } ?? profiles.first
+    }
+}
+
+/// One YouTube identity — a personal channel or a brand channel.
+struct AccountProfile: Identifiable, Hashable {
+    let id: String
+    let name: String
+    let handle: String
+    let avatar: String?
+    let pageId: String?
+    let dataSyncId: String?
+    let authUser: String?
+
+    init(
+        profileId: String, name: String, handle: String = "", avatar: String? = nil,
+        pageId: String? = nil, dataSyncId: String? = nil, authUser: String? = nil
+    ) {
+        id = profileId
+        self.name = name
+        self.handle = handle
+        self.avatar = avatar
+        self.pageId = pageId
+        self.dataSyncId = dataSyncId
+        self.authUser = authUser
+    }
+
+    init(_ profile: YouTubeProfile) {
+        id = profile.profileId
+        name = profile.name
+        handle = profile.handle
+        avatar = profile.avatar
+        pageId = profile.pageId
+        dataSyncId = profile.dataSyncId
+        authUser = profile.authUser
+    }
+
+    var subtitle: String {
+        handle.isEmpty ? name : handle
+    }
 }
