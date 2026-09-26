@@ -26,6 +26,7 @@ xcrun swiftc \
   -swift-version 5 \
   -o "$CHECK_DIR/check" \
   "$ROOT/AppleApp/Sources/UI/SignInNavigation.swift" \
+  "$ROOT/AppleApp/Sources/UI/SignInUserAgent.swift" \
   "$HERE/signin-verify/main.swift" || exit 2
 
 "$CHECK_DIR/check"

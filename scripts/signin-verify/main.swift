@@ -127,6 +127,59 @@ expect("an empty string", "", .refuse)
 expect("no scheme", "accounts.google.com/ServiceLogin", .refuse)
 expect("a scheme with no host over https", "https://", .refuse)
 
+// ---- the user agent -------------------------------------------------------
+
+// A second harness, `check-signin-live.sh`, asks Google. These are the parts
+// that do not need a network, checked here so a failure points at the string
+// rather than at a login.
+let agent = SignInUserAgent.desktopSafari(
+    osVersion: OperatingSystemVersion(majorVersion: 17, minorVersion: 5, patchVersion: 0)
+)
+print("  · agent: \(agent)")
+
+// The three tokens Google identifies a desktop browser by. A UA missing any of
+// them is not "slightly off", it is a browser family Google has no rule for.
+check("names Mozilla", agent.hasPrefix("Mozilla/5.0 "))
+check("presents as a desktop", agent.contains("(Macintosh;") && !agent.contains("Mobile/"))
+check("carries the WebKit build", agent.contains("AppleWebKit/605.1.15"))
+check("names a Safari version", agent.contains("Version/") && agent.contains("Safari/605.1.15"))
+check("does not say it is a phone", !agent.contains("iPhone"))
+check("does not say it is Android", !agent.contains("Android"))
+check("identifies the app", agent.contains("bitchord"))
+check("one line, no newline", !agent.contains("\n") && !agent.contains("\r"))
+
+// A UA with nothing after Safari/ is not a real one, and neither is one with a
+// space where a token should be.
+check("has a token after Safari/", agent.split(separator: " ").count >= 8,
+      "\(agent.split(separator: " ").count) tokens")
+check("the Safari version is a plausible number",
+      SignInUserAgent.safariVersion.split(separator: ".").count == 2
+          && SignInUserAgent.safariVersion.allSatisfy { $0.isNumber || $0 == "." })
+
+// The decision, on the two agents actually in play.
+let iOSOwn = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) "
+    + "AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148 Safari/604.1"
+let macOwn = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko)"
+check("an iOS engine's own agent is replaced", SignInUserAgent.needsReplacing(defaultAgent: iOSOwn))
+// A macOS engine's agent is desktop but names no browser — no `Version/`, no
+// `Safari/` — so it is replaced too. Kept as a check because it is the case
+// where "already a desktop UA, leave it" would have been the wrong call.
+check("a macOS engine's own agent is replaced as well",
+      SignInUserAgent.needsReplacing(defaultAgent: macOwn),
+      "desktop, but naming no browser family")
+check("our own agent is not replaced again", !SignInUserAgent.needsReplacing(defaultAgent: agent))
+check("an empty agent is replaced", SignInUserAgent.needsReplacing(defaultAgent: ""))
+
+// The predicate asks "will Google accept this", so every unusable shape is
+// replaced — not only a phone's.
+for (label, agent) in [
+    ("not Mozilla's", "curl/8.4.0"),
+    ("no browser named", "Mozilla/5.0 (Macintosh) AppleWebKit/605.1.15"),
+    ("a bot", "Googlebot/2.1"),
+] {
+    check("an agent that is \(label) is replaced", SignInUserAgent.needsReplacing(defaultAgent: agent))
+}
+
 // ---- the list itself ------------------------------------------------------
 
 // Every entry is a suffix of its own registrable domain and nothing else. A

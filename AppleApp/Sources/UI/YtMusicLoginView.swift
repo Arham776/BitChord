@@ -164,7 +164,7 @@ private struct LoginWebView: UIViewRepresentable {
 }
 #endif
 
-/// Conformed to  only so it can be registered and
+/// Conformed to `WKHTTPCookieStoreObserver` only so it can be registered and
 /// unregistered; the observer callback is not used. Nothing is captured from it —
 /// the listener presses Continue — and it only matters that the store is
 /// registered, so that the jar is written to the store the harvest reads.
@@ -198,12 +198,26 @@ final class LoginWebCoordinator: NSObject, WKNavigationDelegate, WKUIDelegate, W
         let config = WKWebViewConfiguration()
         config.websiteDataStore = store
         config.defaultWebpagePreferences.allowsContentJavaScript = true
+        // Google's own refusal of embedded web views: on iOS WebKit sends a
+        // *mobile* agent, and `accounts.google.com` answers that with "This
+        // browser or app may not be secure" before the password is ever typed.
+        // Upstream hits none of this because Android's `WebView` is a system
+        // browser Google allowlists, and it sets no agent of its own.
+        //
+        // `applicationNameForUserAgent` would only *append* to the engine's agent,
+        // leaving the mobile one in front, so the whole string is replaced. See
+        // `SignInUserAgent` for why this is the shape it is and why
+        // `ASWebAuthenticationSession` is not the answer.
+        config.applicationNameForUserAgent = nil
+        let webView = WKWebView(frame: .zero, configuration: config)
+        if SignInUserAgent.needsReplacing(defaultAgent: webView.customUserAgent ?? "") {
+            webView.customUserAgent = SignInUserAgent.desktopSafari()
+        }
         // A window that opens itself is how a `youtube://` link gets followed from
         // inside a page. The navigation policy below is the real guard; this is
         // the one that stops the page even asking.
         config.preferences.javaScriptCanOpenWindowsAutomatically = false
         store.httpCookieStore.add(self)
-        let webView = WKWebView(frame: .zero, configuration: config)
         webView.navigationDelegate = self
         webView.uiDelegate = self
         // Weak, because the coordinator is the navigation delegate the web view
