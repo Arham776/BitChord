@@ -1178,6 +1178,9 @@ struct LyricsPane: View {
     var trackId: String = ""
     /// The listener's timing correction, in milliseconds. See [LyricsOffsetBridge].
     var offsetMs: Int32 = 0
+    /// True while the listener is scrolling the list themselves, which stands the
+    /// auto-scroll down until they have been still for a moment.
+    @State private var reading = false
 
     /// The clock the lyrics are judged against, which runs `offsetMs` behind the
     /// transport.
@@ -1193,9 +1196,28 @@ struct LyricsPane: View {
         max(0, Swift.Int64(position * 1000) - Swift.Int64(offsetMs))
     }
 
-    private var activeIndex: Int {
-        let ms = adjustedPositionMs
-        return lines.lastIndex { $0.timeMs <= ms } ?? 0
+    /// Every line being sung right now, which is usually one and is two across a
+    /// duet.
+    ///
+    /// This used to be `lastIndex { $0.timeMs <= position }`, and that was wrong
+    /// in a way nobody could report: a line that says when it ends lost its
+    /// highlight the moment the *next* line's timestamp arrived, so the tail of a
+    /// long line was never shown as sung — and a duet, where the answering vocal
+    /// overlaps the lead, showed only one of the two. See [LyricFocus].
+    private var activeRows: [Int] {
+        // A Kotlin `List<Int>` arrives as `[KotlinInt]`, which Swift will not
+        // index a `ForEach` with directly. Mapped here rather than by changing
+        // the shared signature, because the shared side should say what it means
+        // — a list of row numbers — and not what Swift can index.
+        LyricFocus.shared
+            .activeRows(lines: lines, positionMs: adjustedPositionMs)
+            .map { Int($0) }
+    }
+
+    /// The line the list scrolls to, and the one that is scaled up.
+    private var leadIndex: Int {
+        let lead = LyricFocus.shared.leadRow(lines: lines, positionMs: adjustedPositionMs)
+        return lead < 0 ? 0 : min(Int(lead), max(0, lines.count - 1))
     }
 
     /// Where tapping a line should actually seek.
@@ -1244,8 +1266,8 @@ struct LyricsPane: View {
                                 ForEach(Array(lines.enumerated()), id: \.offset) { index, line in
                                     WordSyncedLine(
                                         line: line,
-                                        active: index == activeIndex,
-                                        distance: abs(index - activeIndex),
+                                        active: activeRows.contains(index),
+                                        distance: abs(index - leadIndex),
                                         position: position
                                     )
                                     .id(index)
@@ -1260,11 +1282,34 @@ struct LyricsPane: View {
                             .frame(maxWidth: .infinity, alignment: .leading)
                         }
                         .scrollIndicators(.never)
-                        .onChange(of: activeIndex) { _, index in
+                        // Following the *lead* line rather than the last one that
+                        // has started: across a duet those differ, and scrolling
+                        // to the answer would push the lead off the top while it
+                        // was still the line being sung.
+                        .onChange(of: leadIndex) { _, index in
+                            // Not while the listener is reading. A list that
+                            // snaps back to the playhead as soon as they let go
+                            // is a list nobody can look anything up in.
+                            guard !reading else { return }
                             withAnimation(.easeInOut(duration: 0.28)) {
                                 proxy.scrollTo(index, anchor: .center)
                             }
                         }
+                        // The reader's own scroll stands the auto-scroll down
+                        // until they have been still for a moment. This is a
+                        // separate gesture rather than a `DragGesture` on the
+                        // ScrollView so it does not compete with the scroll
+                        // itself — simultaneous, and only asked whether a finger
+                        // is down.
+                        .simultaneousGesture(
+                            DragGesture(minimumDistance: 4)
+                                .onChanged { _ in reading = true }
+                                .onEnded { _ in
+                                    withAnimation(.easeOut(duration: 1.6).delay(2.5)) {
+                                        reading = false
+                                    }
+                                }
+                        )
                     }
                 }
             }
