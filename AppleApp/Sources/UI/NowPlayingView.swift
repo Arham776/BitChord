@@ -75,12 +75,12 @@ struct NowPlayingView: View {
                     HStack(spacing: 8) {
                         GlassCircleButton(icon: .bchLyrics, selected: pane == .lyrics, label: "Lyrics") {
                             Haptics.play(.expand)
-                            pane = .lyrics
+                            pane = pane == .lyrics ? .main : .lyrics
                         }
                         .help("Lyrics")
                         GlassCircleButton(icon: .bchQueue, selected: pane == .queue, label: "Up Next") {
                             Haptics.play(.expand)
-                            pane = .queue
+                            pane = pane == .queue ? .main : .queue
                         }
                         .help("Up Next")
                     }
@@ -204,7 +204,7 @@ struct NowPlayingView: View {
     private var rightColumn: some View {
         Group {
             switch pane {
-            case .lyrics:
+            case .main, .lyrics:
                 LyricsPane(
                     lines: controller.displayedLyrics,
                     loading: controller.lyricsLoading,
@@ -225,101 +225,43 @@ struct NowPlayingView: View {
         .padding(.bottom, 56)
     }
 
-    private var creditLine: String {
-        let artist = controller.current?.artist ?? ""
-        let album = controller.current?.albumName ?? ""
-        if artist.isEmpty { return album }
-        if album.isEmpty { return artist }
-        return "\(artist) — \(album)"
-    }
     #endif
 
-    // ---- iOS sheet ----------------------------------------------------------
+    // ---- iOS: the portrait player -----------------------------------------
+    //
+    // Upstream's portrait player is two things, and the port had them the wrong
+    // way up. A *pinned bottom deck* — credits, scrubber, transport, toggles —
+    // measured at its natural height and fixed to the foot of the screen, and the
+    // space above it, which is whatever the artwork or an open panel needs.
+    //
+    // What this had instead was one `VStack`: the artwork at full size, then
+    // everything else crammed beneath it, then lyrics and queue in a fixed
+    // 220-point strip. That put the artwork's size in charge of the layout, left
+    // the lyrics with a strip too short to read, and moved the transport
+    // depending on what was on screen. Pinned to the foot instead, the deck is
+    // in the same place on every screen, and all that is left above it is the
+    // stage.
     #if os(iOS)
     private var iOSBody: some View {
         NavigationStack {
-            ZStack {
-                MeshBackdrop(seed: controller.current?.id.hashValue ?? 0, artwork: controller.current?.artworkData)
-                    .ignoresSafeArea()
-                VStack(spacing: 0) {
-                    HeroArtwork(
-                        entry: controller.current,
-                        canvasURL: controller.canvasURL,
-                        fallbackURL: controller.canvasFallbackURL,
-                        isPlaying: controller.isPlaying
-                    )
-                    .id(controller.current?.id)
-                    VStack(spacing: 16) {
-                        VStack(spacing: 6) {
-                            Text(controller.current?.title ?? "Nothing playing")
-                                .font(.title2.weight(.bold))
-                                .foregroundStyle(.white)
-                                .multilineTextAlignment(.center)
-                                .lineLimit(2)
-                                .shadow(color: .black.opacity(0.45), radius: 6, y: 1)
-                            Text(controller.current?.artist ?? "")
-                                .font(.callout)
-                                .foregroundStyle(.white.opacity(0.75))
-                                .shadow(color: .black.opacity(0.4), radius: 4, y: 1)
-                        }
-                        positionControls
-                            .padding(.horizontal, 32)
-                        if PlatformSettings.shared.getBoolean(key: "show_nerd_stats", default: false) {
-                            if let nerd = controller.nerd, !nerd.codec.isEmpty {
-                                Text(nerdLine(nerd))
-                                    .font(.caption2.monospaced())
-                                    .foregroundStyle(.white.opacity(0.7))
-                            } else if controller.racingLossless {
-                                Text("Upgrading Quality")
-                                    .font(.caption2.monospaced())
-                                    .foregroundStyle(.white.opacity(0.7))
-                            }
-                        }
-                        playerTransport
-                        Group {
-                            switch pane {
-                            case .lyrics:
-                                LyricsPane(
-                                    lines: controller.displayedLyrics,
-                                    loading: controller.lyricsLoading,
-                                    position: controller.position,
-                                    hasTrack: controller.current != nil,
-                                    sourceLabel: controller.lyricsSourceLabel,
-                                    onSeek: { controller.seek(to: $0) },
-                                    translator: controller.lyricsTranslator,
-                                    trackId: controller.current?.id ?? "",
-                                    offsetMs: lyricsOffsetMs
-                                )
-                            case .queue:
-                                UpNextPane()
-                            }
-                        }
-                        .frame(maxHeight: 220)
-                        Spacer(minLength: 20)
+            // The arrangement is the only thing that differs between the two
+            // shapes, so the arrangement is the only thing decided here. Every
+            // slot below — the sleeve, the panes, the deck — is built once and
+            // used by both, which is upstream's arrangement and the reason
+            // rotating mid-song carries the open pane, the scrub and the
+            // translation mode across instead of resetting them.
+            GeometryReader { geo in
+                ZStack {
+                    MeshBackdrop(seed: controller.current?.id.hashValue ?? 0, artwork: controller.current?.artworkData)
+                        .ignoresSafeArea()
+
+                    if PlayerLayout.takesLandscapeShape(
+                        width: geo.size.width, height: geo.size.height
+                    ) {
+                        landscapePlayer(size: geo.size)
+                    } else {
+                        portraitPlayer
                     }
-                }
-                VStack {
-                    HStack {
-                        Spacer()
-                        if auth.signedIn, controller.current?.videoId != nil {
-                            GlassCircleButton(icon: controller.isLiked ? .bchHeartFilled : .bchHeart,
-                                      label: controller.isLiked ? "Remove Like" : "Like") {
-                                controller.toggleLike()
-                            }
-                        }
-                        GlassCircleButton(icon: .bchLyrics, selected: pane == .lyrics, label: "Lyrics") {
-                            Haptics.play(.expand)
-                            pane = .lyrics
-                        }
-                        GlassCircleButton(icon: .bchQueue, selected: pane == .queue, label: "Up Next") {
-                            Haptics.play(.expand)
-                            pane = .queue
-                        }
-                        moreMenu
-                    }
-                    .padding(.horizontal, 24)
-                    .padding(.top, 12)
-                    Spacer()
                 }
             }
             .toolbar { playerToolbar }
@@ -327,6 +269,248 @@ struct NowPlayingView: View {
         }
     }
 
+    /// The shape test lives in [PlayerLayout] with the rest of the window rules,
+    /// so the thresholds have one definition and can be checked without a window.
+
+    /// The portrait player: stage above, pinned deck below.
+    private var portraitPlayer: some View {
+        VStack(spacing: 0) {
+            stage
+            deck
+        }
+    }
+
+    /// The landscape player: two columns of equal width.
+    ///
+    /// The left one is the same in every pane — the sleeve, and under it the row
+    /// that chooses which of the three the right column shows. The right one is
+    /// that one thing. Nothing is drawn twice and nothing moves between columns,
+    /// so opening the lyrics is only ever the right column's page being turned.
+    private func landscapePlayer(size: CGSize) -> some View {
+        // A phone on its side is short as well as wide, and the two are different
+        // problems: a short window needs less gutter and a smaller sleeve, or the
+        // row underneath gets pushed off the bottom.
+        let compact = PlayerLayout.isCompactLandscape(width: size.width, height: size.height)
+        let gutter = PlayerLayout.gutter(compact: compact)
+        return HStack(spacing: 0) {
+            VStack(spacing: compact ? 12 : 24) {
+                // Square, and taking whichever axis runs out first once the row
+                // below has had its height — measured, not estimated, so the row
+                // underneath can never be pushed off the bottom.
+                GeometryReader { geo in
+                    artworkStage(
+                        side: max(80, min(geo.size.width, geo.size.height)),
+                        collapsed: false
+                    )
+                }
+                paneToggles
+            }
+            .frame(maxWidth: .infinity)
+            .padding(.horizontal, gutter)
+
+            Group {
+                switch pane {
+                case .main:
+                    // Credits and transport, and nothing else: the left column
+                    // already has the artwork, and repeating it here is what
+                    // upstream's comment about "nothing is drawn twice" is about.
+                    VStack(spacing: 14) {
+                        creditsRow
+                        positionControls
+                        playerTransport
+                    }
+                    .transition(.opacity)
+                case .lyrics, .queue:
+                    panel
+                        .transition(.opacity)
+                }
+            }
+            .frame(maxWidth: .infinity)
+            .animation(.easeInOut(duration: 0.2), value: pane)
+        }
+        // Held to a maximum width and centred: a very wide window should not
+        // stretch the columns into two narrow strips with a gulf between them.
+        .frame(maxWidth: PlayerLayout.landscapeMaxWidth)
+        .frame(maxWidth: .infinity)
+    }
+
+    /// Everything above the deck: the artwork, or whichever panel is open.
+    ///
+    /// Takes all the height the deck has left, so the artwork is as large as the
+    /// window allows on a tall phone and the panels get the full column on a
+    /// short one — which is the trade upstream makes, in the opposite direction
+    /// from a fixed strip.
+    private var stage: some View {
+        GeometryReader { geo in
+            let collapsed = pane != .main
+            // The largest square that fits, with the gutters the player keeps.
+            // Measured rather than assumed, so a short window shrinks the
+            // artwork instead of pushing the deck off the bottom.
+            let full = PlayerLayout.portraitArtworkSide(
+                stageWidth: geo.size.width, stageHeight: geo.size.height
+            )
+            VStack(spacing: 0) {
+                artworkStage(
+                    side: collapsed ? PlayerLayout.sleeveCollapsedSide : full,
+                    collapsed: collapsed
+                )
+                if collapsed {
+                    panel
+                        .transition(.opacity.combined(with: .move(edge: .bottom)))
+                }
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+            .animation(.snappy(duration: 0.28), value: pane)
+        }
+    }
+
+    /// The artwork sleeve.
+    ///
+    /// A button exactly when there is somewhere to go back to, which is the whole
+    /// point of the collapse: upstream shrinks the artwork into a header when a
+    /// panel is up, and the shrunk artwork is the way back to the player. In the
+    /// main pane it is not a button, because a big artwork that does nothing when
+    /// tapped is a control that lies about being one.
+    @ViewBuilder
+    private func artworkStage(side: CGFloat, collapsed: Bool) -> some View {
+        let art = HeroArtwork(
+            entry: controller.current,
+            canvasURL: controller.canvasURL,
+            fallbackURL: controller.canvasFallbackURL,
+            isPlaying: controller.isPlaying
+        )
+        .frame(width: side, height: side)
+        .id(controller.current?.id)
+
+        if collapsed {
+            Button {
+                Haptics.play(.tap)
+                pane = .main
+            } label: {
+                art
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("Back to player")
+            .padding(.top, 8)
+            .padding(.bottom, 4)
+        } else {
+            art
+                .padding(.top, 12)
+                .padding(.bottom, 20)
+                .accessibilityLabel(controller.current?.title ?? "Nothing playing")
+        }
+    }
+
+    /// The open panel, filling whatever the collapsed sleeve has left.
+    @ViewBuilder
+    private var panel: some View {
+        switch pane {
+        case .main:
+            Color.clear
+        case .lyrics:
+            LyricsPane(
+                lines: controller.displayedLyrics,
+                loading: controller.lyricsLoading,
+                position: controller.position,
+                hasTrack: controller.current != nil,
+                sourceLabel: controller.lyricsSourceLabel,
+                onSeek: { controller.seek(to: $0) },
+                translator: controller.lyricsTranslator,
+                trackId: controller.current?.id ?? "",
+                offsetMs: lyricsOffsetMs
+            )
+        case .queue:
+            UpNextPane()
+        }
+    }
+
+    /// The pinned deck: credits, scrubber, transport, toggles.
+    ///
+    /// Measured at its natural height and fixed to the foot, so opening the
+    /// lyrics does not shove the transport down. The pane toggles live here
+    /// rather than floating over the artwork: they are *which pane* is showing,
+    /// which is the same question the rest of this block answers.
+    private var deck: some View {
+        VStack(spacing: 14) {
+            creditsRow
+            positionControls
+                .padding(.horizontal, 32)
+            playerTransport
+            paneToggles
+        }
+        .padding(.top, 8)
+        .padding(.bottom, 10)
+        .background(
+            // A scrim rather than a blur: the backdrop is already a mesh, and a
+            // material over it muddies the colours the artwork set up. Short
+            // enough to read as the foot of the screen rather than a sheet.
+            LinearGradient(
+                colors: [.clear, .black.opacity(0.30), .black.opacity(0.55)],
+                startPoint: .top,
+                endPoint: .bottom
+            )
+            .ignoresSafeArea(edges: .bottom)
+            .allowsHitTesting(false)
+        )
+    }
+
+    /// Title and artist, with the like and the overflow menu beside them.
+    private var creditsRow: some View {
+        HStack(alignment: .top, spacing: 12) {
+            VStack(alignment: .leading, spacing: 3) {
+                Text(controller.current?.title ?? "Nothing playing")
+                    .font(.headline)
+                    .foregroundStyle(.white)
+                    .lineLimit(1)
+                    .shadow(color: .black.opacity(0.45), radius: 6, y: 1)
+                Text(creditLine)
+                    .font(.subheadline)
+                    .foregroundStyle(.white.opacity(0.75))
+                    .lineLimit(1)
+                    .shadow(color: .black.opacity(0.4), radius: 4, y: 1)
+            }
+            Spacer(minLength: 8)
+            if auth.signedIn, controller.current?.videoId != nil {
+                GlassCircleButton(
+                    icon: controller.isLiked ? .bchHeartFilled : .bchHeart,
+                    label: controller.isLiked ? "Remove Like" : "Like"
+                ) {
+                    controller.toggleLike()
+                }
+                .help(controller.isLiked ? "Remove from Liked Music" : "Like")
+            }
+            moreMenu
+        }
+        .padding(.horizontal, 24)
+    }
+
+    /// Which of the three panes is showing.
+    ///
+    /// The artwork toggle is here rather than implied by the artwork's size: a
+    /// control that only exists while a panel is closed cannot be used to open
+    /// the first one, and one that only exists while a panel is open cannot be
+    /// used to leave it.
+    private var paneToggles: some View {
+        HStack(spacing: 26) {
+            GlassCircleButton(icon: .bchLyrics, selected: pane == .lyrics, label: "Lyrics") {
+                Haptics.play(.expand)
+                pane = pane == .lyrics ? .main : .lyrics
+            }
+            GlassCircleButton(icon: .bchQueue, selected: pane == .queue, label: "Up Next") {
+                Haptics.play(.expand)
+                pane = pane == .queue ? .main : .queue
+            }
+        }
+        .frame(maxWidth: .infinity)
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel("Player panes")
+    }
+
+    #endif
+
+    // iOS only — macOS has its own window-toolbar close button, in
+    // `macPlayerToolbar`.
+    #if os(iOS)
     @ToolbarContentBuilder
     private var playerToolbar: some ToolbarContent {
         ToolbarItem(placement: .cancellationAction) {
@@ -343,6 +527,19 @@ struct NowPlayingView: View {
         }
     }
     #endif
+
+    /// Artist and album on one line, whichever of the two there is.
+    ///
+    /// One line rather than two because the deck has room for one: a title on
+    /// two lines already, and a second line under it pushes the scrubber down and
+    /// the deck is supposed to be the same height whatever is playing.
+    private var creditLine: String {
+        let artist = controller.current?.artist ?? ""
+        let album = controller.current?.albumName ?? ""
+        if artist.isEmpty { return album }
+        if album.isEmpty { return artist }
+        return "\(artist) — \(album)"
+    }
 
     // ---- Shared pieces ------------------------------------------------------
 
@@ -539,8 +736,15 @@ struct NowPlayingView: View {
     }
 }
 
+/// Which of the three the portrait player is showing.
+///
+/// Three states, not two, and the third is the important one. Upstream's player
+/// has a *main* pane that the artwork fills, and lyrics and queue that replace
+/// it; a two-state enum can only ever hold one of the last two at a time and has
+/// nowhere to go back to, which is why the artwork has to be a control to close
+/// them.
 private enum PlayerPane {
-    case lyrics, queue
+    case main, lyrics, queue
 }
 
 /// Frosted circular chrome used for dismiss / lyrics / queue.
