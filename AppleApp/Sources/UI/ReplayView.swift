@@ -93,6 +93,49 @@ struct ReplayModel {
         formatter.numberStyle = .decimal
         return formatter.string(from: NSNumber(value: value)) ?? "\(value)"
     }
+
+    /// The hour of the day with the most listening, or nil when the period has
+    /// no listening in it at all. The index is the bucket, so it is already the
+    /// 0..23 hour rather than a minute-of-day or an offset into the array.
+    static func peakHourIndex(_ hours: [Double]) -> Int? {
+        guard let (index, value) = hours.enumerated().max(by: { $0.element < $1.element }),
+              value > 0 else { return nil }
+        return index % 24
+    }
+
+    /// Upstream `formatHour`: the two hours with names of their own, so the
+    /// sentence reads "around midnight" rather than "around 12 AM".
+    static func formatHour(_ hour: Int) -> String {
+        switch hour {
+        case 0: return "midnight"
+        case 12: return "midday"
+        case 1...11: return "\(hour) AM"
+        default: return "\(hour - 12) PM"
+        }
+    }
+
+    /// Upstream `formatDay`: `2026-08-14` as "14 August" in the user's locale.
+    ///
+    /// A year of 2000 is a placeholder that only has to be a leap year, so
+    /// February 29 survives the round trip. Anything that is not a date comes
+    /// back as it arrived — upstream's own fallback, and the reason this is not
+    /// a thrown error: a malformed day should not cost the user the section.
+    static func formatDay(_ iso: String) -> String {
+        let parts = iso.split(separator: "-")
+        guard parts.count == 3, let month = Int(parts[1]), let day = Int(parts[2]) else { return iso }
+        let formatter = DateFormatter()
+        formatter.locale = .current
+        formatter.timeZone = TimeZone(secondsFromGMT: 0)
+        formatter.dateFormat = "d MMMM"
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = formatter.timeZone
+        var components = DateComponents()
+        components.year = 2000
+        components.month = month
+        components.day = day
+        guard let date = calendar.date(from: components) else { return iso }
+        return formatter.string(from: date)
+    }
 }
 
 struct ReplayView: View {
@@ -242,16 +285,7 @@ struct ReplayView: View {
                         }) { _ in }
                     }
 
-                    if let day = model.summary.busiestDay {
-                        VStack(alignment: .leading, spacing: 4) {
-                            Text("Biggest day")
-                                .font(.title3.weight(.bold))
-                                .foregroundStyle(.white)
-                            Text("\(day) · \(Int(model.summary.busiestDayMs / 60_000)) min")
-                                .foregroundStyle(.white.opacity(0.7))
-                        }
-                        .padding(.horizontal, 24)
-                    }
+                    listeningShape
 
                     Button {
                         shareItem = ReplayShareItem(model: model, page: nil)
@@ -286,6 +320,56 @@ struct ReplayView: View {
         }
         .padding(3)
         .background(.white.opacity(0.10), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+    }
+
+    /// Upstream `Habits`: the three distinct counts as tiles, then the two
+    /// sentences the tiles cannot say. Both notes are conditional — a period
+    /// with no listening at all has neither an hour nor a day, and upstream
+    /// omits the line rather than printing a zero it cannot mean.
+    private var listeningShape: some View {
+        let summary = model.summary
+        let peak = ReplayModel.peakHourIndex(summary.hourOfDay)
+        return VStack(alignment: .leading, spacing: 10) {
+            Text("Your listening pattern")
+                .font(.title2.weight(.heavy))
+                .foregroundStyle(.white)
+                .padding(.top, 8)
+
+            HStack(spacing: 10) {
+                statTile("Songs", summary.distinctSongs)
+                statTile("Artists", summary.distinctArtists)
+                statTile("Albums", summary.distinctAlbums)
+            }
+
+            if let peak {
+                note("You listen most around \(ReplayModel.formatHour(peak)).")
+            }
+            if let day = summary.busiestDay, summary.busiestDayMs > 0 {
+                note("Your biggest day was \(ReplayModel.formatDay(day)) with \(ReplayModel.formatListening(summary.busiestDayMs)) of listening.")
+            }
+        }
+        .padding(.horizontal, 24)
+    }
+
+    private func statTile(_ label: String, _ value: Int) -> some View {
+        VStack(spacing: 2) {
+            Text(ReplayModel.grouped(value))
+                .font(.title2.weight(.heavy))
+                .foregroundStyle(.white)
+            Text(label)
+                .font(.caption2)
+                .tracking(1)
+                .foregroundStyle(.white.opacity(0.55))
+        }
+        .frame(maxWidth: .infinity)
+        .padding(.vertical, 14)
+        .background(.white.opacity(0.09), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+    }
+
+    private func note(_ text: String) -> some View {
+        Text(text)
+            .font(.subheadline)
+            .foregroundStyle(.white.opacity(0.6))
     }
 
     private func actionRow(system: String, title: String) -> some View {
@@ -758,13 +842,14 @@ private struct ReplayStoriesView: View {
         }
     }
 
-    private static func peakHour(_ hours: [Double]) -> String? {
+    static func peakHourIndex(_ hours: [Double]) -> Int? {
         guard let (index, value) = hours.enumerated().max(by: { $0.element < $1.element }),
               value > 0 else { return nil }
-        let hour = index % 24
-        let suffix = hour < 12 ? "AM" : "PM"
-        let display = hour % 12 == 0 ? 12 : hour % 12
-        return "\(display) \(suffix)"
+        return index % 24
+    }
+
+    private static func peakHour(_ hours: [Double]) -> String? {
+        ReplayModel.peakHourIndex(hours).map(ReplayModel.formatHour)
     }
 }
 

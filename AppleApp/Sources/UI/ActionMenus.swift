@@ -55,6 +55,23 @@ struct SongActionButtons: View {
                 }
             }
         }
+        // Revert / upgrade are two halves of one decision, so they are offered on
+        // opposite sides of it and never both. Upstream gates them on the
+        // player's copy of the track specifically — a row opened from a list has
+        // no stream to change, and a track playing off a file the listener saved
+        // has nothing a substitute could replace. The controller holds both
+        // answers so the menu cannot disagree with the resolution path about
+        // what a revert means.
+        if entry.id == controller.current?.id {
+            if controller.canRevertToOriginal {
+                Divider()
+                Button("Revert to Original") { controller.revertToOriginal() }
+            }
+            if controller.canUpgradeQuality {
+                Divider()
+                Button("Upgrade Quality") { controller.upgradeQuality() }
+            }
+        }
         if !entry.isLocal {
             Button("Download") {
                 DownloadStore.shared.download(entry)

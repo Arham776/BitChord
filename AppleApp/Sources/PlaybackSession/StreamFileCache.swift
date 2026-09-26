@@ -47,6 +47,27 @@ actor StreamFileCache {
         DiskCache.clearFolder(folder)
     }
 
+    /// Drops everything cached for one track, and forgets where it was growing.
+    ///
+    /// The growing path has to go too, and not only the finished copy: a revert
+    /// sends the track back to YouTube's own upload, and leaving the old file in
+    /// `inFlight` means the next `path(for:)` finds it still there and hands
+    /// back the exact copy the listener just rejected — so the revert appears to
+    /// do nothing. Every extension is tried because the cached file's extension
+    /// is whichever one the source offered, and the rejected copy is the one
+    /// nobody remembers the extension of.
+    func forget(videoId: String) {
+        let growing = inFlight.removeValue(forKey: videoId)
+        let fm = FileManager.default
+        for ext in Self.extensions {
+            let url = folder.appendingPathComponent("\(Self.sanitized(videoId)).\(ext)")
+            if fm.fileExists(atPath: url.path) { try? fm.removeItem(at: url) }
+        }
+        if let growing, growing != folder.path {
+            try? fm.removeItem(atPath: growing)
+        }
+    }
+
     func trim(keeping videoId: String? = nil) {
         let limit = PlatformSettings.shared.getLong(key: "audio_cache_limit_bytes", default: Self.defaultLimit)
         DiskCache.trimFolder(folder, limitBytes: limit, keepingPrefix: videoId.map(Self.sanitized))

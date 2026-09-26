@@ -229,6 +229,28 @@ enum QualityUpgrade {
         return next
     }
 
+    /**
+     * Puts a track the app had written off back on the automatic path, because
+     * the listener asked for it by hand.
+     *
+     * Two things are cleared, and the difference matters. `refused` is the
+     * "this upgrade broke, leave it alone for the session" mark, and it is the
+     * one a by-hand request overrides — the listener has now said they want
+     * another look, which is the thing that mark stands in the way of. `upgraded`
+     * is *not* cleared: a track that already swapped to a better copy has had
+     * its turn, and re-running the search on it would find the same copy and
+     * swap to it again.
+     */
+    static func askByHand(_ mediaId: String) {
+        store.lock.lock(); defer { store.lock.unlock() }
+        store.refused.remove(mediaId)
+        store.auditioning.remove(mediaId)
+        // Anything found by the automatic search is shelved precisely so a
+        // failed swap can be taken back. A by-hand request wants the fresh
+        // answer, not the one that was already judged and set aside.
+        store.shelved.removeValue(forKey: mediaId)
+    }
+
     static func forget(_ mediaId: String) {
         store.lock.lock()
         let inflight = store.pending.removeValue(forKey: mediaId)?.inFlight

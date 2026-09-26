@@ -383,6 +383,83 @@ final class PlaybackController {
         loadCurrent(index)
     }
 
+    // ---- Revert to original / upgrade quality --------------------------------
+
+    /// A revert is only offered for a streamed YouTube track, because a track
+    /// playing off a file the listener saved is not playing a stream anything
+    /// chose. There is no "original" to go back to for a local file, JioSaavn or
+    /// a remote-library row: those have no YouTube upload behind them at all.
+    var canRevertToOriginal: Bool {
+        guard let entry = current, let id = entry.videoId, entry.source.hasPrefix("yt:") else { return false }
+        return !OriginalVersion.shared.isPinned(videoId: id) && !playingYouTubesOwn
+    }
+
+    /// The way back. A pinned track is held off the automatic search on purpose,
+    /// so nothing but this row will ever offer it a better copy again.
+    var canUpgradeQuality: Bool {
+        guard let entry = current, let id = entry.videoId, entry.source.hasPrefix("yt:") else { return false }
+        return OriginalVersion.shared.isPinned(videoId: id) || playingYouTubesOwn
+    }
+
+    /// Whether the currently playing source *is* YouTube's own stream for this
+    /// track, whether the listener asked for that or an upgrade failed and was
+    /// put back automatically.
+    ///
+    /// Kept as its own question because the two rows are offered on opposite
+    /// sides of it: answering both from the pin alone would offer a revert for a
+    /// track already on YouTube's upload, where the row would do nothing.
+    private var playingYouTubesOwn: Bool {
+        guard let entry = current, let origin = resolvedOrigin[entry.id] else { return false }
+        return origin == .youtube || origin == .cache
+    }
+
+    /// Sends the playing track back to YouTube's own upload and holds it there.
+    ///
+    /// The position is kept: a listener who dislikes a substitute wants the song
+    /// from where it was, not from the top. Upstream replaces the item with a
+    /// direct-YouTube one, and the hold is what makes that stick past this queue
+    /// entry — otherwise the next pass round the queue starts the whole
+    /// substitution search again and lands them right back on the copy they
+    /// rejected.
+    func revertToOriginal() {
+        guard let entry = current, let id = entry.videoId, entry.source.hasPrefix("yt:") else { return }
+        OriginalVersion.shared.pin(videoId: id)
+        // The cached file is whichever copy was downloaded, which for a track
+        // being reverted is the one they just rejected. It has to go, or the
+        // resolve hands it straight back and nothing appears to happen.
+        Task { await StreamFileCache.shared.forget(videoId: id) }
+        QualityUpgrade.forget(id)
+        debugLog.record("reverted to YouTube's own upload", about: id)
+        restartCurrent(keepingPosition: true)
+    }
+
+    /// Releases the hold and asks again, by hand, for a better copy.
+    ///
+    /// "By hand" is the load-bearing word: the automatic path may already have
+    /// found this candidate and rejected it. This is also the only thing that
+    /// clears a pin — an upgrade the app decided on by itself must never
+    /// overturn a decision the listener made.
+    func upgradeQuality() {
+        guard let entry = current, let id = entry.videoId else { return }
+        OriginalVersion.shared.unpin(videoId: id)
+        QualityUpgrade.askByHand(id)
+        debugLog.record("asked again for a better copy", about: id)
+        restartCurrent(keepingPosition: true)
+    }
+
+    /// Reloads the playing entry so a new pin takes effect now rather than the
+    /// next time the song comes round.
+    private func restartCurrent(keepingPosition: Bool) {
+        guard queue.indices.contains(playingIndex) else { return }
+        let resumeAt = keepingPosition ? position : 0
+        // A restart is a new load, so the in-flight guard has to move: a resolve
+        // started by the old source must not be able to `loadTrack` into the new.
+        playGeneration &+= 1
+        engineLoadedId = nil
+        restoredStart = resumeAt
+        loadCurrent(playingIndex)
+    }
+
     func persistSession() {
         guard !queue.isEmpty, queue.indices.contains(playingIndex) else { return }
         var tracks = queue
@@ -916,6 +993,15 @@ final class PlaybackController {
             )
         }
         let videoId = String(entry.source.dropFirst(3))
+        // A track the listener has reverted is held on YouTube's own upload, so
+        // there is nothing to look for: a substitute found here would be the
+        // exact thing they rejected. This has to be checked *before* the lookup
+        // rather than after it, or a revert still costs a network round trip to
+        // arrive at the answer it already knew.
+        if OriginalVersion.shared.isPinned(videoId: videoId) {
+            let source = try await Self.resolveYouTube(videoId: videoId, prefs: prefs)
+            return ResolveOutcome(source: source, leftover: nil)
+        }
         if let cached = await StreamFileCache.shared.path(for: videoId) {
             return ResolveOutcome(
                 source: ResolvedSource(
@@ -1647,6 +1733,16 @@ final class PlaybackController {
     private func lookForBetterCopy(_ entry: QueueEntry, codec: String, kbps: UInt32) {
         guard !entry.isLocal, entry.source.hasPrefix("yt:") else { return }
         let mediaId = entry.id
+        // A pinned track is held off the automatic search on purpose: the
+        // listener reverted it, and an upgrade that arrives mid-playback would
+        // swap them straight back onto the copy they rejected — the same
+        // outcome the pin exists to prevent, arriving without being asked for.
+        // Checked here rather than inside `QualityUpgrade` so the store keeps
+        // one job, and so `upgradeQuality` is the only thing that can undo it.
+        guard !OriginalVersion.shared.isPinned(videoId: mediaId) else {
+            racingLossless = false
+            return
+        }
         let prefs = ResolvePrefs.current()
         if let shelved = QualityUpgrade.shelvedFor(mediaId) {
             debugLog.record("re-offering the upgrade already proved", about: mediaId)
