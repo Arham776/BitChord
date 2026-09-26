@@ -32,8 +32,8 @@ struct SongActionButtons: View {
             Button(likeTitle(vid)) {
                 Task { await toggleLike(vid) }
             }
-            Button("Dislike") {
-                Task { _ = await LibraryActions.rate(videoId: vid, status: "DISLIKE") }
+            Button(dislikeTitle(vid)) {
+                Task { await toggleDislike(vid) }
             }
             Button("Add to Playlist…") {
                 appModel.playlistPicker = PlaylistPickerRequest(videoId: vid, title: entry.title)
@@ -98,6 +98,38 @@ struct SongActionButtons: View {
     private func toggleLike(_ videoId: String) async {
         let next = LibraryActions.cachedLike(videoId) == "LIKE" ? "INDIFFERENT" : "LIKE"
         _ = await LibraryActions.rate(videoId: videoId, status: next)
+    }
+
+    /// The label, which is upstream's: the second tap is an undo and says so.
+    private func dislikeTitle(_ videoId: String) -> String {
+        LibraryActions.cachedLike(videoId) == "DISLIKE" ? "Undo Dislike" : "Dislike"
+    }
+
+    /// Thumb down, and move on if this is the track that is playing.
+    ///
+    /// The decision is `shouldSkipAfterDislike` in the shared module rather than
+    /// anything written here, because it is a rule with an edge case — the second tap
+    /// is an undo and must *not* skip — and the edge case is the whole reason the rule
+    /// exists. The previous status is read before the write, so the answer describes
+    /// what the track was and not what it became.
+    private func toggleDislike(_ videoId: String) async {
+        let wasDisliked = LibraryActions.cachedLike(videoId) == "DISLIKE"
+        let previous = wasDisliked
+            ? LikeStatus.dislike
+            : (LibraryActions.cachedLike(videoId) == "LIKE" ? LikeStatus.like : .indifferent)
+        let next = wasDisliked ? "INDIFFERENT" : "DISLIKE"
+        if let failure = await LibraryActions.rate(videoId: videoId, status: next) {
+            toast.show(failure, kind: .failure)
+            return
+        }
+        let currentId = controller.current?.videoId
+        if DislikeSkipKt.shouldSkipAfterDislike(
+            previousStatus: previous,
+            targetVideoId: videoId,
+            currentVideoId: currentId
+        ) {
+            controller.next()
+        }
     }
 }
 

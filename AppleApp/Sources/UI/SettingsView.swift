@@ -27,6 +27,9 @@ struct SettingsView: View {
     @State private var canvas = PlatformSettings.shared.getBoolean(key: "animated_canvas", default: true)
     @State private var canvasCellular = PlatformSettings.shared.getBoolean(key: "canvas_over_cellular", default: false)
     @State private var reduceBlur = PlatformSettings.shared.getBoolean(key: "reduce_dynamic_blur", default: false)
+    @State private var update = UpdateChecker.shared
+    /// The release being shown, and nil when nothing is.
+    @State private var updateSheet: AppUpdateChecker.UpdateInfo?
     @State private var reduceAnimation = PlatformSettings.shared.getBoolean(key: "reduce_animation", default: false)
     @State private var fullBleed = PlatformSettings.shared.getBoolean(key: "full_bleed_artwork", default: true)
     @State private var syncedLyrics = PlatformSettings.shared.getBoolean(key: "synced_lyrics", default: true)
@@ -742,6 +745,8 @@ struct SettingsView: View {
         Section {
             LabeledContent("Engine", value: "native-core v\(coreVersion())")
             LabeledContent("Logic Core", value: GreetingKt.sharedGreeting())
+            LabeledContent("Version", value: update.currentVersion)
+            updateRow
             Link("GitHub", destination: URL(string: "https://github.com/kushagrasinghx/BitChord")!)
             Link("Developer", destination: URL(string: "https://github.com/kushagrasinghx")!)
             Link("Discord", destination: URL(string: "https://discord.gg/pDdKfrdHY6")!)
@@ -751,6 +756,55 @@ struct SettingsView: View {
             Text("BitChord \(Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "0.1.0")")
                 .frame(maxWidth: .infinity)
                 .multilineTextAlignment(.center)
+        }
+        .sheet(item: $updateSheet) { release in
+            UpdateSheet(release: release)
+                .environment(update)
+        }
+        .task { await update.pollOnce() }
+    }
+
+    /// The update row, which is three things depending on what is known.
+    ///
+    /// A release is offered with its version in the subtitle rather than as a badge:
+    /// an update notice that is only a coloured dot asks the reader to guess, and the
+    /// one question here is "what is it".
+    @ViewBuilder
+    private var updateRow: some View {
+        if let release = update.available {
+            Button {
+                updateSheet = release
+            } label: {
+                SettingsLine(
+                    glyph: .update,
+                    title: release.version,
+                    subtitle: "A newer BitChord is out"
+                ) {
+                    Image(.bchChevronRight)
+                        .resizable()
+                        .scaledToFit()
+                        .frame(width: 12, height: 12)
+                        .foregroundStyle(.tertiary)
+                }
+            }
+            .buttonStyle(.plain)
+        } else {
+            Button {
+                Task { await update.check() }
+            } label: {
+                if update.checking {
+                    ProgressView().controlSize(.small)
+                } else {
+                    SettingsLine(
+                        glyph: .update,
+                        title: "Check for Updates",
+                        subtitle: update.problem ?? "BitChord \(update.comparableVersion)"
+                    ) {
+                        EmptyView()
+                    }
+                }
+            }
+            .disabled(update.checking)
         }
     }
 
@@ -1383,6 +1437,7 @@ private struct SettingsGlyph: View {
         case swipe, dontRepeat, hideVolume
         case discord, listenBrainz, lastFm
         case replay, genres, export, importData, listenTogether
+        case update
     }
 
     var kind: Kind
@@ -1437,6 +1492,9 @@ private struct SettingsGlyph: View {
         // Two people and a sound wave, because the alternative — a single person —
         // reads as a profile picture and this row is not about a profile.
         case .listenTogether: "person.2.wave.2.fill"
+        // An arrow down into a tray, which is what "a newer build is here" looks like
+        // and is not the gear everybody expects an update row to be.
+        case .update: "arrow.down.app.fill"
         }
     }
 
@@ -1474,6 +1532,7 @@ private struct SettingsGlyph: View {
         case .genres: .orange
         case .export, .importData: .gray
         case .listenTogether: .teal
+        case .update: .indigo
         }
     }
 }
