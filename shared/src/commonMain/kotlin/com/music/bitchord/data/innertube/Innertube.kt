@@ -206,6 +206,65 @@ object Innertube {
     }
 
     /**
+     * Takes the session scope from a page the listener was actually looking at,
+     * rather than working it out later from a fetch of our own — port of upstream
+     * `adoptSessionScope`.
+     *
+     * The shell fetch in [fetchSessionScope] can only ever report the channel
+     * music.youtube.com serves by default, and the whole reason the in-app browser
+     * exists is that the listener has just told it, by hand, that they want a
+     * different one. That answer is written into the page's own `ytcfg`, so it is
+     * read from there and adopted whole.
+     *
+     * Adopting also settles [ensureSessionScope] — a scope already in hand is not
+     * refetched — so the shell cannot quietly overwrite the choice with its default
+     * on the next request. A page that reported itself signed out is ignored apart
+     * from its client version: its `DATASYNC_ID` belongs to no account, and sending
+     * one Google cannot tie to the session is answered with 401 on every request.
+     */
+    fun adoptSessionScope(
+        pageId: String?,
+        dataSyncId: String?,
+        authUser: String?,
+        visitorData: String?,
+        clientVersion: String?,
+        loggedIn: Boolean,
+    ) {
+        val version = clientVersion?.takeIf { it.isNotBlank() } ?: scope?.clientVersion
+        if (!loggedIn) {
+            DebugLog.w("captured page was signed out; not scoping requests to it")
+            scope = version?.let { SessionScope(null, null, "0", it) }
+            return
+        }
+        scope = SessionScope(
+            dataSyncId = dataSyncId?.takeIf { it.isNotBlank() },
+            pageId = pageId?.takeIf { it.isNotBlank() },
+            authUser = authUser?.takeIf { it.isNotBlank() } ?: "0",
+            clientVersion = version,
+        )
+        // The page's own visitor id, bound to this session — strictly better than
+        // the anonymous one [fetchVisitorData] mints.
+        visitorData?.takeIf { it.isNotBlank() }?.let {
+            this.visitorData = it
+            visitorDataIsSessionBound = true
+        }
+        DebugLog.d("adopted page scope: pageId=${pageId ?: "none"} authUser=${authUser ?: "0"}")
+    }
+
+    /**
+     * Value accepted by Innertube as `context.user.onBehalfOfUser` — port of upstream
+     * `normalizeDataSyncId`. YouTube commonly exposes `DATASYNC_ID` as
+     * `account||delegated`; the second half is the active identity, while plain
+     * accounts can leave it empty.
+     */
+    fun normalizeDataSyncId(raw: String?): String? {
+        val value = raw?.takeIf { it.isNotBlank() } ?: return null
+        if (!value.contains("||")) return value
+        return value.substringAfter("||").takeIf { it.isNotBlank() }
+            ?: value.substringBefore("||").takeIf { it.isNotBlank() }
+    }
+
+    /**
      * The identity the session is currently acting as, or null when there is no
      * session at all.
      *

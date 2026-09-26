@@ -210,6 +210,73 @@ for (label, agent) in [
     check("an agent that is \(label) is replaced", SignInUserAgent.needsReplacing(defaultAgent: agent))
 }
 
+// ---- the capture: the page's own identity, not a later guess --------------
+
+// The bug that kept the session in the web view while the app stayed signed
+// out: `evaluateJavaScript` hands back a natively-decoded object for a JS
+// object, not the JSON string Android returns. Reading it as a string fails on
+// every signed-in page, so Continue could never succeed. Both shapes are
+// accepted, with fixtures built as values rather than raw JSON text.
+let liveDict: [String: Any] = [
+    "loggedIn": "true",
+    "pageId": "page-1",
+    "dataSyncId": "account||delegated",
+    "authUser": "1",
+    "visitorData": "CgABC",
+    "clientVersion": "1.20250101.01.00",
+]
+if let fields = SignInCapture.parse(jsResult: liveDict) {
+    check("a decoded object parses", fields.loggedIn)
+    check("the page id survives", fields.pageId == "page-1")
+    check("the raw datasync id survives", fields.dataSyncId == "account||delegated")
+    check("the auth user survives", fields.authUser == "1")
+    check("visitor data survives", fields.visitorData == "CgABC")
+    check("the client version survives", fields.clientVersion == "1.20250101.01.00")
+} else {
+    check("a decoded object parses", false)
+}
+
+// The Android shape still parses, so the rule is stated once and the platform
+// difference cannot reintroduce the bug by changing which branch runs.
+let androidJSON = """
+{"loggedIn":"true","pageId":"page-1","dataSyncId":"ds-1","authUser":"0","visitorData":"CgABC","clientVersion":"1.0"}
+"""
+if let fields = SignInCapture.parse(jsResult: androidJSON) {
+    check("a JSON string parses too", fields.loggedIn && fields.pageId == "page-1")
+} else {
+    check("a JSON string parses too", false)
+}
+
+// A page without ytcfg — an error page, a redirect that hasn't landed — is a
+// fine answer and not an error. NSNull is what a null in the object arrives as,
+// and reading it as the string "null" would be an identity made of nothing.
+check("nil is no session", SignInCapture.parse(jsResult: nil) == nil)
+check("NSNull is no session", SignInCapture.parse(jsResult: NSNull()) == nil)
+let signedOut: [String: Any] = ["loggedIn": "false"]
+check("a signed-out page reports signed out",
+      SignInCapture.parse(jsResult: signedOut)?.loggedIn == false)
+let nulls: [String: Any] = ["loggedIn": "true", "pageId": NSNull(), "dataSyncId": NSNull()]
+if let fields = SignInCapture.parse(jsResult: nulls) {
+    check("nulls are absent, not identities", fields.loggedIn && fields.pageId == nil && fields.dataSyncId == nil)
+} else {
+    check("nulls are absent, not identities", false)
+}
+check("a number is not a session", SignInCapture.parse(jsResult: 42) == nil)
+
+// ---- normalizeDataSyncId ----------------------------------------------------
+
+// Same rule as upstream and shared `Innertube`: the second half of
+// `account||delegated` is the active identity.
+check("a plain id is returned as is", SignInCapture.normalizeDataSyncId("ds-123") == "ds-123")
+check("a delegated id resolves to the active half",
+      SignInCapture.normalizeDataSyncId("account||delegated") == "delegated")
+check("an empty active half falls back to the account half",
+      SignInCapture.normalizeDataSyncId("account||") == "account")
+check("blank is absent", SignInCapture.normalizeDataSyncId(nil) == nil
+    && SignInCapture.normalizeDataSyncId("") == nil
+    && SignInCapture.normalizeDataSyncId("   ") == nil
+    && SignInCapture.normalizeDataSyncId("||") == nil)
+
 // ---- the sign-in screen cannot leave the app -------------------------------
 
 // Textual, and said so: this reads the sign-in view's source rather than running
@@ -243,6 +310,10 @@ if let root = CommandLine.arguments.dropFirst().first {
     check("the old open-outside decision is gone", !text.contains("openOutside"))
     check("the policy has no open-outside decision either",
           !String(describing: SignInNavigation.Decision.self).contains("openOutside"))
+    // The confirmation lives in the navigation bar, like upstream's header —
+    // not in a bottom Continue button below a page that scrolls.
+    check("the confirmation matches upstream", text.contains("Use This Profile"))
+    check("no bottom Continue button", !text.contains("Text(\"Continue\")"))
 } else {
     print("  · no repository root given, skipping the source guard")
 }

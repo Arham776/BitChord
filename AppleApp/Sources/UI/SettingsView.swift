@@ -814,16 +814,15 @@ struct SettingsView: View {
 
     private var loginSheet: some View {
         NavigationStack {
-            YtMusicLoginView { header in
-                auth.accept(header)
-                loginPresented = false
-            }
-            .navigationTitle("Sign In")
-            .toolbar {
-                ToolbarItem(placement: .cancellationAction) {
-                    Button("Cancel") { loginPresented = false }
-                }
-            }
+            YtMusicLoginView(
+                onCaptured: { session, done in
+                    auth.accept(session) { accepted in
+                        if accepted { loginPresented = false }
+                        done(accepted)
+                    }
+                },
+                onDismiss: { loginPresented = false }
+            )
         }
         #if os(macOS)
         .frame(minWidth: 720, minHeight: 640)

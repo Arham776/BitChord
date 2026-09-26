@@ -3,7 +3,7 @@ import WebKit
 import BitChordShared
 
 /// In-app Google sign-in for YouTube Music — port of upstream
-/// `auth/YtMusicLoginScreen.kt`.
+/// `auth/YtMusicLoginScreen.kt` plus the confirmation header in `MainActivity.kt`.
 ///
 /// ## Flow
 ///
@@ -11,19 +11,20 @@ import BitChordShared
 /// authenticates against accounts.google.com (2FA, passkeys, etc.). When Google
 /// redirects to music.youtube.com the session cookies land in an isolated
 /// `WKWebsiteDataStore` (not Safari, not `URLSession.shared`), and the listener
-/// presses **Continue** to take them. The password never passes through app code.
+/// confirms the profile shown by the live page. The password never passes through
+/// app code.
 ///
 /// Do not replace this with `ASWebAuthenticationSession`: that uses Safari and
 /// never returns a music.youtube.com cookie jar to the app.
 ///
-/// ## Why the listener presses Continue
+/// ## Why the listener confirms rather than the page capturing
 ///
 /// Upstream does not capture on reaching the Music origin either, and the reason
 /// is the whole design of this screen: a multi-account login can still be waiting
 /// for the listener to choose an identity *on that very page*, and capturing the
 /// moment it loads is the race that used to create a fake profile and close too
-/// soon. So arriving only *enables* the button, and a refused capture leaves the
-/// button there rather than closing on a session that is not a session yet.
+/// soon. So arriving only *enables* confirmation, and a refused capture leaves the
+/// screen open rather than closing on a session that is not a session yet.
 ///
 /// ## Why the navigation is policed
 ///
@@ -33,127 +34,144 @@ import BitChordShared
 /// mid-flow, and the session never comes back. So those are refused here, and
 /// *nothing* on this screen is ever opened anywhere else: see [SignInNavigation]
 /// for why the rest of the web loads in place instead.
+///
+/// ## The header is upstream's
+///
+/// Title, hint and confirmation live in the navigation bar — Close, the "switch
+/// using the avatar" hint once the Music page is up, and Use This Profile — which
+/// is both what upstream's `MainActivity` shows and what a sheet is expected to
+/// look like on this platform. There is deliberately no bottom Continue button: a
+/// confirmation that lives in the bar cannot be missed below a page that scrolls,
+/// and it is where Cancel already lives.
+struct YtMusicLoginView: View {
+    /// The confirmed session, with a completion the owner calls once validation
+    /// finishes. Staying open until then is the point: closing on capture and
+    /// validating afterwards is how a half-finished channel chooser used to
+    /// become a durable broken account.
+    var onCaptured: (SignInCapture, @escaping (Bool) -> Void) -> Void
+    var onDismiss: () -> Void
+
+    @State private var flow = LoginFlow()
+
+    var body: some View {
+        LoginWebView(
+            flow: flow,
+            onCaptured: onCaptured,
+            onUnavailable: { reason in flow.captureFailed(reason) }
+        )
+        .navigationTitle("Sign in to YouTube Music")
+        #if os(iOS)
+        .navigationBarTitleDisplayMode(.inline)
+        #endif
+        .toolbar {
+            ToolbarItem(placement: .cancellationAction) {
+                Button("Close", action: onDismiss)
+            }
+            ToolbarItem(placement: .confirmationAction) {
+                if flow.taking {
+                    ProgressView().controlSize(.small)
+                        .accessibilityLabel("Checking…")
+                } else if flow.pageReady {
+                    Button("Use This Profile") {
+                        flow.session.take?()
+                    }
+                    .accessibilityHint("Saves the profile shown by the page to this device")
+                }
+            }
+        }
+        .overlay(alignment: .top) {
+            // Upstream's subtitle under the title: what to do once the Music page
+            // is up, or that there is nothing to take yet after a failed attempt.
+            // A banner over the page rather than a footer under it, so it reads
+            // against the profile it describes instead of below a page that may
+            // have scrolled it out of sight.
+            if let prompt = flow.prompt {
+                Text(prompt)
+                    .font(.footnote)
+                    .foregroundStyle(flow.captureFailedMessage == nil ? Color.secondary : Color.orange)
+                    .multilineTextAlignment(.center)
+                    .padding(.horizontal, 20)
+                    .padding(.vertical, 8)
+                    .background(.bar)
+                    .transition(.opacity)
+            }
+        }
+    }
+}
+
 @Observable
 final class LoginFlow {
     /// The page has reached the Music origin, so there may be a session to take.
     var reachedMusicOrigin = false
     /// A capture is in flight.
     var taking = false
+    /// The last capture was asked for and there was no session to take.
+    var captureFailedMessage: String?
     /// The newest refusal, if the last thing that happened was a refused link.
     var refusal: SignInNavigation.Refusal?
     /// The host of a page that is not Google's sign-in, or nil while it is.
     var offOriginHost: String?
-    /// A capture the listener asked for that had no session to take.
-    var captureNote: String?
 
-    /// Where the Continue button reaches the web view.
+    /// Where the confirmation button reaches the web view.
     ///
     /// A plain box rather than observable state on purpose. It is written from
     /// `makeWebView`, which runs *during* the view update, and SwiftUI discards
-    /// observable mutations made there — which is how Continue ends up wired to a
-    /// web view the button cannot see, and pressing it does nothing at all. Held
-    /// outside observation the write survives, and the button reads it when it is
-    /// tapped rather than trusting a re-render to have happened in between.
+    /// observable mutations made there — which is how confirmation ends up wired
+    /// to a web view the button cannot see, and pressing it does nothing at all.
+    /// Held outside observation the write survives, and the button reads it when
+    /// it is tapped rather than trusting a re-render to have happened in between.
     let session = SignInSession()
 
-    /// Whether the Continue button should be offered at all.
-    ///
-    /// Only once the page is on the origin: a button that does nothing on the
-    /// Google page is worse than no button, because it looks like the sign-in is
-    /// broken rather than incomplete.
-    var canTake: Bool { reachedMusicOrigin && !taking }
+    /// Upstream's `onPageReady`: the Music page is up, so the confirmation is
+    /// offered. A button anywhere before that is worse than no button, because it
+    /// looks like the sign-in is broken rather than incomplete.
+    var pageReady: Bool { reachedMusicOrigin && !taking }
 
-    /// The one line under the web view: the newest thing worth saying, or nothing.
+    /// A capture was asked for and there was no session to take. Not a failure
+    /// and not a reason to close: the screen stays open and the listener can try
+    /// again once the page has settled.
+    func captureFailed(_ reason: String) {
+        taking = false
+        captureFailedMessage = reason
+    }
+
+    func captureSucceeded() {
+        taking = false
+        captureFailedMessage = nil
+    }
+
+    /// The one line over the page: the newest thing worth saying, or nothing.
     ///
-    /// Derived rather than assigned, so a refusal cannot be left standing over a
-    /// message the listener needs, and the "you have wandered off the sign-in"
-    /// line cannot outlive the page that caused it. Ordered by freshness: what the
-    /// listener just did beats what they just pressed, and the standing "you are
-    /// off the sign-in" warning is the oldest of the three.
-    var message: String? {
-        if let captureNote { return captureNote }
+    /// Ordered by freshness: a failed capture is what the listener just did, a
+    /// refused link is what they just pressed, and the standing guidance is the
+    /// oldest of the three. The avatar-switch hint only appears once the Music
+    /// page is up — before that there is no profile to switch.
+    var prompt: String? {
+        if let captureFailedMessage { return captureFailedMessage }
         if let refusal { return refusal.summary }
+        if reachedMusicOrigin {
+            return "Switch using the avatar, then use this profile."
+        }
         if let offOriginHost { return SignInNavigation.offSignInHostAdvice(host: offOriginHost) }
         return nil
     }
 }
 
-/// The one thing the Continue button has to be able to call. See [LoginFlow.session].
+/// The one thing the confirmation button has to be able to call. See [LoginFlow.session].
 final class SignInSession {
     var take: (() -> Void)?
-}
-
-struct YtMusicLoginView: View {
-    var onCookiesCaptured: (String) -> Void
-
-    @State private var flow = LoginFlow()
-
-    var body: some View {
-        VStack(spacing: 0) {
-            LoginWebView(
-                flow: flow,
-                onCookiesCaptured: onCookiesCaptured,
-                onUnavailable: { reason in flow.captureNote = reason }
-            )
-
-            footer
-        }
-    }
-
-    /// The Continue control, and whatever is worth saying above it.
-    ///
-    /// A real button rather than a capture on navigation, because a capture on
-    /// navigation is the race described above — and because "I signed in and it
-    /// did not take" is almost always this: the page had not settled on an
-    /// identity yet, and a refused capture says so instead of storing something
-    /// that will read as signed out tomorrow.
-    private var footer: some View {
-        VStack(spacing: 8) {
-            if let message = flow.message {
-                Text(message)
-                    .font(.footnote)
-                    .foregroundStyle(.secondary)
-                    .multilineTextAlignment(.center)
-                    .padding(.horizontal, 20)
-                    .transition(.opacity)
-            }
-            Button {
-                flow.captureNote = nil
-                flow.refusal = nil
-                flow.session.take?()
-            } label: {
-                if flow.taking {
-                    ProgressView().controlSize(.small)
-                } else {
-                    Text("Continue").font(.body.weight(.semibold))
-                }
-            }
-            .buttonStyle(.borderedProminent)
-            .controlSize(.large)
-            .disabled(!flow.canTake)
-            .accessibilityHint(
-                flow.reachedMusicOrigin
-                    ? "Finishes the sign-in and saves the session to this device"
-                    : "Available once Google has signed you in"
-            )
-        }
-        .frame(maxWidth: .infinity)
-        .padding(.vertical, 14)
-        .padding(.horizontal, 20)
-        .background(.bar)
-    }
 }
 
 #if os(macOS)
 private struct LoginWebView: NSViewRepresentable {
     let flow: LoginFlow
-    var onCookiesCaptured: (String) -> Void
+    var onCaptured: (SignInCapture, @escaping (Bool) -> Void) -> Void
     var onUnavailable: (String) -> Void
 
     func makeCoordinator() -> LoginWebCoordinator {
         LoginWebCoordinator(
             flow: flow,
-            onCookiesCaptured: onCookiesCaptured,
+            onCaptured: onCaptured,
             onUnavailable: onUnavailable
         )
     }
@@ -167,13 +185,13 @@ private struct LoginWebView: NSViewRepresentable {
 #else
 private struct LoginWebView: UIViewRepresentable {
     let flow: LoginFlow
-    var onCookiesCaptured: (String) -> Void
+    var onCaptured: (SignInCapture, @escaping (Bool) -> Void) -> Void
     var onUnavailable: (String) -> Void
 
     func makeCoordinator() -> LoginWebCoordinator {
         LoginWebCoordinator(
             flow: flow,
-            onCookiesCaptured: onCookiesCaptured,
+            onCaptured: onCaptured,
             onUnavailable: onUnavailable
         )
     }
@@ -188,8 +206,8 @@ private struct LoginWebView: UIViewRepresentable {
 
 /// Conformed to `WKHTTPCookieStoreObserver` only so it can be registered and
 /// unregistered; the observer callback is not used. Nothing is captured from it —
-/// the listener presses Continue — and it only matters that the store is
-/// registered, so that the jar is written to the store the harvest reads.
+/// the listener confirms — and it only matters that the store is registered, so
+/// that the jar is written to the store the harvest reads.
 ///
 /// `@MainActor` because every navigation delegate callback WebKit makes is made on
 /// the main thread, and because [flow] is observed SwiftUI state: the cookie-store
@@ -198,7 +216,7 @@ private struct LoginWebView: UIViewRepresentable {
 @MainActor
 final class LoginWebCoordinator: NSObject, WKNavigationDelegate, WKUIDelegate, WKHTTPCookieStoreObserver {
     private let flow: LoginFlow
-    private let onCookiesCaptured: (String) -> Void
+    private let onCaptured: (SignInCapture, @escaping (Bool) -> Void) -> Void
     private let onUnavailable: (String) -> Void
     /// `nonisolated` so `deinit` can reach it.
     ///
@@ -216,11 +234,11 @@ final class LoginWebCoordinator: NSObject, WKNavigationDelegate, WKUIDelegate, W
 
     init(
         flow: LoginFlow,
-        onCookiesCaptured: @escaping (String) -> Void,
+        onCaptured: @escaping (SignInCapture, @escaping (Bool) -> Void) -> Void,
         onUnavailable: @escaping (String) -> Void
     ) {
         self.flow = flow
-        self.onCookiesCaptured = onCookiesCaptured
+        self.onCaptured = onCaptured
         self.onUnavailable = onUnavailable
     }
 
@@ -261,7 +279,7 @@ final class LoginWebCoordinator: NSObject, WKNavigationDelegate, WKUIDelegate, W
         webView.navigationDelegate = self
         webView.uiDelegate = self
         self.webView = webView
-        // How the Continue button reaches the session. Set here rather than
+        // How the confirmation button reaches the session. Set here rather than
         // handed back to the view as state — see [LoginFlow.session].
         flow.session.take = { [weak self] in self?.takeSession() }
         webView.load(URLRequest(url: Self.loginURL))
@@ -292,7 +310,7 @@ final class LoginWebCoordinator: NSObject, WKNavigationDelegate, WKUIDelegate, W
         switch Self.navigationDecision(for: url) {
         case .load:
             decisionHandler(.allow)
-            announce(url, isMainFrame: isMainFrame)
+            noteMainFrame(url, isMainFrame: isMainFrame)
         case .refuse(let why):
             // Cancelled, and *only* cancelled. There is no branch here that hands
             // a URL to the system: following one is what opened the YouTube Music
@@ -317,6 +335,7 @@ final class LoginWebCoordinator: NSObject, WKNavigationDelegate, WKUIDelegate, W
         switch Self.navigationDecision(for: url) {
         case .load:
             if let url { webView.load(URLRequest(url: url)) }
+            noteMainFrame(url, isMainFrame: true)
         case .refuse(let why):
             NSLog("[BitChord] sign-in refused a new-window navigation to \(url?.absoluteString ?? "?")")
             flow.refusal = why
@@ -331,10 +350,19 @@ final class LoginWebCoordinator: NSObject, WKNavigationDelegate, WKUIDelegate, W
     /// should be able to see that rather than infer it from a page they did not
     /// ask for. Only the main frame counts: Google's own pages load iframes, and
     /// a line of text about an ad server is noise.
-    private func announce(_ url: URL?, isMainFrame: Bool) {
-        guard isMainFrame else { return }
+    ///
+    /// Done here as well as in `didFinish` because the Music page is reached by a
+    /// redirect chain whose intermediate steps are the navigations, and waiting
+    /// for the final commit to notice the origin is waiting for news already in
+    /// hand. `didFinish` still re-checks, so wandering off the origin takes the
+    /// confirmation away even when the leaving hop commits without a decision.
+    private func noteMainFrame(_ url: URL?, isMainFrame: Bool) {
+        guard isMainFrame, let url else { return }
+        if url.absoluteString.hasPrefix(Self.musicOrigin) {
+            flow.reachedMusicOrigin = true
+        }
         let onSignIn = SignInNavigation.isSignInHost(url)
-        flow.offOriginHost = onSignIn ? nil : url?.host?.lowercased()
+        flow.offOriginHost = onSignIn ? nil : url.host?.lowercased()
         // A refused link is newer news than the page it was on.
         if onSignIn { flow.refusal = nil }
     }
@@ -364,12 +392,12 @@ final class LoginWebCoordinator: NSObject, WKNavigationDelegate, WKUIDelegate, W
     private func takeSession() {
         guard !captured, !flow.taking else { return }
         guard flow.reachedMusicOrigin else {
-            flow.captureNote = "Finish signing in on the Google page first."
+            flow.captureFailed("Finish signing in on the Google page first.")
             return
         }
         flow.taking = true
         flow.refusal = nil
-        flow.captureNote = nil
+        flow.captureFailedMessage = nil
         let view = webView
         store.httpCookieStore.getAllCookies { [weak self] cookies in
             let header = Self.cookieHeader(cookies)
@@ -381,14 +409,47 @@ final class LoginWebCoordinator: NSObject, WKNavigationDelegate, WKUIDelegate, W
                 }
                 view.evaluateJavaScript(Self.ytcfgProbe) { raw, _ in
                     Task { @MainActor in
-                        guard Self.isSignedInConfig(raw) else {
+                        guard let fields = SignInCapture.parse(jsResult: raw),
+                              fields.loggedIn
+                        else {
                             // Upstream logs this and leaves the screen open. So does
-                            // this: the listener can press again once the page has
-                            // settled.
-                            self.finish(message: "Still choosing an account on the Google page — try again in a moment.")
+                            // this: the listener can try again once the page has
+                            // settled, including after switching channels in the
+                            // avatar menu.
+                            self.finish(message: "No signed-in profile is available on this page yet.")
                             return
                         }
-                        self.finish(header: header)
+                        // A delegated identity is the most specific answer the live
+                        // page can give. Otherwise normalise its DATASYNC_ID.
+                        let dataSyncId = fields.pageId
+                            ?? SignInCapture.normalizeDataSyncId(fields.dataSyncId)
+                        self.captured = true
+                        self.flow.captureSucceeded()
+                        self.onCaptured(
+                            SignInCapture(
+                                cookie: header,
+                                pageId: fields.pageId,
+                                dataSyncId: dataSyncId,
+                                authUser: fields.authUser,
+                                visitorData: fields.visitorData,
+                                clientVersion: fields.clientVersion,
+                                loggedIn: true
+                            )
+                        ) { [weak self] accepted in
+                            Task { @MainActor in
+                                guard let self else { return }
+                                if accepted {
+                                    self.flow.captureSucceeded()
+                                } else {
+                                    // Validation refused it after the fact. The screen
+                                    // stays open so the listener can try again; the
+                                    // cookie stays stored so the next attempt has
+                                    // something to be judged against.
+                                    self.captured = false
+                                    self.finish(message: "No signed-in profile is available on this page yet.")
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -396,41 +457,40 @@ final class LoginWebCoordinator: NSObject, WKNavigationDelegate, WKUIDelegate, W
     }
 
     private func finish(header: String? = nil, message: String? = nil) {
+        // Kept for the refusal paths, which carry no session: the one line they
+        // need is the reason, and the screen staying open is the behaviour.
         flow.taking = false
-        if let header {
-            // Flushed before the session is handed over, for the reason upstream
-            // gives: a cookie jar written after the screen closes is a jar the
-            // *next* sign-in reads instead of this one. It is the difference
-            // between signing in and appearing to.
-            store.httpCookieStore.getAllCookies { _ in }
-            captured = true
-            onCookiesCaptured(header)
-        } else if let message {
+        if let message {
             onUnavailable(message)
         }
     }
 
     /// Upstream's `YTCFG_PROBE`, unchanged in substance: `ytcfg` is the page's
     /// own account configuration, and `LOGGED_IN` is the only claim on it that
-    /// means an identity has settled.
+    /// means an identity has settled. It returns an object rather than a string
+    /// so the web view serialises it — a probe that stringified its own result
+    /// would come back double-encoded on Android.
     private static let ytcfgProbe = """
     (function () {
       try {
         if (!window.ytcfg || !window.ytcfg.get) return null;
-        return { loggedIn: String(!!window.ytcfg.get('LOGGED_IN')) };
+        var get = function (key) {
+          var value = window.ytcfg.get(key);
+          return (value === undefined || value === null || value === '') ? null : String(value);
+        };
+        return {
+          loggedIn: String(!!window.ytcfg.get('LOGGED_IN')),
+          pageId: get('DELEGATED_SESSION_ID'),
+          dataSyncId: get('DATASYNC_ID'),
+          authUser: get('SESSION_INDEX'),
+          visitorData: get('VISITOR_DATA'),
+          clientVersion: get('INNERTUBE_CLIENT_VERSION')
+        };
       } catch (e) {
         return null;
       }
     })()
     """
-
-    private static func isSignedInConfig(_ raw: Any?) -> Bool {
-        guard let text = raw as? String,
-              let data = text.data(using: .utf8),
-              let object = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
-        else { return false }
-        return object["loggedIn"] as? String == "true"
-    }
 
     /// Upstream `CookieManager.getCookie(MUSIC_ORIGIN)`: only cookies the browser
     /// would send to music.youtube.com. Mixing a `.google.com` SID with YouTube's

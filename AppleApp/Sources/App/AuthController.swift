@@ -91,74 +91,90 @@ final class AuthController {
     /// cookie that the next attempt can still be judged against, and since
     /// [restore] no longer destroys what it cannot apply, the failure is recoverable
     /// rather than terminal.
-    func accept(_ cookieHeader: String) {
-        AuthStore.cookie = cookieHeader
-        guard AuthBridge.shared.applyCookie(cookieHeader: cookieHeader) else {
-            // Visible rather than silent: the listener pressed Continue and the
-            // app is not signed in, and saying nothing is what made this look like
-            // the sign-in had worked.
+    ///
+    /// The page's own identity is adopted before anything validates it — port of
+    /// upstream `onWebSession`. The shell fetch can only ever report the default
+    /// channel, and the listener just chose one by hand; validating first and
+    /// adopting after would check the wrong identity and store the wrong one.
+    /// The screen stays open until `onComplete` fires, so a half-finished channel
+    /// chooser can never become a durable broken account.
+    func accept(_ session: SignInCapture, onComplete: ((Bool) -> Void)? = nil) {
+        let previousCookie = AuthStore.cookie
+        AuthStore.cookie = session.cookie
+        guard AuthBridge.shared.hasApiSid(cookieHeader: session.cookie),
+              AuthBridge.shared.applyCookie(cookieHeader: session.cookie)
+        else {
+            // Visible rather than silent: the listener confirmed and the app is
+            // not signed in, and saying nothing is what made this look like the
+            // sign-in had worked.
             sessionUnavailableReason =
                 "Google gave a session this app could not use. Try signing in again."
+            onComplete?(false)
             return
         }
-        sessionUnavailableReason = nil
-        signedIn = true
-        loginPresented = false
-        sessionEpoch += 1
-        // A new session is a new identity, so the account's own channels have to be
-        // read afresh — the listen-as list belongs to the account that is now
-        // active, and carrying the old one across would offer the wrong channel.
-        recordCurrentAccount()
-        Task { await refreshAccount() }
-    }
-
-    /// Records the signed-in account, with the identity the session is already
-    /// acting as as its one channel.
-    ///
-    /// The default channel rather than the account's full channel list: upstream
-    /// enumerates every channel the account owns, and that is a different call
-    /// this app does not make. What *is* already known is the identity the
-    /// requests are being sent as — the shell's own, or the override a listener
-    /// picked — and that is exactly the one the selector has to offer first.
-    ///
-    /// Best-effort by design. The session works whether or not this succeeds, and
-    /// the channel list is only needed for the selector, so a failure is not
-    /// surfaced: a listener who has just signed in should not be told their
-    /// sign-in did not work over a channel list.
-    private func recordCurrentAccount() {
-        guard let cookie = AuthStore.cookie, !cookie.isEmpty else { return }
-        // Captured up front and read on the main actor at the end, rather than
-        // reached through `self` from two nested closures — the account name is
-        // only the display label for this record, and it is not worth an
-        // explicit capture chain to have the freshest value of.
-        let name = accountName
-        let email = accountEmail
-        AuthBridge.shared.ensureSession(callback: SessionDoneAdapter { ok, _ in
-            guard ok else { return }
-            AuthBridge.shared.currentIdentity(
-                callback: IdentityDoneAdapter { pageId, dataSyncId, authUser in
-                    guard let dataSyncId, !dataSyncId.isEmpty else { return }
-                    let id = AccountSessionsKt.sessionIdOf(
-                        cookie: cookie, dataSyncId: dataSyncId
-                    )
-                    let profile = AccountProfile(
-                        profileId: pageId ?? dataSyncId,
-                        name: name ?? email ?? "YouTube Music",
-                        pageId: pageId,
-                        dataSyncId: dataSyncId,
-                        authUser: authUser
-                    )
-                    Task { @MainActor in
-                        self.record(account: AccountSummary(
-                            id: id,
-                            name: name ?? "",
-                            email: email ?? "",
-                            cookie: cookie,
-                            profiles: [profile]
-                        ))
+        AuthBridge.shared.adoptSessionScope(
+            pageId: session.pageId,
+            dataSyncId: session.dataSyncId,
+            authUser: session.authUser,
+            visitorData: session.visitorData,
+            clientVersion: session.clientVersion,
+            loggedIn: true
+        )
+        AuthBridge.shared.ensureSession(callback: SessionDoneAdapter { _, _ in
+            AccountBridge.shared.account(callback: AccountCallbackAdapter { json, _ in
+                Task { @MainActor in
+                    guard let json,
+                          let info = try? JSONDecoder().decode(AccountInfo.self, from: Data(json.utf8))
+                    else {
+                        // Back to how requests behaved before the attempt, so a
+                        // rejected candidate never leaves the app signing as an
+                        // identity it refused to declare. The new cookie stays
+                        // stored, so the next attempt has something to be judged
+                        // against rather than nothing.
+                        if let previousCookie, !previousCookie.isEmpty {
+                            _ = AuthBridge.shared.applyCookie(cookieHeader: previousCookie)
+                        } else {
+                            _ = AuthBridge.shared.applyCookie(cookieHeader: nil)
+                        }
+                        AuthBridge.shared.clearChannelOverride()
+                        self.sessionUnavailableReason =
+                            "Google gave a session this app could not use. Try signing in again."
+                        onComplete?(false)
+                        return
                     }
+                    self.sessionUnavailableReason = nil
+                    self.signedIn = true
+                    self.sessionEpoch += 1
+                    self.accountName = info.name
+                    self.accountEmail = info.email
+                    self.accountPhotoUrl = info.photoUrl
+                    self.publishAccount()
+                    // The account's own channels are the page's choice, not the
+                    // shell's default: the ids come from the confirmed page and
+                    // only the display name comes from the server.
+                    let id = AccountSessionsKt.sessionIdOf(
+                        cookie: session.cookie, dataSyncId: session.dataSyncId
+                    )
+                    let profileId = AccountSessionsKt.profileIdOf(
+                        pageId: session.pageId, dataSyncId: session.dataSyncId, name: info.name
+                    )
+                    self.record(account: AccountSummary(
+                        id: id,
+                        name: info.name,
+                        email: info.email,
+                        cookie: session.cookie,
+                        profiles: [AccountProfile(
+                            profileId: profileId,
+                            name: info.name,
+                            pageId: session.pageId,
+                            dataSyncId: session.dataSyncId,
+                            authUser: session.authUser
+                        )]
+                    ))
+                    Task { await self.refreshAccount() }
+                    onComplete?(true)
                 }
-            )
+            })
         })
     }
 

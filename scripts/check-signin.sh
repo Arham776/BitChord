@@ -34,6 +34,7 @@ xcrun swiftc \
   -o "$CHECK_DIR/check" \
   "$ROOT/AppleApp/Sources/UI/SignInNavigation.swift" \
   "$ROOT/AppleApp/Sources/UI/SignInUserAgent.swift" \
+  "$ROOT/AppleApp/Sources/UI/SignInCapture.swift" \
   "$HERE/signin-verify/main.swift" || exit 2
 
 # The repository root goes in so the harness can read the sign-in view's own

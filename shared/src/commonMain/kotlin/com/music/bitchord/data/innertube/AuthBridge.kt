@@ -86,6 +86,29 @@ object AuthBridge {
     fun isSignedIn(): Boolean = Innertube.cookie?.let { Innertube.hasApiSid(it) } == true
 
     /**
+     * Takes the session scope from the page the listener confirmed, before anything
+     * validates it — port of upstream's `adoptSessionScope` call in `onWebSession`.
+     * The page's own `ytcfg` outranks whatever the shell fetch would report, because
+     * the shell only knows the default channel and the listener just chose one.
+     */
+    fun adoptSessionScope(
+        pageId: String?,
+        dataSyncId: String?,
+        authUser: String?,
+        visitorData: String?,
+        clientVersion: String?,
+        loggedIn: Boolean,
+    ) {
+        Innertube.adoptSessionScope(pageId, dataSyncId, authUser, visitorData, clientVersion, loggedIn)
+        Innertube.adoptPageScope(pageId, dataSyncId, authUser)
+    }
+
+    /** Forgets the chosen channel without touching the session shell. */
+    fun clearChannelOverride() {
+        Innertube.adoptPageScope(null, null, null)
+    }
+
+    /**
      * Resolve which Google account the cookie acts as, and read the live WEB_REMIX
      * version out of the shell.
      *

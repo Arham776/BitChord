@@ -32,15 +32,15 @@ struct RootView: View {
             set: { auth.loginPresented = $0 }
         )) {
             NavigationStack {
-                YtMusicLoginView { header in
-                    auth.accept(header)
-                }
-                .navigationTitle("Sign in")
-                .toolbar {
-                    ToolbarItem(placement: .cancellationAction) {
-                        Button("Cancel") { auth.loginPresented = false }
-                    }
-                }
+                YtMusicLoginView(
+                    onCaptured: { session, done in
+                        auth.accept(session) { accepted in
+                            if accepted { auth.loginPresented = false }
+                            done(accepted)
+                        }
+                    },
+                    onDismiss: { auth.loginPresented = false }
+                )
             }
             #if os(macOS)
             .frame(minWidth: 720, minHeight: 640)
