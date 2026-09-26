@@ -134,6 +134,12 @@ final class AppModel {
     /// arrives — making somebody find Settings first would put a settings window
     /// between a link and the thing the link is about.
     var listenTogetherPresented = false
+    /// Who is listening, from inside the player.
+    ///
+    /// Its own flag rather than a sheet hung off the playback pill, because the pill
+    /// is built twice — once per platform — and two sheets on it means two sheets
+    /// fighting over the same presentation.
+    var partyMembersPresented = false
     /// An invite link that arrived from outside, waiting to be looked at.
     var pendingPartyInvite: String?
     var focusSearch = false

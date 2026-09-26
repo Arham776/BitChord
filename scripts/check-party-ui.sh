@@ -38,6 +38,7 @@ SOURCES=(
   "$APP/Sources/UI/PartyStore.swift"
   "$APP/Sources/UI/ListenTogetherView.swift"
   "$APP/Sources/UI/ListenTogetherSheets.swift"
+  "$APP/Sources/UI/PartyMembersSheet.swift"
   "$APP/Sources/PlaybackSession/PartySync.swift"
   "$APP/Sources/PlaybackSession/PartySocket.swift"
   "$APP/Sources/UI/Toast.swift"
@@ -97,17 +98,21 @@ struct ArtworkView: View {
     }
 }
 
-/// The app's navigation flags, as far as the party screen reaches them.
+/// The app's navigation flags, as far as the party screens reach them.
 ///
 /// The real `AppModel` lives in `BitChordApp.swift` next to the whole app, and the
-/// party screen uses exactly one of its fields. Declaring the one field it needs is
-/// better than compiling the entire app to check a screen: the screen cannot read a
-/// flag that is not here, so a rename on either side is still a compile error.
+/// party screens use four of its fields. Declaring the ones they need is better than
+/// compiling the entire app to check a screen: a screen cannot read a flag that is not
+/// here, so a rename on either side is still a compile error.
 @Observable
 final class AppModel {
     var scenePhase: ScenePhase = .active
     /// Set by a `bitchord://party/…` link arriving from outside the app.
     var pendingPartyInvite: String?
+    /// The Listen Together screen, presented over whatever the listener was doing.
+    var listenTogetherPresented = false
+    /// Who is listening, from inside the player.
+    var partyMembersPresented = false
 }
 
 /// The player, as far as the party binding reaches it. Every member here is called

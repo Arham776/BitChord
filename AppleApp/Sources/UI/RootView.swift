@@ -73,6 +73,13 @@ struct RootView: View {
         )) {
             NavigationStack { ListenTogetherView() }
         }
+        .sheet(isPresented: Binding(
+            get: { appModel.partyMembersPresented },
+            set: { appModel.partyMembersPresented = $0 }
+        )) {
+            PartyMembersSheet()
+                .environment(PartyStore.shared)
+        }
         .sheet(item: Binding(
             get: { appModel.pendingDetail },
             set: { appModel.pendingDetail = $0 }

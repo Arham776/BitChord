@@ -89,6 +89,8 @@ struct PlaybackPill: View {
                 .buttonStyle(.plain)
                 .foregroundStyle(controller.repeatMode == .off ? .primary : Color.accentColor)
                 .help(controller.repeatMode == .one ? "Repeat one" : controller.repeatMode == .all ? "Repeat all" : "Repeat off")
+
+                partyButton
             }
             .foregroundStyle(.primary)
 
@@ -192,6 +194,63 @@ struct PlaybackPill: View {
         }
     }
 
+    // MARK: - The party
+
+    /**
+     * Who is listening, and the way in when nobody is.
+     *
+     * A person glyph and nothing else, on the same reasoning as the rest of this
+     * pill: the pill is a row of transport glyphs, and anything that is not transport
+     * belongs in the player. But the *count* does belong here, because this is where
+     * a listener looks to find out whether anybody else is listening at all, and the
+     * alternative — opening the player to discover it — is a step for a fact.
+     *
+     * Highlighted when in a party, so the pill says "you are not playing this on your
+     * own" at a glance. Upstream does the same, and for the same reason.
+     */
+    private var partyButton: some View {
+        let party = PartyStore.shared
+        return Button {
+            if party.inParty {
+                // Who is here, rather than the screen that manages it: there is
+                // nothing to create or join once there is a party, and a listener who
+                // is already playing wants to know who else is here rather than go
+                // and manage anything.
+                appModel.partyMembersPresented = true
+            } else {
+                appModel.listenTogetherPresented = true
+            }
+        } label: {
+            ZStack(alignment: .topTrailing) {
+                Image(systemName: "person.2.fill")
+                    .font(.system(size: 15, weight: .semibold))
+                    .frame(width: 32, height: 32)
+                    .contentShape(.rect)
+                if party.inParty, party.state.members.count > 1 {
+                    Text("\(party.state.members.count)")
+                        .font(.system(size: 9, weight: .bold))
+                        .monospacedDigit()
+                        .foregroundStyle(.white)
+                        .padding(.horizontal, 3)
+                        .background(Color.accentColor, in: Capsule())
+                        .offset(x: 4, y: -2)
+                }
+            }
+        }
+        .buttonStyle(.plain)
+        .foregroundStyle(party.inParty ? Color.accentColor : .secondary)
+        .help(partyHelp(party))
+        .accessibilityLabel(partyHelp(party))
+    }
+
+    /// Spoken, the count is the whole point of the control; drawn, it would cost the
+    /// pill its symmetry for something the badge already says.
+    private func partyHelp(_ party: PartyStore) -> String {
+        guard party.inParty else { return "Listen together" }
+        let count = party.state.members.count
+        return count > 1 ? "Listening together · \(count)" : "Listening together"
+    }
+
     private var reduceBlur: Bool {
         PlatformSettings.shared.getBoolean(key: "reduce_dynamic_blur", default: false)
     }
@@ -250,6 +309,8 @@ struct PlaybackPill: View {
             }
             .buttonStyle(.plain)
             .disabled(!controller.canPlayNext)
+
+            partyButton
         }
         .foregroundStyle(.primary)
     }

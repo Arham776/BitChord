@@ -403,6 +403,30 @@ func run() {
     check("the host's own row is marked", host.state.isMe(member: sam) && !host.state.isMe(member: alex))
     check("the code is the party's", host.code == "ABC123")
 
+    // The members sheet, which is the same rows in a different place. Its title is
+    // the one piece of copy it has of its own, and it is the piece most likely to be
+    // wrong: a blank host, a host whose name is only whitespace, and a host with a
+    // long name all have to read as something.
+    check("the sheet names the host's jam", PartyMembersSheet.title(for: host) == "Sam’s Jam")
+    check(
+        "a first name is taken from a full display name",
+        PartyMembersSheet.title(for: {
+            let store = PartyStore()
+            store.setForCheck(
+                partyState(
+                    you: alex,
+                    members: [member("m9", name: "Alexandra Fiona Chen", host: true), alex]
+                ),
+                code: "NAMED1"
+            )
+            return store
+        }()) == "Alexandra’s Jam"
+    )
+    check(
+        "a party with no resolvable host is not called nobody's jam",
+        PartyMembersSheet.title(for: PartyStore()) == "Listening together"
+    )
+
     let locked = PartyStore()
     locked.setForCheck(
         partyState(
@@ -493,6 +517,22 @@ func run() {
     sheet(JoinPartySheet(), "join sheet")
     sheet(InviteSheet(), "invite sheet")
     sheet(PartyServerEditor(), "server editor")
+
+    // The members sheet, in a party and in one that has just emptied. The empty case
+    // is the one a row-driven sheet gets wrong: a list of nothing is a blank panel.
+    func memberSheet(_ store: PartyStore, _ label: String) {
+        laysOut(
+            NavigationStack { PartyMembersSheet() }
+                .environment(store)
+                .environment(ToastCenter())
+                .environment(AppModel()),
+            label: label,
+            width: 460,
+            height: 640
+        )
+    }
+    memberSheet(host, "members sheet")
+    memberSheet(idle, "members sheet with nobody in it")
 
     let fullPreview = PartyPreview(
         code: "FULL01",

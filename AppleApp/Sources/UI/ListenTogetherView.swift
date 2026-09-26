@@ -669,7 +669,12 @@ private struct PartyTransportButton: View {
     }
 }
 
-private struct MemberRow: View {
+/// One member of the party, as a row.
+///
+/// Not private: the same row is the point of the members sheet, and a second,
+/// slightly different row there would be a second thing to keep in step with the
+/// first.
+struct MemberRow: View {
     let name: String
     let avatarUrl: String?
     let isYou: Bool
