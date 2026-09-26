@@ -41,6 +41,17 @@ object PartySocketBridge {
         fun connect(base: String, code: String, token: String, onFrame: FrameCallback)
 
         fun stop()
+
+        /**
+         * Send one already-encoded frame.
+         *
+         * Takes JSON rather than a [PartyOutgoing] because the one frame the client
+         * originates on a timer — the playhead report — is built by
+         * [PartyOutgoingJson] and sent straight from [PartySync], and routing it
+         * through a sealed type just to hand it back unchanged would be a hop with
+         * no purpose.
+         */
+        fun sendRaw(json: String)
     }
 
     fun interface FrameCallback {
@@ -80,5 +91,16 @@ object PartySocketBridge {
 
     fun stop() {
         impl?.stop()
+    }
+
+    /**
+     * Send one frame, or drop it when the socket is not up.
+     *
+     * Dropping rather than queueing is deliberate for the one frame that uses this: a
+     * playhead report describes *now*, and a report that arrives late is worse than
+     * no report — it would describe a position the device has already left.
+     */
+    fun sendRaw(json: String) {
+        impl?.sendRaw(json)
     }
 }

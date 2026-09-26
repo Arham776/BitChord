@@ -55,6 +55,14 @@ final class PartySocket: NSObject, PartySocketBridgeImpl {
         }
     }
 
+    func sendRaw(json: String) {
+        // Dropped when the socket is not up rather than queued: a playhead report
+        // describes *now*, and one that arrives late describes a position this device
+        // has already left.
+        guard let task, !stopped else { return }
+        task.send(.string(json)) { _ in }
+    }
+
     func stop() {
         stopped = true
         timer?.cancel()
