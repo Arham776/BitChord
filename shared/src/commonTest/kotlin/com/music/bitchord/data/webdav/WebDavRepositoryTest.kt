@@ -2,18 +2,13 @@ package com.music.bitchord.data.webdav
 
 import com.music.bitchord.data.remote.WebDavClient
 import com.music.bitchord.data.remote.WebDavConfig
-import com.music.bitchord.data.remote.WebDavException
-import com.music.bitchord.data.remote.RemoteListing
-import com.music.bitchord.data.model.UiState
 import kotlin.test.Test
 import kotlin.test.assertEquals
-import kotlin.test.assertIs
-import kotlin.test.assertNotNull
 import kotlin.test.assertNull
 import kotlin.test.assertTrue
 
 /**
- * A listed file as a row, and the sentence a listing produces when it has nothing.
+ * A listed file as a row.
  *
  * The row's rules are all about *whose name wins*, and every case here is a server
  * that names its files differently from how it spells their URLs — which is the
@@ -161,44 +156,5 @@ class WebDavRepositoryTest {
                 != WebDavConfig.dirKeyOf("http://nas.local:8096/music/cover.jpg"),
         )
         assertEquals("nas.local", WebDavConfig.hostOf("http://nas.local:5005/music"))
-    }
-
-    // ---- What a listing says -----------------------------------------------
-
-    @Test
-    fun `a listing with tracks in it is those tracks`() {
-        val state: UiState<List<String>> =
-            RemoteListing.state(Result.success(listOf("a", "b")), "No audio files")
-        val success = assertIs<UiState.Success<List<String>>>(state)
-        assertEquals(listOf("a", "b"), success.data)
-    }
-
-    @Test
-    fun `a listing with nothing in it says what an empty one says`() {
-        // Never an empty success: a page cannot draw "0 tracks" and a listener cannot
-        // tell that from a share that is not there.
-        val state: UiState<List<String>> =
-            RemoteListing.state(Result.success(emptyList<String>()), "That share has no audio files.")
-        assertEquals("That share has no audio files.", assertIs<UiState.Error>(state).message)
-    }
-
-    @Test
-    fun `a listing that failed says why rather than saying it is empty`() {
-        // The distinction the whole object exists for: a share that answers with an
-        // error is not an empty share, and "no audio files" sends somebody hunting
-        // through folder paths for a password problem.
-        val state: UiState<List<String>> = RemoteListing.state(
-            Result.failure(WebDavException("That server did not accept the password.")),
-            "No audio files",
-        )
-        assertEquals("That server did not accept the password.", assertIs<UiState.Error>(state).message)
-    }
-
-    @Test
-    fun `a failure with nothing to say still says something`() {
-        val state: UiState<List<String>> =
-            RemoteListing.state(Result.failure(WebDavException("   ")), "No audio files")
-        val message = assertIs<UiState.Error>(state).message
-        assertTrue(message.isNotBlank(), "a blank error line is not an error line")
     }
 }

@@ -142,7 +142,14 @@ object WebDavClient {
                     // carried up. A share with one bad subfolder is otherwise a library
                     // that silently omits it, and a listener has no way to tell that
                     // from the folder being empty.
-                    return Result.failure(WebDavException("Listing failed with ${response.status}"))
+                    //
+                    // The sentence is chosen *here*, where the status still is.
+                    // "Listing failed with 401" reaches a person as a status code, and
+                    // the one thing worth saying about a 401 is that the password was
+                    // not accepted.
+                    return Result.failure(
+                        WebDavException(WebDavFailure.describe(response, COULD_NOT_READ).message()),
+                    )
                 }
                 for (entry in parseMultistatus(response.body.orEmpty(), dir)) {
                     val name = entry.displayName.ifBlank { entry.url }
@@ -164,7 +171,11 @@ object WebDavClient {
         } catch (e: kotlinx.coroutines.CancellationException) {
             throw e
         } catch (e: Throwable) {
-            Result.failure(WebDavException(e.message ?: "Could not list the server"))
+            // The sentence rather than `e.message`: this one is shown to a person, and
+            // a transport failure's own message is a URL, a host name and a framework
+            // stack. A share's address is not something to put in front of a listener
+            // because their network dropped.
+            Result.failure(WebDavException(WebDavFailure.Unreachable(COULD_NOT_READ).message()))
         }
     }
 
@@ -278,6 +289,16 @@ object WebDavClient {
 
     private fun headersFor(username: String, password: String, depth: String): Map<String, String> =
         authHeaders(username, password) + mapOf("Depth" to depth)
+
+    /**
+     * The prefix on a refusal that is not one of the statuses with a sentence of its
+     * own — a 500, or a status nobody has thought about.
+     *
+     * A prefix rather than a whole sentence because [WebDavFailure.describe] reads the
+     * status first and only falls back to this; the ones that matter (401, 403, 404,
+     * 405) all say exactly what happened without it.
+     */
+    private const val COULD_NOT_READ = "Could not read that share"
 
     /**
      * The three properties this client asks for.

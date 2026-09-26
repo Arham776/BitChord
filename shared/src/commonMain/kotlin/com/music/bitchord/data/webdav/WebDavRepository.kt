@@ -32,13 +32,26 @@ object WebDavRepository {
     fun isConfigured(): Boolean = WebDavConfig.isConfigured(AppSettings.webDavUrl.value)
 
     /**
-     * Every track on the share, or nothing.
+     * Every track on the share.
      *
-     * Nothing rather than a throw for all three ways this can go wrong — unconfigured,
-     * a server that refused, a server that answered with no audio — because a library
-     * page has to draw *something*, and a page that says "the server refused" is
-     * [RemoteListing.state]'s job rather than this function's. The distinction is not
-     * lost: it is made where the message is chosen.
+     * **Throws** [WebDavException] if the server refused or could not be reached.
+     *
+     * That is a divergence from upstream, and it is the important one in this file.
+     * Upstream's `getSongs` returns an empty list for all three ways this can go
+     * wrong — unconfigured, refused, unreachable — and upstream gives `RemoteListing`
+     * the job of saying that a share which answers with an error must not read as an
+     * empty one. Upstream's own repository defeats that: the failure is swallowed, the
+     * listing arrives as a *success* of zero tracks, and the sentence for a wrong
+     * password comes out as "no audio files". A listener who has mistyped their
+     * password is sent to look for a folder that is not there.
+     *
+     * So the distinction is made where the data is, and the only thing that is not a
+     * failure is a share with nothing on it. An *unconfigured* share is still an empty
+     * list rather than a throw: there is nothing to have refused, and a library page
+     * closed by an error is worse than one that says it is not set up.
+     *
+     * The sentence is [WebDavFailure]'s — the same one the settings screen shows as
+     * somebody types — so the two places a share can be refused say the same thing.
      */
     suspend fun getSongs(): List<Song> {
         val url = AppSettings.webDavUrl.value
@@ -47,7 +60,7 @@ object WebDavRepository {
             baseUrl = url,
             username = AppSettings.webDavUsername.value,
             password = AppSettings.webDavPassword.value,
-        ).getOrNull() ?: return emptyList()
+        ).getOrElse { throw it }
         // One pass over the images, keyed by the folder they sit in, so a cover is
         // one lookup per track rather than a scan of every picture on the share.
         val artByDir = listing.images.groupBy { WebDavConfig.dirKeyOf(it.url) }
