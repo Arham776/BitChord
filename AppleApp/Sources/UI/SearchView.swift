@@ -139,14 +139,23 @@ struct SearchView: View {
             } else if !query.isEmpty && !suggestions.isEmpty && !attempted {
                 suggestionList
             } else if !query.isEmpty {
-                ScrollView {
-                    LazyVStack(spacing: 0) {
-                        if let top = topResult {
-                            TopResultSection(hit: top, scope: scope) { query in
-                                self.query = query
+                List {
+                    if let top = topResult {
+                        // Its own section, with the row chrome taken off, so the
+                        // card scrolls away with the results rather than sitting
+                        // above a second scroll view — two independent scrollers on
+                        // one screen is a thing people fight with.
+                        Section {
+                            TopResultSection(hit: top, scope: scope) { term in
+                                query = term
                             }
+                            .listRowInsets(EdgeInsets(top: 0, leading: 0, bottom: 8, trailing: 0))
+                            .listRowBackground(Color.clear)
+                            .listRowSeparator(.hidden)
                         }
-                        ForEach(Array(listHits.enumerated()), id: \.element.id) { _, hit in
+                    }
+                    ForEach(Array(listHits.enumerated()), id: \.element.id) { _, hit in
+                        Group {
                             if hit.isBrowse, let browseId = hit.browseId {
                                 NavigationLink(destination: DetailView(browseId: browseId, initialTitle: hit.title)) {
                                     browseRow(hit)
@@ -175,10 +184,10 @@ struct SearchView: View {
                                 )
                             }
                         }
+                        .listRowInsets(EdgeInsets(top: 2, leading: 28, bottom: 2, trailing: 28))
                     }
-                    .padding(.horizontal, 28)
-                    .padding(.vertical, 8)
                 }
+                .listStyle(.plain)
             } else {
                 history
             }

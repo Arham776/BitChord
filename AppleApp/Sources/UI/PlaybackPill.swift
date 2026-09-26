@@ -10,6 +10,7 @@ import BitChordShared
 struct PlaybackPill: View {
     @Environment(PlaybackController.self) private var controller
     @Environment(AppModel.self) private var appModel
+    @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
 
     var body: some View {
         #if os(macOS)
@@ -32,7 +33,7 @@ struct PlaybackPill: View {
         .padding(.vertical, 8)
         .background {
             RoundedRectangle(cornerRadius: 14, style: .continuous)
-                .fill(reduceBlur ? AnyShapeStyle(Color.primary.opacity(0.12)) : AnyShapeStyle(.ultraThinMaterial))
+                .fill(chromeFill)
         }
         .overlay(alignment: .bottom) { progressHairline }
         .clipShape(.rect(cornerRadius: 14, style: .continuous))
@@ -123,7 +124,7 @@ struct PlaybackPill: View {
         .padding(.vertical, 8)
         .background {
             RoundedRectangle(cornerRadius: 18, style: .continuous)
-                .fill(reduceBlur ? AnyShapeStyle(Color.primary.opacity(0.12)) : AnyShapeStyle(.ultraThinMaterial))
+                .fill(chromeFill)
         }
         .clipShape(.rect(cornerRadius: 18, style: .continuous))
         .shadow(color: .black.opacity(0.16), radius: 10, y: 4)
@@ -193,6 +194,22 @@ struct PlaybackPill: View {
 
     private var reduceBlur: Bool {
         PlatformSettings.shared.getBoolean(key: "reduce_dynamic_blur", default: false)
+    }
+
+    /// The pill's fill, honouring both the app's own preference and the system's.
+    ///
+    /// Two settings, and the difference matters: `reduce_dynamic_blur` is a
+    /// preference *this app* offers and someone can turn it off, while Reduce
+    /// Transparency is a system accessibility setting that applies to every
+    /// translucent surface on the device. Reading only the first — which is what
+    /// this did — left the pill as the one surface in the app that stayed
+    /// translucent for someone who had asked the system, everywhere, for it not to
+    /// be.
+    private var chromeFill: AnyShapeStyle {
+        if reduceTransparency || reduceBlur {
+            return AnyShapeStyle(Color.primary.opacity(0.12))
+        }
+        return AnyShapeStyle(.ultraThinMaterial)
     }
 
     /// Progress hairline hugging the iOS mini-player's bottom edge.

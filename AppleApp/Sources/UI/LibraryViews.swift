@@ -233,27 +233,25 @@ struct LibraryView: View {
                     buttonTitle: nil, action: nil
                 )
             } else {
-                ScrollView {
-                    LazyVStack(spacing: 2) {
-                        ForEach(Array(store.items.enumerated()), id: \.element.id) { index, track in
-                            SongRow(
-                                entry: QueueEntry(
-                                    id: track.path, title: track.title, artist: track.artist,
-                                    source: track.path, thumbnailUrl: nil, durationText: nil,
-                                    albumName: track.album.isEmpty ? nil : track.album,
-                                    artworkData: track.artwork, isLocal: true
-                                ),
-                                play: {
-                                    controller.play(store.items.map {
-                                        QueueEntry(id: $0.path, title: $0.title, artist: $0.artist, source: $0.path, thumbnailUrl: nil, durationText: nil, albumName: $0.album.isEmpty ? nil : $0.album, artworkData: $0.artwork, isLocal: true)
-                                    }, at: index)
-                                }
-                            )
-                        }
+                List {
+                    ForEach(Array(store.items.enumerated()), id: \.element.id) { index, track in
+                        SongRow(
+                            entry: QueueEntry(
+                                id: track.path, title: track.title, artist: track.artist,
+                                source: track.path, thumbnailUrl: nil, durationText: nil,
+                                albumName: track.album.isEmpty ? nil : track.album,
+                                artworkData: track.artwork, isLocal: true
+                            ),
+                            play: {
+                                controller.play(store.items.map {
+                                    QueueEntry(id: $0.path, title: $0.title, artist: $0.artist, source: $0.path, thumbnailUrl: nil, durationText: nil, albumName: $0.album.isEmpty ? nil : $0.album, artworkData: $0.artwork, isLocal: true)
+                                }, at: index)
+                            }
+                        )
+                        .listRowInsets(EdgeInsets(top: 2, leading: 24, bottom: 2, trailing: 24))
                     }
-                    .padding(.horizontal, 16)
-                    .padding(.vertical, 8)
                 }
+                .listStyle(.plain)
             }
         }
         .safeAreaInset(edge: .top, spacing: 0) { if showsPicker { picker } }
@@ -454,18 +452,16 @@ struct LibraryView: View {
                     buttonTitle: "Choose Folder"
                 ) { pickFolder() }
             } else {
-                ScrollView {
-                    LazyVStack(alignment: .leading, spacing: 4) {
-                        ForEach(local.artistGroups, id: \.name) { group in
-                            ArtistGroupRow(group: group)
-                        }
+                List {
+                    ForEach(local.artistGroups, id: \.name) { group in
+                        ArtistGroupRow(group: group)
+                            .listRowInsets(EdgeInsets(top: 4, leading: 24, bottom: 4, trailing: 24))
                     }
-                    .padding(.horizontal, 16)
-                    .padding(.vertical, 8)
                 }
-                .safeAreaInset(edge: .top, spacing: 0) { if showsPicker { picker } }
+                .listStyle(.plain)
             }
         }
+        .safeAreaInset(edge: .top, spacing: 0) { if showsPicker { picker } }
     }
 }
 
@@ -539,10 +535,9 @@ struct HistoryView: View {
                     buttonTitle: nil, action: nil
                 )
             } else {
-                ScrollView {
-                    LazyVStack(spacing: 2) {
-                        ForEach(Array(songs.enumerated()), id: \.element.id) { index, song in
-                            SongRow(
+                List {
+                    ForEach(Array(songs.enumerated()), id: \.element.id) { index, song in
+                        SongRow(
                                 entry: QueueEntry(
                                     id: song.videoId, title: song.title, artist: song.artist,
                                     source: "yt:\(song.videoId)", thumbnailUrl: song.thumbnailUrl,
@@ -560,11 +555,10 @@ struct HistoryView: View {
                                     }, at: index)
                                 }
                             )
-                        }
+                            .listRowInsets(EdgeInsets(top: 2, leading: 24, bottom: 2, trailing: 24))
                     }
-                    .padding(.horizontal, 16)
-                    .padding(.vertical, 8)
                 }
+                .listStyle(.plain)
             }
         }
         .task(id: auth.sessionEpoch) { await load() }
