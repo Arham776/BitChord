@@ -167,7 +167,7 @@ final class AppModel {
     enum Tab: Int, Hashable {
         case home, explore, library, search
         case libraryYouTube, librarySongs, libraryAlbums
-        case libraryArtists, libraryDownloads, libraryHistory
+        case libraryArtists, libraryDownloads, libraryHistory, libraryWebDav
     }
 }
 

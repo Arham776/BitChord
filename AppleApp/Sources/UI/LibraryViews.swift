@@ -126,11 +126,12 @@ struct LibraryView: View {
     var lockedSection: Section? = nil
 
     enum Section: String, CaseIterable, Identifiable {
-        case youtube, songs, albums, artists, downloads, history
+        case youtube, songs, albums, artists, downloads, history, webdav
         var id: String { rawValue }
         var label: String {
             switch self {
             case .youtube: "Recent"
+            case .webdav: "WebDAV"
             default: rawValue.capitalized
             }
         }
@@ -183,6 +184,9 @@ struct LibraryView: View {
         case .albums: albumGrid
         case .artists: artistList
         case .downloads: downloadsList
+        case .webdav:
+            WebDavLibraryView()
+                .safeAreaInset(edge: .top, spacing: 0) { if showsPicker { picker } }
         case .history:
             HistoryView()
                 .safeAreaInset(edge: .top, spacing: 0) { if showsPicker { picker } }
@@ -205,8 +209,20 @@ struct LibraryView: View {
         .padding(.top, 8)
     }
 
+    /// The sections the picker offers, which is not all of them.
+    ///
+    /// `Recent` needs a signed-in account and `WebDAV` needs a configured share, and
+    /// a picker that offers a section which then says "not set up" is a control that
+    /// exists to be disappointing. The way in for both is elsewhere — Account, and
+    /// Sources respectively — and the toast after saving a share says where it went.
     private var visibleSections: [Section] {
-        auth.signedIn ? Section.allCases : Section.allCases.filter { $0 != .youtube }
+        Section.allCases.filter { section in
+            switch section {
+            case .youtube: return auth.signedIn
+            case .webdav: return WebDavStore.shared.isConfigured
+            default: return true
+            }
+        }
     }
 
     private var youtubeLibrary: some View {

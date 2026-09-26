@@ -13,6 +13,7 @@ import com.music.bitchord.data.library.LocalMusicSort
 import com.music.bitchord.data.library.LocalViewType
 import com.music.bitchord.data.lyrics.LyricsSource
 import com.music.bitchord.data.lyrics.normalizePaxSenixApiKey
+import com.music.bitchord.data.remote.WebDavConfig
 
 /**
  * The stream ceiling for a connection, and — via [permits] — which sources that
@@ -89,6 +90,11 @@ object AppSettings {
 
     private const val KEY_LISTEN_SERVER = "listen_together_server"
     private const val KEY_LISTEN_NICKNAME = "listen_together_nickname"
+
+    // The same key names upstream uses, so a settings dump reads the same across ports.
+    private const val KEY_WEBDAV_URL = "webdav_url"
+    private const val KEY_WEBDAV_USERNAME = "webdav_username"
+    private const val KEY_WEBDAV_PASSWORD = "webdav_password"
 
     /**
      * The longest nickname stored.
@@ -708,6 +714,66 @@ object AppSettings {
     }
 
     /**
+     * The remote library this device reads over WebDAV.
+     *
+     * The address and the username are configuration and live in plain preferences,
+     * as upstream has them; the **password** is a credential and goes through
+     * [PlatformSettings.getSecret], which is the Keychain on Apple. That split is
+     * upstream's and it is the reason: upstream keeps the password in its encrypted
+     * `AuthStore` and mirrors it out into the flow, so it never appears in the
+     * preference file at all — and the file is what `exportPrefsJson` reads.
+     *
+     * [webDavUrl] is stored normalized ([WebDavConfig.normalizeUrl]) rather than as
+     * typed, so the address a listing dials is the address the settings screen shows.
+     * A trailing slash trimmed at use and not at save is how a share ends up with
+     * `//` between two of its own path segments, which some servers treat as a
+     * different folder.
+     */
+    private val _webDavUrl = MutableStateFlow(
+        WebDavConfig.normalizeUrl(settings.getString(KEY_WEBDAV_URL, "")),
+    )
+    val webDavUrl: StateFlow<String> = _webDavUrl.asStateFlow()
+
+    private val _webDavUsername = MutableStateFlow(settings.getString(KEY_WEBDAV_USERNAME, ""))
+    val webDavUsername: StateFlow<String> = _webDavUsername.asStateFlow()
+
+    private val _webDavPassword = MutableStateFlow(settings.getSecret(KEY_WEBDAV_PASSWORD).orEmpty())
+    val webDavPassword: StateFlow<String> = _webDavPassword.asStateFlow()
+
+    fun setWebDavUrl(value: String) {
+        val normalized = WebDavConfig.normalizeUrl(value)
+        _webDavUrl.value = normalized
+        settings.putString(KEY_WEBDAV_URL, normalized)
+    }
+
+    fun setWebDavUsername(value: String) {
+        val trimmed = value.trim()
+        _webDavUsername.value = trimmed
+        settings.putString(KEY_WEBDAV_USERNAME, trimmed)
+    }
+
+    /** Writes through to the Keychain; pass "" to forget. */
+    fun setWebDavPassword(value: String) {
+        _webDavPassword.value = value
+        settings.putSecret(KEY_WEBDAV_PASSWORD, value.ifEmpty { null })
+    }
+
+    /**
+     * Whether there is anything to dial.
+     *
+     * The library reads as empty when this is false rather than refusing to open, so
+     * the check belongs here and not in every caller.
+     */
+    fun isWebDavConfigured(): Boolean = WebDavConfig.isConfigured(_webDavUrl.value)
+
+    /** Forgets the share and its credential together, so neither is left half-set. */
+    fun clearWebDav() {
+        setWebDavUrl("")
+        setWebDavUsername("")
+        setWebDavPassword("")
+    }
+
+    /**
      * Keys that must never leave the device in a backup.
      *
      * `listen_together_server` and `listen_together_nickname` are absent, and that is
@@ -715,10 +781,17 @@ object AppSettings {
      * nothing on another machine, and the second is personal. Neither is in the
      * exported key list below for either reason — nor is the per-install id, which
      * would make two machines claim one identity.
+     *
+     * `webdav_password` is here for the reason every other entry is: it is a
+     * credential, and an import must not be able to write one. Upstream does not need
+     * the entry for its own password — the password never enters its preference file,
+     * so there is nothing to filter — but the entry is the portable statement of the
+     * same rule, and it is what stops an import from putting one there.
      */
     private val SECRET_KEYS = setOf(
         "discord_token", "lastfm_session", "lastfm_secret", "lastfm_api_key",
         "listenbrainz_token", "spotify_spdc_token", "paxsenix_api_key",
+        KEY_WEBDAV_PASSWORD,
     )
 
     fun exportPrefsJson(): String {
@@ -737,6 +810,10 @@ object AppSettings {
             "discord_use_details", "discord_advanced_mode", "discord_button_1_text",
             "discord_button_1_visible", "discord_button_2_text", "discord_button_2_visible",
             "discord_info_dismissed", "discord_name", "discord_avatar",
+            // The share's address and account, and not its password: moving a
+            // configuration to a new machine should not mean re-typing where the
+            // library is, and should certainly not mean handing over a credential.
+            KEY_WEBDAV_URL, KEY_WEBDAV_USERNAME,
         )
         val parts = keys.map { key ->
             val value = when (key) {
@@ -823,6 +900,11 @@ object AppSettings {
                 "discord_info_dismissed" -> setDiscordInfoDismissed(value.toBoolean())
                 "discord_name" -> setDiscordName(value)
                 "discord_avatar" -> setDiscordAvatar(value)
+                KEY_WEBDAV_URL -> setWebDavUrl(value)
+                KEY_WEBDAV_USERNAME -> setWebDavUsername(value)
+                // `KEY_WEBDAV_PASSWORD` is absent on purpose: [SECRET_KEYS] has already
+                // refused the chunk, and a `when` that listed it would be a lie about
+                // that. The password on a restored machine has to be typed again.
             }
         }
     }

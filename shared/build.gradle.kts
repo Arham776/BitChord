@@ -38,6 +38,11 @@ kotlin {
 
         commonTest.dependencies {
             implementation(kotlin("test"))
+            // For `runTest` only. Kotlin/Native's `kotlin.test` refuses a `suspend`
+            // test function outright, and a `@Test` that blocks the test thread
+            // instead is how a suspended read deadlocks in CI rather than in a
+            // screenshot.
+            implementation("org.jetbrains.kotlinx:kotlinx-coroutines-test:1.10.2")
         }
 
         // The Darwin Ktor engine only resolves for Apple targets, so it lives in

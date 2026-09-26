@@ -244,6 +244,20 @@ struct RootView: View {
                 } label: {
                     sidebarLabel("History", image: .bchClock)
                 }
+                // Only when there is a share. A sidebar row that leads to "not set up
+                // yet" is a row that exists to be disappointing, and Sources is where
+                // this is configured.
+                if WebDavStore.shared.isConfigured {
+                    Tab(value: AppModel.Tab.libraryWebDav) {
+                        LibraryView(lockedSection: .webdav).modifier(MacPlaybackChrome())
+                    } label: {
+                        // An SF Symbol, not one of the `bch` images the other rows use.
+                        // Upstream puts Material's `Cloud` on its WebDAV row and has no
+                        // glyph to copy, and the Sources screen already draws this
+                        // feature's row with the same symbol — so the two agree.
+                        Label("WebDAV", systemImage: "cloud")
+                    }
+                }
             }
             Tab(value: AppModel.Tab.search, role: .search) {
                 SearchView().modifier(MacPlaybackChrome())

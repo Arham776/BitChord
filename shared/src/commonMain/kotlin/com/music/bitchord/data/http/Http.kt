@@ -114,6 +114,65 @@ expect object Http {
     ): RawHttpBytes
 
     /**
+     * One request with an arbitrary method, returning status and body.
+     *
+     * For the methods a protocol needs that are not GET or POST, and which therefore
+     * have no business each growing their own seam here: WebDAV's `PROPFIND`,
+     * `MKCOL` and `PUT`, and the party socket's handshake. Every one of them wants
+     * exactly what [getRaw] already offers — the status, and the body whether or not
+     * the status was a success — and the difference is one word.
+     *
+     * Non-2xx returns rather than throws, for the same reason as [getRaw]: a WebDAV
+     * `412` and a `405` are *answers*, and reading them is the whole point.
+     */
+    suspend fun requestRaw(
+        url: String,
+        method: String,
+        body: String? = null,
+        headers: Map<String, String> = emptyMap(),
+        timeoutMillis: Long = 30_000,
+    ): RawHttpText
+
+    /**
+     * The same, with a byte body, for a `PUT` of audio.
+     *
+     * Separate from [requestRaw] rather than a string overload because a hundred
+     * megabyte FLAC has no encoding a string is the right answer for, and because the
+     * caller's decision about how to stream it is not something this seam should
+     * hide behind a `String`.
+     */
+    suspend fun requestBytes(
+        url: String,
+        method: String,
+        body: ByteArray,
+        contentType: String,
+        headers: Map<String, String> = emptyMap(),
+        timeoutMillis: Long = 120_000,
+    ): RawHttpBytes
+
+    /**
+     * A GET that returns raw bytes and the status, reading **at most** [maxBytes] of
+     * the body.
+     *
+     * [getBytes] cannot answer a ranged read, because the whole point of a ranged read
+     * is the difference between a `206` and a `200` — the first is a server that
+     * honoured the range, the second is one that ignored it and sent the entire file.
+     * A caller finding a cover has to be able to tell those apart, and it has to be
+     * able to do so *without* receiving the entire file to find out: a cover is a few
+     * kilobytes at the front of a hundred-megabyte FLAC, so the bound is what keeps
+     * "this server does not do ranges" from costing a whole download per track.
+     *
+     * Non-2xx returns rather than throws, for the same reason as [getRaw]: a `404` on
+     * a cover is an answer.
+     */
+    suspend fun getBytesRaw(
+        url: String,
+        headers: Map<String, String> = emptyMap(),
+        maxBytes: Int = Int.MAX_VALUE,
+        timeoutMillis: Long = 30_000,
+    ): RawHttpBytes
+
+    /**
      * Write cookies for [originUrl] into the jar so a subsequent [getRaw]
      * actually sends them. For a provider that handed us a cookie to reuse on
      * a later request to a host we already know — never for the account

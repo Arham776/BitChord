@@ -9,6 +9,7 @@ import io.ktor.client.request.get
 import io.ktor.client.request.header
 import io.ktor.client.request.parameter
 import io.ktor.client.request.post
+import io.ktor.client.request.request
 import io.ktor.client.request.setBody
 import io.ktor.client.statement.HttpResponse
 import io.ktor.client.statement.bodyAsBytes
@@ -16,6 +17,7 @@ import io.ktor.client.statement.bodyAsChannel
 import io.ktor.client.statement.bodyAsText
 import com.music.bitchord.data.innertube.PlayerClient
 import io.ktor.http.ContentType
+import io.ktor.http.HttpMethod
 import io.ktor.http.Parameters
 import io.ktor.http.contentType
 import io.ktor.utils.io.cancel
@@ -206,6 +208,94 @@ actual object Http {
             setBody(body)
         }
         val bytes = runCatching { response.bodyAsBytes() }.getOrNull()
+        return RawHttpBytes(status = response.status.value, body = bytes)
+    }
+
+    actual suspend fun requestRaw(
+        url: String,
+        method: String,
+        body: String?,
+        headers: Map<String, String>,
+        timeoutMillis: Long,
+    ): RawHttpText {
+        val response = client.request(url) {
+            // Set on the builder rather than passed to `request`, because Ktor 3
+            // has no `request(url, method)` overload — and a WebDAV method is a
+            // perfectly ordinary token, so naming it is better than reaching for
+            // the one verb Ktor does have an overload for. Qualified because this
+            // function's own parameter is called `method` too, and Kotlin binds the
+            // nearer one.
+            this.method = HttpMethod(method)
+            timeout {
+                requestTimeoutMillis = timeoutMillis
+                connectTimeoutMillis = 20_000
+            }
+            headers.forEach { (key, value) -> header(key, value) }
+            if (body != null) {
+                header("Content-Type", "application/xml; charset=utf-8")
+                setBody(body)
+            }
+        }
+        val text = runCatching { response.bodyAsText() }.getOrNull()
+        return RawHttpText(status = response.status.value, body = text)
+    }
+
+    actual suspend fun requestBytes(
+        url: String,
+        method: String,
+        body: ByteArray,
+        contentType: String,
+        headers: Map<String, String>,
+        timeoutMillis: Long,
+    ): RawHttpBytes {
+        val response = client.request(url) {
+            this.method = HttpMethod(method)
+            timeout {
+                // A hundred-megabyte FLAC on a slow connection is minutes, not
+                // seconds. The connect bound still applies, so a dead server is
+                // refused promptly rather than after the whole timeout.
+                requestTimeoutMillis = timeoutMillis
+                connectTimeoutMillis = 20_000
+            }
+            headers.forEach { (key, value) ->
+                if (!key.equals("Content-Type", ignoreCase = true)) header(key, value)
+            }
+            header("Content-Type", contentType)
+            setBody(body)
+        }
+        val bytes = runCatching { response.bodyAsBytes() }.getOrNull()
+        return RawHttpBytes(status = response.status.value, body = bytes)
+    }
+
+    actual suspend fun getBytesRaw(
+        url: String,
+        headers: Map<String, String>,
+        maxBytes: Int,
+        timeoutMillis: Long,
+    ): RawHttpBytes {
+        val response = client.get(url) {
+            timeout {
+                requestTimeoutMillis = timeoutMillis
+                connectTimeoutMillis = 20_000
+            }
+            headers.forEach { (key, value) -> header(key, value) }
+        }
+        val bytes = if (maxBytes >= Int.MAX_VALUE) {
+            runCatching { response.bodyAsBytes() }.getOrNull()
+        } else {
+            // Bounded, then the connection is dropped. The alternative — reading a
+            // hundred-megabyte body to keep its first eight kilobytes — is what makes
+            // "the server ignored my range" expensive exactly when it is already
+            // inconvenient. Same shape as `readProbeBytes`, for the same reason.
+            try {
+                val channel = response.bodyAsChannel()
+                val taken = channel.readRemaining(maxBytes.toLong()).readByteArray()
+                channel.cancel(null)
+                taken
+            } catch (_: Exception) {
+                null
+            }
+        }
         return RawHttpBytes(status = response.status.value, body = bytes)
     }
 

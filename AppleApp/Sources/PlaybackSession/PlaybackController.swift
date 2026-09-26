@@ -17,6 +17,15 @@ struct QueueEntry: Identifiable, Hashable, Sendable {
     var durationText: String?
     var albumName: String?
     var artworkData: Data?
+    /// The audio is already on a disk this device can reach, so it is not something
+    /// to download and not a catalogue row to rate.
+    ///
+    /// True for a file in the device's own library *and* for a file on a remote
+    /// library the listener configured — a share on their own server is already saved
+    /// as far as they are concerned, and offering to download it would be offering to
+    /// copy a file they already have. It is not, and must not be read as, "a path on
+    /// this device": a remote row's [source] is an `https` address, so the places that
+    /// treat `source` as a filesystem path ask again before they open it.
     var isLocal: Bool
     var fromAutoplay: Bool = false
     var artistId: String? = nil
@@ -879,8 +888,18 @@ final class PlaybackController {
             throw InnertubeStreamResolver.StreamError(message: "JioSaavn had no stream")
         }
         guard entry.source.hasPrefix("yt:") else {
+            // A file on a remote library plays from its own address, and that address
+            // needs the share's credential — the same header the cover fetch and the
+            // listing used, asked of the one rule that decides which requests may carry
+            // it. Empty for a local path and for a JioSaavn URL, which is why this is
+            // safe on the path every non-YouTube row takes.
             return ResolveOutcome(
-                source: ResolvedSource(source: entry.source, headers: [:], kbps: 0, origin: .local),
+                source: ResolvedSource(
+                    source: entry.source,
+                    headers: WebDavBridge.shared.playbackHeaders(fileUrl: entry.source),
+                    kbps: 0,
+                    origin: .local
+                ),
                 leftover: nil
             )
         }
@@ -1373,7 +1392,12 @@ final class PlaybackController {
         // a track change would show one song's words over another's music, which is
         // worse than having no translation at all.
         lyricsTranslator.reset()
-        let localPath = entry.isLocal && !entry.source.isEmpty ? entry.source : nil
+        // A remote library's file is "local" in the sense that it needs no download,
+        // but its `source` is an `https` address and cannot be opened for tags. Asking
+        // again here is what keeps a remote row from trying to read a URL as a file.
+        let localPath = entry.isLocal && !entry.source.isEmpty && !entry.source.hasPrefix("http")
+            ? entry.source
+            : nil
         let allowNetwork = PlatformSettings.shared.getBoolean(key: "synced_lyrics", default: true)
         if !allowNetwork, localPath == nil {
             lyricsLoading = false

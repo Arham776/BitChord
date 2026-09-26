@@ -12,12 +12,27 @@ struct ArtworkView: View {
     var url: String?
     var data: Data?
     var side: CGFloat?
+    /// The id of a track in a remote file library, when the picture may be inside
+    /// its file rather than beside it.
+    ///
+    /// Nil for everything else and no task runs, so the common case — a YouTube row —
+    /// costs one optional and a comparison. Carried here rather than resolved by each
+    /// caller because this is the one view every surface draws a track through: the
+    /// library page, the queue, the mini player and the player itself, which is
+    /// upstream's list of `rememberRemoteArtworkUrl` callers as well.
+    var remoteId: String?
+    @State private var embedded: Data?
 
     init(entry: QueueEntry?, side: CGFloat? = nil) {
-        self.init(url: entry?.thumbnailUrl, data: entry?.artworkData, side: side)
+        self.init(
+            url: entry?.thumbnailUrl,
+            data: entry?.artworkData,
+            side: side,
+            remoteId: entry.flatMap { EmbeddedArtwork.trackId(of: $0) }
+        )
     }
 
-    init(url: String?, data: Data?, side: CGFloat? = nil) {
+    init(url: String?, data: Data?, side: CGFloat? = nil, remoteId: String? = nil) {
         // Ask for the size the screen will actually draw at, on the screen's
         // actual scale. The old fixed `× 2` under-sampled every Retina row — a
         // 160pt card on a @3x display needs 480px and was being sent 320.
@@ -26,39 +41,12 @@ struct ArtworkView: View {
         self.url = url.flatMap { SharedArtwork.sized($0, Int((points * scale).rounded())) }
         self.data = data
         self.side = side
+        self.remoteId = remoteId
     }
 
     var body: some View {
         Group {
-#if os(iOS)
-            if let data, let image = UIImage(data: data) {
-                Image(uiImage: image)
-                    .resizable()
-                    .scaledToFill()
-            } else if let url, let cached = ArtworkCache.shared.get(url) {
-                Image(uiImage: cached)
-                    .resizable()
-                    .scaledToFill()
-            } else if let url {
-                RemoteArtwork(url: url)
-            } else {
-                placeholder
-            }
-#else
-            if let data, let image = NSImage(data: data) {
-                Image(nsImage: image)
-                    .resizable()
-                    .scaledToFill()
-            } else if let url, let cached = ArtworkCache.shared.get(url) {
-                Image(nsImage: cached)
-                    .resizable()
-                    .scaledToFill()
-            } else if let url {
-                RemoteArtwork(url: url)
-            } else {
-                placeholder
-            }
-#endif
+            artwork
         }
         .frame(width: side, height: side)
         .aspectRatio(1, contentMode: .fit)
@@ -69,6 +57,54 @@ struct ArtworkView: View {
         // which showed up as a one-frame flicker on every track change. The
         // identity that matters is the row's, and the parent already has it.
         .accessibilityHidden(true)
+        // Keyed on the track, so a row that scrolls round and comes back as a
+        // different track re-resolves instead of showing the previous one's cover.
+        .task(id: remoteId) {
+            guard let remoteId else { return }
+            embedded = await EmbeddedArtwork.embeddedCoverData(id: remoteId)
+        }
+    }
+
+    @ViewBuilder
+    private var artwork: some View {
+        // Bytes already in hand win: a downloaded track's own artwork, and a remote
+        // track's extracted cover once it has arrived.
+        if let bytes = data ?? embedded, let image = Self.image(from: bytes) {
+            scaled(image)
+        } else if let url, let cached = ArtworkCache.shared.get(url) {
+            scaled(cached)
+        } else if let url {
+            RemoteArtwork(url: url)
+        } else {
+            placeholder
+        }
+    }
+
+    /// One drawing of a decoded image, for both platforms.
+    ///
+    /// A function rather than an `#if` between `Image(…)` and `.resizable()`: the
+    /// compiler cannot see a base for the chain across a conditional compilation
+    /// boundary, and a view builder that returns `some View` from two branches is the
+    /// shape it wants anyway.
+    @ViewBuilder
+    private func scaled(_ image: PlatformImage) -> some View {
+        #if os(iOS)
+        Image(uiImage: image)
+            .resizable()
+            .scaledToFill()
+        #else
+        Image(nsImage: image)
+            .resizable()
+            .scaledToFill()
+        #endif
+    }
+
+    private static func image(from data: Data) -> PlatformImage? {
+        #if os(iOS)
+        return UIImage(data: data)
+        #else
+        return NSImage(data: data)
+        #endif
     }
 
     private var placeholder: some View {
@@ -215,7 +251,17 @@ final class ArtworkCache: @unchecked Sendable {
         if let onDisk { return onDisk }
 
         guard let endpoint = URL(string: url) else { return nil }
-        guard let (data, _) = try? await URLSession.shared.data(from: endpoint),
+        // A remote library's covers are behind the share's credential, and
+        // `AsyncImage`/`URLSession` have nowhere to put one — so the header is asked
+        // of the shared rule, which answers with an empty dictionary for anything that
+        // is not on the configured share. Every YouTube and local URL goes through
+        // this unchanged, and the rule itself (host, not port) lives in Kotlin
+        // because it is the same rule the cover fetch and the stream fetch obey.
+        var request = URLRequest(url: endpoint)
+        for (field, value) in WebDavBridge.shared.playbackHeaders(fileUrl: url) {
+            request.setValue(value, forHTTPHeaderField: field)
+        }
+        guard let (data, _) = try? await URLSession.shared.data(for: request),
               let image = PlatformImage(data: data) else { return nil }
         memory.setObject(image, forKey: url as NSString, cost: data.count)
         let file = diskURL(url)

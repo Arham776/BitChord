@@ -28,6 +28,11 @@ struct SourcesView: View {
     @State private var editing: ConfigDocument?
     /// The confirm JioSaavn opens before it is opted into — see `onConfirmJioSaavn`.
     @State private var confirmingJioSaavn = false
+    /// The WebDAV editor. A sheet on this screen rather than inside Settings, which is
+    /// where upstream raises it: this is the screen that says where audio is allowed
+    /// to come from, and a personal library is exactly that.
+    @State private var editingWebDav = false
+    @State private var webDavStore = WebDavStore.shared
     /// iOS only: `EditMode` does not exist on macOS, where the list is reordered
     /// by click-to-move instead.
     #if os(iOS)
@@ -52,6 +57,14 @@ struct SourcesView: View {
                 Text("Sources, tried in this order")
             } footer: {
                 orderFooter
+            }
+
+            Section {
+                webDavRow
+            } header: {
+                Text("Your libraries")
+            } footer: {
+                Text("A library you host yourself, played from the server rather than from a catalogue. It takes no part in the ranking above — it holds your own files, so it is not standing in for anything.")
             }
         }
         #if os(iOS)
@@ -78,6 +91,9 @@ struct SourcesView: View {
         .refreshable { await reload() }
         .sheet(item: $editing) { config in
             SourceEditorSheet(config: config) { await reload() }
+        }
+        .sheet(isPresented: $editingWebDav) {
+            WebDavSettingsSheet()
         }
         .confirmationDialog(
             jioSaavnWarning,
@@ -123,9 +139,54 @@ struct SourcesView: View {
         .onMove(perform: moveAddons)
     }
 
+    /// The WebDAV share: its address, whether it answers, and the three things that
+    /// can be done about it.
+    ///
+    /// One row rather than a section of controls, because there is exactly one share
+    /// and the row answers the only question that has an answer: *is it set up, and
+    /// where*. Everything else about it belongs in the editor.
+    private var webDavRow: some View {
+        HStack(spacing: 10) {
+            Image(systemName: "cloud")
+                .font(.title3)
+                .foregroundStyle(.primary)
+                .frame(width: 26)
+
+            VStack(alignment: .leading, spacing: 2) {
+                Text("WebDAV")
+                    .font(.body)
+                Text(webDavStore.subtitle)
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(2)
+            }
+
+            Spacer(minLength: 8)
+
+            if webDavStore.isConfigured {
+                Button("Edit") { editingWebDav = true }
+                    .buttonStyle(.bordered)
+            } else {
+                Button("Set Up") { editingWebDav = true }
+                    .buttonStyle(.borderedProminent)
+            }
+        }
+        .padding(.vertical, 5)
+        .frame(minHeight: 44)
+        .contentShape(Rectangle())
+        .onTapGesture { editingWebDav = true }
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel(accessibilityLabel)
+    }
+
+    private var accessibilityLabel: String {
+        var parts = ["WebDAV"]
+        parts.append(webDavStore.isConfigured ? "Set up at \(webDavStore.url)" : "Not set up")
+        return parts.joined(separator: ", ")
+    }
+
     @ViewBuilder
-    private var orderFooter: some View {
-        VStack(alignment: .leading, spacing: 8) {
+    private var orderFooter: some View {        VStack(alignment: .leading, spacing: 8) {
             Text("If a source does not have a track or cannot be reached, BitChord tries the next one. Sources above YouTube can replace its recording when they return a better version.")
             if cappedByQuality {
                 Text("This connection is set below High quality, so streams are transcoded to fit that limit. Downloads are unaffected.")

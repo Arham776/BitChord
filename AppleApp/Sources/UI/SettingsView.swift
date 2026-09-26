@@ -199,7 +199,9 @@ struct SettingsView: View {
                         "dynamic blur", "contrast"]
             case .storage:
                 return ["storage", "cache", "clear cache", "local library",
-                        "local music", "library", "folder", "scan", "space", "disk"]
+                        "local music", "library", "folder", "scan", "space", "disk",
+                        "webdav", "remote library", "nextcloud", "owncloud", "nas",
+                        "self hosted", "share", "server"]
             case .yourData:
                 return ["backup", "export", "import", "reset", "privacy", "data",
                         "pinned playlists", "delete", "erase"]
