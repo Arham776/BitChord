@@ -77,7 +77,10 @@ struct AccountProfileSheet: View {
             }
         }
         #if os(iOS)
+        // See `LyricsOffsetSheet`: upstream's player sheets are bottom drawers
+        // with a grab handle, and the platform's own indicator is the handle.
         .presentationDetents([.medium, .large])
+        .presentationDragIndicator(.visible)
         #endif
     }
 

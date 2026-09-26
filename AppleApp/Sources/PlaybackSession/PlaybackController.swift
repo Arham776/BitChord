@@ -219,6 +219,19 @@ final class PlaybackController {
     var displayedLyrics: [LyricLineDto] {
         lyricsTranslator.translatedLines ?? lyrics
     }
+
+    /// Whether a lyric was looked for and none was found, as opposed to one still
+    /// being looked for.
+    ///
+    /// The deck's current-lyric strip shows something in both cases, and they are
+    /// different messages: "no lyrics for this track" is a fact about the track
+    /// and "looking" is a fact about the moment. Telling them apart needs a flag
+    /// rather than `lyrics.isEmpty`, which is true during the search too.
+    var lyricsUnavailable: Bool {
+        attemptedLyrics && !lyricsLoading && lyrics.isEmpty
+    }
+
+    private(set) var attemptedLyrics = false
     private(set) var canvasURL: URL?
     private(set) var canvasFallbackURL: URL?
     private(set) var nerd: NerdStatsRec?
@@ -1503,6 +1516,10 @@ final class PlaybackController {
     private func fetchLyrics(for entry: QueueEntry) {
         lyrics = []
         lyricsSourceLabel = nil
+        // Cleared rather than set: a new track has not been looked up yet, and a
+        // stale "there are none" from the previous one would say so about this
+        // one before anyone had asked.
+        attemptedLyrics = false
         // A translation belongs to the lyric it was made from. Carrying it across
         // a track change would show one song's words over another's music, which is
         // worse than having no translation at all.
@@ -1515,7 +1532,11 @@ final class PlaybackController {
             : nil
         let allowNetwork = PlatformSettings.shared.getBoolean(key: "synced_lyrics", default: true)
         if !allowNetwork, localPath == nil {
+            // Not a search that found nothing — a search that was never going to
+            // be made, because the listener has lyrics off. "Unavailable" would
+            // be a lie; the strip says nothing was looked for.
             lyricsLoading = false
+            attemptedLyrics = true
             return
         }
         lyricsLoading = true
@@ -1533,6 +1554,9 @@ final class PlaybackController {
                     self.lyrics = lines
                     self.lyricsSourceLabel = label.isEmpty ? nil : label
                     self.lyricsLoading = false
+                    // The search finished either way, which is what the deck's
+                    // strip reads to tell "none" apart from "looking".
+                    self.attemptedLyrics = true
                 }
             }
         )

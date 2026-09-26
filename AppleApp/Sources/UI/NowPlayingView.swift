@@ -433,6 +433,12 @@ struct NowPlayingView: View {
     private var deck: some View {
         VStack(spacing: 14) {
             creditsRow
+            // Upstream's deck is "lyric strip, scrubber, transport, volume,
+            // toggles", and the strip is the first item: one line of the lyric
+            // being sung right now, or the line saying why there is not one. It
+            // stays on the player in every pane, so the words are there without
+            // opening the lyrics at all.
+            currentLyricStrip
             positionControls
                 .padding(.horizontal, 32)
             playerTransport
@@ -452,6 +458,64 @@ struct NowPlayingView: View {
             .ignoresSafeArea(edges: .bottom)
             .allowsHitTesting(false)
         )
+    }
+
+    /// One line of the lyric being sung now — or why there is not one.
+    ///
+    /// A button, because tapping it opens the lyrics. That is the whole
+    /// interaction: the strip is a preview of a pane rather than a display of its
+    /// own, and a line of text that looks like the lyrics but cannot be reached
+    /// by tapping it is the one part of the player a listener would try and fail.
+    private var currentLyricStrip: some View {
+        Button {
+            Haptics.play(.expand)
+            pane = pane == .lyrics ? .main : .lyrics
+        } label: {
+            Group {
+                if let line = currentLyric {
+                    Text(line)
+                        .foregroundStyle(.white.opacity(0.92))
+                } else if controller.lyricsLoading {
+                    Text("Looking for lyrics…")
+                        .foregroundStyle(.white.opacity(0.5))
+                } else if controller.lyricsUnavailable {
+                    Text("No lyrics for this track")
+                        .foregroundStyle(.white.opacity(0.5))
+                } else {
+                    // Nothing has been looked for yet — a track whose lyrics are
+                    // off, or a player with nothing loaded. Saying so is better
+                    // than an empty gap where the words would be.
+                    Text(controller.current == nil ? "" : "Lyrics off")
+                        .foregroundStyle(.white.opacity(0.4))
+                }
+            }
+            .font(.subheadline.weight(.medium))
+            .lineLimit(1)
+            .truncationMode(.tail)
+            .frame(maxWidth: .infinity, alignment: .center)
+            .shadow(color: .black.opacity(0.45), radius: 5, y: 1)
+            .padding(.horizontal, 24)
+            .frame(height: 20)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .disabled(currentLyric == nil)
+        .accessibilityLabel(
+            currentLyric.map { "Now singing: \($0)" }
+                ?? (controller.lyricsLoading ? "Looking for lyrics" : "No lyrics")
+        )
+        .accessibilityHint("Opens the lyrics")
+    }
+
+    /// The line at the playhead, from the same set the lyrics pane shows and on
+    /// the same adjusted clock — the offset applies to both, since they are
+    /// showing the same thing in two sizes.
+    private var currentLyric: String? {
+        let lines = controller.displayedLyrics
+        guard !lines.isEmpty else { return nil }
+        let ms = max(0, Int64(controller.position * 1000) - Int64(lyricsOffsetMs))
+        guard let index = lines.lastIndex(where: { $0.timeMs <= ms }) else { return nil }
+        return lines[index].text
     }
 
     /// Title and artist, with the like and the overflow menu beside them.

@@ -104,7 +104,14 @@ struct LyricsOffsetSheet: View {
             }
         }
         #if os(iOS)
+        // Upstream puts its player sheets up as a bottom drawer: dark over a
+        // scrim, a grab handle, a title, drag down to put it away. The handle
+        // and the drag are what `.presentationDetents` and
+        // `.presentationDragIndicator` are *for* — building a handle by hand
+        // would be a second, worse implementation of a control the platform
+        // already has, and one that would not animate with the sheet.
         .presentationDetents([.height(340)])
+        .presentationDragIndicator(.visible)
         #endif
     }
 
