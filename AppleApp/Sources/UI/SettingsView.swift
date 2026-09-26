@@ -56,6 +56,9 @@ struct SettingsView: View {
     @State private var discordPresented = false
     @State private var songCacheNote: String?
     @State private var imageCacheNote: String?
+    /// The settings search box. Empty means "no filter", not "nothing" — clearing
+    /// it must bring the whole screen back.
+    @State private var search = ""
 
     private var metered: Bool { NetworkQuality.shared.metered }
 
@@ -63,6 +66,8 @@ struct SettingsView: View {
         NavigationStack {
             settingsForm
                 .navigationTitle("Settings")
+                .searchable(text: $search, prompt: "Search settings")
+                .searchSuggestions { searchSuggestions }
                 #if os(iOS)
                 .toolbar {
                     ToolbarItem(placement: .confirmationAction) {
@@ -138,17 +143,151 @@ struct SettingsView: View {
         }
     }
 
+    /// The sections of this screen, in order, with what a listener might type to
+    /// find them.
+    ///
+    /// The terms live here rather than in the rows they describe, for the same
+    /// reason the section titles do: a search index kept next to the setting it
+    /// describes cannot drift from it, and one kept in a table elsewhere does.
+    enum SettingsSection: String, CaseIterable, Identifiable {
+        case account, audioQuality, downloads, playback
+        case appearance, storage, yourData, miscellaneous, about
+
+        var id: String { rawValue }
+
+        var title: String {
+            switch self {
+            case .account: return "Account & Integrations"
+            case .audioQuality: return "Audio Quality"
+            case .downloads: return "Downloads"
+            case .playback: return "Playback"
+            case .appearance: return "Appearance"
+            case .storage: return "Storage"
+            case .yourData: return "Your Data"
+            case .miscellaneous: return "Miscellaneous"
+            case .about: return "About"
+            }
+        }
+
+        /// What is *in* the section, in the words a listener would use.
+        ///
+        /// The section titles are things like "Playback" and "Storage", which
+        /// nobody types when they mean "crossfade". Without these the search box
+        /// only finds the nine words already on screen.
+        var terms: [String] {
+            switch self {
+            case .account:
+                return ["sign in", "login", "google", "discord", "rich presence",
+                        "scrobbling", "last.fm", "lastfm", "listenbrainz", "spotify",
+                        "canvas", "paxsenix", "api key", "account", "profile"]
+            case .audioQuality:
+                return ["quality", "lossless", "flac", "bitrate", "bitrate cap",
+                        "wifi", "wi-fi", "cellular", "mobile data", "metered",
+                        "transcode", "streaming quality"]
+            case .downloads:
+                return ["download", "downloaded", "offline", "wifi only",
+                        "over cellular", "save", "storage location", "cache"]
+            case .playback:
+                return ["crossfade", "gapless", "automix", "autoplay", "skip silence",
+                        "playback speed", "speed", "spatial audio", "fade", "sounds",
+                        "equalizer", "eq", "volume", "sleep timer", "queue", "repeat",
+                        "shuffle", "scrobble"]
+            case .appearance:
+                return ["theme", "dark mode", "light mode", "appearance", "colour",
+                        "color", "accent", "transparency", "reduce motion",
+                        "reduce transparency", "animation", "full bleed", "artwork",
+                        "dynamic blur", "contrast"]
+            case .storage:
+                return ["storage", "cache", "clear cache", "local library",
+                        "local music", "library", "folder", "scan", "space", "disk"]
+            case .yourData:
+                return ["backup", "export", "import", "reset", "privacy", "data",
+                        "pinned playlists", "delete", "erase"]
+            case .miscellaneous:
+                return ["language", "lyrics", "sources", "video", "lyric video",
+                        "swipe", "suggestions", "volume bar", "lyrics source",
+                        "spotify canvas", "jiosaavn", "background", "stop when backgrounded"]
+            case .about:
+                return ["about", "version", "credits", "licence", "license",
+                        "acknowledgements", "privacy policy", "github"]
+            }
+        }
+    }
+
+    private func shows(_ section: SettingsSection) -> Bool {
+        SettingsSearchBridge.shared.matches(
+            query: search,
+            title: section.title,
+            termsCsv: section.terms.joined(separator: "\u{1F}")
+        )
+    }
+
+    private var visibleSections: [SettingsSection] {
+        SettingsSection.allCases.filter(shows)
+    }
+
+    /// A handful of whole sections to jump to, offered under the field.
+    ///
+    /// Apple's suggestion list, used for the thing a *section* can be jumped to.
+    /// It narrows to the strongest few matches rather than every one, because a
+    /// suggestion list that lists everything is just a shorter form.
+    @ViewBuilder
+    private var searchSuggestions: some View {
+        if !search.isEmpty {
+            ForEach(visibleSections.prefix(4)) { section in
+                NavigationLink {
+                    sectionContents(section)
+                        .navigationTitle(section.title)
+                } label: {
+                    Text(section.title)
+                }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func sectionContents(_ section: SettingsSection) -> some View {
+        switch section {
+        case .account: accountSection
+        case .audioQuality: audioQualitySection
+        case .downloads: downloadsSection
+        case .playback: playbackSection
+        case .appearance: appearanceSection
+        case .storage: storageSection
+        case .yourData: yourDataSection
+        case .miscellaneous: miscellaneousSection
+        case .about: aboutSection
+        }
+    }
+
     private var settingsForm: some View {
         Form {
-            accountSection
-            audioQualitySection
-            downloadsSection
-            playbackSection
-            appearanceSection
-            storageSection
-            yourDataSection
-            miscellaneousSection
-            aboutSection
+            if shows(.account) { accountSection }
+            if shows(.audioQuality) { audioQualitySection }
+            if shows(.downloads) { downloadsSection }
+            if shows(.playback) { playbackSection }
+            if shows(.appearance) { appearanceSection }
+            if shows(.storage) { storageSection }
+            if shows(.yourData) { yourDataSection }
+            if shows(.miscellaneous) { miscellaneousSection }
+            if shows(.about) { aboutSection }
+            if search.isEmpty {
+                // Nothing.
+            } else if visibleSections.isEmpty {
+                // Not a `SettingsLine`: there is no setting here, so a row shaped
+                // like one — with a glyph for a thing that does not exist — is the
+                // wrong kind of empty.
+                Section {
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("No setting matches \u{201C}\(search)\u{201D}")
+                            .font(.body)
+                        Text("Try a shorter word, or the name of the section it is in.")
+                            .font(.subheadline)
+                            .foregroundStyle(.secondary)
+                    }
+                    .padding(.vertical, 4)
+                }
+            }
         }
         .formStyle(.grouped)
     }
