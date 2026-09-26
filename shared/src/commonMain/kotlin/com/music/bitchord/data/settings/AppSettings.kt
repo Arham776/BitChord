@@ -66,12 +66,37 @@ enum class DownloadQuality(val maxKbps: Int, val keepsLossless: Boolean, val lab
 }
 
 /**
+ * The signed-in account, as far as the settings tier needs to describe it.
+ *
+ * Only what one feature asked for, which is the point: a party needs a name to call
+ * somebody and a face to put beside it, and holding the rest of an account in a
+ * process-wide cache to serve that would be more account in memory than the app
+ * needs to be holding.
+ */
+data class PartyAccount(
+    val name: String,
+    val email: String,
+    val avatarUrl: String?,
+)
+
+/**
  * Port of upstream `data/settings/AppSettings.kt`. Keys match Android so a
  * settings dump is readable across ports. Backed by [PlatformSettings].
  */
 object AppSettings {
 
     private val settings = PlatformSettings
+
+    private const val KEY_LISTEN_SERVER = "listen_together_server"
+    private const val KEY_LISTEN_NICKNAME = "listen_together_nickname"
+
+    /**
+     * The longest nickname stored.
+     *
+     * Bounded on the way in rather than on the way out, because the name is sent to
+     * every other device in the party and rendered in a list row on each of them.
+     */
+    private const val MAX_NICKNAME_LENGTH = 48
 
     // ---- Playback ----------------------------------------------------------
     private val _crossfadeSeconds = MutableStateFlow(settings.getInt("crossfade_seconds", 0))
@@ -632,7 +657,65 @@ object AppSettings {
         settings.putBoolean("replay_genres", value)
     }
 
-    /** Keys that must never leave the device in a backup. */
+    /**
+     * The account this device is signed in as, as far as Listen Together cares.
+     *
+     * Cached here rather than read from the network on demand because the signed-in
+     * name is wanted the moment somebody taps Join, and a party is a LAN-scale thing
+     * where a round trip to work out what to call somebody is a visible stall. It is
+     * also the only account detail the feature has any use for.
+     *
+     * A cache rather than a source of truth: null means "not known", which includes
+     * signed out. The identity it feeds falls back to a local name when it is null, so
+     * nothing here is load-bearing.
+     */
+    private val _partyAccount = MutableStateFlow<PartyAccount?>(null)
+    val partyAccount: StateFlow<PartyAccount?> = _partyAccount.asStateFlow()
+    fun setPartyAccount(value: PartyAccount?) {
+        _partyAccount.value = value
+    }
+
+    /**
+     * The party server this device talks to, empty when the listener has not named
+     * one.
+     *
+     * Empty is the shipped default and the build's own default is empty too, on
+     * purpose: a party server is a deployment somebody has to run, so the app asks
+     * the listener for theirs rather than coupling every install to one address's
+     * uptime.
+     */
+    private val _listenTogetherServer = MutableStateFlow(settings.getString(KEY_LISTEN_SERVER, ""))
+    val listenTogetherServer: StateFlow<String> = _listenTogetherServer.asStateFlow()
+    fun setListenTogetherServer(value: String) {
+        val trimmed = value.trim()
+        _listenTogetherServer.value = trimmed
+        settings.putString(KEY_LISTEN_SERVER, trimmed)
+    }
+
+    /**
+     * The name this device joins a party under, empty when the listener has not
+     * chosen one.
+     *
+     * Empty is meaningful and not the same as a default: the name actually shown is
+     * the signed-in account's, and this is an override of it.
+     */
+    private val _listenTogetherNickname = MutableStateFlow(settings.getString(KEY_LISTEN_NICKNAME, ""))
+    val listenTogetherNickname: StateFlow<String> = _listenTogetherNickname.asStateFlow()
+    fun setListenTogetherNickname(value: String) {
+        val trimmed = value.trim().take(MAX_NICKNAME_LENGTH)
+        _listenTogetherNickname.value = trimmed
+        settings.putString(KEY_LISTEN_NICKNAME, trimmed)
+    }
+
+    /**
+     * Keys that must never leave the device in a backup.
+     *
+     * `listen_together_server` and `listen_together_nickname` are absent, and that is
+     * a decision rather than an oversight: the first is a LAN address that means
+     * nothing on another machine, and the second is personal. Neither is in the
+     * exported key list below for either reason — nor is the per-install id, which
+     * would make two machines claim one identity.
+     */
     private val SECRET_KEYS = setOf(
         "discord_token", "lastfm_session", "lastfm_secret", "lastfm_api_key",
         "listenbrainz_token", "spotify_spdc_token", "paxsenix_api_key",

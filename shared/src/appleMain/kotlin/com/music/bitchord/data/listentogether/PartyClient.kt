@@ -1,23 +1,20 @@
 package com.music.bitchord.data.listentogether
 
 import io.ktor.client.HttpClient
+import io.ktor.client.request.bearerAuth
 import io.ktor.client.request.get
 import io.ktor.client.request.post
 import io.ktor.client.request.setBody
+import io.ktor.client.statement.HttpResponse
 import io.ktor.client.statement.bodyAsText
 import io.ktor.http.ContentType
 import io.ktor.http.contentType
 import io.ktor.http.isSuccess
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.NonCancellable
-import kotlinx.coroutines.flow.Flow
-import kotlinx.coroutines.flow.MutableStateFlow
-import kotlinx.coroutines.flow.StateFlow
-import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.withTimeout
 import kotlinx.serialization.builtins.serializer
 import kotlinx.serialization.json.Json
-import kotlinx.serialization.builtins.serializer
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.contentOrNull
@@ -30,7 +27,7 @@ import kotlinx.serialization.json.put
  *
  * ## Why the local clock is passed in
  *
- * [PartySocket] measures the offset from the party server with a [ServerClock], and
+ * [PartySession] measures the offset from the party server with a [ServerClock], and
  * that clock needs a *monotonic* local reading. This is the one place that decision
  * becomes concrete: on Apple it is
  * `ProcessInfo.processInfo.systemUptime` — seconds since boot, unaffected by the
@@ -39,6 +36,18 @@ import kotlinx.serialization.json.put
  * the offset, and move this device's playhead relative to everyone else's mid-track.
  * So it arrives as a lambda and the platform decides, and there is nowhere in this
  * file that a wall clock could be read by accident.
+ *
+ * ## Why these throw
+ *
+ * Every function here throws [PartyException] rather than returning a `Result`.
+ *
+ * A `Result` is a fine thing inside Kotlin, and a poor thing in a `suspend`
+ * function: it cannot be thrown, so a caller who wants the usual `try`/`catch` around
+ * a join has to unwrap it by hand at every level. It is also why these functions were
+ * unreachable from the app at all — Kotlin/Native hands a Swift caller an opaque
+ * boxed `Result` with no header and no `getOrNull`, so `create` was callable,
+ * compiled, and useless. A throwing `suspend` function arrives in Swift as
+ * `(T?, NSError?)`, which is the shape Swift already understands.
  */
 class PartyClient(
     private val scope: CoroutineScope,
@@ -55,7 +64,11 @@ class PartyClient(
 
     // ---- Getting in and out ------------------------------------------------
 
-    /** Create a party and join it as host. */
+    /**
+     * Create a party and join it as host.
+     *
+     * @throws PartyException
+     */
     suspend fun create(
         base: String,
         userId: String,
@@ -63,7 +76,7 @@ class PartyClient(
         displayName: String,
         avatarUrl: String? = null,
         autoplayEnabled: Boolean? = null,
-    ): Result<PartyMembership> = post(
+    ): PartyMembership = post(
         base = base,
         path = "/api/parties",
         body = buildJsonObject {
@@ -76,7 +89,11 @@ class PartyClient(
         serializer = PartyMembership.serializer(),
     )
 
-    /** Join an existing party. The code alone is not a credential; the token is. */
+    /**
+     * Join an existing party. The code alone is not a credential; the token is.
+     *
+     * @throws PartyException
+     */
     suspend fun join(
         base: String,
         code: String,
@@ -84,7 +101,7 @@ class PartyClient(
         deviceId: String,
         displayName: String,
         avatarUrl: String? = null,
-    ): Result<PartyMembership> = post(
+    ): PartyMembership = post(
         base = base,
         path = "/api/parties/$code/join",
         body = buildJsonObject {
@@ -102,30 +119,53 @@ class PartyClient(
      * Deliberately smaller than a full snapshot: enough to show a face and a name
      * before committing a device slot, and nothing that would let the holder of a
      * code act on a party they are not in.
+     *
+     * @throws PartyException
      */
-    suspend fun preview(base: String, code: String): Result<PartyPreview> = get(
+    suspend fun preview(base: String, code: String): PartyPreview = get(
         base = base,
         path = "/api/parties/$code/preview",
         serializer = PartyPreview.serializer(),
     )
 
-    suspend fun leave(base: String, code: String, memberId: String, token: String): Result<Unit> = post(
-        base = base,
-        path = "/api/parties/$code/leave",
-        body = buildJsonObject {
-            put("memberId", memberId)
-            put("token", token)
-        },
-        serializer = Unit.serializer(),
-    )
+    /**
+     * Leave a party.
+     *
+     * The token goes in the `Authorization` header and **not** in the body, which is
+     * the whole content of this function. `handleLeaveParty` reads
+     * `parseBearerToken(r)` and answers 401 before it looks at the party at all, so a
+     * body-carried token is not a different encoding of the same request — it is a
+     * request that can never succeed. The member is identified by the token: the
+     * server derives the member id from the credential and removes that one, so an id
+     * sent alongside it would be a second claim about who is leaving, and the one the
+     * server ignores.
+     *
+     * @throws PartyException
+     */
+    suspend fun leave(base: String, code: String, token: String) {
+        val response = request {
+            client.post(url(base, "/api/parties/$code/leave")) { bearerAuth(token) }
+        }
+        if (!response.status.isSuccess()) {
+            val text = response.bodyAsText()
+            throw PartyException(response.status.value, errorCodeOf(text), errorMessageOf(text))
+        }
+    }
 
-    /** One health check, for [ServerSelection]. */
+    /**
+     * One health check, for [ServerSelection].
+     *
+     * [timeoutMs] is applied per call rather than being a hint: this is the check
+     * that decides whether a server is *absent*, and a check with no bound would sit
+     * on a half-open connection for as long as the OS takes to give up, which on a
+     * listener's phone is long enough to read as the app hanging.
+     */
     suspend fun probe(base: String, timeoutMs: Long): ProbeResult {
         val normalized = ServerUrl.parseAndNormalize(base).normalizedOrNull.orEmpty()
         if (normalized.isEmpty()) return ProbeResult(isOnline = false)
         val started = localNowMs()
         return try {
-            val response = client.get("$normalized/healthz")
+            val response = withTimeout(timeoutMs) { client.get("$normalized/healthz") }
             val online = response.status.isSuccess() && response.bodyAsText().contains("\"ok\":true")
             val elapsed = (localNowMs() - started).coerceAtLeast(0)
             ProbeResult(isOnline = online, latencyMs = if (online) elapsed else 0)
@@ -136,61 +176,60 @@ class PartyClient(
 
     // ---- Plumbing ----------------------------------------------------------
 
-    private val clock = ServerClock()
-
-    /** The measured offset from the party server, once there is one. */
-    fun serverClock(): ServerClock = clock
-
-    /**
-     * Feed one completed round trip to the clock.
-     *
-     * Called by [PartySocket] when a pong lands. The clock lives here rather than in
-     * the socket because [PartySession] and [PartySync] both read the offset, and two
-     * copies of a measurement is one too many.
-     */
-    fun recordRoundTrip(sentAtLocalMs: Long, serverMs: Long, receivedAtLocalMs: Long) {
-        clock.record(sentAtLocalMs, serverMs, receivedAtLocalMs)
-    }
-
     private suspend inline fun <reified T> post(
         base: String,
         path: String,
         body: JsonObject,
         serializer: kotlinx.serialization.KSerializer<T>,
-    ): Result<T> = try {
-        val response = client.post(ServerUrl.parseAndNormalize(base).normalizedOrNull.orEmpty() + path) {
-            contentType(ContentType.Application.Json)
-            setBody(body.toString())
+    ): T {
+        val response = request {
+            client.post(url(base, path)) {
+                contentType(ContentType.Application.Json)
+                setBody(body.toString())
+            }
         }
-        val text = response.bodyAsText()
-        if (response.status.isSuccess()) {
-            Result.success(json.decodeFromString(serializer, text))
-        } else {
-            Result.failure(PartyException(response.status.value, errorCodeOf(text), errorMessageOf(text)))
+        if (!response.status.isSuccess()) {
+            throw PartyException(response.status.value, errorCodeOf(response.bodyAsText()), errorMessageOf(response.bodyAsText()))
         }
-    } catch (e: CancellationException) {
-        throw e
-    } catch (e: Throwable) {
-        Result.failure(PartyException(0, "transport", e.message.orEmpty()))
+        return json.decodeFromString(serializer, response.bodyAsText())
     }
 
     private suspend inline fun <reified T> get(
         base: String,
         path: String,
         serializer: kotlinx.serialization.KSerializer<T>,
-    ): Result<T> = try {
-        val response = client.get(ServerUrl.parseAndNormalize(base).normalizedOrNull.orEmpty() + path)
-        val text = response.bodyAsText()
-        if (response.status.isSuccess()) {
-            Result.success(json.decodeFromString(serializer, text))
-        } else {
-            Result.failure(PartyException(response.status.value, errorCodeOf(text), errorMessageOf(text)))
+    ): T {
+        val response = request { client.get(url(base, path)) }
+        if (!response.status.isSuccess()) {
+            throw PartyException(response.status.value, errorCodeOf(response.bodyAsText()), errorMessageOf(response.bodyAsText()))
         }
+        return json.decodeFromString(serializer, response.bodyAsText())
+    }
+
+    /**
+     * One HTTP call, with every transport problem turned into one exception type.
+     *
+     * `expectSuccess` is off, deliberately: a 409 "party full" is a *sentence* the
+     * screen should show, and it arrives in the body. Letting Ktor throw on it would
+     * discard the code and the message and leave the listener with "something went
+     * wrong" for the one refusal that has an obvious remedy.
+     */
+    private suspend inline fun request(
+        crossinline call: suspend () -> HttpResponse,
+    ): HttpResponse = try {
+        call()
     } catch (e: CancellationException) {
         throw e
     } catch (e: Throwable) {
-        Result.failure(PartyException(0, "transport", e.message.orEmpty()))
+        // `null` status rather than a made-up one: this is the case where the server
+        // was never reached, and the difference is what decides whether another
+        // server is worth trying.
+        throw PartyException(null, "transport", e.message ?: e.toString())
     }
+
+    /** The normalised base plus a path, without doubling or losing the separator. */
+    private fun url(base: String, path: String): String =
+        ServerUrl.parseAndNormalize(base).normalizedOrNull.orEmpty() + path
 
     private fun errorCodeOf(text: String): String = runCatching {
         json.parseToJsonElement(text).jsonObject["error"]?.jsonPrimitive?.contentOrNull.orEmpty()
@@ -201,7 +240,12 @@ class PartyClient(
     }.getOrDefault("")
 
     companion object {
-        /** How often to measure the clock. Five seconds is a third of a tolerance. */
+        /**
+         * Not used: the socket pings on its own schedule, because the platform's ping
+         * and the protocol's ping travel on the same timer in
+         * `AppleApp/Sources/PlaybackSession/PartySocket.swift`, and a second timer
+         * here would only be able to disagree with it.
+         */
         const val PING_INTERVAL_MS = 5_000L
     }
 }

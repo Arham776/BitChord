@@ -135,6 +135,38 @@ data class PartyPlayback(
 }
 
 /**
+ * This state, with everything except the playhead taken from [newer].
+ *
+ * ## Why the split is here and not in the state machine
+ *
+ * A playback state carries two kinds of fact, and the server moves them on different
+ * schedules. Its `PlaybackState.touch` — which is what increments `seq` — is called for
+ * a change of track, transport or position. Its `touchQueue`, which increments
+ * `queueSeq`, is called for a change to the queue. And `SetAutoplay` increments
+ * **neither**. So `seq` is a *playhead* version, not a version of the whole struct.
+ *
+ * A client that gates the entire struct on `seq` therefore drops exactly the changes
+ * `seq` does not track, and the symptom is quiet and long-lived: a host switches
+ * AutoPlay off, the server accepts it and broadcasts it, and every other device goes on
+ * showing AutoPlay on until the song happens to change.
+ *
+ * So the gate is applied to the playhead alone and these fields are taken from every
+ * state frame. They are safe to take because none of them is derived from a position.
+ *
+ * [effectivePositionMs] is deliberately *not* among them. The server recomputes it on
+ * every broadcast, so a repeated frame's copy of it is a snapshot taken when that frame
+ * was built; this device's own corrected position — `ServerClock.positionFor` over
+ * `positionMs` and `anchorMs` — is both later and measured on this device's own clock,
+ * and two positions to choose from is how a playhead ends up fighting itself.
+ */
+fun PartyPlayback.withPartyFactsFrom(newer: PartyPlayback): PartyPlayback = copy(
+    autoplayEnabled = newer.autoplayEnabled,
+    queueLength = newer.queueLength,
+    queueIndex = newer.queueIndex,
+    queueSeq = newer.queueSeq,
+)
+
+/**
  * The party's running order, which travels on its own schedule.
  *
  * Sent whole when a device joins — there is no other way for it to learn the list —

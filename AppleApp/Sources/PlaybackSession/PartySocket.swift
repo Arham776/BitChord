@@ -21,24 +21,49 @@ import BitChordShared
 /// It does not parse frames, apply them, know what a party is, or decide when to
 /// give up. All of that is policy and lives in `PartySession` above this line,
 /// where it can be tested without a socket. The one thing decided here is the one
-/// only here can be: a `bye` frame means the server ended the session *on purpose*,
+/// only here can: a `bye` frame means the server ended the session *on purpose*,
 /// and that is the single fact that stops the reconnect loop.
-final class PartySocket: NSObject, PartySocketBridgeImpl {
+///
+/// # Why the loop is written with `async` rather than a callback chain
+///
+/// Because the previous version of it did not work, and the way it failed is worth
+/// recording. Its read loop registered a `receive` callback and returned
+/// immediately, and its caller — which assumed the read loop *blocked* until the
+/// socket ended — therefore read that return as "the socket is finished". The
+/// consequence was a reconnect every half second: the ping timer, scheduled five
+/// seconds out, was cancelled before it could ever fire, so the party's clock was
+/// never measured and the party never synchronised; and the backoff, which is
+/// supposed to be the thing that stops a dead server being hammered, was slept
+/// through on the way into the next attempt rather than before it. It compiled, it
+/// linked, and it reconnected in a loop for as long as the app was open.
+///
+/// The shape here is the one that cannot have that bug: `await readLoop` is a
+/// suspension that only returns when the socket really has ended, and the backoff
+/// happens after it, before the next attempt, and is cancellable.
+final class PartySocket: NSObject, PartySocketBridgeImpl, @unchecked Sendable {
 
     /// How often to measure the clock. Five seconds is a third of a sync tolerance.
-    private static let pingInterval: TimeInterval = 5
+    private static let pingIntervalSeconds: Double = 5
 
     /// Grows because a server that is down will stay down, and hammering it does not
     /// make it come back sooner; capped because a party somebody is waiting to join
     /// should not stay unreachable for minutes after the server comes back.
-    private static let maxBackoff: TimeInterval = 30
+    private static let maxBackoffSeconds: Double = 30
 
     private static let shared = PartySocket()
+
+    /// Guards the fields below.
+    ///
+    /// Not a hot path — a control, a report and a connect or two a second at most —
+    /// so a lock is the honest answer, and it is the only thing that makes
+    /// `@unchecked Sendable` true rather than aspirational. `sendRaw` and `stop` are
+    /// called from whichever thread the caller happens to be on, including Kotlin's.
+    private let lock = NSLock()
 
     private var task: URLSessionWebSocketTask?
     private var session: URLSession?
     private var onFrame: PartySocketBridgeFrameCallback?
-    private var timer: DispatchSourceTimer?
+    private var loop: Task<Void, Never>?
     private var attempt = 0
     private var stopped = false
 
@@ -50,121 +75,167 @@ final class PartySocket: NSObject, PartySocketBridgeImpl {
     // MARK: - PartySocketBridgeImpl
 
     func connect(base: String, code: String, token: String, onFrame callback: PartySocketBridgeFrameCallback) {
-        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            self?.run(base: base, code: code, token: token, onFrame: callback)
+        lock.withLock {
+            loop?.cancel()
+            stopped = false
+            attempt = 0
+        }
+        loop = Task.detached(priority: .userInitiated) { [weak self] in
+            await self?.run(base: base, code: code, token: token, onFrame: callback)
         }
     }
 
     func sendRaw(json: String) {
+        let live = lock.withLock { stopped ? nil : task }
         // Dropped when the socket is not up rather than queued: a playhead report
         // describes *now*, and one that arrives late describes a position this device
         // has already left.
-        guard let task, !stopped else { return }
-        task.send(.string(json)) { _ in }
+        live?.send(.string(json)) { _ in }
     }
 
     func stop() {
-        stopped = true
-        timer?.cancel()
-        timer = nil
-        task?.cancel(with: .goingAway, reason: nil)
-        task = nil
+        let (live, session, loop) = lock.withLock { () -> (URLSessionWebSocketTask?, URLSession?, Task<Void, Never>?) in
+            stopped = true
+            let taken = (task, self.session, self.loop)
+            task = nil
+            self.session = nil
+            self.onFrame = nil
+            self.loop = nil
+            return taken
+        }
+
+        // Cancelling the loop is what actually unblocks the read: a cancelled
+        // `receive` throws, and that is the only way out of an await that would
+        // otherwise sit there until the server's idle timeout.
+        loop?.cancel()
+        live?.cancel(with: .goingAway, reason: nil)
         session?.invalidateAndCancel()
-        session = nil
-        onFrame = nil
     }
 
     // MARK: - The loop
 
-    private func run(base: String, code: String, token: String, onFrame callback: PartySocketBridgeFrameCallback) {
-        guard let url = Self.socketURL(base: base, code: code) else { return }
+    private func run(base: String, code: String, token: String, onFrame callback: PartySocketBridgeFrameCallback) async {
+        while !isStopped {
+            guard let url = Self.socketURL(base: base, code: code) else { return }
+            // Tokens are intentionally not in the URL: the server takes them in the
+            // handshake, and a token in a path lands in every log between here and there.
+            var request = URLRequest(url: url)
+            request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
 
-        // Tokens are intentionally not in the URL: the server takes them in the
-        // handshake, and a token in a path lands in every log between here and there.
-        var request = URLRequest(url: url)
-        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+            let session = URLSession(configuration: .default)
+            let task = session.webSocketTask(with: request)
 
-        let session = URLSession(configuration: .default)
-        let task = session.webSocketTask(with: request)
-        self.session = session
-        self.task = task
-        self.onFrame = callback
-        self.stopped = false
-        task.resume()
-        startPinging()
-
-        let semaphore = DispatchSemaphore(value: 0)
-        readLoop(task: task, semaphore: semaphore)
-
-        // A clean read is a disconnection and worth retrying; a `bye` has already
-        // stopped us and is a decision, not a fault.
-        if !stopped {
-            timer?.cancel()
-            timer = nil
-            Thread.sleep(forTimeInterval: backoff())
-            attempt += 1
-            if !stopped {
-                run(base: base, code: code, token: token, onFrame: callback)
+            let abandoned = lock.withLock { () -> Bool in
+                guard !stopped else { return true }
+                self.session = session
+                self.task = task
+                self.onFrame = callback
+                // A connection that was accepted resets the backoff. Carrying the count
+                // across a successful connect is what turns one blip into a minute of
+                // slow reconnects for a party that is otherwise fine.
+                self.attempt = 0
+                return false
             }
-        }
-        semaphore.signal()
-    }
+            if abandoned {
+                session.invalidateAndCancel()
+                return
+            }
 
-    private func readLoop(task: URLSessionWebSocketTask, semaphore: DispatchSemaphore) {
-        while !stopped {
-            task.receive { [weak self] result in
-                guard let self else { return }
-                switch result {
-                case .success(let message):
-                    var text: String?
-                    switch message {
-                    case .string(let value): text = value
-                    case .data(let value): text = String(data: value, encoding: .utf8)
-                    @unknown default: text = nil
-                    }
-                    if let text, !text.isEmpty {
-                        self.onFrame?.onFrame(json: text)
-                        // A `bye` is a decision, not a disconnection. The reconnect
-                        // loop stops on it: a removed listener watching a reconnect
-                        // refused every time reads, to everyone in the party, as a
-                        // network problem rather than as the decision it was.
-                        if Self.isBye(text) {
-                            self.stopped = true
-                        }
-                    }
-                    self.readLoop(task: task, semaphore: semaphore)
+            task.resume()
 
-                case .failure:
-                    // The socket ended. Whether it ended politely or not does not
-                    // change what to do, which is reconnect; the one close that *does*
-                    // change it arrived as a `bye` frame first.
-                    self.stopped = true
+            // Reading and pinging run together because each is a wait the other would
+            // otherwise sit behind: the read only returns when the socket ends, and a
+            // ping loop that only ran between reads would never run at all. Whichever
+            // finishes first ends the pair.
+            // `keepGoing` is "this is still a socket we want", which is the negation
+            // of `isStopped` — and also false once `self` has gone, because a loop
+            // with nobody to report to has nothing left to do.
+            await withTaskGroup(of: Void.self) { group in
+                let keepGoing: @Sendable () -> Bool = { [weak self] in self.map { !$0.isStopped } ?? false }
+                group.addTask { await Self.read(task: task, onFrame: callback, keepGoing: keepGoing) }
+                group.addTask { await Self.ping(task: task, keepGoing: keepGoing) }
+                await group.next()
+                group.cancelAll()
+            }
+
+            task.cancel(with: .goingAway, reason: nil)
+            session.invalidateAndCancel()
+            let wait = lock.withLock { () -> Duration in
+                if self.task === task {
+                    self.task = nil
+                    self.session = nil
                 }
+                attempt += 1
+                return backoff()
             }
-            return
+
+            // A clean read is a disconnection and worth retrying; a `bye` has already
+            // stopped us and is a decision, not a fault. A cancelled sleep means
+            // `stop()` was called, and the loop condition ends it.
+            if isStopped { return }
+            try? await Task.sleep(for: wait)
         }
     }
 
-    private func startPinging() {
-        timer?.cancel()
-        let timer = DispatchSource.makeTimerSource(queue: .global(qos: .utility))
-        timer.schedule(deadline: .now() + Self.pingInterval, repeating: Self.pingInterval)
-        timer.setEventHandler { [weak self] in
-            guard let self, let task = self.task, !self.stopped else { return }
-            // A platform ping *and* the protocol ping, on the same interval. The
-            // platform one keeps the connection measured at the transport even while
-            // the socket is idle; the protocol one is what carries the clock, because
-            // the server's reading has to come back attached to a local one.
+    private var isStopped: Bool {
+        lock.withLock { stopped }
+    }
+
+    /// Read until the socket ends, reporting each frame.
+    ///
+    /// A `bye` is a decision, not a disconnection, and stopping here is the whole
+    /// point of noticing it: a removed listener watching a reconnect refused every
+    /// time reads, to everyone in the party, as a network problem rather than as the
+    /// decision it was.
+    private static func read(
+        task: URLSessionWebSocketTask,
+        onFrame: PartySocketBridgeFrameCallback,
+        keepGoing: @Sendable () -> Bool,
+    ) async {
+        while keepGoing() && !Task.isCancelled {
+            let message: URLSessionWebSocketTask.Message
+            do {
+                message = try await task.receive()
+            } catch {
+                // The socket ended. Whether it ended politely does not change what to
+                // do, which is reconnect; the one close that *does* change it arrived
+                // as a `bye` frame first.
+                return
+            }
+            let text: String?
+            switch message {
+            case .string(let value): text = value
+            case .data(let value): text = String(data: value, encoding: .utf8)
+            @unknown default: text = nil
+            }
+            guard let text, !text.isEmpty else { continue }
+            onFrame.onFrame(json: text)
+            if isBye(text) { return }
+        }
+    }
+
+    /// Keep the connection measured at both layers.
+    ///
+    /// Two pings, deliberately, because they answer different questions. The platform
+    /// one keeps the transport itself alive and is answered by `URLSession` without
+    /// travelling through the party at all; the protocol one is the only thing that
+    /// can turn the server's clock into this device's, because the server's reading
+    /// has to come back attached to a local one.
+    ///
+    /// The first one goes out immediately rather than after an interval. The clock is
+    /// the thing everything else waits on — until it is measured, every position is a
+    /// guess — and a party that spends its first five seconds unsynchronised is five
+    /// seconds of every member hearing the wrong bar.
+    private static func ping(task: URLSessionWebSocketTask, keepGoing: @Sendable () -> Bool) async {
+        while keepGoing() && !Task.isCancelled {
             task.sendPing { _ in }
-            let payload = PartyOutgoingJson.shared.ping(clientMs: Self.localNowMs())
-            task.send(.string(payload)) { _ in }
+            task.send(.string(PartyOutgoingJson.shared.ping(clientMs: localNowMs()))) { _ in }
+            try? await Task.sleep(for: .seconds(pingIntervalSeconds))
         }
-        timer.resume()
-        self.timer = timer
     }
 
-    private func backoff() -> TimeInterval {
-        min(0.5 * pow(2, Double(min(attempt, 5))), Self.maxBackoff)
+    private func backoff() -> Duration {
+        .milliseconds(Int(min(0.5 * pow(2.0, Double(attempt)), Self.maxBackoffSeconds) * 1000))
     }
 
     // MARK: - Clocks and addresses

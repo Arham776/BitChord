@@ -31,6 +31,11 @@ import kotlinx.coroutines.flow.update
  */
 class PartySession {
 
+    private val _state = MutableStateFlow(PartyState())
+    val state: StateFlow<PartyState> = _state.asStateFlow()
+
+    val current: PartyState get() = _state.value
+
     // ---- The clock ---------------------------------------------------------
     //
     // It lives here rather than in the socket because the state machine and the player
@@ -46,19 +51,22 @@ class PartySession {
      * Called on a pong, with the local reading stamped on the outgoing ping and the
      * local reading when the answer arrived. Nothing else can establish the offset,
      * and without it a party's position is a guess.
+     *
+     * The two facts it produces are published into [PartyState] rather than left on
+     * the clock alone, because "is this device in time with the party" is the first
+     * thing a screen shows and a value buried in a collaborator object is not
+     * something an observing view can be told about.
      */
     fun recordPong(sentAtLocalMs: Long, serverMs: Long, receivedAtLocalMs: Long) {
         clock.record(sentAtLocalMs, serverMs, receivedAtLocalMs)
+        _state.update {
+            it.copy(clockSynced = clock.synced, roundTripMs = clock.roundTripMs)
+        }
     }
 
     /** Where the party is, on this device's clock. Zero until the first pong lands. */
     fun correctedPosition(playback: PartyPlayback, localNowMs: Long): Long =
         clock.positionFor(playback.positionMs, playback.anchorMs, localNowMs)
-
-    private val _state = MutableStateFlow(PartyState())
-    val state: StateFlow<PartyState> = _state.asStateFlow()
-
-    val current: PartyState get() = _state.value
 
     /**
      * Whether a fresh queue is needed.
@@ -107,7 +115,10 @@ class PartySession {
         this.code = code
         appliedSeq = null
         refetchQueued = false
-        _state.value = PartyState(inParty = true)
+        // Connecting, not live: [PartyConnection.LIVE] arrives with the first frame,
+        // and until then there is no party to be in. A screen that showed a party
+        // immediately would be showing a thing that has not been confirmed to exist.
+        _state.value = PartyState(inParty = true, connection = PartyConnection.CONNECTING)
     }
 
     fun reset() {
@@ -115,6 +126,7 @@ class PartySession {
         code = ""
         appliedSeq = null
         refetchQueued = false
+        clock.reset()
         _state.value = PartyState()
     }
 
@@ -130,7 +142,8 @@ class PartySession {
             _state.update {
                 it.copy(
                     inParty = true,
-                    self = frame.you,
+                    connection = PartyConnection.LIVE,
+                    you = frame.you,
                     members = frame.party.members,
                     maxMembers = frame.party.maxMembers,
                     hostOnlyControl = frame.party.hostOnlyControl,
@@ -185,7 +198,13 @@ class PartySession {
             // A decision, not a disconnection, and the one thing that ends a session
             // rather than the socket. The reason is kept so the screen can say what
             // happened instead of showing a generic failure.
-            _state.update { it.copy(inParty = false, error = PartyError("left", frame.reason)) }
+            _state.update {
+                it.copy(
+                    inParty = false,
+                    connection = PartyConnection.OFFLINE,
+                    error = PartyError("left", frame.reason),
+                )
+            }
             Applied.Left
         }
 
@@ -197,30 +216,45 @@ class PartySession {
 
     private fun applyState(frame: PartyFrame.State): Applied {
         val incoming = frame.playback
+        val held = _state.value
         val applied = appliedSeq
-        // The gate. Strictly greater, and the reason is on PartyPlayback.supersedes:
-        // the server re-sends the same state on every heartbeat, so an equal frame is
-        // not new information, and applying one would reset the playhead to a
-        // position captured when the frame was *first* sent.
-        if (applied != null && incoming.seq <= applied) return Applied.Nothing
 
-        val queueStale = incoming.queueSeq > _state.value.queue.seq
-        val shouldRefetch = queueStale && !refetchQueued
-        if (shouldRefetch) refetchQueued = true
+        // A queue the state says is newer than the copy held is a queue to ask for,
+        // whichever frame happened to say so. Checked before the gate below, because a
+        // heartbeat is enough to notice and not only a change of song.
+        val staleQueue = incoming.queueSeq > held.queue.seq && !refetchQueued
+        if (staleQueue) refetchQueued = true
 
-        // A refusal is cleared by the next state, not left to time out: the party
-        // moving on is the answer to "only the host can do that", and a stale refusal
-        // left on screen is a complaint about something that is no longer true.
+        // The gate. Strictly greater, and narrow on purpose — the reason it exists at
+        // all is on PartyPlayback.supersedes: the server re-sends the same state on
+        // every heartbeat, so an equal frame is not new information, and applying one
+        // wholesale would reset the playhead to a position captured when the frame was
+        // *first* sent. It guards the playhead and nothing else, because the playhead
+        // is the only thing a repeated frame would rewind; see
+        // [PartyPlayback.withPartyFactsFrom] for what the rest of the frame carries.
+        val isNewer = applied == null || incoming.seq > applied
+        val playback = if (isNewer) incoming else held.playback.withPartyFactsFrom(incoming)
+
+        // A refusal is answered by the party's next *word*, not by its next change.
+        // The two are not the same length of time: a listener who taps next at the end
+        // of a queue is told "already at the end", and then nothing about the party
+        // changes for as long as the song plays. Clearing only on a newer `seq` would
+        // leave that sentence on screen for the rest of the track, complaining about
+        // something five seconds ago.
         _state.update {
             it.copy(
-                playback = incoming,
+                playback = playback,
                 lastServerMs = frame.serverMs,
-                needsQueueRefetch = shouldRefetch,
+                needsQueueRefetch = staleQueue,
                 error = null,
             )
         }
-        appliedSeq = incoming.seq
-        return if (shouldRefetch) Applied.Queue else Applied.Playback
+        if (isNewer) appliedSeq = incoming.seq
+        return when {
+            staleQueue -> Applied.Queue
+            isNewer -> Applied.Playback
+            else -> Applied.Nothing
+        }
     }
 
     /** Called once a refetch has actually been sent, so the next stale frame asks again. */
@@ -230,10 +264,31 @@ class PartySession {
     }
 }
 
+/** Whether the socket to the party server is up, as far as this device can tell. */
+enum class PartyConnection {
+    /** Not in a party, or the socket is not up. */
+    OFFLINE,
+
+    /** Joined, and waiting for the first frame to confirm the party exists. */
+    CONNECTING,
+
+    /** A frame has arrived: the party is real and this device is in it. */
+    LIVE,
+}
+
 /** Everything this device knows, in one value. */
 data class PartyState(
     val inParty: Boolean = false,
-    val self: PartyMember? = null,
+    /**
+     * This device's own member record, or null before the first frame.
+     *
+     * Named as upstream names it, and deliberately not `self`: a Kotlin property
+     * called `self` is exported to Swift as an Objective-C property *also* called
+     * `self`, where it collides with the language's own and becomes unreachable. It
+     * still compiles on the Kotlin side, so the trap is silent until something tries
+     * to read it from a view.
+     */
+    val you: PartyMember? = null,
     val members: List<PartyMember> = emptyList(),
     val maxMembers: Int = 5,
     val hostOnlyControl: Boolean = false,
@@ -241,6 +296,11 @@ data class PartyState(
     val queue: PartyQueue = PartyQueue(),
     val activity: PartyActivity? = null,
     val error: PartyError? = null,
+    val connection: PartyConnection = PartyConnection.OFFLINE,
+    /** False until the first round trip; the playhead is a guess until then. */
+    val clockSynced: Boolean = false,
+    /** How long the last measured round trip took. Zero until [clockSynced]. */
+    val roundTripMs: Long = 0,
     /** The server's clock at the last frame, for a rough offset before a pong lands. */
     val lastServerMs: Long = 0,
     /** Set on the frame that noticed a stale queue, cleared once it is asked for. */
@@ -248,7 +308,18 @@ data class PartyState(
 ) {
     val host: PartyMember? get() = members.firstOrNull { it.isHost }
 
-    val isHost: Boolean get() = self?.isHost == true
+    val isHost: Boolean get() = you?.isHost == true
+
+    /**
+     * This device's member id, or empty before the first frame.
+     *
+     * What a member list compares against to mark the row that is you, since a list
+     * of members carries no other way to tell.
+     */
+    val myMemberId: String get() = you?.memberId.orEmpty()
+
+    /** Whether [member] is this device. False while [myMemberId] is empty. */
+    fun isMe(member: PartyMember): Boolean = myMemberId.isNotEmpty() && myMemberId == member.memberId
 
     /**
      * Whether this device may drive the music.
@@ -259,6 +330,19 @@ data class PartyState(
      * and do nothing.
      */
     val canControl: Boolean get() = isHost || !hostOnlyControl
+
+    /**
+     * The negative of [canControl], which is the form a view actually wants.
+     *
+     * Both are provided because they are asked in opposite shapes — "may I" when
+     * deciding whether to send, "am I locked out" when deciding whether to disable a
+     * button — and a view that has to write `!state.canControl` at each call site is
+     * a view that will get one of them wrong.
+     *
+     * This can go true under a listener mid-party: the host is reassigned when the
+     * host leaves, and everything reading it has to follow.
+     */
+    val controlsLocked: Boolean get() = inParty && !canControl
 
     /**
      * Whether there is room for one more device.

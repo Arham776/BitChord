@@ -198,6 +198,118 @@ class PartySessionTest {
     // ---- Starting and stopping --------------------------------------------
 
     @Test
+    fun `a refusal is answered by the party's next word and not only by a change`() {
+        // The bug this pins: the `seq` gate exists so a repeated heartbeat cannot
+        // rewind the playhead, and gating the refusal on it as well meant that tapping
+        // next at the end of a queue left "Already at the end of the queue" on screen
+        // until the music happened to move — which, at the end of a queue, is never.
+        val s = session()
+        s.apply(state(seq = 7))
+        s.apply(PartyFrame.Failure(error = "end_of_queue", message = "Already at the end of the queue."))
+        assertEquals("end_of_queue", s.current.error?.code)
+
+        // The same `seq`, which is the heartbeat re-sending what we already have.
+        assertEquals(PartySession.Applied.Nothing, s.apply(state(seq = 7)))
+        assertNull(s.current.error)
+    }
+
+    @Test
+    fun `a repeated heartbeat with nothing to clear changes nothing`() {
+        val s = session()
+        s.apply(state(seq = 3))
+        val before = s.current
+        s.apply(state(seq = 3))
+        assertEquals(before, s.current)
+    }
+
+    @Test
+    fun `a setting the server does not version with seq still lands`() {
+        // The bug this pins, found against the live server: `SetAutoplay` on the Go
+        // side increments neither `seq` nor `queueSeq`, so the state frame carrying it
+        // has the *same* seq as the one already held. Gating the whole struct on seq
+        // dropped it, and a host who switched AutoPlay off watched every other device
+        // go on showing it on until the song changed.
+        val s = session()
+        s.apply(PartyFrame.State(playback = PartyPlayback(seq = 4, isPlaying = true, autoplayEnabled = true), serverMs = 1_000))
+        assertTrue(s.current.playback.autoplayEnabled)
+        s.apply(
+            PartyFrame.State(
+                playback = PartyPlayback(seq = 4, isPlaying = true, autoplayEnabled = false),
+                serverMs = 2_000,
+            ),
+        )
+        assertFalse(s.current.playback.autoplayEnabled)
+    }
+
+    @Test
+    fun `queue counters move without moving the playhead`() {
+        // `touchQueue` bumps `queueSeq` and not `seq`, so a queue growing is the same
+        // situation: same playhead version, different queue.
+        val s = session()
+        s.apply(state(seq = 4, queueSeq = 0))
+        assertEquals(0, s.current.playback.queueLength)
+        s.apply(
+            PartyFrame.State(
+                playback = PartyPlayback(seq = 4, isPlaying = true, queueSeq = 2, queueLength = 2),
+                serverMs = 2_000,
+            ),
+        )
+        assertEquals(2, s.current.playback.queueLength)
+        assertEquals(2L, s.current.playback.queueSeq)
+    }
+
+    @Test
+    fun `a stale queue is noticed from a repeated heartbeat and not only a new song`() {
+        // The queue frame is the server's own answer and normally arrives; asking again
+        // off the state frame is what covers the case where it did not.
+        val s = session()
+        s.apply(state(seq = 4, queueSeq = 0))
+        val applied = s.apply(
+            PartyFrame.State(
+                playback = PartyPlayback(seq = 4, isPlaying = true, queueSeq = 5),
+                serverMs = 2_000,
+            ),
+        )
+        assertEquals(PartySession.Applied.Queue, applied)
+        assertTrue(s.current.needsQueueRefetch)
+    }
+
+    @Test
+    fun `a repeated heartbeat does not rewind the playhead but does not lose the rest`() {
+        // Both halves of the rule at once, because they are the same decision.
+        val s = session()
+        s.apply(PartyFrame.State(playback = PartyPlayback(seq = 9, positionMs = 5_000, isPlaying = true), serverMs = 1_000))
+        s.apply(
+            PartyFrame.State(
+                playback = PartyPlayback(
+                    seq = 9, positionMs = 5_000, isPlaying = true,
+                    autoplayEnabled = false, queueLength = 3, queueIndex = 1,
+                ),
+                serverMs = 6_000,
+            ),
+        )
+        assertEquals(5_000L, s.current.playback.positionMs)
+        assertFalse(s.current.playback.autoplayEnabled)
+        assertEquals(3, s.current.playback.queueLength)
+    }
+
+    @Test
+    fun `the server's own idea of the position is not taken over the local one`() {
+        // `effectivePositionMs` is recomputed on every broadcast, so a repeated frame's
+        // copy of it is as old as that frame. The local corrected position is later and
+        // is on this device's clock.
+        val s = session()
+        s.apply(PartyFrame.State(playback = PartyPlayback(seq = 9, positionMs = 5_000, effectivePositionMs = 5_000), serverMs = 1_000))
+        s.apply(
+            PartyFrame.State(
+                playback = PartyPlayback(seq = 9, positionMs = 5_000, effectivePositionMs = 99_000),
+                serverMs = 6_000,
+            ),
+        )
+        assertEquals(5_000L, s.current.playback.effectivePositionMs)
+    }
+
+    @Test
     fun `beginning a session starts empty and in the party`() {
         val s = PartySession()
         assertFalse(s.current.inParty)
