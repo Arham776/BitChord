@@ -50,6 +50,25 @@ final class AuthController {
         Task { await refreshAccount() }
     }
 
+    /// The account, pushed to the one place that keeps a copy for anybody else who
+    /// wants it.
+    ///
+    /// Listen Together needs a name and a face for its member rows, and it needs them
+    /// on *every* device in the party rather than just this one — so the account has
+    /// to travel with a join request rather than each device fetching it. A fetch at
+    /// join time would be a visible stall on a LAN-scale feature, so it is cached
+    /// here instead and refreshed whenever the account actually changes.
+    private func publishAccount() {
+        MainActor.assumeIsolated {
+            PartyAccountCache.update(
+                name: accountName,
+                email: accountEmail,
+                avatarUrl: accountPhotoUrl
+            )
+            PartyStore.shared.accountChanged()
+        }
+    }
+
     func accept(_ cookieHeader: String) {
         guard AuthBridge.shared.applyCookie(cookieHeader: cookieHeader) else { return }
         AuthStore.cookie = cookieHeader
@@ -68,6 +87,7 @@ final class AuthController {
         accountPhotoUrl = nil
         sessionUnavailableReason = nil
         sessionEpoch += 1
+        publishAccount()
     }
 
     private func refreshAccount() async {
@@ -80,6 +100,7 @@ final class AuthController {
                             self.accountEmail = info.email
                             self.accountPhotoUrl = info.photoUrl
                         }
+                        self.publishAccount()
                         cont.resume()
                     }
                 })

@@ -340,6 +340,7 @@ final class PlaybackController {
 
     /// Plays `entries`, starting at `index`. Replaces the queue.
     func play(_ entries: [QueueEntry], at index: Int = 0) {
+        noteLocalIntent()
         guard entries.indices.contains(index) else { return }
         let entry = entries[index]
         // Same song already loading or playing: extra taps are from the
@@ -405,6 +406,7 @@ final class PlaybackController {
     }
 
     func playNext(_ entry: QueueEntry) {
+        noteLocalIntent()
         let at = min(playingIndex + 1, queue.count)
         queue.insert(entry, at: at)
         if var original = unshuffledQueue {
@@ -467,13 +469,48 @@ final class PlaybackController {
     }
 
     func addToQueue(_ entry: QueueEntry) {
+        noteLocalIntent()
         queue.append(entry)
         unshuffledQueue?.append(entry)
         persistSession()
         syncEngineQueueNext()
     }
 
+    /// Told when *the listener* uses this device's controls, so a party can stop
+    /// trying to undo the press for a moment.
+    ///
+    /// The listener, specifically, and not "whenever the transport changes": a party
+    /// binding moves this transport itself several times a minute, and telling it
+    /// about its own corrections would leave it permanently convinced that the
+    /// listener had just pressed something and it should therefore not correct
+    /// anything at all. The binding wraps its own calls in
+    /// [withLocalIntentSuppressed].
+    ///
+    /// A closure rather than a direct reference to the binding, because the controller
+    /// is created before anything else exists and a party is not always there.
+    @ObservationIgnored var onLocalIntent: (() -> Void)?
+
+    /// How deep the party binding is in the middle of moving the transport itself.
+    ///
+    /// A counter rather than a flag because reconcile can be re-entered — a load that
+    /// finishes can schedule work that seeks — and a boolean cleared by an inner call
+    /// would leave the outer one reporting itself as the listener.
+    @ObservationIgnored private var intentSuppression = 0
+
+    /// Run `body` without its transport changes being reported as the listener's.
+    func withLocalIntentSuppressed<T>(_ body: () -> T) -> T {
+        intentSuppression += 1
+        defer { intentSuppression -= 1 }
+        return body()
+    }
+
+    private func noteLocalIntent() {
+        guard intentSuppression == 0 else { return }
+        onLocalIntent?()
+    }
+
     func togglePlayPause() {
+        noteLocalIntent()
         startEngineIfNeeded()
         if state == .buffering { return }
         if current == nil {
@@ -499,6 +536,7 @@ final class PlaybackController {
     }
 
     func next() {
+        noteLocalIntent()
         guard !queue.isEmpty else { return }
         if playingIndex + 1 < queue.count {
             loadCurrent(playingIndex + 1)
@@ -508,6 +546,7 @@ final class PlaybackController {
     }
 
     func previous() {
+        noteLocalIntent()
         if position > Self.backRestartsAfter {
             seek(to: 0)
             return
@@ -555,6 +594,7 @@ final class PlaybackController {
     }
 
     func seek(to seconds: Double) {
+        noteLocalIntent()
         try? engine.seek(seconds: seconds)
         position = seconds
     }

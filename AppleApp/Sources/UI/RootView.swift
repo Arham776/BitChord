@@ -64,6 +64,15 @@ struct RootView: View {
         )) {
             ReplayView()
         }
+        // Listen Together, presented over whatever the listener was doing. A party
+        // invite is a request to look at a party, and the screen that answers it has
+        // to be the one that arrives.
+        .sheet(isPresented: Binding(
+            get: { appModel.listenTogetherPresented },
+            set: { appModel.listenTogetherPresented = $0 }
+        )) {
+            NavigationStack { ListenTogetherView() }
+        }
         .sheet(item: Binding(
             get: { appModel.pendingDetail },
             set: { appModel.pendingDetail = $0 }

@@ -11,7 +11,18 @@ import BitChordShared
 /// policy and the state machine are shared Kotlin with tests, and this file is the
 /// part that cannot have any: it touches a player.
 ///
-/// # What it does on each tick
+/// ## It is a reader, and that is the whole design
+///
+/// The port had this owning a `PartySession`, a socket and a clock of its own, while
+/// `PartyCoordinator` owned a second set of all three. Only one socket can exist, so
+/// whichever was started last silently won and the other one's state was fiction.
+///
+/// Now [PartyCoordinator] owns the only session, the only socket and the only clock,
+/// and this reads it. There is no state here that is not either the party's or the
+/// player's, which is what makes it safe for the screen and the player to both be
+/// looking at the same thing at once.
+///
+/// ## What it does on each tick
 ///
 /// Three things, in an order that matters:
 ///
@@ -24,7 +35,7 @@ import BitChordShared
 ///     for two consecutive ticks, and no more than once per cooldown. A seek is
 ///     audible; doing this well means mostly *not* doing it.
 ///
-/// # The two quiet rules
+/// ## The two quiet rules
 ///
 /// **A local press wins for a moment.** A listener who presses pause has said
 /// something, and the next state frame — which still says *playing*, because the
@@ -43,14 +54,14 @@ final class PartySync {
     private static let tickMs: UInt64 = 700
 
     /// How long this device's own press keeps it out of the party's way.
+    ///
+    /// Long enough to cover the round trip the control takes to reach the server and
+    /// the state frame to come back, and not much longer — past that a press really
+    /// has been overruled and continuing to hold out helps nobody.
     private static let intentQuietMs: Int64 = 4_500
 
     private let controller: PlaybackController
-    private let session = PartySession()
     private let judge = PartyDriftJudge()
-
-    /// The offset from the party server's clock, measured from pongs.
-    private let clock = ServerClock()
 
     /// The video id this device is currently playing, so a track change is a
     /// comparison rather than a guess.
@@ -60,12 +71,24 @@ final class PartySync {
     private var localIntentAtMs: Int64?
 
     private var task: Task<Void, Never>?
-    private var socketTask: Task<Void, Never>?
 
     private(set) var isActive = false
 
-    /// The party, for the screen to read.
-    var state: PartyState { session.current }
+    /// Where the party is right now, on this device's clock, or nil with no clock.
+    ///
+    /// The screen's "Now playing" position reads this rather than the last frame's,
+    /// because *that is the feature*: between server updates each device advances the
+    /// same anchored position on its own clock, and two devices side by side should
+    /// show the same number. A value that only moved when a frame arrived would
+    /// prove nothing.
+    var partyPositionMs: Int64? {
+        let playback = PartyCoordinator.shared.session.current.playback
+        guard PartyCoordinator.shared.session.current.clockSynced else { return nil }
+        return PartyCoordinator.shared.session.correctedPosition(
+            playback: playback,
+            localNowMs: PartySocket.localNowMs()
+        )
+    }
 
     init(controller: PlaybackController) {
         self.controller = controller
@@ -73,29 +96,23 @@ final class PartySync {
 
     // MARK: - Lifecycle
 
-    func start(base: String, code: String, token: String) {
+    /// Follow the party, for as long as this device is in one.
+    ///
+    /// Idempotent, and driven by membership rather than by a screen appearing: a
+    /// party's lifetime is the listener's, not a view's, so nothing here is tied to
+    /// the Listen Together screen being open.
+    func start() {
         guard !isActive else { return }
         isActive = true
-        session.begin(serverBase: base, code: code)
         judge.reset()
         loadedVideoId = nil
         localIntentAtMs = nil
-
-        socketTask = Task { [weak self] in
-            try? await PartySocketBridge.shared.connect(base: base, code: code, token: token) { json in
-                // Synchronous by contract: the socket already runs off the main
-                // thread, so this is where the hop belongs rather than a `Task` per
-                // frame in the bridge.
-                guard let frame = PartyFrameCodec.shared.decode(text: json) else { return }
-                Task { @MainActor in self?.ingest(frame) }
-            }
-        }
-
+        reconcile()
         task = Task { [weak self] in
             while !Task.isCancelled {
                 try? await Task.sleep(nanoseconds: Self.tickMs * 1_000_000)
                 guard let self else { return }
-                await MainActor.run { self.reconcile() }
+                self.reconcile()
             }
         }
     }
@@ -105,13 +122,15 @@ final class PartySync {
         isActive = false
         task?.cancel()
         task = nil
-        socketTask?.cancel()
-        socketTask = nil
-        PartySocketBridge.shared.stop()
-        session.reset()
         judge.reset()
         loadedVideoId = nil
         localIntentAtMs = nil
+    }
+
+    /// Start or stop to match the party, which is what the app asks for when the
+    /// screen appears and when a frame says the session ended.
+    func syncWithMembership() {
+        if PartyCoordinator.shared.membership != nil { start() } else { stop() }
     }
 
     // MARK: - A local press
@@ -125,42 +144,22 @@ final class PartySync {
         localIntentAtMs = PartySocket.localNowMs()
     }
 
-    // MARK: - Frames
-
-    private func ingest(_ frame: PartyFrame) {
-        // A pong is the only frame that measures anything, and it is the only thing
-        // that can turn the party server's clock into this device's. Without it the
-        // offset is never known and every corrected position is a guess.
-        if let pong = frame as? PartyFramePong {
-            clock.record(
-                sentAtLocalMs: pong.clientMs,
-                serverMs: pong.serverMs,
-                receivedAtLocalMs: PartySocket.localNowMs()
-            )
-        }
-        let applied = session.apply(frame: frame)
-
-        // The state machine noticed a queue it does not hold. Asking for it is the
-        // only refetch trigger, and it is deliberately not fired on every state.
-        if applied is PartySessionAppliedQueue {
-            session.queueRefetchSent()
-        }
-        if applied is PartySessionAppliedLeft {
-            stop()
-        }
-        reconcile()
-    }
-
     // MARK: - The tick
 
     private func reconcile() {
-        let state = session.current
-        guard state.inParty else { return }
+        let state = PartyCoordinator.shared.session.current
+        guard state.inParty else {
+            // Out of a party, this device is on its own again. Anything it was
+            // playing is its own business, not the party's.
+            stop()
+            return
+        }
         let playback = state.playback
 
         // 1. The track. Nothing else means anything until the right song is loaded.
         if let track = playback.track, track.videoId != loadedVideoId {
-            load(track)
+            // Loading is following, not the listener asking for something.
+            controller.withLocalIntentSuppressed { load(track) }
             return
         }
         // A party with no track at all, and something of ours playing, means the
@@ -175,7 +174,7 @@ final class PartySync {
 
         // 2 and 3 together: the judge owns the transport and the playhead, and
         // answering it is the whole of "following".
-        let partyPosition = correctedPosition(of: playback, nowMs: now)
+        let partyPosition = partyPositionMs ?? playback.positionMs
         let decision = judge.onTick(
             partyPositionMs: partyPosition,
             localPositionMs: Int64(controller.position * 1000),
@@ -185,10 +184,19 @@ final class PartySync {
         )
         // A Kotlin sealed interface is a Swift protocol, so this is a cast rather
         // than a switch over cases.
+        //
+        // Every correction is wrapped in the controller's own suppression, so that
+        // moving this device towards the party is never mistaken for the listener
+        // having pressed something. Without it the binding would hear itself and
+        // conclude it had been overruled, and would stop correcting entirely.
         if let seek = decision as? PartyDriftJudgeDecisionSeek {
-            controller.seek(to: Double(seek.seekToMs) / 1000)
-        } else if decision is PartyDriftJudgeDecisionPause {
-            if controller.isPlaying { controller.togglePlayPause() }
+            controller.withLocalIntentSuppressed {
+                controller.seek(to: Double(seek.seekToMs) / 1000)
+            }
+        } else if decision is PartyDriftJudgeDecisionPause, controller.isPlaying {
+            controller.withLocalIntentSuppressed {
+                controller.togglePlayPause()
+            }
         }
 
         // Tell the party where this device is — but only if this device is allowed to
@@ -196,24 +204,6 @@ final class PartySync {
         if state.canControl, !isQuiet(nowMs: now) {
             publish(positionMs: Int64(controller.position * 1000), isPlaying: controller.isPlaying)
         }
-    }
-
-    /// Where the party is, on this device's clock.
-    ///
-    /// The state's position is *not* current — it is the position at the instant the
-    /// server sent it, which may have been 300 ms ago. Correcting it by the elapsed
-    /// time since is the entire sync mechanism, and it is why a frame delayed by a
-    /// slow network still lands in the right place instead of a beat behind.
-    private func correctedPosition(of playback: PartyPlayback, nowMs: Int64) -> Int64 {
-        guard playback.isPlaying else { return playback.positionMs }
-        // No pong has landed yet means no offset and no honest answer, and the
-        // position is held at zero rather than played: a party that is briefly wrong
-        // is better than one that is confidently wrong.
-        return clock.positionFor(
-            positionMs: playback.positionMs,
-            trueAtServerMs: playback.anchorMs,
-            localNowMs: nowMs
-        )
     }
 
     /// Whether this device's own press still outranks the party.
@@ -258,7 +248,6 @@ final class PartySync {
             return
         }
         lastPublishedMs = positionMs
-        let json = PartyOutgoingJson.shared.report(positionMs: positionMs, isPlaying: isPlaying)
-        PartySocketBridge.shared.sendRaw(json: json)
+        PartyCoordinator.shared.report(positionMs: positionMs, isPlaying: isPlaying)
     }
 }

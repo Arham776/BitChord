@@ -7,6 +7,15 @@ struct BitChordApp: App {
     @State private var appModel = AppModel()
     @State private var auth = AuthController()
     @State private var toast = ToastCenter()
+    @State private var party = PartyStore.shared
+    /// The one binding between a party and this device's player.
+    ///
+    /// Replaced rather than constructed inline, because it has to hold *this* session's
+    /// `PlaybackController` and a `@State` initialiser runs before the environment is
+    /// available. Kept at the app rather than in a view because a party's lifetime is
+    /// the listener's and not a view's — most of listening together is the screen
+    /// being somewhere else.
+    @State private var partySync = PartySync(controller: PlaybackController())
     @Environment(\.scenePhase) private var scenePhase
 
     var body: some Scene {
@@ -16,11 +25,25 @@ struct BitChordApp: App {
                 .environment(appModel)
                 .environment(auth)
                 .environment(toast)
+                .environment(party)
                 .task {
                     CipherUnlockWiring.install()
                     SecretStoreWiring.install()
                     ModuleEngineWiring.install()
                     PartySocket.register()
+                    // Before anything can reach the coordinator: it needs the platform
+                    // clock and somewhere to publish, and a coordinator that has
+                    // neither measures against a clock of zero and believes the answer.
+                    PartyStore.install()
+                    partySync = PartySync(controller: controller)
+                    party.attach(player: partySync)
+                    // The player tells the party when the *listener* presses something,
+                    // so a press is not undone by the next frame still describing the
+                    // old transport. Wired here, once, because the controller outlives
+                    // every view and the party binding is replaced on each launch.
+                    controller.onLocalIntent = { [weak partySync] in
+                        partySync?.onLocalIntent()
+                    }
                     installAutomixModels()
                     controller.startEngineIfNeeded()
                     LocalLibrary.shared.restore()
@@ -47,6 +70,16 @@ struct BitChordApp: App {
                     // a cold launch from a link actually needs.
                     if url.absoluteString.contains("open-player") {
                         appModel.nowPlayingPresented = true
+                    }
+                    // An invite is not joined on the spot: it is carried to the
+                    // Listen Together screen, which shows who is in the party before
+                    // a slot is committed. Same as upstream, where a link is consent
+                    // to *look*, not to join. The screen carries its own server editor,
+                    // so a link pointing at somebody else's server needs no trip
+                    // through Settings to get there.
+                    if JamInviteLink.shared.looksLikeInvite(value: url.absoluteString) {
+                        appModel.pendingPartyInvite = url.absoluteString
+                        appModel.listenTogetherPresented = true
                     }
                     _ = MusicLink.shared.submitUrl(url: url.absoluteString)
                     consumeMusicLink(appModel: appModel, controller: controller)
@@ -94,6 +127,15 @@ final class AppModel {
     var playlistPicker: PlaylistPickerRequest?
     var downloadManagerPresented = false
     var replayPresented = false
+    /// Listen Together, presented over whatever the listener was doing.
+    ///
+    /// Its own flag rather than a settings row, because a party invite is a request
+    /// to *look* at a party, and the screen that answers it has to be the one that
+    /// arrives — making somebody find Settings first would put a settings window
+    /// between a link and the thing the link is about.
+    var listenTogetherPresented = false
+    /// An invite link that arrived from outside, waiting to be looked at.
+    var pendingPartyInvite: String?
     var focusSearch = false
     var pendingSearchQuery: String?
     /// Set by the macOS menu commands to ask the player to reveal a pane that is

@@ -130,6 +130,17 @@ class PartySession {
         _state.value = PartyState()
     }
 
+    companion object {
+        /**
+         * How many actions the log keeps.
+         *
+         * Upstream's number, and for the same reason: a party long enough to need
+         * more than this is one where nobody is reading it any more, and the list
+         * rides along in every state frame's worth of memory.
+         */
+        const val ACTIVITY_LIMIT = 100
+    }
+
     /**
      * Apply one frame, and report what it changed.
      *
@@ -185,7 +196,23 @@ class PartySession {
         }
 
         is PartyFrame.Activity -> {
-            _state.update { it.copy(activity = PartyActivity(frame.action, frame.by, frame.atMs, frame.detail)) }
+            // Kept as a log rather than a single latest value, because the log is the
+            // point: a party of five is a thing several people want to look back
+            // over. Bounded, because a party can run for a day and the server sends
+            // an activity for every control; newest first, because that is the order
+            // anybody reads it in.
+            //
+            // Deduped on the whole entry, because a reconnect re-broadcasts the
+            // activity frames the socket missed on the way up and a log that repeats
+            // itself after every tunnel is worse than a short one.
+            val fresh = PartyActivity(frame.action, frame.by, frame.atMs, frame.detail)
+            val existing = _state.value.activities
+            _state.update {
+                it.copy(
+                    activity = fresh,
+                    activities = (listOf(fresh) + existing.filterNot { entry -> entry == fresh }).take(ACTIVITY_LIMIT),
+                )
+            }
             Applied.Nothing
         }
 
@@ -295,6 +322,13 @@ data class PartyState(
     val playback: PartyPlayback = PartyPlayback(),
     val queue: PartyQueue = PartyQueue(),
     val activity: PartyActivity? = null,
+    /**
+     * The log, newest first, for this session only.
+     *
+     * [activity] is this list's head, kept as its own field so the common case — "did
+     * somebody just do something" — is a field read rather than a list walk.
+     */
+    val activities: List<PartyActivity> = emptyList(),
     val error: PartyError? = null,
     val connection: PartyConnection = PartyConnection.OFFLINE,
     /** False until the first round trip; the playhead is a guess until then. */

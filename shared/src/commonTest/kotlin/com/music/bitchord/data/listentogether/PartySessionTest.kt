@@ -259,6 +259,39 @@ class PartySessionTest {
     }
 
     @Test
+    fun `the activity log is kept and not just the latest`() {
+        // Upstream keeps a hundred and the screen shows them. A single latest value
+        // cannot be looked back over, which is the entire reason the log is a log.
+        val s = session()
+        s.apply(PartyFrame.Activity(action = "play", by = "Sam", atMs = 1_000, serverMs = 1_000))
+        s.apply(PartyFrame.Activity(action = "pause", by = "Alex", atMs = 2_000, serverMs = 2_000))
+        assertEquals(2, s.current.activities.size)
+        // Newest first, because that is the order anybody reads it in.
+        assertEquals("pause", s.current.activities.first().action)
+        assertEquals("pause", s.current.activity?.action)
+    }
+
+    @Test
+    fun `the activity log is bounded`() {
+        val s = session()
+        repeat(PartySession.ACTIVITY_LIMIT + 25) { index ->
+            s.apply(PartyFrame.Activity(action = "seek", by = "Sam", atMs = index.toLong(), serverMs = 0))
+        }
+        assertEquals(PartySession.ACTIVITY_LIMIT, s.current.activities.size)
+    }
+
+    @Test
+    fun `a replayed activity is not logged twice`() {
+        // A reconnect re-broadcasts what the socket missed on the way up, and a log
+        // that repeats itself after every tunnel is worse than a short one.
+        val s = session()
+        val frame = PartyFrame.Activity(action = "next", by = "Sam", atMs = 5_000, detail = "Skipped ahead")
+        s.apply(frame)
+        s.apply(frame)
+        assertEquals(1, s.current.activities.size)
+    }
+
+    @Test
     fun `a stale queue is noticed from a repeated heartbeat and not only a new song`() {
         // The queue frame is the server's own answer and normally arrives; asking again
         // off the state frame is what covers the case where it did not.

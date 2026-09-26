@@ -206,7 +206,9 @@ struct SettingsView: View {
             case .miscellaneous:
                 return ["language", "lyrics", "sources", "video", "lyric video",
                         "swipe", "suggestions", "volume bar", "lyrics source",
-                        "spotify canvas", "jiosaavn", "background", "stop when backgrounded"]
+                        "spotify canvas", "jiosaavn", "background", "stop when backgrounded",
+                        "listen together", "party", "jam", "party code", "invite",
+                        "party server", "in sync", "synchronise", "synchronize"]
             case .about:
                 return ["about", "version", "credits", "licence", "license",
                         "acknowledgements", "privacy policy", "github"]
@@ -314,6 +316,27 @@ struct SettingsView: View {
         if let email = auth.accountEmail, !email.isEmpty { return email }
         if let name = auth.accountName, !name.isEmpty { return name }
         return auth.signedIn ? "Signed in" : "Not signed in"
+    }
+
+    /// What the Listen Together row says.
+    ///
+    /// Says what the feature is rather than how to start it, because a settings row
+    /// is a label for a thing and not a call to action — the screen it opens is where
+    /// the button is.
+    private var listenTogetherSubtitle: String {
+        let party = PartyStore.shared
+        if party.inParty { return "In a party · \(party.code)" }
+        return "Share a code and play the same music, in time"
+    }
+
+    /// How many are listening, when it is more than one person.
+    ///
+    /// A count of one is not news — a party of one is a person alone, which is what
+    /// they already know — so the badge appears only once somebody else is there.
+    private var partyBadge: String? {
+        let party = PartyStore.shared
+        let count = party.state.members.count
+        return party.inParty && count > 1 ? "\(count)" : nil
     }
 
     // MARK: - Audio quality
@@ -664,6 +687,18 @@ struct SettingsView: View {
                 subtitle: "Pauses playback when the app leaves the foreground",
                 isOn: $stopBackground
             )
+            NavigationLink {
+                ListenTogetherView()
+            } label: {
+                SettingsLine(
+                    glyph: .listenTogether,
+                    title: "Listen together",
+                    subtitle: listenTogetherSubtitle,
+                    badge: partyBadge
+                ) {
+                    EmptyView()
+                }
+            }
             NavigationLink {
                 SpotifyCanvasAuthView(cookie: $spotifyCookie)
             } label: {
@@ -1345,7 +1380,7 @@ private struct SettingsGlyph: View {
         case storage, clearSongs, clearImages
         case swipe, dontRepeat, hideVolume
         case discord, listenBrainz, lastFm
-        case replay, genres, export, importData
+        case replay, genres, export, importData, listenTogether
     }
 
     var kind: Kind
@@ -1397,6 +1432,9 @@ private struct SettingsGlyph: View {
         case .genres: "tag.fill"
         case .export: "square.and.arrow.up.fill"
         case .importData: "square.and.arrow.down.fill"
+        // Two people and a sound wave, because the alternative — a single person —
+        // reads as a profile picture and this row is not about a profile.
+        case .listenTogether: "person.2.wave.2.fill"
         }
     }
 
@@ -1433,6 +1471,7 @@ private struct SettingsGlyph: View {
         case .replay: .indigo
         case .genres: .orange
         case .export, .importData: .gray
+        case .listenTogether: .teal
         }
     }
 }
