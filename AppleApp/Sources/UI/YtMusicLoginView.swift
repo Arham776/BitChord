@@ -37,12 +37,13 @@ import BitChordShared
 ///
 /// ## The header is upstream's
 ///
-/// Title, hint and confirmation live in the navigation bar — Close, the "switch
-/// using the avatar" hint once the Music page is up, and Use This Profile — which
-/// is both what upstream's `MainActivity` shows and what a sheet is expected to
-/// look like on this platform. There is deliberately no bottom Continue button: a
-/// confirmation that lives in the bar cannot be missed below a page that scrolls,
-/// and it is where Cancel already lives.
+/// Title, hint and confirmation mirror what upstream's `MainActivity` shows —
+/// Close, the "switch using the avatar" hint once the Music page is up, and Use
+/// This Profile — mapped onto the navigation bar, which is where a sheet keeps
+/// such things on this platform. The hint reads as a banner that pushes the page
+/// down, exactly as upstream's `Column` lays its header above the web view.
+/// There is deliberately nothing below the page: a confirmation in the bar cannot
+/// be missed below content that scrolls, and it is where Close already lives.
 struct YtMusicLoginView: View {
     /// The confirmed session, with a completion the owner calls once validation
     /// finishes. Staying open until then is the point: closing on capture and
@@ -54,11 +55,32 @@ struct YtMusicLoginView: View {
     @State private var flow = LoginFlow()
 
     var body: some View {
-        LoginWebView(
-            flow: flow,
-            onCaptured: onCaptured,
-            onUnavailable: { reason in flow.captureFailed(reason) }
-        )
+        // Upstream's `MainActivity` structure, in Apple form: a header (here the
+        // navigation bar: Close, title, Use This Profile) with its subtitle as a
+        // banner, and the web page filling the rest. A `VStack` rather than an
+        // overlay on purpose — upstream's `Column` pushes the page down instead
+        // of floating over it, so the banner never covers the profile it talks
+        // about. And nothing below the page: the confirmation lives in the bar,
+        // where Cancel already lives, not in a footer under content that scrolls.
+        VStack(spacing: 0) {
+            if let prompt = flow.prompt {
+                Text(prompt)
+                    .font(.footnote)
+                    .foregroundStyle(flow.captureFailedMessage == nil ? Color.secondary : Color.orange)
+                    .multilineTextAlignment(.center)
+                    .frame(maxWidth: .infinity)
+                    .padding(.horizontal, 20)
+                    .padding(.vertical, 8)
+                    .background(.bar)
+                    .transition(.opacity)
+            }
+            LoginWebView(
+                flow: flow,
+                onCaptured: onCaptured,
+                onUnavailable: { reason in flow.captureFailed(reason) }
+            )
+        }
+        .animation(.easeInOut(duration: 0.2), value: flow.prompt)
         .navigationTitle("Sign in to YouTube Music")
         #if os(iOS)
         .navigationBarTitleDisplayMode(.inline)
@@ -77,23 +99,6 @@ struct YtMusicLoginView: View {
                     }
                     .accessibilityHint("Saves the profile shown by the page to this device")
                 }
-            }
-        }
-        .overlay(alignment: .top) {
-            // Upstream's subtitle under the title: what to do once the Music page
-            // is up, or that there is nothing to take yet after a failed attempt.
-            // A banner over the page rather than a footer under it, so it reads
-            // against the profile it describes instead of below a page that may
-            // have scrolled it out of sight.
-            if let prompt = flow.prompt {
-                Text(prompt)
-                    .font(.footnote)
-                    .foregroundStyle(flow.captureFailedMessage == nil ? Color.secondary : Color.orange)
-                    .multilineTextAlignment(.center)
-                    .padding(.horizontal, 20)
-                    .padding(.vertical, 8)
-                    .background(.bar)
-                    .transition(.opacity)
             }
         }
     }
