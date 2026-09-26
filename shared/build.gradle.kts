@@ -44,6 +44,10 @@ kotlin {
         // appleMain — the common ancestor of every configured Apple target.
         appleMain.dependencies {
             implementation("io.ktor:ktor-client-darwin:3.2.0")
+            // The party socket is NSURLSessionWebSocketTask, not Ktor: Ktor 3.2's
+            // client websockets plugin is an empty shell on Darwin, and the platform
+            // API is both shorter and gives the close code and ping/pong this
+            // protocol needs.
         }
     }
 }
