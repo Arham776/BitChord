@@ -31,6 +31,30 @@ import kotlinx.coroutines.flow.update
  */
 class PartySession {
 
+    // ---- The clock ---------------------------------------------------------
+    //
+    // It lives here rather than in the socket because the state machine and the player
+    // binding both read the offset, and two copies of a measurement is one too many.
+    private val clock = ServerClock()
+
+    /** The offset from the party server's clock, once a pong has landed. */
+    fun serverClock(): ServerClock = clock
+
+    /**
+     * Record one completed round trip.
+     *
+     * Called on a pong, with the local reading stamped on the outgoing ping and the
+     * local reading when the answer arrived. Nothing else can establish the offset,
+     * and without it a party's position is a guess.
+     */
+    fun recordPong(sentAtLocalMs: Long, serverMs: Long, receivedAtLocalMs: Long) {
+        clock.record(sentAtLocalMs, serverMs, receivedAtLocalMs)
+    }
+
+    /** Where the party is, on this device's clock. Zero until the first pong lands. */
+    fun correctedPosition(playback: PartyPlayback, localNowMs: Long): Long =
+        clock.positionFor(playback.positionMs, playback.anchorMs, localNowMs)
+
     private val _state = MutableStateFlow(PartyState())
     val state: StateFlow<PartyState> = _state.asStateFlow()
 
