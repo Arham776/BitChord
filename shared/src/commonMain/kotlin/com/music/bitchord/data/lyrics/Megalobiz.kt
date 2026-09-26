@@ -11,6 +11,19 @@ import kotlinx.coroutines.withContext
  * does. It is last in the default order for that reason, and it is here because
  * it does hold a long tail of older catalogue that none of the licensed
  * sources carry.
+ *
+ * ## It is currently broken, and the two regexes are not why
+ *
+ * Checked on 26 September 2026: `/searchall` answers 404 and `/search/` answers 503.
+ * The page this reads is not serving, so there is nothing to match against and the
+ * walk returns a miss. Written down because the alternative — seeing "no lyrics" and
+ * assuming the database has never heard of the song — is exactly the misreading the
+ * note above warns about, and because the next person to look should not have to
+ * rediscover that both patterns still work.
+ *
+ * Fixing it means finding where the search moved, and a guess at a new path is worse
+ * than a source that admits it is down: a scraper pointed at the wrong page returns
+ * confidently and wrongly.
  */
 object Megalobiz {
 

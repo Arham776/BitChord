@@ -8,6 +8,14 @@ package com.music.bitchord.data.lyrics
  * Separate entries in the settings because they fail independently — a track
  * one has and the other does not is common, and which of them is worth asking
  * depends on the catalogue rather than on anything the listener sets.
+ *
+ * ## The Portato endpoint is gone
+ *
+ * Checked on 26 September 2026: `getLyricsPortato` answers `404 page not found`
+ * while `getLyrics` answers normally. The second source therefore never returns
+ * anything, and the setting is still here because the endpoint may come back and
+ * because removing it would take a listener's saved choice away. Noted so that
+ * "Portato never has anything" is not read as a bug in the lookup.
  */
 object BetterLyrics {
     private const val BASE = "https://lyrics-api.boidu.dev/getLyrics"

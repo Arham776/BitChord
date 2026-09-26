@@ -380,13 +380,12 @@ actual object Http {
                 response.discardBody()
                 return ProbeResult(status = status, contentType = ct, bodyArrived = false)
             }
-            // Audio only. Upstream requires this and a muxed `video/mp4` answer
-            // is not something this engine can play, so accepting it here would
-            // pass a URL the caller then has to reject.
-            if (!isAudioContentType(ct)) {
-                response.discardBody()
-                return ProbeResult(status = status, contentType = ct, bodyArrived = false)
-            }
+            // Whether the bytes are the media the caller asked for is *not* decided
+            // here. It was, once, and the test was "does the content type begin
+            // `audio/`" — which refused every muxed `video/mp4`, i.e. exactly the
+            // format a guest session is left with when adaptive audio is SABR-only,
+            // and the one this engine can demux audio out of. The caller knows which
+            // format it minted a URL for; this only reports what the server said.
             val bodyArrived = response.readProbeBytes()
             if (!bodyArrived) {
                 return ProbeResult(status = status, contentType = ct, bodyArrived = false)
@@ -426,10 +425,7 @@ actual object Http {
         }
     }
 
-    private fun isAudioContentType(ct: String?): Boolean = ct?.startsWith("audio/") == true
-
     private val REFUSAL_CODES = setOf(403, 404, 410)
-
     private const val PROBE_TIMEOUT_MS = 6_000L
 
     /**

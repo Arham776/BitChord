@@ -965,16 +965,61 @@ object Innertube {
     }
 }
 
-/** The verdict of a ranged GET on a freshly minted stream URL. */
-internal fun ProbeResult.classify(): ProbeVerdict = when {
-    status in setOf(403, 404, 410) -> ProbeVerdict.REFUSED
+/**
+ * The verdict of a ranged GET on a freshly minted stream URL.
+ *
+ * [expected] is the mime type of the format the URL was minted for, and the content
+ * type is judged against *it* rather than against "must be audio". That distinction
+ * is the whole reason this is a parameter. A format with no adaptive audio left —
+ * which is what a guest session is handed for most of the catalogue — is a muxed
+ * `video/mp4` carrying AAC, [StreamResolver] takes it deliberately, and the engine
+ * demuxes the audio track out of it: `native-core`'s track search looks for a track
+ * that has audio and names muxed itag 18 in the comment above it. A test that insisted
+ * the answer begin `audio/` threw away the only rung the ladder had, and a track that
+ * resolved on a guest session resolved on nothing.
+ */
+internal fun ProbeResult.classify(expected: String? = null): ProbeVerdict = when {
+    status in REFUSAL_STATUSES -> ProbeVerdict.REFUSED
     status !in 200..299 && status != 416 -> ProbeVerdict.UNREACHABLE
-    // Audio only — the engine plays audio, and a muxed `video/mp4` answer is not
-    // something it can be handed. [Http.probe] applies the same test, so a URL
-    // that clears here cleared the same test there.
-    !contentType.orEmpty().startsWith("audio/") -> ProbeVerdict.REFUSED
+    // 416 is the end of the file and has no body to judge: a seek past the
+    // container's length, which the reader treats as a clean finish.
+    status == 416 -> ProbeVerdict.UNREACHABLE
+    !contentType.isMediaFamilyOf(expected) -> ProbeVerdict.REFUSED
     !bodyArrived -> ProbeVerdict.UNREACHABLE
     else -> ProbeVerdict.OK
+}
+
+/** Answers that mean *this client is being refused*, rather than a bad minute. */
+private val REFUSAL_STATUSES = setOf(403, 404, 410)
+
+/**
+ * Whether a content type is the kind of media [expected] asked for.
+ *
+ * A family rather than an equality, and that is deliberate in both directions. A
+ * range for a muxed `video/mp4` is answered `video/mp4` by one server and
+ * `audio/mp4` by another for the same bytes, while a `text/html` body — the shape a
+ * bot check or a consent page takes — matches no family at all, and that is the case
+ * this test earns its keep on.
+ *
+ * `application/octet-stream` matches anything, because a server declining to name a
+ * type is not the same as one naming a wrong type.
+ *
+ * A null [expected] means nothing was asked for, and then only the outright wrong
+ * answers are refused: the check is here to catch an error page, not to insist on a
+ * spelling.
+ */
+private fun String?.isMediaFamilyOf(expected: String?): Boolean {
+    val answer = this?.substringBefore(';')?.trim()?.lowercase().orEmpty()
+    // A server declining to name a type is not naming a wrong one.
+    if (answer == "application/octet-stream") return true
+    // Only the two families the engine can take audio out of. With no format to
+    // compare against this is the whole test, and it is why an error page is refused
+    // rather than waved through: `text/html` has a slash in it too.
+    val family = answer.substringBefore('/')
+    if (family != "audio" && family != "video") return false
+    val wanted = expected?.substringBefore(';')?.trim()?.lowercase()?.substringBefore('/')
+        ?.takeIf { it == "audio" || it == "video" }
+    return wanted == null || wanted == family
 }
 
 internal enum class ProbeVerdict {

@@ -40,8 +40,12 @@ final class InnertubeStreamResolver: Sendable {
                             continuation.resume(throwing: error)
                         }
                     } else {
-                        continuation.resume(throwing: StreamError(
-                            message: message ?? "Stream resolution failed"))
+                        // The shared module's message names the track and every client
+                        // that refused it, which is right for a log and wrong for a
+                        // listener. `say` is where the two are separated; the raw
+                        // reason is kept on the error's `raw` for whoever wants it.
+                        let raw = message ?? "Stream resolution failed"
+                        continuation.resume(throwing: StreamError(message: StreamError.say(raw), raw: raw))
                     }
                 }
             )
@@ -64,8 +68,50 @@ final class InnertubeStreamResolver: Sendable {
     }
 
     struct StreamError: Error, LocalizedError {
+        /// The sentence a listener sees.
         let message: String
+        /// What the shared module said, in full.
+        ///
+        /// Kept rather than discarded because it is the only place the per-client
+        /// reasons exist and they are what a bug report needs. Never shown: it
+        /// contains a video id and internal client names.
+        let raw: String
+
+        init(message: String, raw: String? = nil) {
+            self.message = message
+            self.raw = raw ?? message
+        }
+
         var errorDescription: String? { message }
+
+        /// What to show a listener, from whatever the shared module said.
+        ///
+        /// The shared module's message names the track and every client that refused
+        /// it, which is the right thing for a log and the wrong thing to put in front
+        /// of somebody: a video id and a list of internal client names is not a
+        /// explanation. The two cases that are not "this one track is being awkward"
+        /// get their own sentences, because they are the two a listener can do
+        /// something about — and everything else gets one honest sentence rather than
+        /// five words that name a subsystem.
+        ///
+        /// Same rule as the party screen's `describe`: the server's own words when it
+        /// sent any, otherwise a statement of what failed and never the raw error.
+        static func say(_ raw: String) -> String {
+            let said = raw.lowercased()
+            if said.contains("sign in") || said.contains("not a bot") {
+                return "YouTube is asking this device to sign in before it will serve anything. That is YouTube's gate rather than anything to do with the track."
+            }
+            if said.contains("needs to be reloaded") || said.contains("page needs") {
+                return "YouTube's player refused this connection. Trying again in a moment usually clears it."
+            }
+            if said.contains("unavailable") || said.contains("not available") {
+                return "That track isn’t available right now."
+            }
+            if said.contains("no signature timestamp") {
+                return "BitChord could not read YouTube’s player, so it could not open a stream. Check the connection and try again."
+            }
+            return "Couldn’t open a stream for that track."
+        }
     }
 }
 

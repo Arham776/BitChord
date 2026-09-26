@@ -257,7 +257,7 @@ final class PlaybackController {
     /// Last resolve/upgrade/source decisions, for a UI "Debug log" action.
     var debugLogText: String { debugLog.dump() }
 
-    private let debugLog = PlaybackDebugLog()
+    private let debugLog = PlaybackDebugLog.shared
     private var pendingAutomixPlan: TransitionPlanRec?
     private var upgradeFor: String?
     private var mixFadeUntil: Date?
@@ -1013,7 +1013,19 @@ final class PlaybackController {
     /// better second chance than minting a new URL for a problem the new URL would
     /// not fix.
     private static func resolveYouTube(videoId: String, prefs: ResolvePrefs) async throws -> ResolvedSource {
-        let stream = try await InnertubeStreamResolver.shared.resolve(videoId: videoId, maxKbps: prefs.maxKbps)
+        let stream: ResolvedYouTubeStream
+        do {
+            stream = try await InnertubeStreamResolver.shared.resolve(videoId: videoId, maxKbps: prefs.maxKbps)
+        } catch {
+            // The per-client reasons, which the shared module carries and the
+            // sentence a listener sees does not. Recorded here because this is where
+            // the debug log lives, and a report that says "playback failed" is worth
+            // nothing next to one that says which client refused and why.
+            if let streamError = error as? InnertubeStreamResolver.StreamError {
+                PlaybackDebugLog.shared.record(streamError.raw, about: videoId)
+            }
+            throw error
+        }
         do {
             let localPath = try await streamViaKtor(
                 videoId: videoId, url: stream.url, headers: stream.headers)

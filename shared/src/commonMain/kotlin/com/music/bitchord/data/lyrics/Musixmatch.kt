@@ -13,6 +13,19 @@ import kotlin.math.abs
 
 /**
  * Line-synced lyrics from Musixmatch's own web client API.
+ *
+ * ## The endpoint no longer issues tokens
+ *
+ * Checked on 26 September 2026: `token.get` answers
+ * `status_code: 401, hint: "upgrade"` for the `web-desktop-app-v1.0` app id and the
+ * shared signing secret, which is what upstream uses and what this port uses. No
+ * token means no search and no subtitle, so this source answers nothing at all.
+ *
+ * The failure is handled rather than papered over — [signedGet] gives up cleanly and
+ * the race carries on to the next source — and it is written down because the symptom
+ * is indistinguishable from "Musixmatch has never heard of this song", which is what
+ * it will look like to a listener and to the next person to check. A paid key is the
+ * only way back, and there is nothing to configure on this side of it.
  */
 object Musixmatch {
 

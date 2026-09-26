@@ -4,6 +4,15 @@ import Foundation
 /// song-menu "Debug log" action. Not a port of Android `TrackLog` — last N
 /// lines only, no persistence.
 final class PlaybackDebugLog: @unchecked Sendable {
+    /// The one log.
+    ///
+    /// Shared rather than one per controller because two places need to write to it
+    /// and only one of them has the controller: a resolution failure is reported by
+    /// `resolveYouTube`, which is static, and the per-client reasons it carries are
+    /// the most useful thing this log ever holds. Two logs would mean the reasons
+    /// somewhere nobody looks.
+    static let shared = PlaybackDebugLog()
+
     private let lock = NSLock()
     private var lines: [String] = []
     private let capacity: Int

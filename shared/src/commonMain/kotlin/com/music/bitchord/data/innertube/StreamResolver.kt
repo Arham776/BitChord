@@ -209,7 +209,15 @@ object StreamResolver {
             DebugLog.w("$videoId is not playable: $reason; not asking again for 10 minutes")
             throw PermanentlyUnplayableException(reason)
         }
-        throw IllegalStateException("No playable stream for $videoId")
+        // The reasons travel with the failure rather than staying in the log. The log
+        // is read by whoever is already looking; this is read by the app, and "No
+        // playable stream for fJ9rUzIMcZQ" is not a sentence anybody can act on — the
+        // difference between "YouTube is refusing every client" and "this track is not
+        // available" is the whole of what a listener is told. The app turns it into
+        // something to show; the detail is here for it to be honest about.
+        throw IllegalStateException(
+            "No playable stream for $videoId: ${errors.joinToString("; ")}",
+        )
     }
 
     /**
@@ -334,8 +342,20 @@ object StreamResolver {
 
             val formats = rankForPlayback(response, maxKbps)
             if (formats.isEmpty()) {
-                DebugLog.d("$videoId: ${client.clientName} offered no usable format")
-                errors += "${client.clientName}: no audio formats"
+                // What it found, not what it could not use. "no audio formats" is a
+                // statement about the *filter*, and the filter is rarely the answer: the
+                // iOS client as of September 2026 answers with two dozen adaptive
+                // formats, the two audio-bearing ones among them included, and gives
+                // not one of them a `url` or a `signatureCipher` — everything is
+                // server-side ABR now. Saying "no audio formats" sends the next reader
+                // to the filter when the truth is about the client.
+                val offered = countFormats(response)
+                val detail = when {
+                    offered == 0 -> "no formats at all"
+                    else -> "$offered format(s), none of them with a direct address"
+                }
+                DebugLog.d("$videoId: ${client.clientName} offered $detail")
+                errors += "${client.clientName}: $detail"
                 standDown(videoId, client)
                 refused(videoId, client)
                 continue
@@ -348,7 +368,10 @@ object StreamResolver {
                 continue
             }
 
-            when (probe(picked.url, client.mediaHeaders())) {
+            // The format the URL was minted for is what the answer is judged against,
+            // so a muxed `video/mp4` is accepted for the `video/mp4` it was minted
+            // for and an error page is refused for both of them.
+            when (probe(picked.url, client.mediaHeaders(), picked.mimeType)) {
                 ProbeVerdict.OK -> {
                     DebugLog.d(
                         "resolved $videoId via ${client.clientName}@${client.clientVersion} " +
@@ -486,7 +509,7 @@ object StreamResolver {
                 formats,
                 mutableListOf(),
             ) ?: return null
-            if (probe(picked.url, PlayerClient.WEB_REMIX.mediaHeaders()) != ProbeVerdict.OK) {
+            if (probe(picked.url, PlayerClient.WEB_REMIX.mediaHeaders(), picked.mimeType) != ProbeVerdict.OK) {
                 DebugLog.d("$videoId: signed-in WEB_REMIX URL did not probe clean")
                 standDown(videoId, PlayerClient.WEB_REMIX)
                 return null
@@ -732,6 +755,20 @@ object StreamResolver {
     }
 
     /**
+     * How many formats the response held, playable or not.
+     *
+     * For the line that says what a client did *not* give us. Counting the audio
+     * entries here would make the number agree with the filter and say nothing; the
+     * useful number is what arrived.
+     */
+    private fun countFormats(response: JsonObject): Int {
+        val streamingData = response["streamingData"] as? JsonObject ?: return 0
+        val adaptive = (streamingData["adaptiveFormats"] as? JsonArray).orEmpty()
+        val legacy = (streamingData["formats"] as? JsonArray).orEmpty()
+        return adaptive.size + legacy.size
+    }
+
+    /**
      * Audio-only, or muxed MP4 that still carries AAC — the remaining guest format
      * when adaptive audio is SABR-only.
      */
@@ -752,8 +789,8 @@ object StreamResolver {
 
     private val REFUSAL_CODES = setOf(403, 404, 410)
 
-    private suspend fun probe(url: String, headers: Map<String, String>): ProbeVerdict =
-        Http.probe(url, headers).classify()
+    private suspend fun probe(url: String, headers: Map<String, String>, expected: String): ProbeVerdict =
+        Http.probe(url, headers).classify(expected)
 
     /**
      * Align the URL's `cver` with the client that actually asked.
