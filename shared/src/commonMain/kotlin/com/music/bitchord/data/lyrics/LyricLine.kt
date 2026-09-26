@@ -27,6 +27,15 @@ data class LyricLineDto(
     val words: List<LyricWordDto> = emptyList(),
     val sungUntilMs: Long? = null,
     val background: LyricLineDto? = null,
+    /**
+     * Which side of the panel this line is sung from.
+     *
+     * A duet is written in TTML as a `ttm:agent` per line, and the two voices are
+     * laid out on opposite sides so a call-and-response reads as two people rather
+     * than one long verse. [LyricAlignment.Start] is the default and the only side
+     * a single-voice song ever uses — which is every provider but Apple's.
+     */
+    val alignment: LyricAlignment = LyricAlignment.Start,
 ) {
     val isGap: Boolean get() = text.isEmpty()
 

@@ -63,6 +63,18 @@ final class LyricsTranslator {
     private(set) var outcome: Outcome = .idle
     private(set) var translatedLines: [LyricLineDto]?
 
+    /**
+     * Which side each line of the *original* was sung from, index for index.
+     *
+     * Held here rather than copied onto the translation, because the side is a
+     * property of the song and not of the translation — and because
+     * `LyricAlignment` is a Kotlin enum, which is not `Sendable` and so cannot be
+     * captured by the `@Sendable` completion that the translation arrives on. A
+     * plain `Bool` is, and "is this the second voice" is all the answer needs to
+     * be.
+     */
+    private var originalSides: [Bool] = []
+
     private var translateLanguages: [Language] = []
     private var romanizeLanguages: [Language] = []
     private var loaded = false
@@ -104,6 +116,7 @@ final class LyricsTranslator {
         lines: [LyricLineDto],
         then: @escaping ([LyricLineDto]?) -> Void,
     ) {
+        originalSides = lines.map { $0.alignment == .end }
         guard !lines.isEmpty else {
             outcome = .unavailable
             translatedLines = nil
@@ -121,7 +134,6 @@ final class LyricsTranslator {
                 switch status {
                 case "translated":
                     let decoded = self.decode(body)
-                    self.translatedLines = decoded
                     self.outcome = .done(language: language, fromCache: cached)
                     then(decoded)
                 case "same":
@@ -244,7 +256,12 @@ final class LyricsTranslator {
                     LyricWordDto(startMs: $0.startMs, endMs: $0.endMs, text: $0.text)
                 },
                 sungUntilMs: sungUntilMs.map { KotlinLong(value: $0) },
-                background: background?.toModel()
+                background: background?.toModel(),
+                // Left on the default side deliberately. A translation is drawn
+                // under its original and is looked up by index, so the side comes
+                // from the original at display time — see `translatedLines`. It is
+                // a property of who was singing, and only the original knows.
+                alignment: LyricAlignment.start
             )
         }
     }

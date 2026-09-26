@@ -1329,21 +1329,34 @@ private struct WordSyncedLine: View {
     let distance: Int
     let position: Double
 
+    /// Which side of the panel this line is sung from.
+    ///
+    /// A duet reads as two people because the voices are on opposite sides, not
+    /// because the words say so. A call-and-response laid out down one side is one
+    /// long verse with no idea who is singing it.
+    private var isSecondVoice: Bool {
+        line.alignment == .end
+    }
+
     var body: some View {
-        VStack(alignment: .leading, spacing: 4) {
+        VStack(alignment: isSecondVoice ? .trailing : .leading, spacing: 4) {
             Text(leadRendered)
                 .font(.title)
-                .multilineTextAlignment(.leading)
+                .multilineTextAlignment(isSecondVoice ? .trailing : .leading)
                 .fixedSize(horizontal: false, vertical: true)
-                .frame(maxWidth: .infinity, alignment: .leading)
+                // The frame and the scale anchor follow the side as well. A second
+                // voice that grew towards the left would lean out of its own column
+                // the moment it was sung, which is the one moment the reader is
+                // looking at it.
+                .frame(maxWidth: .infinity, alignment: isSecondVoice ? .trailing : .leading)
                 .shadow(color: active ? .white.opacity(0.35) : .clear, radius: active ? 8 : 0, y: 0)
-                .scaleEffect(active ? 1.04 : 1, anchor: .leading)
+                .scaleEffect(active ? 1.04 : 1, anchor: isSecondVoice ? .trailing : .leading)
             if let backing = backingRendered {
                 Text(backing)
                     .font(.title3)
-                    .multilineTextAlignment(.leading)
+                    .multilineTextAlignment(isSecondVoice ? .trailing : .leading)
                     .fixedSize(horizontal: false, vertical: true)
-                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .frame(maxWidth: .infinity, alignment: isSecondVoice ? .trailing : .leading)
                     .opacity(0.45)
             }
         }
