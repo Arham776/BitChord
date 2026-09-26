@@ -67,6 +67,9 @@ final class FeedLoader {
 /// card navigates to its detail page (spec parity with upstream's two-row cards).
 struct ShelfCarousel: View {
     let shelf: FeedShelf
+    /// Flips which end of a card that has *both* ids wins. See
+    /// [ShelfCardView] for why the two orders are not interchangeable.
+    var preferTrack: Bool = false
     @Environment(PlaybackController.self) private var controller
 
     var body: some View {
@@ -76,7 +79,7 @@ struct ShelfCarousel: View {
             ScrollView(.horizontal, showsIndicators: false) {
                 LazyHStack(alignment: .top, spacing: 14) {
                     ForEach(shelf.items) { card in
-                        ShelfCardView(card: card)
+                        ShelfCardView(card: card, preferTrack: preferTrack)
                     }
                 }
                 .padding(.vertical, 2)
@@ -89,34 +92,50 @@ struct ShelfCardView: View {
     let card: ShelfCard
     @Environment(PlaybackController.self) private var controller
 
+    /// Which end of a card carrying *both* a video id and a browse id wins.
+    ///
+    /// The two orders are not interchangeable, and upstream uses both. On Home
+    /// and a detail page the browse id wins: the card is a shelf of albums and
+    /// playlists, and a browse id is what the shelf meant. On a mood or genre
+    /// category the track wins — upstream branches on `videoId` first there, and
+    /// it is the more specific thing the listener aimed at, since the category
+    /// page is a list of things to *start*, not things to read.
+    var preferTrack: Bool = false
+
     var body: some View {
         Group {
-            if let browseId = card.browseId, !browseId.isEmpty {
+            if preferTrack, let videoId = card.videoId, !videoId.isEmpty {
+                trackButton(videoId)
+            } else if let browseId = card.browseId, !browseId.isEmpty {
                 NavigationLink(destination: DetailView(browseId: browseId, initialTitle: card.title)) {
                     cardContent
                 }
                 .buttonStyle(.plain)
             } else if let videoId = card.videoId, !videoId.isEmpty {
-                Button {
-                    controller.playRadio(QueueEntry.youtube(
-                        videoId: videoId, title: card.title, artist: card.subtitle ?? "",
-                        thumbnailUrl: card.thumbnailUrl
-                    ))
-                } label: {
-                    cardContent
-                        .overlay(alignment: .topLeading) {
-                            if controller.current?.id == videoId && controller.isBuffering {
-                                ProgressView()
-                                    .controlSize(.small)
-                                    .padding(8)
-                            }
-                        }
-                }
-                .buttonStyle(.plain)
+                trackButton(videoId)
             } else {
                 cardContent
             }
         }
+    }
+
+    private func trackButton(_ videoId: String) -> some View {
+        Button {
+            controller.playRadio(QueueEntry.youtube(
+                videoId: videoId, title: card.title, artist: card.subtitle ?? "",
+                thumbnailUrl: card.thumbnailUrl
+            ))
+        } label: {
+            cardContent
+                .overlay(alignment: .topLeading) {
+                    if controller.current?.id == videoId && controller.isBuffering {
+                        ProgressView()
+                            .controlSize(.small)
+                            .padding(8)
+                    }
+                }
+        }
+        .buttonStyle(.plain)
     }
 
     private var cardContent: some View {

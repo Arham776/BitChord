@@ -6,6 +6,8 @@ import com.music.bitchord.data.model.BrowseType
 import com.music.bitchord.data.model.HomeShelf
 import com.music.bitchord.data.model.LibraryState
 import com.music.bitchord.data.model.LikeStatus
+import com.music.bitchord.data.model.MoodGenre
+import com.music.bitchord.data.model.MoodGenreSection
 import com.music.bitchord.data.model.SearchFilter
 import com.music.bitchord.data.model.SearchResult
 import com.music.bitchord.data.model.ShelfItem
@@ -329,6 +331,44 @@ object InnertubeParser {
         }
         walk(root)
         return out
+    }
+
+    /**
+     * The server-defined mood and genre categories behind Explore.
+     *
+     * A fixed path rather than a walk, because these are `gridRenderer`
+     * sections of `musicNavigationButtonRenderer` and nothing else on a browse
+     * response has that shape — a walk would pick up any nested grid and call it
+     * a mood, which is how a page ends up offering "for you" as a category.
+     *
+     * A section with no heading or no buttons is dropped rather than rendered
+     * empty: an empty grid is a hole in the page, and the heading is what makes
+     * the buttons mean anything ("Moods" and "Genres" are different sets).
+     */
+    fun parseMoodAndGenres(response: JsonObject): List<MoodGenreSection> {
+        val sections = response.o("contents")
+            .o("singleColumnBrowseResultsRenderer").a("tabs")?.firstOrNull()
+            .o("tabRenderer").o("content").o("sectionListRenderer").a("contents")
+            .orEmpty()
+        return sections.mapNotNull { section ->
+            val grid = section.o("gridRenderer") ?: return@mapNotNull null
+            val title = grid.o("header").o("gridHeaderRenderer").o("title").runs()
+            val items = grid.a("items").orEmpty().mapNotNull { item ->
+                val button = item.o("musicNavigationButtonRenderer") ?: return@mapNotNull null
+                // `clickCommand` is what the button was built to do; the bare
+                // `navigationEndpoint` is the fallback for a response that only
+                // carries the one. A button with neither is not navigable, so
+                // there is nothing to represent.
+                val endpoint = button.o("clickCommand").o("browseEndpoint")
+                    ?: button.o("navigationEndpoint").o("browseEndpoint")
+                    ?: return@mapNotNull null
+                val browseId = endpoint.s("browseId") ?: return@mapNotNull null
+                val label = button.o("buttonText").runs().takeIf { it.isNotBlank() }
+                    ?: return@mapNotNull null
+                MoodGenre(label, browseId, endpoint.s("params"))
+            }
+            if (title.isBlank() || items.isEmpty()) null else MoodGenreSection(title, items)
+        }
     }
 
     /** The token for the next page of a browse feed, null once exhausted. */

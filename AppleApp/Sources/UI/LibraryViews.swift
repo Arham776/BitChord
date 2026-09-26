@@ -71,13 +71,20 @@ struct ExploreView: View {
     @Bindable var feed: FeedLoader
     @Environment(PlaybackController.self) private var controller
     @Environment(AuthController.self) private var auth
+    @State private var moods = MoodGenreLoader()
 
     var body: some View {
         NavigationStack {
             content
                 .navigationTitle("Explore")
-                .refreshable { await feed.load(force: true, epoch: auth.sessionEpoch) }
-                .task(id: auth.sessionEpoch) { await feed.load(force: false, epoch: auth.sessionEpoch) }
+                .refreshable {
+                    await feed.load(force: true, epoch: auth.sessionEpoch)
+                    await moods.load(force: true)
+                }
+                .task(id: auth.sessionEpoch) {
+                    await feed.load(force: false, epoch: auth.sessionEpoch)
+                    await moods.load(force: false)
+                }
         }
     }
 
@@ -96,6 +103,10 @@ struct ExploreView: View {
         case .loaded(let shelves):
             ScrollView {
                 VStack(alignment: .leading, spacing: 28) {
+                    // The shelves first: they are what Explore is for, and they
+                    // arrive from a call the tab already makes. The categories
+                    // are a second browse response, so they fill in underneath
+                    // rather than holding the page at a skeleton.
                     ForEach(shelves) { shelf in
                         ShelfCarousel(shelf: shelf)
                             .onAppear {
@@ -104,11 +115,210 @@ struct ExploreView: View {
                                 }
                             }
                     }
+                    moodGrid
                 }
                 .padding(.horizontal, 24)
                 .padding(.vertical, 20)
             }
         }
+    }
+
+    @ViewBuilder
+    private var moodGrid: some View {
+        switch moods.phase {
+        case .loading:
+            // A grid of grey squares. Sized as the real tiles so the page does
+            // not jump when the categories land.
+            VStack(alignment: .leading, spacing: 10) {
+                RoundedRectangle(cornerRadius: 6).fill(.white.opacity(0.10))
+                    .frame(width: 140, height: 22)
+                LazyVGrid(columns: Self.moodColumns, spacing: 12) {
+                    ForEach(0..<10, id: \.self) { _ in
+                        RoundedRectangle(cornerRadius: 10, style: .continuous)
+                            .fill(.white.opacity(0.08))
+                            .frame(height: 44)
+                    }
+                }
+            }
+        case .failed:
+            // Upstream's grid is supplementary, so a refusal here is not the
+            // page's failure and gets no error state of its own — the shelves
+            // above are still perfectly good Explore.
+            EmptyView()
+        case .loaded(let sections):
+            ForEach(sections) { section in
+                VStack(alignment: .leading, spacing: 10) {
+                    Text(section.title)
+                        .font(.title3.weight(.bold))
+                        .foregroundStyle(.white)
+                    LazyVGrid(columns: Self.moodColumns, spacing: 12) {
+                        ForEach(section.items) { item in
+                            NavigationLink {
+                                MoodGenrePlaylistsView(category: item)
+                            } label: {
+                                MoodTile(category: item)
+                            }
+                            .buttonStyle(.plain)
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Three across on a phone, six on a Mac. Upstream's grid is a fixed
+    /// column count rather than a width, and matching it matters more than the
+    /// arithmetic: the tiles are meant to read as a dense index of categories,
+    /// which a two-across layout on a wide window turns into a list.
+    private static let moodColumns = [GridItem(.adaptive(minimum: 104, maximum: 160), spacing: 12)]
+}
+
+/// One category button. A tile rather than a chip because the category's own
+/// artwork is what makes "Chill" mean something, and a grid of words is a list.
+private struct MoodTile: View {
+    let category: MoodGenre
+
+    var body: some View {
+        ZStack {
+            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                .fill(.white.opacity(0.12))
+            if let url = category.thumbnailUrl {
+                AsyncImage(url: URL(string: url)) { phase in
+                    if case .success(let image) = phase {
+                        image.resizable().aspectRatio(contentMode: .fill)
+                    }
+                }
+                .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+            }
+            // A scrim rather than a plain label: the artwork is arbitrary, and
+            // a white title on a pale cover is unreadable in a way no amount of
+            // font weight fixes.
+            LinearGradient(
+                colors: [.clear, .black.opacity(0.62)],
+                startPoint: .center,
+                endPoint: .bottom
+            )
+            .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+            Text(category.title)
+                .font(.subheadline.weight(.semibold))
+                .foregroundStyle(.white)
+                .multilineTextAlignment(.center)
+                .lineLimit(2)
+                .padding(.horizontal, 8)
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottom)
+                .padding(.bottom, 6)
+        }
+        .frame(height: 72)
+        .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+        .contentShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+        .accessibilityLabel(category.title)
+    }
+}
+
+/// The playlists behind one mood or genre category — upstream
+/// `MoodGenrePlaylistsScreen`, a push rather than a sheet because it is a page
+/// with its own scroll position and a back button, not an action on what is on
+/// screen.
+struct MoodGenrePlaylistsView: View {
+    let category: MoodGenre
+    @Environment(PlaybackController.self) private var controller
+    @Environment(AppModel.self) private var appModel
+    @State private var shelves: [FeedShelf] = []
+    @State private var phase: LoadPhase = .loading
+
+    enum LoadPhase { case loading, loaded, failed(String) }
+
+    var body: some View {
+        Group {
+            switch phase {
+            case .loading:
+                ScrollView { FeedSkeleton() }
+            case .failed(let message):
+                EmptyStateView(
+                    icon: Image(.bchExplore),
+                    title: "Nothing here right now",
+                    subtitle: message,
+                    buttonTitle: "Retry"
+                ) { Task { await load() } }
+            case .loaded:
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 28) {
+                        ForEach(shelves) { shelf in
+                            // `preferTrack`: on a mood or genre page a card that
+                            // has both ids is a thing to start, not a thing to
+                            // read. See `ShelfCardView`.
+                            ShelfCarousel(shelf: shelf, preferTrack: true)
+                        }
+                    }
+                    .padding(.horizontal, 24)
+                    .padding(.vertical, 20)
+                }
+            }
+        }
+        .navigationTitle(category.title)
+        .task { await load() }
+    }
+
+    private func load() async {
+        phase = .loading
+        do {
+            shelves = try await InnertubeFeed.shared.moodGenreShelves(
+                browseId: category.browseId, params: category.params
+            )
+            phase = .loaded
+        } catch {
+            phase = .failed(error.localizedDescription)
+        }
+    }
+}
+
+/// Loads the mood/genre categories, and their tile artwork afterwards.
+///
+/// The two-step shape is upstream's and it is deliberate: the grid is worth
+/// painting before it is worth labelling with pictures, and the artwork comes
+/// from the same cached response that backs each category's page, so a listener
+/// who taps a category whose cover has already appeared does not pay for it
+/// twice.
+@MainActor @Observable
+final class MoodGenreLoader {
+    enum Phase { case loading, loaded([MoodGenreSection]), failed(String) }
+
+    private(set) var phase: Phase = .loading
+    private var loaded = false
+
+    func load(force: Bool) async {
+        if !force, loaded, case .loaded = phase { return }
+        phase = .loading
+        do {
+            var sections = try await InnertubeFeed.shared.moodAndGenres()
+            phase = .loaded(sections)
+            loaded = true
+            await fillArtwork(&sections)
+        } catch {
+            phase = .failed(error.localizedDescription)
+        }
+    }
+
+    /// Replaces the categories with ones carrying artwork, once each has
+    /// answered. Published one section at a time so the first covers to arrive
+    /// are on screen while the rest are still being asked for.
+    private func fillArtwork(_ sections: inout [MoodGenreSection]) async {
+        for index in sections.indices {
+            for itemIndex in sections[index].items.indices {
+                let item = sections[index].items[itemIndex]
+                guard item.thumbnailUrl == nil else { continue }
+                if let cover = await InnertubeFeed.shared
+                    .moodGenreArtwork(browseId: item.browseId, params: item.params) {
+                    sections[index].items[itemIndex].thumbnailUrl = cover
+                    publish(sections)
+                }
+            }
+        }
+    }
+
+    private func publish(_ sections: [MoodGenreSection]) {
+        guard case .loaded = phase else { return }
+        phase = .loaded(sections)
     }
 }
 

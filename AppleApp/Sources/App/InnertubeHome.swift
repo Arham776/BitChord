@@ -75,6 +75,33 @@ struct FeedResult {
     let continuation: String?
 }
 
+/// A grid of mood/genre buttons, as YouTube Music groups them. Decoded from the
+/// shared module's serialized `MoodGenreSection` list, same JSON contract as
+/// every other bridge here.
+struct MoodGenreSection: Decodable, Identifiable {
+    let title: String
+    /// Not a `let`, for the same reason [MoodGenre.thumbnailUrl] is not: the
+    /// grid is published again as each section's covers arrive.
+    var items: [MoodGenre]
+    var id: String { title }
+}
+
+/// A category button. [params] travels with the id rather than being folded into
+/// it — YouTube's `browseEndpoint` takes the two separately, and a mood category
+/// without its own params answers with a different, generic page rather than an
+/// error, so a lost `params` looks like a working feature returning the wrong
+/// thing.
+struct MoodGenre: Decodable, Identifiable, Hashable {
+    let title: String
+    let browseId: String
+    let params: String?
+    /// Not a `let`: the category grid paints first and the artwork is filled in
+    /// afterwards, one section at a time, so the first covers to arrive are on
+    /// screen while the rest are still being asked for.
+    var thumbnailUrl: String?
+    var id: String { "\(browseId)?\(params ?? "")" }
+}
+
 final class InnertubeFeed: Sendable {
     static let shared = InnertubeFeed()
 
@@ -92,6 +119,47 @@ final class InnertubeFeed: Sendable {
 
     func moreExplore(token: String) async throws -> FeedResult {
         try await fetch { HomeBridge.shared.moreExplore(token: token, callback: $0) }
+    }
+
+    /// The mood and genre categories behind Explore.
+    func moodAndGenres() async throws -> [MoodGenreSection] {
+        try await withCheckedThrowingContinuation { continuation in
+            HomeBridge.shared.moodAndGenres(callback: MoodCallbackAdapter { json, message in
+                guard let json else {
+                    continuation.resume(throwing: InnertubeFeed.FeedError(
+                        message: message ?? "no mood or genre categories"
+                    ))
+                    return
+                }
+                do {
+                    continuation.resume(returning: try JSONDecoder().decode(
+                        [MoodGenreSection].self, from: Data(json.utf8)
+                    ))
+                } catch {
+                    continuation.resume(throwing: error)
+                }
+            })
+        }
+    }
+
+    /// One category's playlist shelves.
+    func moodGenreShelves(browseId: String, params: String?) async throws -> [FeedShelf] {
+        try await fetch {
+            HomeBridge.shared.moodGenreShelves(browseId: browseId, params: params, callback: $0)
+        }.shelves
+    }
+
+    /// A category's tile artwork — the first real cover from the playlists it
+    /// opens, fetched after the grid has painted.
+    func moodGenreArtwork(browseId: String, params: String?) async -> String? {
+        await withCheckedContinuation { continuation in
+            HomeBridge.shared.moodGenreArtwork(
+                browseId: browseId, params: params,
+                callback: ArtworkCallbackAdapter { url, _ in
+                    continuation.resume(returning: url)
+                }
+            )
+        }
     }
 
     func history() async throws -> [YouTubeSong] {
@@ -158,6 +226,18 @@ private final class FeedCallbackAdapter: HomeBridgeFeedCallback {
     private let onResult: (String?, String?) -> Void
     init(onResult: @escaping (String?, String?) -> Void) { self.onResult = onResult }
     func onResult(json: String?, message: String?) { onResult(json, message) }
+}
+
+private final class MoodCallbackAdapter: HomeBridgeMoodCallback {
+    private let onResult: (String?, String?) -> Void
+    init(onResult: @escaping (String?, String?) -> Void) { self.onResult = onResult }
+    func onResult(json: String?, message: String?) { onResult(json, message) }
+}
+
+private final class ArtworkCallbackAdapter: HomeBridgeArtworkCallback {
+    private let onResult: (String?, String?) -> Void
+    init(onResult: @escaping (String?, String?) -> Void) { self.onResult = onResult }
+    func onResult(url: String?, message: String?) { onResult(url, message) }
 }
 
 private final class LibraryFeedAdapter: LibraryBridgeFeedCallback {

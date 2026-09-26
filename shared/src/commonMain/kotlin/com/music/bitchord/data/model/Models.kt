@@ -161,6 +161,35 @@ data class HomeFeed(
     val continuation: String? = null,
 )
 
+/** A grid of mood/genre buttons on the Explore page, as YouTube Music groups them. */
+@Serializable
+data class MoodGenreSection(
+    val title: String,
+    val items: List<MoodGenre>,
+)
+
+/**
+ * A mood or genre button and the exact browse request that it represents.
+ *
+ * [params] is carried rather than folded into [browseId] because YouTube's
+ * `browseEndpoint` takes the two separately and a mood category is meaningless
+ * without its own params — sending the id alone answers with a different, generic
+ * page rather than an error, which is the sort of thing that looks like a working
+ * feature returning the wrong thing.
+ *
+ * [thumbnailUrl] is the first real cover from the category's own playlist
+ * shelves, fetched in the background after the grid has already painted. The grid
+ * does not wait on it: a grid of blank tiles is a worse first paint than a grid
+ * of unlabelled ones.
+ */
+@Serializable
+data class MoodGenre(
+    val title: String,
+    val browseId: String,
+    val params: String? = null,
+    val thumbnailUrl: String? = null,
+)
+
 /** A browsed album / artist / playlist page. */
 @Serializable
 data class DetailPage(
