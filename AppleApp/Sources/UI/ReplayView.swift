@@ -411,6 +411,15 @@ struct ReplayCreditCardView: View {
     var memberSince: String?
     var onClick: () -> Void
 
+    /// The card's figure, tracking Dynamic Type.
+    ///
+    /// Fixed at 26pt it sat next to a `.caption2` label that grows, so past a
+    /// certain text size the number became the *smaller* of the two — backwards on
+    /// a card whose whole job is to show a figure. Clamped at both ends, because a
+    /// shareable card is a fixed-geometry artefact and a figure that grows without
+    /// limit stops fitting the one it is printed on.
+    @ScaledMetric(relativeTo: .title3) private var valueSize: CGFloat = 26
+
     var body: some View {
         Button(action: onClick) {
             ZStack(alignment: .topLeading) {
@@ -433,7 +442,12 @@ struct ReplayCreditCardView: View {
                     .foregroundStyle(.white.opacity(0.75))
                     Spacer()
                     Text(card.value)
-                        .font(.system(size: 26, weight: .bold, design: .monospaced))
+                        // Scales, because it sits next to scaled text: fixed at 26pt
+                        // it became the *smallest* thing on the card once the
+                        // reader's text grew past it. Clamped, because a figure
+                        // that grows without limit stops being a figure and starts
+                        // being the card.
+                        .font(.system(size: min(64, max(26, valueSize)), weight: .bold, design: .monospaced))
                         .foregroundStyle(.white)
                         .lineLimit(2)
                         .minimumScaleFactor(0.7)
@@ -671,6 +685,14 @@ private struct ReplayStoriesView: View {
         }
     }
 
+    /// A size that tracks Dynamic Type, for the numbers a card is *about*.
+    ///
+    /// `@ScaledMetric` rather than a text style, because these are display figures
+    /// whose size is a design decision, not a semantic role — and then clamped at
+    /// both ends, because a hero number that grows with the reader is right and a
+    /// hero number that grows without limit stops being a hero.
+    @ScaledMetric(relativeTo: .largeTitle) private var heroNumberSize: CGFloat = 56
+
     @ViewBuilder
     private var middle: some View {
         let s = model.summary
@@ -682,7 +704,12 @@ private struct ReplayStoriesView: View {
             }
         case .minutes:
             Text("\(ReplayModel.grouped(s.minutes))")
-                .font(.system(size: 56, weight: .bold, design: .rounded))
+                // Same reasoning as the stat card, and the failure was more
+                // obvious here: the sibling cases of this switch use `.title2`
+                // and `.largeTitle`, so at an accessibility text size they grew
+                // past a fixed 56pt and the number became the smallest thing on
+                // screen — the one element whose whole job is to be read first.
+                .font(.system(size: min(150, max(56, heroNumberSize)), weight: .bold, design: .rounded))
                 .foregroundStyle(.white)
         case .songs:
             if let song = s.songs.first {
@@ -831,6 +858,14 @@ private struct ReplayPosterView: View {
                     startPoint: .top,
                     endPoint: .bottom
                 )
+                // Every font in here is a fixed point size, deliberately, and this
+                // is the one place in the app where that is right: it is a
+                // shareable poster with a fixed aspect and a composed hierarchy.
+                // Scaling it with the sender's text size would make the typography
+                // of an image *other people* see depend on the sender's settings,
+                // and would break the composition — a 128pt figure beside a
+                // 300pt one because someone set their text large. It is a rendered
+                // artefact, like a chart's axis labels, not interface text.
                 VStack(alignment: .leading, spacing: 16 * k) {
                     Text("BITCHORD REPLAY")
                         .font(.system(size: 30 * k, weight: .bold))

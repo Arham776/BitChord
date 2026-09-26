@@ -314,7 +314,17 @@ struct SongRow: View {
 
     @Environment(PlaybackController.self) private var controller
     @Environment(AuthController.self) private var auth
+    @Environment(\.dynamicTypeSize) private var dynamicTypeSize
     @State private var hovering = false
+
+    /// How many lines a track's text may take.
+    ///
+    /// One at ordinary sizes, because this is the most-repeated row in the app and
+    /// a list of wrapping rows is a list nobody can scan. Two once the reader has
+    /// asked for larger text: a row that truncates harder as somebody needs it more
+    /// is the opposite of what the setting is for, and this is where that shows
+    /// first — a long title is exactly what stops being readable.
+    private var titleLines: Int? { dynamicTypeSize.isAccessibilitySize ? 2 : 1 }
 
     private var active: Bool { isCurrent || controller.current?.id == entry.id }
     private var buffering: Bool { controller.current?.id == entry.id && controller.isBuffering }
@@ -333,12 +343,12 @@ struct SongRow: View {
                     Text(entry.title)
                         .font(.body.weight(active ? .semibold : .regular))
                         .foregroundStyle(active ? Color.accentColor : .primary)
-                        .lineLimit(1)
+                        .lineLimit(titleLines)
                     if !entry.artist.isEmpty {
                         Text(entry.artist)
                             .font(.callout)
                             .foregroundStyle(.secondary)
-                            .lineLimit(1)
+                            .lineLimit(titleLines)
                     }
                 }
                 Spacer(minLength: 8)
