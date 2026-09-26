@@ -52,40 +52,22 @@ struct NowPlayingView: View {
     // ---- macOS: window-root player -----------------------------------------
     #if os(macOS)
     private var macOSBody: some View {
-        ZStack {
-            MeshBackdrop(seed: controller.current?.id.hashValue ?? 0, artwork: controller.current?.artworkData)
-                .ignoresSafeArea()
-                .allowsHitTesting(false)
-
-            HStack(alignment: .top, spacing: 8) {
-                leftColumn
-                    .frame(width: 420)
-                rightColumn
-                    .frame(maxWidth: .infinity)
-            }
-            .padding(.top, 8)
-            .padding(.bottom, 16)
-
-            VStack {
-                Spacer()
+        // The same arrangement decision iOS makes, and for the same reason: the
+        // two shapes are one set of slots arranged differently, so a Mac window
+        // that is not wide enough gets the portrait player rather than a
+        // two-column layout whose columns cannot hold what they are given.
+        GeometryReader { geo in
+            ZStack {
+                MeshBackdrop(seed: controller.current?.id.hashValue ?? 0, artwork: controller.current?.artworkData)
+                    .ignoresSafeArea()
                     .allowsHitTesting(false)
-                HStack {
-                    Spacer()
-                        .allowsHitTesting(false)
-                    HStack(spacing: 8) {
-                        GlassCircleButton(icon: .bchLyrics, selected: pane == .lyrics, label: "Lyrics") {
-                            Haptics.play(.expand)
-                            pane = pane == .lyrics ? .main : .lyrics
-                        }
-                        .help("Lyrics")
-                        GlassCircleButton(icon: .bchQueue, selected: pane == .queue, label: "Up Next") {
-                            Haptics.play(.expand)
-                            pane = pane == .queue ? .main : .queue
-                        }
-                        .help("Up Next")
-                    }
-                    .padding(.trailing, 22)
-                    .padding(.bottom, 18)
+
+                if PlayerLayout.takesLandscapeShape(
+                    width: geo.size.width, height: geo.size.height
+                ) {
+                    landscapePlayer(size: geo.size)
+                } else {
+                    portraitPlayer
                 }
             }
         }
@@ -146,88 +128,9 @@ struct NowPlayingView: View {
         }
     }
 
-    private var leftColumn: some View {
-        VStack(spacing: 0) {
-            HeroArtwork(
-                entry: controller.current,
-                canvasURL: controller.canvasURL,
-                fallbackURL: controller.canvasFallbackURL,
-                isPlaying: controller.isPlaying
-            )
-            .id(controller.current?.id)
-
-            VStack(spacing: 18) {
-            HStack(alignment: .top, spacing: 12) {
-                VStack(alignment: .leading, spacing: 4) {
-                    Text(controller.current?.title ?? "Nothing playing")
-                        .font(.title2.weight(.bold))
-                        .foregroundStyle(.white)
-                        .lineLimit(2)
-                        .shadow(color: .black.opacity(0.45), radius: 6, y: 1)
-                    Text(creditLine)
-                        .font(.callout)
-                        .foregroundStyle(.white.opacity(0.78))
-                        .lineLimit(1)
-                        .shadow(color: .black.opacity(0.4), radius: 4, y: 1)
-                }
-                Spacer(minLength: 8)
-                if auth.signedIn, controller.current?.videoId != nil {
-                    GlassCircleButton(icon: controller.isLiked ? .bchHeartFilled : .bchHeart,
-                                      label: controller.isLiked ? "Remove Like" : "Like") {
-                        controller.toggleLike()
-                    }
-                    .help(controller.isLiked ? "Remove from Liked Music" : "Like")
-                }
-                moreMenu
-            }
-
-            positionControls
-            playerTransport
-            if PlatformSettings.shared.getBoolean(key: "show_nerd_stats", default: false) {
-                if let nerd = controller.nerd, !nerd.codec.isEmpty {
-                    Text(nerdLine(nerd))
-                        .font(.caption2.monospaced())
-                        .foregroundStyle(.white.opacity(0.7))
-                } else if controller.racingLossless {
-                    Text("Upgrading Quality")
-                        .font(.caption2.monospaced())
-                        .foregroundStyle(.white.opacity(0.7))
-                }
-            }
-            Spacer(minLength: 12)
-            }
-            .padding(.horizontal, 36)
-            .padding(.top, 4)
-        }
-    }
-
-    private var rightColumn: some View {
-        Group {
-            switch pane {
-            case .main, .lyrics:
-                LyricsPane(
-                    lines: controller.displayedLyrics,
-                    loading: controller.lyricsLoading,
-                    position: controller.position,
-                    hasTrack: controller.current != nil,
-                    sourceLabel: controller.lyricsSourceLabel,
-                    onSeek: { controller.seek(to: $0) },
-                    translator: controller.lyricsTranslator,
-                    trackId: controller.current?.id ?? "",
-                    offsetMs: lyricsOffsetMs
-                )
-            case .queue:
-                UpNextPane()
-            }
-        }
-        .padding(.trailing, 28)
-        .padding(.leading, 8)
-        .padding(.bottom, 56)
-    }
-
     #endif
 
-    // ---- iOS: the portrait player -----------------------------------------
+    // ---- The player's two shapes -------------------------------------------
     //
     // Upstream's portrait player is two things, and the port had them the wrong
     // way up. A *pinned bottom deck* — credits, scrubber, transport, toggles —
@@ -241,6 +144,10 @@ struct NowPlayingView: View {
     // depending on what was on screen. Pinned to the foot instead, the deck is
     // in the same place on every screen, and all that is left above it is the
     // stage.
+    //
+    // Everything below this comment is shared by both platforms. Only the two
+    // bodies and the two toolbars are platform-specific, and they are the
+    // arrangement — which is the only thing that should differ.
     #if os(iOS)
     private var iOSBody: some View {
         NavigationStack {
@@ -268,6 +175,7 @@ struct NowPlayingView: View {
             .toolbarTitleDisplayMode(.inline)
         }
     }
+    #endif
 
     /// The shape test lives in [PlayerLayout] with the rest of the window rules,
     /// so the thresholds have one definition and can be checked without a window.
@@ -311,11 +219,15 @@ struct NowPlayingView: View {
             Group {
                 switch pane {
                 case .main:
-                    // Credits and transport, and nothing else: the left column
-                    // already has the artwork, and repeating it here is what
-                    // upstream's comment about "nothing is drawn twice" is about.
+                    // Credits, the lyric strip, the scrubber and the transport,
+                    // in that order — the same deck as the portrait player with
+                    // the artwork left out, because the left column already has it
+                    // and nothing is drawn twice. The lyric strip stays: it is the
+                    // one line of the words, and the pane it opens is the one this
+                    // column can swap to.
                     VStack(spacing: 14) {
                         creditsRow
+                        currentLyricStrip
                         positionControls
                         playerTransport
                     }
@@ -569,8 +481,6 @@ struct NowPlayingView: View {
         .accessibilityElement(children: .contain)
         .accessibilityLabel("Player panes")
     }
-
-    #endif
 
     // iOS only — macOS has its own window-toolbar close button, in
     // `macPlayerToolbar`.
