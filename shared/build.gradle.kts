@@ -86,6 +86,16 @@ val escaped = listenTogetherServer.replace("\\", "\\\\").replace("\"", "\\\"").r
 val generatedDir = layout.buildDirectory.dir("generated/listentogether").get().asFile
 val generateDefaults by tasks.registering {
     val out = File(generatedDir, "com/music/bitchord/BuildDefaults.kt")
+    val localFile = rootProject.file("local.properties")
+    // Declared as an input, which it was not, and the consequence was that editing
+    // `local.properties` did nothing: the task had an output and no inputs, so Gradle
+    // considered it up to date and the address kept whatever it was generated with.
+    // That is the worst possible failure for this file — a build-time value that
+    // silently refuses to change, so a distributor who removes a server ships the
+    // server anyway. A missing file is a legitimate input state, not an error: the
+    // empty default is the shipped one.
+    inputs.file(localFile).optional()
+    inputs.property("listenTogetherServer", listenTogetherServer)
     outputs.file(out)
     doLast {
         out.parentFile.mkdirs()
