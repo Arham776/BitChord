@@ -17,13 +17,22 @@ struct NowPlayingView: View {
     @Environment(\.dismiss) private var dismiss
     @Environment(AuthController.self) private var auth
     @State private var pane: PlayerPane = .lyrics
+    @State private var showPipeline = false
 
     var body: some View {
-        #if os(macOS)
-        macOSBody
-        #else
-        iOSBody
-        #endif
+        // The platform split has to close *inside* a `Group`: a `#if` in a view
+        // builder is two statements, and the `.sheet` after it has nothing to
+        // attach to. Both branches present the same readout.
+        Group {
+            #if os(macOS)
+            macOSBody
+            #else
+            iOSBody
+            #endif
+        }
+        .sheet(isPresented: $showPipeline) {
+            AudioPipelineSheet()
+        }
     }
 
     // ---- macOS: window-root player -----------------------------------------
@@ -456,6 +465,11 @@ struct NowPlayingView: View {
                 SongActionButtons(entry: current, showSleepTimer: true, showDebugLog: true)
                 Divider()
             }
+            // Upstream opens the pipeline from the player's output sheet, which
+            // is the same place this row sits: it is a readout of what is playing
+            // right now, not a setting.
+            AudioOutputRow { showPipeline = true }
+            Divider()
             Button("Download") { controller.downloadCurrent() }
         } label: {
             Image(systemName: "ellipsis")

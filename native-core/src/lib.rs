@@ -297,7 +297,28 @@ pub struct PlayerEngine {
     /// device choice stands.
     requested_rate: Arc<AtomicU32>,
     requested_channels: Arc<AtomicU32>,
+    /// The name of the device the output was last opened on, for the audio
+    /// pipeline readout. Empty until a stream is built. `Mutex` rather than an
+    /// atomic because a device name is a `String` and there is no reason to
+    /// pretend otherwise; the panel reads it, nothing writes it in a loop.
+    device_name: Arc<Mutex<String>>,
     nerd: Arc<Mutex<mixer::NerdSnapshot>>,
+}
+
+/// What the engine actually opened, for the audio pipeline readout.
+///
+/// A snapshot rather than a live query: the answer changes only when the route
+/// does, and the readout is a panel the listener opens to look at, not a
+/// dashboard polling a device. `started` is separate from the format because
+/// "nothing is open yet" and "something is open" are the two states worth
+/// telling apart — the first means the panel is empty for a reason, and the
+/// second means every row below it is real.
+#[derive(uniffi::Record, Debug, Clone)]
+pub struct OutputDeviceRec {
+    pub name: String,
+    pub sample_rate: u32,
+    pub channels: u32,
+    pub started: bool,
 }
 
 #[uniffi::export]
@@ -322,6 +343,7 @@ impl PlayerEngine {
             output_channels: Arc::new(AtomicU32::new(2)),
             requested_rate: Arc::new(AtomicU32::new(0)),
             requested_channels: Arc::new(AtomicU32::new(0)),
+            device_name: Arc::new(Mutex::new(String::new())),
             nerd: Arc::new(Mutex::new(mixer::NerdSnapshot::default())),
         })
     }
@@ -370,6 +392,7 @@ impl PlayerEngine {
         // with nothing plugged in) resolves to a null device that drains as fast
         // as the callback fires, which looks exactly like a mixer running far too
         // fast — so the name is what tells those two apart.
+        *self.device_name.lock().unwrap() = device.to_string();
         log::info!(
             "output {device} — {sample_rate} Hz, {channels} ch"
         );
@@ -419,6 +442,7 @@ impl PlayerEngine {
             output_channels: self.output_channels.clone(),
             requested_rate: self.requested_rate.clone(),
             requested_channels: self.requested_channels.clone(),
+            device_name: self.device_name.clone(),
             volume_bits: self.volume_bits.clone(),
             buffered: self.buffered_frames.clone(),
             flush_ring: self.flush_ring.clone(),
@@ -484,6 +508,18 @@ impl PlayerEngine {
             .is_err()
         {
             log::warn!("seek dropped — engine not started");
+        }
+    }
+
+    /// What the output is, for the audio pipeline panel. Reports `started:
+    /// false` before the first stream is built rather than inventing a device.
+    pub fn output_device(&self) -> OutputDeviceRec {
+        OutputDeviceRec {
+            name: self.device_name.lock().unwrap().clone(),
+            sample_rate: self.output_rate.load(Ordering::Relaxed),
+            channels: self.output_channels.load(Ordering::Relaxed),
+            started: self.started.load(Ordering::Relaxed)
+                && self.output_rate.load(Ordering::Relaxed) > 0,
         }
     }
 
@@ -611,6 +647,7 @@ struct OutputControl {
     output_channels: Arc<AtomicU32>,
     requested_rate: Arc<AtomicU32>,
     requested_channels: Arc<AtomicU32>,
+    device_name: Arc<Mutex<String>>,
     volume_bits: Arc<AtomicU32>,
     buffered: Arc<AtomicU64>,
     flush_ring: Arc<AtomicBool>,
@@ -707,7 +744,10 @@ impl OutputControl {
             .map_err(|e| EngineError::StreamInit(e.to_string()))?;
         *self.stream.lock().unwrap() = Some(stream);
         self.output_paused.store(user_paused, Ordering::Release);
-        log::info!("output rebuilt: {rate} Hz, {channels} ch");
+        // A rebuild after a route change is a *different* device, so the name
+        // is re-read here rather than left as the one the first start found.
+        *self.device_name.lock().unwrap() = device.to_string();
+        log::info!("output rebuilt: {device} — {rate} Hz, {channels} ch");
         Ok(())
     }
 }

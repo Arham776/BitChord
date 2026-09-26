@@ -169,5 +169,35 @@ do {
     check("a repeated start is a no-op", false, "\(error)")
 }
 
+// 7. The audio pipeline panel reads this, and a panel that reports a device the
+//    engine did not open would be worse than no panel. So the honest answer
+//    before anything is open has to be "not open" — checked on a *fresh*
+//    engine, since the idle one above did start (it is how the seek-with-
+//    nothing-playing check gets a running mixer to refuse against).
+let never = PlayerEngine()
+let neverDevice = never.outputDevice()
+check("an engine that was never started says so", !neverDevice.started,
+      "started=\(neverDevice.started) name=\(neverDevice.name.isEmpty ? "<none>" : neverDevice.name)")
+check("an engine that was never started has no rate to report",
+      neverDevice.sampleRate == 0, "\(neverDevice.sampleRate)")
+
+let device = engine.outputDevice()
+check("a started engine reports its device", device.started && !device.name.isEmpty,
+      "\(device.name) at \(device.sampleRate) Hz / \(device.channels) ch")
+check("the reported rate is the rate it is playing at",
+      device.sampleRate == 48_000, "\(device.sampleRate) Hz")
+check("the reported rate is not the source rate",
+      device.sampleRate != 44_100,
+      "source is 44100, output is \(device.sampleRate) — the resampler is real")
+check("a started engine reports its channel count", device.channels > 0, "\(device.channels)")
+
+// 8. The readout has to be stable while nothing is changing, or the panel would
+//    flicker values nobody touched. Read twice across a short gap.
+let again = engine.outputDevice()
+check("the readout is stable between reads",
+      again.name == device.name && again.sampleRate == device.sampleRate
+          && again.channels == device.channels,
+      "\(again.name) \(again.sampleRate) Hz / \(again.channels) ch")
+
 print(failures == 0 ? "\nall \(checks) checks passed" : "\n\(failures) of \(checks) checks FAILED")
 exit(failures == 0 ? 0 : 1)

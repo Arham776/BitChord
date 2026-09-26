@@ -460,6 +460,11 @@ final class PlaybackController {
         loadCurrent(playingIndex)
     }
 
+    /// What the output is, for the audio pipeline panel. Read rather than
+    /// observed: a panel that has to be told the device changed would be a
+    /// panel nobody trusts.
+    var outputDevice: OutputDeviceRec { engine.outputDevice() }
+
     func persistSession() {
         guard !queue.isEmpty, queue.indices.contains(playingIndex) else { return }
         var tracks = queue
