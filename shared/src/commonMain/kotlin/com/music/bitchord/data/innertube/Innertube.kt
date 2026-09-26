@@ -206,6 +206,29 @@ object Innertube {
     }
 
     /**
+     * The identity the session is currently acting as, or null when there is no
+     * session at all.
+     *
+     * Which channel that is *depends on the override* — the same [pageIdFor] /
+     * [dataSyncIdFor] / [authUserFor] the requests themselves use, so a caller
+     * asking "who am I" cannot be told a different answer from the one the next
+     * request will send. That is the whole reason this is a function and not the
+     * raw scope: reading the scope directly would report the shell's default
+     * identity after a listener had switched to another one.
+     *
+     * Null `pageId` and `dataSyncId` together mean the session has not settled on
+     * an identity yet, and a caller must treat that as "unknown" rather than as
+     * an identity with empty fields.
+     */
+    fun currentIdentity(): ChannelSelection? {
+        val session = scope ?: return null
+        val pageId = pageIdFor(session)
+        val dataSyncId = dataSyncIdFor(session)
+        if (pageId == null && dataSyncId == null) return null
+        return ChannelSelection(pageId, dataSyncId, authUserFor(session))
+    }
+
+    /**
      * The brand channel to send, chosen one first.
      *
      * The shape is `override ?: shell` rather than "override, else shell" as a

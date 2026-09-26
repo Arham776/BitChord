@@ -36,6 +36,28 @@ object AuthBridge {
         fun onResult(ok: Boolean, message: String?)
     }
 
+    fun interface IdentityCallback {
+        fun onResult(pageId: String?, dataSyncId: String?, authUser: String?)
+    }
+
+    /**
+     * The YouTube identity this session is acting as, once it has settled on one.
+     *
+     * Answered as three strings rather than a record because "not settled yet" is
+     * the common answer for the first second or so of a launch, and null is how
+     * that says so. A caller building the listen-as list wants the *default*
+     * channel — the one requests are already being sent as — and has nowhere else
+     * to get it: the full channel listing is a different call upstream makes, and
+     * a caller that guessed would be guessing.
+     */
+    fun currentIdentity(callback: IdentityCallback) {
+        bridgeScope.launch {
+            runCatching { Innertube.ensureSessionScope() }
+            val identity = Innertube.currentIdentity()
+            callback.onResult(identity?.pageId, identity?.dataSyncId, identity?.authUser)
+        }
+    }
+
     /** Same name-match as upstream `AuthStore.hasApiSid` — not a substring. */
     fun hasApiSid(cookieHeader: String): Boolean = Innertube.hasApiSid(cookieHeader)
 

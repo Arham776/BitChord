@@ -39,10 +39,22 @@ final class AuthController {
             return
         }
         guard AuthBridge.shared.applyCookie(cookieHeader: cookie) else {
-            // A stored cookie with no signing secret in it is worse than none: it
-            // would have every request go out unsigned while the UI claimed
-            // otherwise. Drop it rather than keep re-applying it.
-            AuthStore.clear()
+            // The stored cookie is *kept*.
+            //
+            // It used to be cleared here, on the reasoning that a jar with no
+            // signing secret is worse than none. But a stored cookie is the only
+            // evidence that the listener ever signed in, and throwing it away means
+            // a refusal costs them the session permanently — the one remedy left
+            // is to sign in again, which is the thing they were already doing. So a
+            // refusal is reported and the cookie stays, and the next launch tries
+            // again with whatever the state was by then.
+            //
+            // The cost of keeping it is bounded and visible: the app reports
+            // itself signed out, so nothing goes out claiming to be signed in. A
+            // session that is silently gone is a far worse failure than one that is
+            // visibly gone.
+            sessionUnavailableReason =
+                "Your saved session could not be restored. Sign in again to continue."
             return
         }
         signedIn = true
@@ -70,13 +82,84 @@ final class AuthController {
         }
     }
 
+    /// Installs a freshly captured session.
+    ///
+    /// The cookie is written to the Keychain **first**, and the refusal check
+    /// comes after. The other way round, a jar that was refused was never stored —
+    /// so a refusal cost the listener the sign-in they had just completed, and the
+    /// next launch was signed out. Writing first means a refusal leaves a stored
+    /// cookie that the next attempt can still be judged against, and since
+    /// [restore] no longer destroys what it cannot apply, the failure is recoverable
+    /// rather than terminal.
     func accept(_ cookieHeader: String) {
-        guard AuthBridge.shared.applyCookie(cookieHeader: cookieHeader) else { return }
         AuthStore.cookie = cookieHeader
+        guard AuthBridge.shared.applyCookie(cookieHeader: cookieHeader) else {
+            // Visible rather than silent: the listener pressed Continue and the
+            // app is not signed in, and saying nothing is what made this look like
+            // the sign-in had worked.
+            sessionUnavailableReason =
+                "Google gave a session this app could not use. Try signing in again."
+            return
+        }
+        sessionUnavailableReason = nil
         signedIn = true
         loginPresented = false
         sessionEpoch += 1
+        // A new session is a new identity, so the account's own channels have to be
+        // read afresh — the listen-as list belongs to the account that is now
+        // active, and carrying the old one across would offer the wrong channel.
+        recordCurrentAccount()
         Task { await refreshAccount() }
+    }
+
+    /// Records the signed-in account, with the identity the session is already
+    /// acting as as its one channel.
+    ///
+    /// The default channel rather than the account's full channel list: upstream
+    /// enumerates every channel the account owns, and that is a different call
+    /// this app does not make. What *is* already known is the identity the
+    /// requests are being sent as — the shell's own, or the override a listener
+    /// picked — and that is exactly the one the selector has to offer first.
+    ///
+    /// Best-effort by design. The session works whether or not this succeeds, and
+    /// the channel list is only needed for the selector, so a failure is not
+    /// surfaced: a listener who has just signed in should not be told their
+    /// sign-in did not work over a channel list.
+    private func recordCurrentAccount() {
+        guard let cookie = AuthStore.cookie, !cookie.isEmpty else { return }
+        // Captured up front and read on the main actor at the end, rather than
+        // reached through `self` from two nested closures — the account name is
+        // only the display label for this record, and it is not worth an
+        // explicit capture chain to have the freshest value of.
+        let name = accountName
+        let email = accountEmail
+        AuthBridge.shared.ensureSession(callback: SessionDoneAdapter { ok, _ in
+            guard ok else { return }
+            AuthBridge.shared.currentIdentity(
+                callback: IdentityDoneAdapter { pageId, dataSyncId, authUser in
+                    guard let dataSyncId, !dataSyncId.isEmpty else { return }
+                    let id = AccountSessionsKt.sessionIdOf(
+                        cookie: cookie, dataSyncId: dataSyncId
+                    )
+                    let profile = AccountProfile(
+                        profileId: pageId ?? dataSyncId,
+                        name: name ?? email ?? "YouTube Music",
+                        pageId: pageId,
+                        dataSyncId: dataSyncId,
+                        authUser: authUser
+                    )
+                    Task { @MainActor in
+                        self.record(account: AccountSummary(
+                            id: id,
+                            name: name ?? "",
+                            email: email ?? "",
+                            cookie: cookie,
+                            profiles: [profile]
+                        ))
+                    }
+                }
+            )
+        })
     }
 
     func signOut() {
@@ -189,6 +272,14 @@ private final class SessionDoneAdapter: AuthBridgeDoneCallback {
     private let onResult: (Bool, String?) -> Void
     init(onResult: @escaping (Bool, String?) -> Void) { self.onResult = onResult }
     func onResult(ok: Bool, message: String?) { onResult(ok, message) }
+}
+
+private final class IdentityDoneAdapter: AuthBridgeIdentityCallback {
+    private let onResult: (String?, String?, String?) -> Void
+    init(onResult: @escaping (String?, String?, String?) -> Void) { self.onResult = onResult }
+    func onResult(pageId: String?, dataSyncId: String?, authUser: String?) {
+        onResult(pageId, dataSyncId, authUser)
+    }
 }
 
 private final class AccountCallbackAdapter: AccountBridgeAccountCallback {

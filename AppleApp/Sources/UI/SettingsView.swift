@@ -318,6 +318,10 @@ struct SettingsView: View {
     }
 
     private var accountSubtitle: String {
+        // "Session saved, not restored" rather than "Not signed in", because the
+        // two call for opposite actions and this row is where the listener looks
+        // to find out which one they are in.
+        if let reason = auth.sessionUnavailableReason { return reason }
         if let email = auth.accountEmail, !email.isEmpty { return email }
         if let name = auth.accountName, !name.isEmpty { return name }
         return auth.signedIn ? "Signed in" : "Not signed in"
@@ -909,6 +913,26 @@ private struct AccountIntegrationsView: View {
 
     var body: some View {
         Form {
+            // A session that is saved but could not be put back, said out loud.
+            //
+            // This is the only place it can be seen, and it matters: the failure
+            // is invisible everywhere else. The account row says "Not signed in",
+            // the library says signed out, and every request goes out anonymous —
+            // with nothing on screen to say that a session is *there* and merely
+            // unrestored, which is a different thing from never having signed in
+            // and the one thing the listener cannot work out for themselves.
+            if let reason = auth.sessionUnavailableReason {
+                Section {
+                    HStack(alignment: .top, spacing: 10) {
+                        Image(systemName: "exclamationmark.triangle.fill")
+                            .foregroundStyle(.orange)
+                        Text(reason)
+                            .font(.callout)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                    .padding(.vertical, 2)
+                }
+            }
             Section {
                 if auth.signedIn {
                     HStack(spacing: 14) {
