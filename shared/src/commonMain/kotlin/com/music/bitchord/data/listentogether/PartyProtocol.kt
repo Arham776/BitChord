@@ -333,3 +333,24 @@ object PartyFrameCodec {
         }.getOrNull()
     }
 }
+
+/**
+ * The frames the Swift socket needs to send, as plain functions.
+ *
+ * Encoding stays here rather than in Swift because the wire format is one contract
+ * with the server, and a second implementation of it is a second thing to keep in
+ * step. The socket's whole job is transport, and this is the one frame it originates
+ * on its own initiative.
+ */
+object PartyOutgoingJson {
+
+    /** A protocol ping carrying the local monotonic reading it will be given back. */
+    fun ping(clientMs: Long): String = PartyOutgoingCodec.encode(PartyOutgoing.Ping(clientMs))
+
+    fun sync(): String = PartyOutgoingCodec.encode(PartyOutgoing.Sync)
+
+    fun syncQueue(): String = PartyOutgoingCodec.encode(PartyOutgoing.SyncQueue)
+
+    fun report(positionMs: Long, isPlaying: Boolean): String =
+        PartyOutgoingCodec.encode(PartyOutgoing.Report(positionMs, isPlaying))
+}

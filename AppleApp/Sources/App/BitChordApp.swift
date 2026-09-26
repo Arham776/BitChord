@@ -20,6 +20,7 @@ struct BitChordApp: App {
                     CipherUnlockWiring.install()
                     SecretStoreWiring.install()
                     ModuleEngineWiring.install()
+                    PartySocket.register()
                     installAutomixModels()
                     controller.startEngineIfNeeded()
                     LocalLibrary.shared.restore()
