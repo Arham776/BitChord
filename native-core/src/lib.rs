@@ -19,6 +19,37 @@ pub mod analyzer;
 pub mod decode;
 pub mod eq;
 pub mod mixer;
+
+/// The audio render thread's scheduling class.
+///
+/// Thread Performance Checker named the pairing that started this: a
+/// user-interactive thread waiting on a default-QoS mixer. The wait is gone —
+/// a seek queues and returns, like every player upstream — but the mixer's own
+/// class still decides how it competes with everything else in the app for the
+/// CPU. A render thread that gets scheduled late misses a real-time deadline,
+/// the ring drains, and the dropout is audible as a stutter.
+mod qos {
+    /// Puts the calling thread in the user-interactive class.
+    ///
+    /// The relative priority argument is 0: the mixer keeps the class that a
+    /// gesture runs at rather than claiming a higher band than the UI, so this
+    /// cannot outrank the main thread. It only stops the mixer being starved
+    /// by it.
+    #[cfg(target_os = "macos")]
+    pub fn raise_current_thread() {
+        // SAFETY: `pthread_set_qos_class_self_np` reads the calling thread's
+        // QoS and stores a class on it. No pointer argument, nothing to get
+        // wrong, and the return value only reports an unavailable class.
+        unsafe {
+            libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_USER_INTERACTIVE, 0);
+        }
+    }
+
+    /// Nothing to raise: only Apple platforms express a scheduling class here,
+    /// and on the others the equivalent is the platform's own audio policy.
+    #[cfg(not(target_os = "macos"))]
+    pub fn raise_current_thread() {}
+}
 pub mod metadata;
 pub mod spatial;
 pub mod transition_filter;
@@ -163,7 +194,6 @@ pub enum EngineError {
     NoOutputDevice,
     StreamInit(String),
     LoadFailed(String),
-    SeekFailed(String),
     NotStarted,
 }
 
@@ -173,7 +203,6 @@ impl std::fmt::Display for EngineError {
             EngineError::NoOutputDevice => write!(f, "no audio output device"),
             EngineError::StreamInit(e) => write!(f, "stream init failed: {e}"),
             EngineError::LoadFailed(e) => write!(f, "load failed: {e}"),
-            EngineError::SeekFailed(e) => write!(f, "seek failed: {e}"),
             EngineError::NotStarted => write!(f, "engine not started"),
         }
     }
@@ -260,6 +289,14 @@ pub struct PlayerEngine {
     rebuilding: Arc<AtomicBool>,
     output_rate: Arc<AtomicU32>,
     output_channels: Arc<AtomicU32>,
+    /// The format the host platform asked for, `0` meaning "no opinion". iOS
+    /// knows the hardware format because the `AVAudioSession` owns it there, and
+    /// cpal's own answer is the RemoteIO unit's opinion of the same thing; when
+    /// the two disagree the unit can fail to start without an error worth
+    /// reading. macOS has no such owner, so it leaves these at `0` and cpal's
+    /// device choice stands.
+    requested_rate: Arc<AtomicU32>,
+    requested_channels: Arc<AtomicU32>,
     nerd: Arc<Mutex<mixer::NerdSnapshot>>,
 }
 
@@ -283,6 +320,8 @@ impl PlayerEngine {
             rebuilding: Arc::new(AtomicBool::new(false)),
             output_rate: Arc::new(AtomicU32::new(0)),
             output_channels: Arc::new(AtomicU32::new(2)),
+            requested_rate: Arc::new(AtomicU32::new(0)),
+            requested_channels: Arc::new(AtomicU32::new(0)),
             nerd: Arc::new(Mutex::new(mixer::NerdSnapshot::default())),
         })
     }
@@ -292,7 +331,13 @@ impl PlayerEngine {
     }
 
     /// Opens the output device and starts the mixer thread.
-    pub fn start(&self) -> Result<(), EngineError> {
+    ///
+    /// `rate` and `channels` are the host platform's own figures when it has
+    /// them — iOS reads them off the `AVAudioSession`, which owns the hardware
+    /// format there, and passes them in so the audio unit and the session agree
+    /// by construction. `None` asks cpal, which is the only answer available
+    /// everywhere else.
+    pub fn start(&self, rate: Option<f64>, channels: Option<u32>) -> Result<(), EngineError> {
         let _ = env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
             .try_init();
         if self.started.swap(true, Ordering::SeqCst) {
@@ -301,14 +346,33 @@ impl PlayerEngine {
         let device = cpal::default_host()
             .default_output_device()
             .ok_or(EngineError::NoOutputDevice)?;
+        // Remember the platform's request before asking cpal, so a later
+        // rebuild (route change) resolves the same way the first start did.
+        if let Some(r) = rate.filter(|r| *r > 0.0) {
+            self.requested_rate.store(r as u32, Ordering::Relaxed);
+        }
+        if let Some(c) = channels.filter(|c| *c > 0) {
+            self.requested_channels.store(c, Ordering::Relaxed);
+        }
         let supported = device
             .default_output_config()
             .map_err(|e| EngineError::StreamInit(e.to_string()))?;
-        let sample_rate = supported.sample_rate();
-        let channels = supported.channels() as usize;
+        let (sample_rate, channels) = choose_format(
+            &self.requested_rate,
+            &self.requested_channels,
+            supported.sample_rate(),
+            supported.channels() as usize,
+        );
         self.output_rate.store(sample_rate, Ordering::Relaxed);
         self.output_channels.store(channels as u32, Ordering::Relaxed);
-        log::info!("output {sample_rate} Hz, {channels} ch");
+        // The device's own name, because "no sound" is otherwise indistinguishable
+        // from "the wrong output". A machine with no real sink (a VM, a session
+        // with nothing plugged in) resolves to a null device that drains as fast
+        // as the callback fires, which looks exactly like a mixer running far too
+        // fast — so the name is what tells those two apart.
+        log::info!(
+            "output {device} — {sample_rate} Hz, {channels} ch"
+        );
 
         // ~2 s of stereo at 192 kHz — big enough that a 24 kHz AirPods
         // rebuild can reuse the same capacity without shrinking.
@@ -331,6 +395,7 @@ impl PlayerEngine {
         std::thread::Builder::new()
             .name("native-core-mixer".into())
             .spawn(move || {
+                qos::raise_current_thread();
                 mixer::run_mixer(
                     rx,
                     producer,
@@ -352,6 +417,8 @@ impl PlayerEngine {
             rebuilding: self.rebuilding.clone(),
             output_rate: self.output_rate.clone(),
             output_channels: self.output_channels.clone(),
+            requested_rate: self.requested_rate.clone(),
+            requested_channels: self.requested_channels.clone(),
             volume_bits: self.volume_bits.clone(),
             buffered: self.buffered_frames.clone(),
             flush_ring: self.flush_ring.clone(),
@@ -399,16 +466,24 @@ impl PlayerEngine {
         self.send(Command::Stop)
     }
 
-    pub fn seek(&self, seconds: f64) -> Result<(), EngineError> {
-        let (reply_tx, reply_rx) = crossbeam_channel::bounded::<Result<(), String>>(1);
-        self.send(Command::Seek {
-            seconds: seconds.max(0.0),
-            reply: reply_tx,
-        })?;
-        match reply_rx.recv_timeout(std::time::Duration::from_secs(15)) {
-            Ok(Ok(())) => Ok(()),
-            Ok(Err(e)) => Err(EngineError::SeekFailed(e)),
-            Err(_) => Err(EngineError::SeekFailed("seek timed out".into())),
+    /// Moves the playhead. Returns as soon as the request is queued.
+    ///
+    /// It does not wait for the mixer to apply it, and deliberately so. This is
+    /// called straight from a lyric-line tap on the main thread, and waiting
+    /// there put a user-interactive thread behind a default-QoS mixer for up to
+    /// fifteen seconds — Thread Performance Checker named it, and the UI stall it
+    /// caused was the "navigating stutters the song" half of the report. Every
+    /// player upstream is asynchronous here too. A refusal comes back as an
+    /// error event; the position readout reconciles from the playhead on the
+    /// next tick either way.
+    pub fn seek(&self, seconds: f64) {
+        if self
+            .send(Command::Seek {
+                seconds: seconds.max(0.0),
+            })
+            .is_err()
+        {
+            log::warn!("seek dropped — engine not started");
         }
     }
 
@@ -534,6 +609,8 @@ struct OutputControl {
     rebuilding: Arc<AtomicBool>,
     output_rate: Arc<AtomicU32>,
     output_channels: Arc<AtomicU32>,
+    requested_rate: Arc<AtomicU32>,
+    requested_channels: Arc<AtomicU32>,
     volume_bits: Arc<AtomicU32>,
     buffered: Arc<AtomicU64>,
     flush_ring: Arc<AtomicBool>,
@@ -594,8 +671,14 @@ impl OutputControl {
         let supported = device
             .default_output_config()
             .map_err(|e| EngineError::StreamInit(e.to_string()))?;
-        let rate = supported.sample_rate();
-        let channels = supported.channels() as usize;
+        // The same resolution `PlayerEngine::start` applies, so a rebuild after
+        // a route change cannot land on a different format than the first start.
+        let (rate, channels) = choose_format(
+            &self.requested_rate,
+            &self.requested_channels,
+            supported.sample_rate(),
+            supported.channels() as usize,
+        );
         let prev_rate = self.output_rate.load(Ordering::Relaxed);
         let prev_ch = self.output_channels.load(Ordering::Relaxed);
         if !force && rate == prev_rate && channels as u32 == prev_ch {
@@ -627,6 +710,29 @@ impl OutputControl {
         log::info!("output rebuilt: {rate} Hz, {channels} ch");
         Ok(())
     }
+}
+
+/// The format the host platform asked for, falling back to cpal's answer.
+///
+/// A hint of `0` means "no opinion" and takes cpal's figure. A requested
+/// channel count of 1 is honoured rather than read as unset — a mono session
+/// is a real configuration, and treating it as absent would hand the audio unit
+/// a different channel count than the session believes it has.
+fn choose_format(
+    requested_rate: &AtomicU32,
+    requested_channels: &AtomicU32,
+    device_rate: u32,
+    device_channels: usize,
+) -> (u32, usize) {
+    let rate = match requested_rate.load(Ordering::Relaxed) {
+        0 => device_rate,
+        r => r,
+    };
+    let channels = match requested_channels.load(Ordering::Relaxed) {
+        0 => device_channels,
+        c => c as usize,
+    };
+    (rate.max(1), channels.max(1))
 }
 
 fn open_output_stream(
@@ -835,4 +941,60 @@ fn decode_region_impl(
         sample_rate: rate,
         start_seconds: actual_start,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::choose_format;
+    use std::sync::atomic::AtomicU32;
+
+    fn pick(rate: u32, channels: u32, dev_rate: u32, dev_channels: usize) -> (u32, usize) {
+        choose_format(&AtomicU32::new(rate), &AtomicU32::new(channels), dev_rate, dev_channels)
+    }
+
+    #[test]
+    fn no_hint_takes_cpals_figures() {
+        assert_eq!(pick(0, 0, 48_000, 2), (48_000, 2));
+    }
+
+    #[test]
+    fn a_platform_hint_overrides_cpals_figures() {
+        // The iOS case: the session says 44.1 kHz, cpal's RemoteIO unit says
+        // 48 kHz, and the session is the one that owns the hardware.
+        assert_eq!(pick(44_100, 2, 48_000, 2), (44_100, 2));
+    }
+
+    #[test]
+    fn a_mono_hint_is_honoured_rather_than_read_as_unset() {
+        // Zero is the only "no opinion" marker. One is a real configuration,
+        // and discarding it would hand the unit two channels for a session that
+        // believes it has one.
+        assert_eq!(pick(48_000, 1, 48_000, 2), (48_000, 1));
+    }
+
+    #[test]
+    fn hints_are_resolved_independently() {
+        assert_eq!(pick(44_100, 0, 48_000, 6), (44_100, 6));
+        assert_eq!(pick(0, 1, 48_000, 6), (48_000, 1));
+    }
+
+    #[test]
+    fn a_zero_device_figure_is_never_handed_to_cpal() {
+        // Nothing should reach the unit as 0 Hz or 0 channels, whatever the
+        // source of the zero. A hint of 0 means "no opinion" and falls through
+        // to the device; a device that also reports 0 is floored at 1 rather
+        // than passed on.
+        assert_eq!(choose_format(
+            &AtomicU32::new(0),
+            &AtomicU32::new(0),
+            0,
+            0
+        ), (1, 1));
+        assert_eq!(choose_format(
+            &AtomicU32::new(48_000),
+            &AtomicU32::new(2),
+            0,
+            0
+        ), (48_000, 2));
+    }
 }

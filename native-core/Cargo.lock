@@ -968,6 +968,7 @@ dependencies = [
  "cpal",
  "crossbeam-channel",
  "env_logger",
+ "libc",
  "lofty",
  "log",
  "rten",

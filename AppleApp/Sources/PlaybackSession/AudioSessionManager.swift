@@ -3,46 +3,72 @@ import AVFoundation
 /// Background audio session (spec §3.2). iOS needs `.playback` + activation
 /// for lock-screen / Control Center continuity; macOS has no AVAudioSession.
 ///
-/// ## Why this is a `Task` and not a `Task { }` on the main actor
+/// ## Why activation is awaited rather than fired and forgotten
 ///
-/// `setActive(_:)` can synchronously talk to the audio daemon, and it is documented as
-/// unsafe to call on the main thread — the system logs exactly that, twice per call:
+/// It used to spawn a detached `setActive` and return. That raced the engine:
+/// `PlaybackController.init` scheduled the activation, and
+/// `startEngineIfNeeded` scheduled `engine.start()` as a *second* detached task,
+/// with nothing ordering them. On iOS the engine's output is a RemoteIO audio
+/// unit, and a unit that starts while the session is still inactive is never
+/// pulled by the audio daemon. The ring then fills to capacity in about eight
+/// seconds, `render_available` stops decoding, and the whole track downloads
+/// in silence — until the deferred activation lands and the backlog bursts out.
+/// That is the "shows as playing, no sound, then one stutter" report, and
+/// because activation eventually won the race, the *next* track played fine.
 ///
-/// > This method can lead to UI unresponsiveness if called on the main thread.
-/// > Consider using the asynchronous activate/deactivate API instead.
+/// The ordering is now explicit instead of probabilistic: no output stream is
+/// built before the session is up.
 ///
-/// The async form (`setActive(_:options:completionHandler:)`) is the one the warning
-/// asks for, and it is also the correct one here for a second reason: activation
-/// blocks on whatever else holds the session, and a queue that has to wait for that
-/// before it can push its first buffer is a queue that stutters on the first track
-/// after a cold start.
+/// ## Why the session's format is reported back
 ///
-/// The completion runs on an arbitrary queue, so the result is logged there rather
-/// than hopping back — there is nothing on the other side of it but a line, and
-/// `Task.detached` would buy a thread hop for the privilege of being told about a
-/// failure that is not actionable in the first place. The one thing worth surfacing
-/// is a refusal, because a session that will not activate is a session with no
-/// background audio at all.
+/// On iOS the session owns the hardware format. cpal's `default_output_config()`
+/// reports the RemoteIO unit's opinion, and when the two disagree the unit can
+/// fail to start without an error worth reading. Handing the engine the
+/// session's own numbers makes the two agree by construction.
 enum AudioSessionManager {
-    /// Idempotent, and cheap when the session is already what it should be.
+    /// The format the session settled on, or `nil` on macOS (where cpal's device
+    /// choice stands) and on iOS when the session reported an unusable format.
+    struct Format: Equatable {
+        let rate: Double
+        let channels: UInt32
+    }
+
+    /// Activates the playback session and reports the format it settled on.
     ///
-    /// A `Task` rather than a stored handle: this is called from playback setup on
-    /// both platforms and on iOS the call is a no-op after the first, so there is
-    /// nothing to keep. The category is set every time because it is the documented
-    /// pairing to do with activation, and `setCategory` is not the expensive one.
-    static func activate() {
+    /// Idempotent, and cheap when the session is already what it should be. The
+    /// category is set every time because it is the documented pairing to do with
+    /// activation, and `setCategory` is not the expensive one.
+    ///
+    /// `setActive(_:)` can synchronously talk to the audio daemon, and it is
+    /// documented as unsafe on the main thread — the system logs exactly that
+    /// when it happens. The async form is the one that warning asks for, and it
+    /// is also the correct one here for a second reason: activation blocks on
+    /// whatever else holds the session, and a queue that must wait for that
+    /// before it can push its first buffer is a queue that stutters on the first
+    /// track after a cold start. Every caller reaches here from a detached task,
+    /// so the work is never on the main thread in the first place.
+    @discardableResult
+    static func activate() async -> Format? {
 #if os(iOS)
         let session = AVAudioSession.sharedInstance()
-        try? session.setCategory(.playback, mode: .default, options: [])
-        // Detached, and off the main thread by construction: `Task {}` inherits the
-        // actor of its caller, which is the main actor for every call site in this app.
-        Task.detached(priority: .userInitiated) {
-            do {
-                try await session.setActive(true)
-            } catch {
-                NSLog("[BitChord] audio session would not activate: \(error.localizedDescription)")
-            }
+        do {
+            try session.setCategory(.playback, mode: .default, options: [])
+            try await session.setActive(true)
+        } catch {
+            // Worth surfacing: a session that will not activate is a session with
+            // no background audio at all. Nothing actionable beyond the log.
+            NSLog("[BitChord] audio session would not activate: \(error.localizedDescription)")
         }
+        // `currentRoute` rather than the session: the session has no channel
+        // count of its own, the output it is currently routed through does, and
+        // that is the number the audio unit has to agree with. A route with no
+        // outputs means nothing is plugged in — reported as "no format" so the
+        // engine asks the device instead of guessing.
+        let channels = session.currentRoute.outputs.first?.channels?.count ?? 0
+        guard channels > 0, session.sampleRate > 0 else { return nil }
+        return Format(rate: session.sampleRate, channels: UInt32(channels))
+#else
+        return nil
 #endif
     }
 }

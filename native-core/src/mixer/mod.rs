@@ -118,10 +118,13 @@ pub enum Command {
     Play,
     Pause,
     Stop,
-    Seek {
-        seconds: f64,
-        reply: Sender<Result<(), String>>,
-    },
+    /// Move the playhead. Carries no reply: a seek is a request, and blocking
+    /// the caller's thread on the mixer's answer is a priority inversion when the
+    /// caller is the main thread — which is exactly what a tap on a lyric line
+    /// is. Both Android's `MediaPlayer.seekTo` and ExoPlayer's `seekTo` return
+    /// before the seek lands, and the position reconciles from the playhead
+    /// afterwards. A refusal arrives as an error event instead.
+    Seek { seconds: f64 },
     SetVolume(f32),
     SetCrossfadeWindow(f64),
     SetSpatial(bool),
@@ -1106,7 +1109,7 @@ fn handle_command(state: &mut MixerState, cmd: Command, ring: &mut Producer<f32>
         Command::Stop => {
             state.stop_all();
         }
-        Command::Seek { seconds, reply } => {
+        Command::Seek { seconds } => {
             if state.transition.is_some() {
                 state.bail();
             }
@@ -1125,15 +1128,14 @@ fn handle_command(state: &mut MixerState, cmd: Command, ring: &mut Producer<f32>
                             state.flush_ring.store(true, Ordering::Release);
                             state.buffered_frames.store(0, Ordering::Relaxed);
                             state.position_ms.store((seconds * 1000.0) as u64, Ordering::Relaxed);
-                            let _ = reply.send(Ok(()));
                         }
                         Err(e) => {
-                            let _ = reply.send(Err(e.to_string()));
+                            state.events.error(format!("seek failed: {e}"));
                         }
                     }
                 }
                 None => {
-                    let _ = reply.send(Err("nothing playing".into()));
+                    state.events.error("seek ignored — nothing playing".into());
                 }
             }
         }

@@ -58,3 +58,14 @@ rten-tensor = "0.26"
 
 # No build.rs needed: the proc-macro route (#[uniffi::export] + setup_scaffolding!)
 # replaces the UDL/uniffi-build setup.
+
+# Apple only: the render thread's QoS class. The mixer answers a real-time
+# deadline — the device callback drains its ring on a schedule the hardware sets
+# — so a mixer that can be scheduled below the app work competing with it
+# underruns, and an underrun is a dropout. Nothing outside this crate needs it.
+#
+# Kept last deliberately: a `[target.…]` table ends the `[dependencies]` table
+# it follows, so anything written after one of these silently becomes a
+# target-specific dependency instead.
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = "0.2"

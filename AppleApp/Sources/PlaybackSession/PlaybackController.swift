@@ -291,7 +291,10 @@ final class PlaybackController {
         nowPlaying.onNext = { [weak self] in self?.next() }
         nowPlaying.onPrevious = { [weak self] in self?.previous() }
         nowPlaying.onSeek = { [weak self] seconds in self?.seek(to: seconds) }
-        AudioSessionManager.activate()
+        // The audio session is activated by `startEngineIfNeeded`, not here.
+        // Activating from `init` raced the engine start — two detached tasks
+        // with nothing ordering them — and a RemoteIO unit built before the
+        // session was up never gets pulled, so the track played in silence.
         QualityUpgrade.forgetLastSession()
         restoreSession()
         let token = PlatformSettings.shared.getSecret(key: "discord_token") ?? ""
@@ -313,7 +316,14 @@ final class PlaybackController {
         let eq = EqualizerView.load().map { Float($0) }
         Task.detached(priority: .utility) {
             do {
-                try eng.start()
+                // The session has to be up before the output stream exists, and
+                // the iOS session owns the hardware format — so this is awaited,
+                // and its answer is what the engine is told to open at.
+                let format = await AudioSessionManager.activate()
+                try eng.start(
+                    rate: format?.rate,
+                    channels: format?.channels
+                )
                 try eng.setCrossfadeWindow(seconds: crossfade)
                 try eng.setSpatialEnabled(enabled: spatial)
                 try eng.setSkipSilence(enabled: skip)
@@ -604,7 +614,9 @@ final class PlaybackController {
 
     func seek(to seconds: Double) {
         noteLocalIntent()
-        try? engine.seek(seconds: seconds)
+        // Queues and returns: the playhead is the engine's to move, and waiting
+        // for it here would stall whatever thread asked — usually the main one.
+        engine.seek(seconds: seconds)
         position = seconds
     }
 
