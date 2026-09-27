@@ -18,9 +18,10 @@ struct DetailPageModel: Decodable {
     let librarySaved: Bool?
     let playlistOwned: Bool?
     let type: String?
+    let url: String?
 
     enum CodingKeys: String, CodingKey {
-        case browseId, title, subtitle, thumbnailUrl, songs, sections, description, subscriberCountText, monthlyListenerCount, subscription, continuation, type, suggestedSongs, libraryPlaylistId, librarySaved, playlistOwned
+        case browseId, title, subtitle, thumbnailUrl, songs, sections, description, subscriberCountText, monthlyListenerCount, subscription, continuation, type, suggestedSongs, libraryPlaylistId, librarySaved, playlistOwned, url
     }
 
     init(from decoder: Decoder) throws {
@@ -41,6 +42,7 @@ struct DetailPageModel: Decodable {
         libraryPlaylistId = try c.decodeIfPresent(String.self, forKey: .libraryPlaylistId)
         librarySaved = try c.decodeIfPresent(Bool.self, forKey: .librarySaved)
         playlistOwned = try c.decodeIfPresent(Bool.self, forKey: .playlistOwned)
+        url = try c.decodeIfPresent(String.self, forKey: .url)
     }
 
     struct SongPayload: Decodable {

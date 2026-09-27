@@ -13,6 +13,28 @@ enum LibraryActions {
         }
     }
 
+    /// Toggle the heart on `videoId` — write the rating to the screen first and
+    /// roll it back if YouTube refuses. Upstream `MainViewModel.setLike`.
+    ///
+    /// A rating is a one-tap, low-stakes action taken while a song is playing;
+    /// waiting on a round trip before the heart fills reads as the tap not
+    /// having registered, and people tap again. The rollback is the other half
+    /// of that bargain, and the port was missing it: every call site wrote the
+    /// result of `rate` to `_`, so a rating YouTube refused left the heart
+    /// showing a status the account did not have and said nothing about it.
+    ///
+    /// - Returns: the failure message, or `nil` on success.
+    static func toggleLike(videoId: String) async -> String? {
+        let previous = cachedLike(videoId)
+        let next = previous == "LIKE" ? "INDIFFERENT" : "LIKE"
+        let failure = await rate(videoId: videoId, status: next)
+        if failure != nil {
+            // `rate` already wrote `next` optimistically; put it back.
+            LikeStore.shared.set(videoId, previous)
+        }
+        return failure
+    }
+
     static func ratePlaylist(playlistId: String, saved: Bool) async -> String? {
         await withCheckedContinuation { cont in
             LibraryActionsBridge.shared.ratePlaylist(playlistId: playlistId, saved: saved, callback: DoneCB { ok, msg in

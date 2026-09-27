@@ -31,10 +31,36 @@ struct SearchHitDTO: Codable, Identifiable, Hashable {
     /// Whether this is a playable track, promoted or not.
     var isTrack: Bool { !isBrowse && videoId != nil }
 
+    var resolvedArtist: String {
+        guard let raw = subtitle?.trimmingCharacters(in: .whitespacesAndNewlines), !raw.isEmpty else {
+            return ""
+        }
+        if raw.caseInsensitiveCompare("Unknown artist") == .orderedSame {
+            return ""
+        }
+        if raw.contains(" • ") {
+            let segments = raw.components(separatedBy: " • ").map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
+            for seg in segments {
+                let lower = seg.lowercased()
+                if ["song", "video", "album", "single", "ep", "artist", "playlist"].contains(lower) {
+                    continue
+                }
+                if seg.range(of: #"^\d+:\d{2}$"#, options: .regularExpression) != nil {
+                    continue
+                }
+                if seg.caseInsensitiveCompare("Unknown artist") != .orderedSame {
+                    return seg
+                }
+            }
+        }
+        return raw
+    }
+
     func asEntry() -> QueueEntry {
+        let artistName = resolvedArtist
         if let videoId, videoId.hasPrefix("saavn:") {
             return QueueEntry(
-                id: videoId, title: title, artist: subtitle ?? "", source: videoId,
+                id: videoId, title: title, artist: artistName, source: videoId,
                 thumbnailUrl: thumbnailUrl, durationText: durationText, albumName: albumName,
                 artworkData: nil, isLocal: false
             )
@@ -42,7 +68,7 @@ struct SearchHitDTO: Codable, Identifiable, Hashable {
         return QueueEntry.youtube(
             videoId: videoId ?? id,
             title: title,
-            artist: subtitle ?? "",
+            artist: artistName,
             thumbnailUrl: thumbnailUrl,
             durationText: durationText,
             albumName: albumName,
