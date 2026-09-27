@@ -28,3 +28,9 @@ AppleApp/Resources/Models/*.onnx
 docs/
 
 .DS_Store
+
+# Scratch homes for a sandboxed attempt at the shared-framework build. Gradle
+# and Kotlin/Native both want to write outside the workspace by default, so a
+# sandboxed run has to relocate them here; neither is part of the project.
+.gradle-sandbox/
+.konan-sandbox/
