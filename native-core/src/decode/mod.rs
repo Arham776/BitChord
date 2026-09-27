@@ -370,13 +370,19 @@ impl SymphoniaDecoder {
                 self.decoder.reset();
                 self.pending.clear();
                 self.pending_cursor = 0;
-                self.decoded_frames = match self.time_base() {
-                    Some(tb) => tb
-                        .calc_time_saturating(seeked_to.actual_ts)
-                        .as_secs_f64()
-                        .mul_add(self.sample_rate as f64, 0.5) as u64,
-                    None => 0,
-                };
+                // Frame counting restarts from where the seek landed. The
+                // container's timestamp is the better answer when it has one,
+                // but a stream with no real timestamps (raw WAV, ADTS) reports
+                // zero there — and trusting that restarts the playhead at the
+                // file start while the audio is in the middle of the song. The
+                // requested time is the honest fallback.
+                let requested = seconds.max(0.0);
+                let landed = self
+                    .time_base()
+                    .map(|tb| tb.calc_time_saturating(seeked_to.actual_ts).as_secs_f64())
+                    .filter(|t| t.is_finite() && *t > 0.0)
+                    .unwrap_or(requested);
+                self.decoded_frames = (landed * self.sample_rate as f64).round() as u64;
                 Ok(())
             }
             Err(e) => Err(DecodeError(format!("seek: {e}"))),

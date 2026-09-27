@@ -11,9 +11,11 @@
 //! Singh. The original is AGPLv3-or-later; this port keeps that status as
 //! part of the same GPL-3 combined work.
 
+mod audio_analysis;
 mod beat;
 mod models;
 mod plan;
+mod tempo;
 mod vocal;
 
 pub use beat::Grid;
@@ -90,47 +92,6 @@ pub fn resample(input: &[f32], input_rate: f64, output_rate: f64) -> Vec<f32> {
         };
     }
     output
-}
-
-/// Energy-envelope BPM estimate used by Automix when ONNX is unavailable.
-/// Autocorrelation of a 50 ms hop RMS series, searched over 70–180 BPM.
-pub fn estimate_tempo(samples: &[f32], sample_rate: f64) -> f64 {
-    if samples.is_empty() || sample_rate <= 0.0 {
-        return 120.0;
-    }
-    let hop = (sample_rate * 0.05).max(1.0) as usize;
-    let mut envelope = Vec::new();
-    let mut i = 0;
-    while i + hop <= samples.len() {
-        let mut acc = 0.0f64;
-        for s in &samples[i..i + hop] {
-            acc += (*s as f64) * (*s as f64);
-        }
-        envelope.push((acc / hop as f64).sqrt());
-        i += hop;
-    }
-    if envelope.len() < 16 {
-        return 120.0;
-    }
-    let min_lag = ((60.0_f64 / 180.0) / 0.05).round() as usize; // 180 BPM
-    let max_lag = ((60.0_f64 / 70.0) / 0.05).round() as usize; // 70 BPM
-    let max_lag = max_lag.min(envelope.len() / 2).max(min_lag + 1);
-    let mut best_lag = min_lag;
-    let mut best = f64::MIN;
-    for lag in min_lag..=max_lag {
-        let mut corr = 0.0;
-        let n = envelope.len() - lag;
-        for i in 0..n {
-            corr += envelope[i] * envelope[i + lag];
-        }
-        corr /= n as f64;
-        if corr > best {
-            best = corr;
-            best_lag = lag;
-        }
-    }
-    let bpm = 60.0 / (best_lag as f64 * 0.05);
-    bpm.clamp(70.0, 180.0)
 }
 
 fn sinc(x: f64) -> f64 {

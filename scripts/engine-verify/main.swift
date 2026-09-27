@@ -114,7 +114,7 @@ var loaded: TrackInfoRec?
 do {
     loaded = try engine.loadTrack(request: LoadRequest(
         source: wav, title: "tone", artist: "harness",
-        startSeconds: 0, plan: nil, headers: nil, claimedKbps: 0
+        startSeconds: 0, plan: nil, headers: nil, claimedKbps: 0, loudnessDb: nil
     ))
     check("load reports the decoded duration", loaded!.durationSeconds > 5.5,
           "\(String(format: "%.2f", loaded!.durationSeconds))s")
@@ -168,6 +168,16 @@ do {
 } catch {
     check("a repeated start is a no-op", false, "\(error)")
 }
+let rebuildsBeforeNoOp = engine.outputHealth().outputRebuilds
+do {
+    try engine.setPreferUsbDac(enabled: false)
+    Thread.sleep(forTimeInterval: 0.35)
+    check("an unchanged USB preference does not rebuild output",
+          engine.outputHealth().outputRebuilds == rebuildsBeforeNoOp,
+          "rebuilds=\(engine.outputHealth().outputRebuilds)")
+} catch {
+    check("an unchanged USB preference does not rebuild output", false, "\(error)")
+}
 
 // 7. The audio pipeline panel reads this, and a panel that reports a device the
 //    engine did not open would be worse than no panel. So the honest answer
@@ -198,6 +208,73 @@ check("the readout is stable between reads",
       again.name == device.name && again.sampleRate == device.sampleRate
           && again.channels == device.channels,
       "\(again.name) \(again.sampleRate) Hz / \(again.channels) ch")
+
+// 9. Output precision: the default opens the unit as int16, and FLOAT_32
+//    rebuilds it as float. The readout names what was actually opened — the
+//    setting is the request, this is the answer.
+check("the default output is PCM_16", device.sampleFormat == "PCM_16", device.sampleFormat)
+do {
+    try engine.setOutputPcmMode(mode: "FLOAT_32")
+    Thread.sleep(forTimeInterval: 1.0)
+    let float = engine.outputDevice()
+    check("FLOAT_32 rebuilds the unit as float", float.sampleFormat == "FLOAT_32", float.sampleFormat)
+    try engine.setOutputPcmMode(mode: "PCM_16")
+    Thread.sleep(forTimeInterval: 1.0)
+    let back = engine.outputDevice()
+    check("PCM_16 rebuilds the unit as int16", back.sampleFormat == "PCM_16", back.sampleFormat)
+} catch {
+    check("PCM mode switching rebuilds the unit", false, "\(error)")
+}
+
+// 10. Loudness: a load carrying a figure reports the correction upstream
+//     would apply (-loudnessDb clamped to -15...+3 dB); a load without one
+//     reports none; the switch reports off without a reload.
+do {
+    try engine.loadTrack(request: LoadRequest(
+        source: wav, title: "tone", artist: "harness",
+        startSeconds: 0, plan: nil, headers: nil, claimedKbps: 0, loudnessDb: -7.0
+    ))
+    let nerd = engine.nerdStats()
+    check("a figured load reports the clamped correction",
+          nerd.loudnessGainDb == 3.0, "\(nerd.loudnessGainDb.map { "\($0)" } ?? "nil") dB")
+    try engine.setLoudnessEnabled(enabled: false)
+    // The toggle travels to the mixer thread as a command (the same async
+    // path as volume and skip-silence), so the readout follows it within a
+    // loop turn — not within the call.
+    Thread.sleep(forTimeInterval: 0.3)
+    let off = engine.nerdStats()
+    check("the switch reports off without a reload", off.loudnessGainDb == nil,
+          "\(off.loudnessGainDb.map { "\($0)" } ?? "nil")")
+    try engine.setLoudnessEnabled(enabled: true)
+    Thread.sleep(forTimeInterval: 0.3)
+    let on = engine.nerdStats()
+    check("re-enabling restores the correction", on.loudnessGainDb == 3.0,
+          "\(on.loudnessGainDb.map { "\($0)" } ?? "nil") dB")
+    try engine.loadTrack(request: LoadRequest(
+        source: wav, title: "tone", artist: "harness",
+        startSeconds: 0, plan: nil, headers: nil, claimedKbps: 0, loudnessDb: nil
+    ))
+    let bare = engine.nerdStats()
+    check("a figureless load reports no correction", bare.loudnessGainDb == nil,
+          "\(bare.loudnessGainDb.map { "\($0)" } ?? "nil")")
+} catch {
+    check("loudness correction is reported", false, "\(error)")
+}
+
+// 11. Route preference and analysis tier: neither may throw, and the tier
+//     setter is read back through planning rather than a getter (there is no
+//     getter — the plan is the answer).
+do {
+    try engine.setPreferUsbDac(enabled: true)
+    check("preferring USB without a DAC keeps the default",
+          !engine.outputDevice().name.isEmpty, engine.outputDevice().name)
+    try engine.setPreferUsbDac(enabled: false)
+    engine.setAutomixPerformance(mode: "EFFICIENT")
+    engine.setAutomixPerformance(mode: "BALANCED")
+    check("route and tier setters hold", true)
+} catch {
+    check("route and tier setters hold", false, "\(error)")
+}
 
 print(failures == 0 ? "\nall \(checks) checks passed" : "\n\(failures) of \(checks) checks FAILED")
 exit(failures == 0 ? 0 : 1)

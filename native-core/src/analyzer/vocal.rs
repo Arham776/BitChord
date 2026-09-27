@@ -10,6 +10,13 @@ pub const FFT: usize = 4096;
 pub const BINS: usize = FFT / 2 + 1;
 pub const HOP: usize = 1024;
 pub const FIXED_FRAMES: usize = 960;
+/// Longest source window the fixed-length STFT can ingest without exceeding
+/// [`FIXED_FRAMES`]. Upstream trims the decode to
+/// `(FIXED_FRAMES - 2) · hop / rate` (TrackAnalyzer), which lands at 958
+/// frames; the previous 22.8 s window decoded to 982 frames and made
+/// [`track`] reject every normal track, so no vocal mask was ever produced.
+pub const MAX_WINDOW_SECONDS: f64 =
+    (FIXED_FRAMES as f64 - 2.0) * HOP as f64 / SAMPLE_RATE;
 const LOW_HZ: f64 = 200.0;
 const HIGH_HZ: f64 = 4000.0;
 

@@ -143,8 +143,12 @@ impl SpatialRenderer {
             self.delay_right[self.delay_index] = right;
             self.delay_index = (self.delay_index + 1) % delay_size;
 
-            chunk[0] = clamp_unit(widened_left * self.output_gain);
-            chunk[1] = clamp_unit(widened_right * self.output_gain);
+            // Headroom is preserved, matching upstream's float `process` path:
+            // the widened value is NOT clamped here. The output boundary (and
+            // the equaliser's make-up preamp, which runs later on this same
+            // signal) is where the clamp belongs — see `render_available`.
+            chunk[0] = widened_left * self.output_gain;
+            chunk[1] = widened_right * self.output_gain;
             let (l, r) = self.head_lock(chunk[0], chunk[1]);
             chunk[0] = l;
             chunk[1] = r;
@@ -173,8 +177,8 @@ impl SpatialRenderer {
         self.itd_index = (self.itd_index + 1) % n;
 
         (
-            clamp_unit(out_l * db_gain(-MAX_ILD_DB * az.max(0.0))),
-            clamp_unit(out_r * db_gain(-MAX_ILD_DB * (-az).max(0.0))),
+            out_l * db_gain(-MAX_ILD_DB * az.max(0.0)),
+            out_r * db_gain(-MAX_ILD_DB * (-az).max(0.0)),
         )
     }
 }
@@ -203,13 +207,6 @@ fn read_frac(buf: &[f32], write: usize, delay: f32) -> f32 {
     }
     let b = buf[(write + n - (i0 + 1)) % n];
     a + (b - a) * frac
-}
-
-/// f32 analogue of upstream's clamp-to-int16: keeps the widened signal inside
-/// the range the output stage can carry, so a widened peak never wraps
-/// downstream.
-fn clamp_unit(value: f32) -> f32 {
-    value.clamp(-1.0, 1.0)
 }
 
 #[cfg(test)]

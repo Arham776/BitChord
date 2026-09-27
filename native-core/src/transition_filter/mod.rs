@@ -161,7 +161,9 @@ impl TransitionFilter {
                     if high_on {
                         value = self.high_pass(channel, value);
                     }
-                    samples[idx] = clamp_unit(value);
+                    // Headroom preserved, matching upstream's float `process`
+                    // path — no clamp here; the output boundary clamps.
+                    samples[idx] = value;
                 }
             }
             cursor += block * ch;
@@ -238,10 +240,6 @@ impl TransitionFilter {
         }
         value
     }
-}
-
-fn clamp_unit(value: f32) -> f32 {
-    value.clamp(-1.0, 1.0)
 }
 
 #[cfg(test)]

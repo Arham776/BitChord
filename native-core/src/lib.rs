@@ -139,6 +139,10 @@ pub struct LoadRequest {
     pub headers: Option<std::collections::HashMap<String, String>>,
     /// Resolver-claimed bitrate (0 = unknown).
     pub claimed_kbps: Option<u32>,
+    /// Per-track loudness from the player response (`None` for local files
+    /// and substitutes). Upstream's `StreamResolver.loudnessDbFor`; the mixer
+    /// stays at unity gain without one.
+    pub loudness_db: Option<f64>,
 }
 
 #[derive(uniffi::Record, Debug, Clone)]
@@ -161,6 +165,9 @@ pub struct NerdStatsRec {
     pub bit_depth: u32,
     pub channels: u32,
     pub kbps: u32,
+    /// Applied loudness correction in dB (`None` = unity: switch off or no
+    /// figure). The pipeline panel reads this, not the setting.
+    pub loudness_gain_db: Option<f32>,
 }
 
 #[derive(uniffi::Record, Debug, Clone)]
@@ -277,6 +284,13 @@ pub struct PlayerEngine {
     command_rx: Mutex<Option<crossbeam_channel::Receiver<Command>>>,
     events: Arc<SharedEvents>,
     buffered_frames: Arc<AtomicU64>,
+    callback_underruns: Arc<AtomicU64>,
+    output_rebuilds: Arc<AtomicU64>,
+    output_xruns: Arc<AtomicU64>,
+    /// Peak absolute sample the output callback actually wrote, as f32 bits.
+    /// `0.0` means the callback is being fed silence — which distinguishes
+    /// "the ring is empty/quiet" from "the stream is not reaching the speaker".
+    output_peak: Arc<AtomicU32>,
     position_ms: Arc<AtomicU64>,
     duration_ms: Arc<AtomicU64>,
     volume_bits: Arc<AtomicU32>,
@@ -303,6 +317,23 @@ pub struct PlayerEngine {
     /// pretend otherwise; the panel reads it, nothing writes it in a loop.
     device_name: Arc<Mutex<String>>,
     nerd: Arc<Mutex<mixer::NerdSnapshot>>,
+    /// Requested PCM word length (0 = PCM_16, 1 = FLOAT_32). Read when a
+    /// stream is (re)built; changing it rebuilds the unit.
+    pcm_mode: Arc<AtomicU32>,
+    /// Prefer a USB audio device over the system default (upstream
+    /// `preferUsbDac`). Advisory on iOS, where the session owns the route;
+    /// a real device choice on macOS.
+    prefer_usb: Arc<AtomicBool>,
+    /// Loudness-normalization master switch (upstream
+    /// `loudnessNormalization`, on by default).
+    loudness_enabled: Arc<AtomicBool>,
+    /// Automix analysis tier (EFFICIENT / BALANCED / PERFORMANCE). Read when
+    /// a plan is computed; no rebuild involved.
+    automix_tier: Arc<Mutex<AutomixTier>>,
+    /// The output control built at `start`, retained so later setting changes
+    /// (PCM mode, route preference) can ask for the same rebuild a route
+    /// change gets.
+    control: Mutex<Option<OutputControl>>,
 }
 
 /// What the engine actually opened, for the audio pipeline readout.
@@ -313,12 +344,90 @@ pub struct PlayerEngine {
 /// "nothing is open yet" and "something is open" are the two states worth
 /// telling apart — the first means the panel is empty for a reason, and the
 /// second means every row below it is real.
+/// Requested PCM word length at the output boundary.
+///
+/// Upstream's `OutputPcmMode`, minus the 24-bit rung: Media3's sink chain has
+/// no packed-24 path (its own comment says so), and neither does this one —
+/// CoreAudio converts whatever the unit is opened as, so a 24-bit request
+/// would name a depth that was never written. PCM_16 opens the unit as int16
+/// (quantized at the callback); FLOAT_32 is the lossless path and the mix
+/// format throughout.
+#[derive(uniffi::Enum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OutputPcmMode {
+    Pcm16,
+    Float32,
+}
+
+impl OutputPcmMode {
+    /// Stored settings predate this enum and one of them names a rung that
+    /// never existed here — both fall back to the lossless path rather than
+    /// the lossy one, because a wrong default should cost nothing audible.
+    fn parse(mode: &str) -> Self {
+        match mode {
+            "FLOAT_32" | "PCM_24" => OutputPcmMode::Float32,
+            _ => OutputPcmMode::Pcm16,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            OutputPcmMode::Pcm16 => "PCM_16",
+            OutputPcmMode::Float32 => "FLOAT_32",
+        }
+    }
+}
+
+/// CPU budget for Automix analysis (upstream `AutomixPerformanceMode`).
+///
+/// rten runs single-threaded — there is no intra-op pool to resize, so the
+/// thread counts (1 / 2 / 4) have no knob here. What the tier does control is
+/// how much analysis runs at all: EFFICIENT skips the open-unmix vocal model
+/// (the expensive half) and plans from the beat grid plus energy, which is
+/// upstream's own "yields to decoding and playback" in effect if not in
+/// mechanism. BALANCED and PERFORMANCE both run the full graphs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AutomixTier {
+    Efficient,
+    Balanced,
+    Performance,
+}
+
+impl AutomixTier {
+    fn parse(mode: &str) -> Self {
+        match mode {
+            "EFFICIENT" => AutomixTier::Efficient,
+            "PERFORMANCE" => AutomixTier::Performance,
+            _ => AutomixTier::Balanced,
+        }
+    }
+
+    /// Whether the vocal-separation model runs for this plan.
+    fn runs_vocal_model(self) -> bool {
+        self != AutomixTier::Efficient
+    }
+}
+
 #[derive(uniffi::Record, Debug, Clone)]
 pub struct OutputDeviceRec {
     pub name: String,
     pub sample_rate: u32,
     pub channels: u32,
     pub started: bool,
+    /// Word length the unit was actually opened as (`PCM_16` = int16 stream,
+    /// `FLOAT_32` = float). The setting is the request; this is the answer.
+    pub sample_format: String,
+}
+
+/// Monotonic output counters for a device playback trace. Compare deltas while
+/// a track is playing; the output callback also runs while the queue is idle.
+#[derive(uniffi::Record, Debug, Clone)]
+pub struct OutputHealthRec {
+    pub buffered_frames: u64,
+    pub callback_underruns: u64,
+    pub output_rebuilds: u64,
+    pub output_xruns: u64,
+    /// Peak absolute sample the device callback last wrote (0.0 = silence).
+    pub output_peak: f32,
 }
 
 #[uniffi::export]
@@ -331,6 +440,10 @@ impl PlayerEngine {
             command_rx: Mutex::new(Some(rx)),
             events: Arc::new(SharedEvents::default()),
             buffered_frames: Arc::new(AtomicU64::new(0)),
+            callback_underruns: Arc::new(AtomicU64::new(0)),
+            output_rebuilds: Arc::new(AtomicU64::new(0)),
+            output_xruns: Arc::new(AtomicU64::new(0)),
+            output_peak: Arc::new(AtomicU32::new(0.0f32.to_bits())),
             position_ms: Arc::new(AtomicU64::new(0)),
             duration_ms: Arc::new(AtomicU64::new(0)),
             volume_bits: Arc::new(AtomicU32::new(1.0f32.to_bits())),
@@ -345,6 +458,11 @@ impl PlayerEngine {
             requested_channels: Arc::new(AtomicU32::new(0)),
             device_name: Arc::new(Mutex::new(String::new())),
             nerd: Arc::new(Mutex::new(mixer::NerdSnapshot::default())),
+            pcm_mode: Arc::new(AtomicU32::new(if cfg!(target_os = "ios") { 1 } else { 0 })),
+            prefer_usb: Arc::new(AtomicBool::new(false)),
+            loudness_enabled: Arc::new(AtomicBool::new(true)),
+            automix_tier: Arc::new(Mutex::new(AutomixTier::Balanced)),
+            control: Mutex::new(None),
         })
     }
 
@@ -365,9 +483,11 @@ impl PlayerEngine {
         if self.started.swap(true, Ordering::SeqCst) {
             return Ok(());
         }
-        let device = cpal::default_host()
-            .default_output_device()
-            .ok_or(EngineError::NoOutputDevice)?;
+        let host = cpal::default_host();
+        let Some(device) = pick_output_device(&host, self.prefer_usb.load(Ordering::Relaxed)) else {
+            self.started.store(false, Ordering::Release);
+            return Err(EngineError::NoOutputDevice);
+        };
         // Remember the platform's request before asking cpal, so a later
         // rebuild (route change) resolves the same way the first start did.
         if let Some(r) = rate.filter(|r| *r > 0.0) {
@@ -376,9 +496,13 @@ impl PlayerEngine {
         if let Some(c) = channels.filter(|c| *c > 0) {
             self.requested_channels.store(c, Ordering::Relaxed);
         }
-        let supported = device
-            .default_output_config()
-            .map_err(|e| EngineError::StreamInit(e.to_string()))?;
+        let supported = match device.default_output_config() {
+            Ok(config) => config,
+            Err(e) => {
+                self.started.store(false, Ordering::Release);
+                return Err(EngineError::StreamInit(e.to_string()));
+            }
+        };
         let (sample_rate, channels) = choose_format(
             &self.requested_rate,
             &self.requested_channels,
@@ -445,14 +569,22 @@ impl PlayerEngine {
             device_name: self.device_name.clone(),
             volume_bits: self.volume_bits.clone(),
             buffered: self.buffered_frames.clone(),
+            callback_underruns: self.callback_underruns.clone(),
+            output_rebuilds: self.output_rebuilds.clone(),
+            output_xruns: self.output_xruns.clone(),
+            output_peak: self.output_peak.clone(),
             flush_ring: self.flush_ring.clone(),
             output_paused: self.output_paused.clone(),
+            pcm_mode: self.pcm_mode.clone(),
+            prefer_usb: self.prefer_usb.clone(),
         };
-        let stream = open_output_stream(&device, sample_rate, channels, consumer, &control)?;
+        let pcm16 = self.pcm_mode.load(Ordering::Relaxed) == 0;
+        let stream = open_output_stream(&device, sample_rate, channels, pcm16, consumer, &control)?;
         stream
             .play()
             .map_err(|e| EngineError::StreamInit(e.to_string()))?;
         *self.stream.lock().unwrap() = Some(stream);
+        *self.control.lock().unwrap() = Some(control);
         Ok(())
     }
 
@@ -467,6 +599,30 @@ impl PlayerEngine {
             Ok(Ok(info)) => Ok(info_to_rec(info)),
             Ok(Err(e)) => Err(EngineError::LoadFailed(e)),
             Err(_) => Err(EngineError::LoadFailed("load timed out".into())),
+        }
+    }
+
+    /// Replaces the playing source with a better one for the same recording,
+    /// crossfading into it — upstream `swapCurrentToVersion`. The replacement
+    /// opens at the engine's own position rather than `request.start_seconds`:
+    /// the caller only knows the audible playhead, which trails the decoder by
+    /// the whole output ring, and a crossfade between two copies of the same
+    /// audio is only inaudible while they are aligned.
+    pub fn swap_source(
+        &self,
+        request: LoadRequest,
+        crossfade_seconds: f64,
+    ) -> Result<TrackInfoRec, EngineError> {
+        let (reply_tx, reply_rx) = crossbeam_channel::bounded::<Result<TrackInfo, String>>(1);
+        self.send(Command::SwapSource {
+            request: to_track_source(request),
+            crossfade_seconds,
+            reply: reply_tx,
+        })?;
+        match reply_rx.recv_timeout(std::time::Duration::from_secs(30)) {
+            Ok(Ok(info)) => Ok(info_to_rec(info)),
+            Ok(Err(e)) => Err(EngineError::LoadFailed(e)),
+            Err(_) => Err(EngineError::LoadFailed("swap timed out".into())),
         }
     }
 
@@ -514,12 +670,28 @@ impl PlayerEngine {
     /// What the output is, for the audio pipeline panel. Reports `started:
     /// false` before the first stream is built rather than inventing a device.
     pub fn output_device(&self) -> OutputDeviceRec {
+        let format = if self.pcm_mode.load(Ordering::Relaxed) == 0 && !cfg!(target_os = "ios") {
+            "PCM_16"
+        } else {
+            "FLOAT_32"
+        };
         OutputDeviceRec {
             name: self.device_name.lock().unwrap().clone(),
             sample_rate: self.output_rate.load(Ordering::Relaxed),
             channels: self.output_channels.load(Ordering::Relaxed),
             started: self.started.load(Ordering::Relaxed)
                 && self.output_rate.load(Ordering::Relaxed) > 0,
+            sample_format: format.to_string(),
+        }
+    }
+
+    pub fn output_health(&self) -> OutputHealthRec {
+        OutputHealthRec {
+            buffered_frames: self.buffered_frames.load(Ordering::Relaxed),
+            callback_underruns: self.callback_underruns.load(Ordering::Relaxed),
+            output_rebuilds: self.output_rebuilds.load(Ordering::Relaxed),
+            output_xruns: self.output_xruns.load(Ordering::Relaxed),
+            output_peak: f32::from_bits(self.output_peak.load(Ordering::Relaxed)),
         }
     }
 
@@ -566,8 +738,76 @@ impl PlayerEngine {
         self.send(Command::SetSkipSilence(enabled))
     }
 
-    pub fn set_eq_gains(&self, gains_db: Vec<f32>) -> Result<(), EngineError> {
-        self.send(Command::SetEqGains(gains_db))
+    /// Sets the equaliser tuning (upstream `EqualizerProcessor.setTuning`).
+    ///
+    /// `gains_db` and `qs` are the ten-slot [`crate::eq::EqLayout`] values —
+    /// slots 0..6 the manual tab (low shelf at 60 Hz, high shelf at 14 kHz,
+    /// bells between), slots 7..9 the tone pad (250 Hz shelf, 1 kHz bell,
+    /// 4 kHz shelf). The make-up preamp is computed here, once, from the
+    /// summed response so the audio thread never walks it. `balance` is the
+    /// −1..1 output trim (ignored for mono). `enabled = false` is a flat curve
+    /// and centred balance — it glides down rather than cutting out.
+    pub fn set_eq_tuning(
+        &self,
+        enabled: bool,
+        gains_db: Vec<f32>,
+        qs: Vec<f32>,
+        balance: f32,
+    ) -> Result<(), EngineError> {
+        let curve = crate::eq::EqCurve::of(&gains_db, &qs);
+        self.send(Command::SetEqTuning {
+            enabled,
+            gains_db: curve.gains_db,
+            qs: curve.qs,
+            preamp_db: curve.preamp_db,
+            balance,
+        })
+    }
+
+    /// Requested PCM word length (`PCM_16` / `FLOAT_32`; a stored `PCM_24`
+    /// from before the rung was removed maps to the lossless path). The unit
+    /// is rebuilt when the answer differs — same rebuild a route change gets,
+    /// so a toggle mid-track never cuts the blend.
+    pub fn set_output_pcm_mode(&self, mode: String) -> Result<(), EngineError> {
+        let parsed = OutputPcmMode::parse(&mode);
+        let code = match parsed {
+            OutputPcmMode::Pcm16 => 0,
+            OutputPcmMode::Float32 => 1,
+        };
+        if self.pcm_mode.swap(code, Ordering::Relaxed) == code {
+            return Ok(());
+        }
+        log::info!("output PCM mode -> {}", parsed.label());
+        if let Some(control) = self.control.lock().unwrap().clone() {
+            control.request_rebuild(true);
+        }
+        Ok(())
+    }
+
+    /// Prefer a USB DAC over the system default. Takes effect through the
+    /// same rebuild path: the next device pick prefers the USB match, and the
+    /// name check forces the swap even at an identical format.
+    pub fn set_prefer_usb_dac(&self, enabled: bool) -> Result<(), EngineError> {
+        if self.prefer_usb.swap(enabled, Ordering::Relaxed) == enabled {
+            return Ok(());
+        }
+        if let Some(control) = self.control.lock().unwrap().clone() {
+            control.request_rebuild(false);
+        }
+        Ok(())
+    }
+
+    /// Loudness-normalization master switch. No reload: the render reads the
+    /// flag per chunk and the readout follows it.
+    pub fn set_loudness_enabled(&self, enabled: bool) -> Result<(), EngineError> {
+        self.loudness_enabled.store(enabled, Ordering::Relaxed);
+        self.send(Command::SetLoudnessEnabled(enabled))
+    }
+
+    /// Automix analysis tier (`EFFICIENT` / `BALANCED` / `PERFORMANCE`). Read
+    /// when a plan is computed; EFFICIENT skips the vocal model.
+    pub fn set_automix_performance(&self, mode: String) {
+        *self.automix_tier.lock().unwrap() = AutomixTier::parse(&mode);
     }
 
     pub fn nerd_stats(&self) -> NerdStatsRec {
@@ -578,6 +818,7 @@ impl PlayerEngine {
             bit_depth: snap.bit_depth,
             channels: snap.channels,
             kbps: snap.kbps,
+            loudness_gain_db: snap.loudness_gain_db,
         }
     }
 
@@ -619,14 +860,28 @@ impl PlayerEngine {
     }
 
     /// Plan an Automix transition from two local files (Beat This! + open-unmix
-    /// when models are configured, energy/tempo otherwise).
+    /// when models are configured, energy/tempo otherwise). `outgoing_text` /
+    /// `incoming_text` are the "title artist album" strings the speech/live
+    /// guard reads.
     pub fn plan_automix(
         &self,
         outgoing_path: String,
         incoming_path: String,
+        outgoing_text: String,
+        incoming_text: String,
+        album_sequential: bool,
         crossfade_seconds: f64,
     ) -> TransitionPlanRec {
-        plan_automix_impl(&outgoing_path, &incoming_path, crossfade_seconds)
+        let tier = *self.automix_tier.lock().unwrap();
+        plan_automix_impl_with_tier(
+            &outgoing_path,
+            &incoming_path,
+            &outgoing_text,
+            &incoming_text,
+            album_sequential,
+            crossfade_seconds,
+            tier,
+        )
     }
 }
 
@@ -650,8 +905,14 @@ struct OutputControl {
     device_name: Arc<Mutex<String>>,
     volume_bits: Arc<AtomicU32>,
     buffered: Arc<AtomicU64>,
+    callback_underruns: Arc<AtomicU64>,
+    output_rebuilds: Arc<AtomicU64>,
+    output_xruns: Arc<AtomicU64>,
+    output_peak: Arc<AtomicU32>,
     flush_ring: Arc<AtomicBool>,
     output_paused: Arc<AtomicBool>,
+    pcm_mode: Arc<AtomicU32>,
+    prefer_usb: Arc<AtomicBool>,
 }
 
 impl OutputControl {
@@ -670,6 +931,7 @@ impl OutputControl {
                 self.request_rebuild(true);
             }
             ErrorKind::Xrun => {
+                self.output_xruns.fetch_add(1, Ordering::Relaxed);
                 log::debug!("output xrun: {err}");
             }
             other => log::warn!("output stream error ({other:?}): {err}"),
@@ -691,6 +953,13 @@ impl OutputControl {
                         Err(EngineError::NoOutputDevice) if attempt < 19 => {
                             log::info!("waiting for an output device…");
                         }
+                        // Route changes can also race CoreAudio while the new
+                        // unit is being created. Keep retrying transient stream
+                        // setup failures; a single failed attempt must not leave
+                        // the engine permanently without an output callback.
+                        Err(e) if attempt < 19 => {
+                            log::info!("output rebuild attempt {} failed: {e}", attempt + 1);
+                        }
                         Err(e) => {
                             log::warn!("output rebuild failed: {e}");
                             break;
@@ -702,9 +971,13 @@ impl OutputControl {
     }
 
     fn rebuild(&self, force: bool) -> Result<(), EngineError> {
-        let device = cpal::default_host()
-            .default_output_device()
+        let host = cpal::default_host();
+        let device = pick_output_device(&host, self.prefer_usb.load(Ordering::Relaxed))
             .ok_or(EngineError::NoOutputDevice)?;
+        // A route/DAC change is a *different* device even at the same format —
+        // without the name check the comparison below would keep the old
+        // stream on the old device.
+        let device_changed = device.to_string() != *self.device_name.lock().unwrap();
         let supported = device
             .default_output_config()
             .map_err(|e| EngineError::StreamInit(e.to_string()))?;
@@ -718,7 +991,9 @@ impl OutputControl {
         );
         let prev_rate = self.output_rate.load(Ordering::Relaxed);
         let prev_ch = self.output_channels.load(Ordering::Relaxed);
-        if !force && rate == prev_rate && channels as u32 == prev_ch {
+        if !force && !device_changed && rate == prev_rate && channels as u32 == prev_ch
+            && self.stream.lock().unwrap().is_some()
+        {
             log::info!("output still {rate} Hz / {channels} ch — keeping stream");
             return Ok(());
         }
@@ -732,21 +1007,47 @@ impl OutputControl {
 
         let cap = (rate.max(192_000) as usize) * 2 * 2;
         let (producer, consumer) = rtrb::RingBuffer::<f32>::new(cap);
-        self.commands
+        if self
+            .commands
             .send(Command::SetOutputFormat { rate, producer })
-            .map_err(|_| EngineError::NotStarted)?;
+            .is_err()
+        {
+            self.output_paused.store(user_paused, Ordering::Release);
+            return Err(EngineError::NotStarted);
+        }
         self.output_rate.store(rate, Ordering::Relaxed);
         self.output_channels.store(channels as u32, Ordering::Relaxed);
 
-        let stream = open_output_stream(&device, rate, channels, consumer, self)?;
-        stream
-            .play()
-            .map_err(|e| EngineError::StreamInit(e.to_string()))?;
+        let stream_result = (|| {
+            let stream = open_output_stream(
+                &device,
+                rate,
+                channels,
+                self.pcm_mode.load(Ordering::Relaxed) == 0,
+                consumer,
+                self,
+            )?;
+            stream
+                .play()
+                .map_err(|e| EngineError::StreamInit(e.to_string()))?;
+            Ok::<_, EngineError>(stream)
+        })();
+        let stream = match stream_result {
+            Ok(stream) => stream,
+            Err(error) => {
+                // Every early return after muting the callback must restore
+                // the user's pause state. Otherwise a transient CoreAudio
+                // setup failure makes all later callbacks output silence.
+                self.output_paused.store(user_paused, Ordering::Release);
+                return Err(error);
+            }
+        };
         *self.stream.lock().unwrap() = Some(stream);
         self.output_paused.store(user_paused, Ordering::Release);
         // A rebuild after a route change is a *different* device, so the name
         // is re-read here rather than left as the one the first start found.
         *self.device_name.lock().unwrap() = device.to_string();
+        self.output_rebuilds.fetch_add(1, Ordering::Relaxed);
         log::info!("output rebuilt: {device} — {rate} Hz, {channels} ch");
         Ok(())
     }
@@ -758,6 +1059,37 @@ impl OutputControl {
 /// channel count of 1 is honoured rather than read as unset — a mono session
 /// is a real configuration, and treating it as absent would hand the audio unit
 /// a different channel count than the session believes it has.
+/// The output device to open: the system default, unless the listener asked
+/// to prefer a USB DAC and one is actually attached (upstream
+/// `applyOutputRoute` / `setPreferredAudioDevice`, minus the Android routing
+/// API — here the choice is which cpal device to open).
+///
+/// Name match rather than device id: cpal gives no stable identifier across
+/// route changes, and "USB" in the product name is what every class-compliant
+/// DAC reports through CoreAudio. No match falls back to the default rather
+/// than failing — an absent DAC must never mean silence.
+fn pick_output_device(host: &cpal::Host, prefer_usb: bool) -> Option<cpal::Device> {
+    let fallback = host.default_output_device();
+    if !prefer_usb {
+        return fallback;
+    }
+    // cpal 0.18 has no `Device::name` — the human name is the `Display`
+    // impl, same string the pipeline readout already reports.
+    let usb = host.output_devices().ok().and_then(|mut devices| {
+        devices.find(|d| d.to_string().to_lowercase().contains("usb"))
+    });
+    match usb {
+        Some(d) => {
+            log::info!("preferring USB output: {d}");
+            Some(d)
+        }
+        None => {
+            log::info!("USB DAC preferred but none attached; using system default");
+            fallback
+        }
+    }
+}
+
 fn choose_format(
     requested_rate: &AtomicU32,
     requested_channels: &AtomicU32,
@@ -779,6 +1111,7 @@ fn open_output_stream(
     device: &cpal::Device,
     sample_rate: u32,
     channels: usize,
+    pcm16: bool,
     mut consumer: rtrb::Consumer<f32>,
     control: &OutputControl,
 ) -> Result<cpal::Stream, EngineError> {
@@ -789,68 +1122,160 @@ fn open_output_stream(
     };
     let volume = control.volume_bits.clone();
     let buffered = control.buffered.clone();
+    let callback_underruns = control.callback_underruns.clone();
+    let output_peak = control.output_peak.clone();
     let flush_ring = control.flush_ring.clone();
     let paused = control.output_paused.clone();
     let err_ctrl = control.clone();
-    device
-        .build_output_stream(
-            config,
-            move |data: &mut [f32], _| {
-                if flush_ring.swap(false, Ordering::AcqRel) {
-                    while consumer.pop().is_ok() {}
-                    buffered.store(0, Ordering::Relaxed);
-                }
-                if paused.load(Ordering::Acquire) {
-                    data.fill(0.0);
-                    return;
-                }
-                let vol = f32::from_bits(volume.load(Ordering::Relaxed));
-                match channels {
-                    1 => {
-                        for frame in data.iter_mut() {
-                            let l = consumer.pop().unwrap_or(0.0);
-                            let r = consumer.pop().unwrap_or(0.0);
-                            *frame = (l + r) * 0.5 * vol;
-                        }
+    // PCM_16 opens the unit as int16: the ring stays f32 throughout (mix, EQ
+    // and volume all run in float, exactly as upstream's processors run before
+    // the sink's conversion) and quantization happens once, at the boundary.
+    // FLOAT_32 is the passthrough — the mix format is the wire format.
+    //
+    // On iOS CoreAudio, RemoteIO requires 32-bit float streams; CPAL's i16 path
+    // fails to render to hardware or produces silence/choppy audio. Force f32 on iOS.
+    let pcm16 = if cfg!(target_os = "ios") {
+        false
+    } else {
+        pcm16
+    };
+    if pcm16 {
+        let mut scratch: Vec<f32> = Vec::new();
+        device
+            .build_output_stream(
+                config,
+                move |data: &mut [i16], _| {
+                    if scratch.len() < data.len() {
+                        scratch.resize(data.len(), 0.0);
                     }
-                    2 => {
-                        for sample in data.iter_mut() {
-                            *sample = consumer.pop().unwrap_or(0.0) * vol;
-                        }
+                    let frames = &mut scratch[..data.len()];
+                    render_f32(&mut consumer, &volume, &buffered, &callback_underruns, &output_peak, &flush_ring, &paused, channels, frames);
+                    for (out, s) in data.iter_mut().zip(frames.iter()) {
+                        *out = clamp16_from_float(*s);
                     }
-                    _ => {
-                        let frames = data.len() / channels;
-                        for frame in 0..frames {
-                            let l = consumer.pop().unwrap_or(0.0);
-                            let r = consumer.pop().unwrap_or(0.0);
-                            let base = frame * channels;
-                            for slot in &mut data[base..base + channels] {
-                                *slot = 0.0;
-                            }
-                            data[base] = l * vol;
-                            data[base + 1] = r * vol;
-                        }
-                    }
+                },
+                move |err| err_ctrl.on_stream_error(err),
+                None,
+            )
+            .map_err(|e| EngineError::StreamInit(e.to_string()))
+    } else {
+        device
+            .build_output_stream(
+                config,
+                move |data: &mut [f32], _| {
+                    render_f32(&mut consumer, &volume, &buffered, &callback_underruns, &output_peak, &flush_ring, &paused, channels, data);
+                },
+                move |err| err_ctrl.on_stream_error(err),
+                None,
+            )
+            .map_err(|e| EngineError::StreamInit(e.to_string()))
+    }
+}
+
+/// Quantizes a normalized f32 to signed 16-bit, matching upstream
+/// `PcmBoundary.clamp16FromFloat` exactly: scale by 32768 (asymmetric full
+/// scale, so −1.0 → −32768 and +1.0 → +32767), and Java `Math.round`'s
+/// half-toward-positive-infinity rounding rather than Rust's half-away-from-zero.
+fn clamp16_from_float(f: f32) -> i16 {
+    if f.is_nan() {
+        return 0;
+    }
+    let scaled = f * 32768.0f32;
+    if scaled <= -32768.0 {
+        return i16::MIN;
+    }
+    if scaled >= 32767.0 {
+        return i16::MAX;
+    }
+    (scaled + 0.5).floor() as i16
+}
+
+/// Drains the mixer's ring into `data`: volume applied, underruns zero-filled,
+/// leftover-ring flush and pause-silence handled. The one render path both
+/// output formats share — the word length is a property of the unit, not of
+/// the mix.
+#[allow(clippy::too_many_arguments)]
+fn render_f32(
+    consumer: &mut rtrb::Consumer<f32>,
+    volume: &Arc<AtomicU32>,
+    buffered: &Arc<AtomicU64>,
+    callback_underruns: &Arc<AtomicU64>,
+    output_peak: &Arc<AtomicU32>,
+    flush_ring: &Arc<AtomicBool>,
+    paused: &Arc<AtomicBool>,
+    channels: usize,
+    data: &mut [f32],
+) {
+    if flush_ring.swap(false, Ordering::AcqRel) {
+        while consumer.pop().is_ok() {}
+        buffered.store(0, Ordering::Relaxed);
+    }
+    if paused.load(Ordering::Acquire) {
+        data.fill(0.0);
+        output_peak.store(0.0f32.to_bits(), Ordering::Relaxed);
+        return;
+    }
+    let vol = f32::from_bits(volume.load(Ordering::Relaxed));
+    let mut underflowed = false;
+    let mut pop = || match consumer.pop() {
+        Ok(sample) => sample,
+        Err(_) => { underflowed = true; 0.0 }
+    };
+    match channels {
+        1 => {
+            for frame in data.iter_mut() {
+                let l = pop();
+                let r = pop();
+                *frame = (l + r) * 0.5 * vol;
+            }
+        }
+        2 => {
+            for sample in data.iter_mut() {
+                *sample = pop() * vol;
+            }
+        }
+        _ => {
+            let frames = data.len() / channels;
+            for frame in 0..frames {
+                let l = pop();
+                let r = pop();
+                let base = frame * channels;
+                for slot in &mut data[base..base + channels] {
+                    *slot = 0.0;
                 }
-                let consumed = (data.len() / channels.max(1)) as u64;
-                let mut current = buffered.load(Ordering::Relaxed);
-                while current > 0 {
-                    let next = current.saturating_sub(consumed);
-                    match buffered.compare_exchange_weak(
-                        current,
-                        next,
-                        Ordering::Relaxed,
-                        Ordering::Relaxed,
-                    ) {
-                        Ok(_) => break,
-                        Err(observed) => current = observed,
-                    }
-                }
-            },
-            move |err| err_ctrl.on_stream_error(err),
-            None,
-        )
-        .map_err(|e| EngineError::StreamInit(e.to_string()))
+                data[base] = l * vol;
+                data[base + 1] = r * vol;
+            }
+        }
+    }
+    // What actually left the callback. Zero here with a non-zero ring means the
+    // data is silent; non-zero here with no audible output means the stream is
+    // not reaching the speaker.
+    let mut peak = 0.0f32;
+    for sample in data.iter() {
+        let magnitude = sample.abs();
+        if magnitude > peak {
+            peak = magnitude;
+        }
+    }
+    output_peak.store(peak.to_bits(), Ordering::Relaxed);
+    if underflowed {
+        callback_underruns.fetch_add(1, Ordering::Relaxed);
+    }
+    let consumed = (data.len() / channels.max(1)) as u64;
+    let mut current = buffered.load(Ordering::Relaxed);
+    while current > 0 {
+        let next = current.saturating_sub(consumed);
+        match buffered.compare_exchange_weak(
+            current,
+            next,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => break,
+            Err(observed) => current = observed,
+        }
+    }
 }
 
 fn to_track_source(request: LoadRequest) -> TrackSource {
@@ -862,6 +1287,7 @@ fn to_track_source(request: LoadRequest) -> TrackSource {
         plan: request.plan.map(Into::into).unwrap_or_default(),
         headers: request.headers.unwrap_or_default(),
         claimed_kbps: request.claimed_kbps.unwrap_or(0),
+        loudness_db: request.loudness_db.filter(|db| db.is_finite()),
     }
 }
 
@@ -879,11 +1305,27 @@ fn info_to_rec(info: TrackInfo) -> TrackInfoRec {
     }
 }
 
-fn plan_automix_impl(outgoing: &str, incoming: &str, crossfade_seconds: f64) -> TransitionPlanRec {
+fn plan_automix_impl_with_tier(
+    outgoing: &str,
+    incoming: &str,
+    outgoing_text: &str,
+    incoming_text: &str,
+    album_sequential: bool,
+    crossfade_seconds: f64,
+    tier: AutomixTier,
+) -> TransitionPlanRec {
+    let skip_vocals = !tier.runs_vocal_model();
+    if skip_vocals {
+        log::info!("automix: EFFICIENT tier — beat grid + energy, vocal model skipped");
+    }
     let plan = analyzer::plan_pair(
         outgoing,
         incoming,
+        outgoing_text,
+        incoming_text,
+        album_sequential,
         crossfade_seconds,
+        skip_vocals,
         |path, start, dur, mono| {
             decode_region_impl(path, start, dur, mono)
                 .ok()
@@ -1036,5 +1478,42 @@ mod tests {
             0,
             0
         ), (48_000, 2));
+    }
+
+    #[test]
+    fn pcm_mode_parses_the_two_upstream_rungs() {
+        use super::{AutomixTier, OutputPcmMode};
+        assert_eq!(OutputPcmMode::parse("PCM_16"), OutputPcmMode::Pcm16);
+        assert_eq!(OutputPcmMode::parse("FLOAT_32"), OutputPcmMode::Float32);
+        // The removed PCM_24 rung and anything unknown fall to the lossless
+        // path, never the lossy one.
+        assert_eq!(OutputPcmMode::parse("PCM_24"), OutputPcmMode::Float32);
+        assert_eq!(OutputPcmMode::parse(""), OutputPcmMode::Pcm16);
+        assert_eq!(AutomixTier::parse("EFFICIENT"), AutomixTier::Efficient);
+        assert_eq!(AutomixTier::parse("PERFORMANCE"), AutomixTier::Performance);
+        assert_eq!(AutomixTier::parse("BALANCED"), AutomixTier::Balanced);
+        assert!(!AutomixTier::Efficient.runs_vocal_model());
+        assert!(AutomixTier::Balanced.runs_vocal_model());
+        assert!(AutomixTier::Performance.runs_vocal_model());
+    }
+
+    #[test]
+    fn loudness_correction_matches_upstream_clamps() {
+        use super::mixer::loudness_gain;
+        // Upstream: gainMb = round(-loudnessDb * 100) clamped to [-1500, 300].
+        // A track 7 dB hot asks for -(-7) = ... precisely: gain = -loudnessDb
+        // = +7 dB, clamped to +3 dB → 10^(3/20) ≈ 1.4125.
+        let (gain, db) = loudness_gain(Some(-7.0), true);
+        assert_eq!(db, Some(3.0));
+        assert!((gain - 1.4125375).abs() < 1e-5);
+        // A track 20 dB quiet asks for -20 dB, clamped to -15 dB.
+        let (gain, db) = loudness_gain(Some(20.0), true);
+        assert_eq!(db, Some(-15.0));
+        assert!((gain - 10f32.powf(-15.0 / 20.0)).abs() < 1e-6);
+        // Unity figure, switch off, missing figure, NaN: all unity, all None.
+        assert_eq!(loudness_gain(Some(0.0), true), (1.0, Some(0.0)));
+        assert_eq!(loudness_gain(Some(-7.0), false), (1.0, None));
+        assert_eq!(loudness_gain(None, true), (1.0, None));
+        assert_eq!(loudness_gain(Some(f64::NAN), true), (1.0, None));
     }
 }
