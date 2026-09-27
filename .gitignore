@@ -23,4 +23,8 @@ DerivedData/
 # Automix ONNX graphs — fetched by scripts/fetch-automix-models.sh
 AppleApp/Resources/Models/*.onnx
 
+# Working parity/audit notes — kept locally, deliberately never published.
+# The release specs at the repo root (*.md) are the tracked documents.
+docs/
+
 .DS_Store
