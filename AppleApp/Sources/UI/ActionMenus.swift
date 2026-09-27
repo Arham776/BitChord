@@ -128,8 +128,12 @@ struct SongActionButtons: View {
     }
 
     private func toggleLike(_ videoId: String) async {
-        let next = LibraryActions.cachedLike(videoId) == "LIKE" ? "INDIFFERENT" : "LIKE"
-        _ = await LibraryActions.rate(videoId: videoId, status: next)
+        // Same shape as `toggleDislike` below: the optimistic write and its
+        // rollback live in `LibraryActions.toggleLike`, and a refusal is said
+        // out loud instead of being written to `_`.
+        if let failure = await LibraryActions.toggleLike(videoId: videoId) {
+            toast.show(failure, kind: .failure)
+        }
     }
 
     /// The label, which is upstream's: the second tap is an undo and says so.

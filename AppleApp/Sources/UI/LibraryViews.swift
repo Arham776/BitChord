@@ -25,11 +25,7 @@ struct HomeView: View {
                     // Keep Home as the large in-feed title while the brand mark
                     // occupies the top bar's leading position.
                     ToolbarItem(placement: .topBarLeading) {
-                        Image(.bchLogo)
-                            .resizable()
-                            .scaledToFit()
-                            .frame(width: 28, height: 18)
-                            .accessibilityHidden(true)
+                        TopBarLeadingMark()
                     }
                     ToolbarItem(placement: .topBarTrailing) { TopBarAccountButton() }
                     #endif
@@ -362,6 +358,9 @@ struct ExploreView: View {
                 .navigationTitle("Explore")
                 .toolbar {
                     #if os(iOS)
+                    ToolbarItem(placement: .topBarLeading) {
+                        TopBarLeadingMark()
+                    }
                     ToolbarItem(placement: .topBarTrailing) { TopBarAccountButton() }
                     #endif
                 }
@@ -399,15 +398,15 @@ struct ExploreView: View {
     private var moodGrid: some View {
         switch moods.phase {
         case .loading:
-            // A grid of grey squares. Sized as the real tiles so the page does
-            // not jump when the categories land.
-            VStack(alignment: .leading, spacing: 10) {
-                RoundedRectangle(cornerRadius: 6).fill(.white.opacity(0.10))
+            // A grid of placeholder squares sized as real tiles to avoid layout jumping.
+            VStack(alignment: .leading, spacing: 14) {
+                RoundedRectangle(cornerRadius: 6, style: .continuous)
+                    .fill(.quaternary)
                     .frame(width: 140, height: 22)
-                LazyVGrid(columns: Self.moodColumns, spacing: 12) {
+                LazyVGrid(columns: Self.moodColumns, spacing: 14) {
                     ForEach(0..<10, id: \.self) { _ in
-                        RoundedRectangle(cornerRadius: 10, style: .continuous)
-                            .fill(.white.opacity(0.08))
+                        RoundedRectangle(cornerRadius: 12, style: .continuous)
+                            .fill(.quaternary)
                             .frame(height: 100)
                     }
                 }
@@ -416,11 +415,11 @@ struct ExploreView: View {
             EmptyView()
         case .loaded(let sections):
             ForEach(sections) { section in
-                VStack(alignment: .leading, spacing: 10) {
+                VStack(alignment: .leading, spacing: 12) {
                     Text(section.title)
                         .font(.title3.weight(.bold))
-                        .foregroundStyle(.white)
-                    LazyVGrid(columns: Self.moodColumns, spacing: 12) {
+                        .foregroundStyle(.primary)
+                    LazyVGrid(columns: Self.moodColumns, spacing: 14) {
                         ForEach(section.items) { item in
                             NavigationLink {
                                 MoodGenrePlaylistsView(category: item)
@@ -431,6 +430,7 @@ struct ExploreView: View {
                         }
                     }
                 }
+                .padding(.bottom, 12)
             }
         }
     }
@@ -440,11 +440,11 @@ struct ExploreView: View {
     /// would read as a list in a wide window.
     #if os(iOS)
     private static let moodColumns = [
-        GridItem(.flexible(), spacing: 12),
-        GridItem(.flexible(), spacing: 12),
+        GridItem(.flexible(), spacing: 14),
+        GridItem(.flexible(), spacing: 14),
     ]
     #else
-    private static let moodColumns = [GridItem(.adaptive(minimum: 180, maximum: 260), spacing: 12)]
+    private static let moodColumns = [GridItem(.adaptive(minimum: 180, maximum: 260), spacing: 14)]
     #endif
 }
 
@@ -491,33 +491,37 @@ private struct MoodTile: View {
             }
             .overlay(alignment: .bottomTrailing) {
                 ZStack {
-                    RoundedRectangle(cornerRadius: 7, style: .continuous)
-                        .fill(.white.opacity(0.22))
-                    if let url = category.thumbnailUrl, let endpoint = URL(string: url) {
-                        AsyncImage(url: endpoint) { phase in
-                            if case .success(let image) = phase {
-                                image.resizable().aspectRatio(contentMode: .fill)
-                            }
-                        }
-                        .clipShape(RoundedRectangle(cornerRadius: 7, style: .continuous))
+                    RoundedRectangle(cornerRadius: 8, style: .continuous)
+                        .fill(Color.white.opacity(0.22))
+                    if let url = category.thumbnailUrl {
+                        ArtworkView(url: url, data: nil, side: 82)
+                            .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
                     }
                 }
                 .frame(width: 82, height: 82)
                 .rotationEffect(.degrees(16))
                 .offset(x: 10, y: 12)
+                .shadow(color: .black.opacity(0.25), radius: 5, x: 2, y: 2)
             }
-            .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+            .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+
             Text(category.title)
-                .font(.callout.weight(.bold))
+                .font(.headline.weight(.bold))
                 .foregroundStyle(.white)
+                .shadow(color: .black.opacity(0.3), radius: 2, x: 0, y: 1)
                 .lineLimit(2)
                 .padding(12)
                 .padding(.trailing, 48)
                 .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         }
         .frame(height: 100)
-        .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
-        .contentShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+        .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+        .contentShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .strokeBorder(Color.white.opacity(0.12), lineWidth: 0.5)
+        )
+        .shadow(color: .black.opacity(0.08), radius: 4, x: 0, y: 2)
         .accessibilityLabel(category.title)
     }
 }
@@ -551,18 +555,52 @@ struct MoodGenrePlaylistsView: View {
                 ScrollView {
                     VStack(alignment: .leading, spacing: 28) {
                         ForEach(shelves) { shelf in
-                            // `preferTrack`: on a mood or genre page a card that
-                            // has both ids is a thing to start, not a thing to
-                            // read. See `ShelfCardView`.
-                            ShelfCarousel(shelf: shelf, preferTrack: true)
+                            VStack(alignment: .leading, spacing: 10) {
+                                HStack {
+                                    Text(shelf.title)
+                                        .font(.headline)
+                                        .lineLimit(2)
+                                    Spacer()
+                                    if shelf.items.count > 5 {
+                                        NavigationLink {
+                                            LibraryGridView(title: shelf.title, items: shelf.items)
+                                        } label: {
+                                            HStack(spacing: 2) {
+                                                Text("Show all")
+                                                Image(systemName: "chevron.right")
+                                                    .font(.caption.weight(.semibold))
+                                            }
+                                            .font(.callout)
+                                            .foregroundStyle(.tint)
+                                        }
+                                    }
+                                }
+                                ScrollView(.horizontal, showsIndicators: false) {
+                                    LazyHStack(alignment: .top, spacing: 14) {
+                                        ForEach(shelf.items) { card in
+                                            ShelfCardView(card: card, preferTrack: true)
+                                        }
+                                    }
+                                    .padding(.vertical, 2)
+                                }
+                            }
                         }
                     }
                     .padding(.horizontal, 24)
                     .padding(.vertical, 20)
                 }
+                .refreshable { await load() }
             }
         }
         .navigationTitle(category.title)
+        #if os(iOS)
+        .navigationBarTitleDisplayMode(.large)
+        .toolbar {
+            ToolbarItem(placement: .topBarTrailing) {
+                TopBarAccountButton()
+            }
+        }
+        #endif
         .task { await load() }
     }
 
@@ -659,6 +697,44 @@ struct LibraryView: View {
             content
                 .navigationTitle(lockedSection?.label ?? "Library")
                 .toolbar {
+                    #if os(iOS)
+                    if lockedSection == nil {
+                        ToolbarItem(placement: .topBarLeading) {
+                            TopBarLeadingMark()
+                        }
+                    }
+                    ToolbarItemGroup(placement: .topBarTrailing) {
+                        if lockedSection == nil {
+                            NavigationLink {
+                                HistoryView()
+                            } label: {
+                                Image(systemName: "clock")
+                                    .font(.system(size: 14, weight: .medium))
+                                    .foregroundStyle(.primary)
+                                    .frame(width: 34, height: 34)
+                                    .background(.ultraThinMaterial, in: Circle())
+                                    .overlay(Circle().strokeBorder(Color.white.opacity(0.22), lineWidth: 0.6))
+                            }
+                            .buttonStyle(ProfileCircleButtonStyle())
+                            .accessibilityLabel("Listening History")
+                        }
+
+                        Button {
+                            pickFolder()
+                        } label: {
+                            Image(systemName: "plus")
+                                .font(.system(size: 15, weight: .medium))
+                                .foregroundStyle(.primary)
+                                .frame(width: 34, height: 34)
+                                .background(.ultraThinMaterial, in: Circle())
+                                .overlay(Circle().strokeBorder(Color.white.opacity(0.22), lineWidth: 0.6))
+                        }
+                        .buttonStyle(ProfileCircleButtonStyle())
+                        .accessibilityLabel("Scan a folder")
+
+                        TopBarAccountButton()
+                    }
+                    #else
                     ToolbarItem {
                         Button {
                             pickFolder()
@@ -670,8 +746,6 @@ struct LibraryView: View {
                         }
                         .help("Scan a folder")
                     }
-                    #if os(iOS)
-                    ToolbarItem(placement: .topBarTrailing) { TopBarAccountButton() }
                     #endif
                 }
                 .onAppear {
@@ -845,40 +919,62 @@ struct LibraryLandingView: View {
 
     private var signedInShelves: some View {
         VStack(alignment: .leading, spacing: 26) {
-            ForEach(pinnedShelves(shelves)) { shelf in
-                VStack(alignment: .leading, spacing: 10) {
-                    HStack {
-                        Text(shelf.title).font(.title3.weight(.bold))
-                        Spacer()
-                        if shelf.items.count > 5 {
-                            NavigationLink("Show all") {
-                                LibraryGridView(title: shelf.title, items: shelf.items)
-                            }
-                            .font(.callout)
+            let sortedShelves = pinnedShelves(shelves)
+            let hasPlaylists = sortedShelves.contains { isPlaylistsShelf($0) }
+
+            // Upstream parity: fresh account has no Playlists shelf yet, but
+            // needs the New Playlist tile to start one.
+            if !hasPlaylists {
+                shelfSection(FeedShelf(title: "Playlists", items: []))
+            }
+
+            ForEach(sortedShelves) { shelf in
+                shelfSection(shelf)
+            }
+        }
+    }
+
+    private func shelfSection(_ shelf: FeedShelf) -> some View {
+        let isPlaylists = isPlaylistsShelf(shelf)
+        let totalCount = shelf.items.count + (isPlaylists ? 1 : 0)
+        return VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                Text(shelf.title).font(.title3.weight(.bold))
+                Spacer()
+                if totalCount > 5 {
+                    NavigationLink {
+                        LibraryGridView(title: shelf.title, items: shelf.items, isPlaylists: isPlaylists)
+                    } label: {
+                        HStack(spacing: 2) {
+                            Text("Show all")
+                            Image(systemName: "chevron.right")
+                                .font(.caption.weight(.semibold))
                         }
-                    }
-                    ScrollView(.horizontal, showsIndicators: false) {
-                        LazyHStack(alignment: .top, spacing: 14) {
-                            if isPlaylistsShelf(shelf) {
-                                NewPlaylistTile {
-                                    appModel.playlistPicker = PlaylistPickerRequest(videoId: "", title: "")
-                                }
-                            }
-                            ForEach(displayItems(shelf)) { card in
-                                ShelfCardView(card: card)
-                            }
-                        }
-                        .padding(.vertical, 2)
+                        .font(.callout)
+                        .foregroundStyle(.tint)
                     }
                 }
+            }
+            ScrollView(.horizontal, showsIndicators: false) {
+                LazyHStack(alignment: .top, spacing: 14) {
+                    if isPlaylists {
+                        NewPlaylistTile {
+                            appModel.playlistPicker = PlaylistPickerRequest(videoId: "", title: "")
+                        }
+                    }
+                    ForEach(displayItems(shelf)) { card in
+                        ShelfCardView(card: card)
+                    }
+                }
+                .padding(.vertical, 2)
             }
         }
     }
 
     private func pinnedShelves(_ shelves: [FeedShelf]) -> [FeedShelf] {
-        let pinned = PlatformSettings.shared.getString(key: "pinned_playlists", default: "")
-            .split(separator: ",").map(String.init)
+        let pinned = PlaylistPinning.pinnedIds()
         return shelves.map { shelf in
+            guard isPlaylistsShelf(shelf) else { return shelf }
             let items = shelf.items.sorted { a, b in
                 let ap = pinned.contains(a.browseId ?? "")
                 let bp = pinned.contains(b.browseId ?? "")
@@ -927,15 +1023,15 @@ struct OnDeviceCard<Destination: View>: View {
         NavigationLink(destination: destination) {
             VStack(alignment: .leading, spacing: 8) {
                 ZStack {
-                    RoundedRectangle(cornerRadius: 12, style: .continuous)
+                    RoundedRectangle(cornerRadius: 14, style: .continuous)
                         .fill(tintColor.opacity(0.12))
-                        .frame(width: 156, height: 156)
+                        .frame(width: 160, height: 160)
                     Image(systemName: systemImage)
-                        .font(.system(size: 44, weight: .medium))
+                        .font(.system(size: 46, weight: .medium))
                         .foregroundStyle(tintColor)
                 }
                 .overlay(
-                    RoundedRectangle(cornerRadius: 12, style: .continuous)
+                    RoundedRectangle(cornerRadius: 14, style: .continuous)
                         .strokeBorder(.separator.opacity(0.4), lineWidth: 0.5)
                 )
 
@@ -949,17 +1045,88 @@ struct OnDeviceCard<Destination: View>: View {
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
             }
-            .frame(width: 156, alignment: .leading)
+            .frame(width: 160, alignment: .leading)
             .contentShape(.rect)
         }
         .buttonStyle(.plain)
     }
 }
 
-/// Dedicated Downloads destination.
+/// Dedicated Downloads destination with Songs, Albums, and Artists tabs,
+/// matching upstream's unified LocalMusicScreen (isDownloads = true).
 struct DownloadsView: View {
     @Environment(PlaybackController.self) private var controller
     @State private var store = DownloadStore.shared
+    @State private var selectedTab: Tab = .songs
+    @State private var searchQuery: String = ""
+    @State private var sort: SortOption = .titleAsc
+
+    enum Tab: String, CaseIterable, Identifiable {
+        case songs = "Songs"
+        case albums = "Albums"
+        case artists = "Artists"
+        var id: String { rawValue }
+    }
+
+    enum SortOption: String, CaseIterable, Identifiable {
+        case titleAsc = "Title (A–Z)"
+        case titleDesc = "Title (Z–A)"
+        case artist = "Artist"
+        case album = "Album"
+        var id: String { rawValue }
+    }
+
+    private var localTracks: [LocalTrack] {
+        store.items.map { t in
+            LocalTrack(
+                path: t.path,
+                title: t.title,
+                artist: t.artist,
+                album: t.album,
+                durationSeconds: 0,
+                artwork: t.artwork,
+                dateAdded: nil,
+                dateModified: nil
+            )
+        }
+    }
+
+    private var filteredAndSortedTracks: [LocalTrack] {
+        var result = localTracks
+        if !searchQuery.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            let q = searchQuery.lowercased()
+            result = result.filter {
+                $0.title.lowercased().contains(q) ||
+                $0.artist.lowercased().contains(q) ||
+                $0.album.lowercased().contains(q)
+            }
+        }
+        switch sort {
+        case .titleAsc:
+            result.sort { $0.title.localizedCaseInsensitiveCompare($1.title) == .orderedAscending }
+        case .titleDesc:
+            result.sort { $0.title.localizedCaseInsensitiveCompare($1.title) == .orderedDescending }
+        case .artist:
+            result.sort { $0.artist.localizedCaseInsensitiveCompare($1.artist) == .orderedAscending }
+        case .album:
+            result.sort { $0.album.localizedCaseInsensitiveCompare($1.album) == .orderedAscending }
+        }
+        return result
+    }
+
+    private var albumGroups: [(name: String, artist: String, tracks: [LocalTrack])] {
+        let grouped = Dictionary(grouping: filteredAndSortedTracks) { $0.album.isEmpty ? "Unknown Album" : $0.album }
+        return grouped.map { name, tracks in
+            (name: name, artist: tracks.first?.artist ?? "Unknown artist", tracks: tracks)
+        }.sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+    }
+
+    private var artistGroups: [(name: String, tracks: [LocalTrack])] {
+        let grouped = Dictionary(grouping: filteredAndSortedTracks) { $0.artist.isEmpty ? "Unknown Artist" : $0.artist }
+        return grouped.map { name, tracks in
+            (name: name, tracks: tracks)
+        }.sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+    }
 
     var body: some View {
         Group {
@@ -971,29 +1138,178 @@ struct DownloadsView: View {
                     buttonTitle: nil, action: nil
                 )
             } else {
-                List {
-                    ForEach(Array(store.items.enumerated()), id: \.element.id) { index, track in
-                        SongRow(
-                            entry: QueueEntry(
-                                id: track.path, title: track.title, artist: track.artist,
-                                source: track.path, thumbnailUrl: nil, durationText: nil,
-                                albumName: track.album.isEmpty ? nil : track.album,
-                                artworkData: track.artwork, isLocal: true
-                            ),
-                            play: {
-                                controller.play(store.items.map {
-                                    QueueEntry(id: $0.path, title: $0.title, artist: $0.artist, source: $0.path, thumbnailUrl: nil, durationText: nil, albumName: $0.album.isEmpty ? nil : $0.album, artworkData: $0.artwork, isLocal: true)
-                                }, at: index)
-                            }
-                        )
-                        .listRowInsets(EdgeInsets(top: 2, leading: 24, bottom: 2, trailing: 24))
-                    }
-                }
-                .listStyle(.plain)
+                content
             }
         }
         .navigationTitle("Downloads")
+        #if os(iOS)
+        .navigationBarTitleDisplayMode(.large)
+        .toolbar {
+            ToolbarItem(placement: .topBarTrailing) {
+                TopBarAccountButton()
+            }
+        }
+        #endif
         .onAppear { store.refresh() }
+    }
+
+    @ViewBuilder
+    private var content: some View {
+        VStack(spacing: 0) {
+            tabPicker
+            toolbar
+            switch selectedTab {
+            case .songs:
+                songsContent
+            case .albums:
+                albumsContent
+            case .artists:
+                artistsContent
+            }
+        }
+    }
+
+    private var tabPicker: some View {
+        Picker("Category", selection: $selectedTab) {
+            ForEach(Tab.allCases) { tab in
+                Text(tab.rawValue).tag(tab)
+            }
+        }
+        .pickerStyle(.segmented)
+        .padding(.horizontal, 24)
+        .padding(.vertical, 8)
+        .frame(maxWidth: 380)
+    }
+
+    private var toolbar: some View {
+        HStack(spacing: 10) {
+            HStack(spacing: 6) {
+                Image(systemName: "magnifyingglass")
+                    .foregroundStyle(.secondary)
+                TextField("Filter downloads", text: $searchQuery)
+                    .textFieldStyle(.plain)
+                if !searchQuery.isEmpty {
+                    Button {
+                        searchQuery = ""
+                    } label: {
+                        Image(systemName: "xmark.circle.fill")
+                            .foregroundStyle(.secondary)
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+            .padding(.horizontal, 10)
+            .padding(.vertical, 6)
+            .background(.quaternary, in: Capsule())
+
+            Spacer(minLength: 8)
+
+            Menu {
+                Picker("Sort By", selection: $sort) {
+                    ForEach(SortOption.allCases) { Text($0.rawValue).tag($0) }
+                }
+            } label: {
+                Label("Sort", systemImage: "arrow.up.arrow.down")
+                    .labelStyle(.iconOnly)
+                    .font(.system(size: 13, weight: .medium))
+                    .foregroundStyle(.primary)
+                    .frame(width: 32, height: 32)
+                    .background(.quaternary, in: Circle())
+            }
+            .menuStyle(.borderlessButton)
+            .fixedSize()
+        }
+        .padding(.horizontal, 24)
+        .padding(.vertical, 4)
+    }
+
+    private var playShuffleRow: some View {
+        HStack(spacing: 12) {
+            Button {
+                controller.play(filteredAndSortedTracks.map(QueueEntry.from), at: 0)
+            } label: {
+                Label("Play", systemImage: "play.fill")
+                    .font(.subheadline.weight(.semibold))
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 8)
+            }
+            .buttonStyle(.borderedProminent)
+            .clipShape(Capsule())
+
+            Button {
+                var shuffled = filteredAndSortedTracks.map(QueueEntry.from)
+                shuffled.shuffle()
+                controller.play(shuffled, at: 0)
+            } label: {
+                Label("Shuffle", systemImage: "shuffle")
+                    .font(.subheadline.weight(.semibold))
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 8)
+            }
+            .buttonStyle(.bordered)
+            .clipShape(Capsule())
+        }
+        .padding(.horizontal, 24)
+        .padding(.vertical, 6)
+    }
+
+    private var songsContent: some View {
+        VStack(spacing: 0) {
+            if !filteredAndSortedTracks.isEmpty {
+                playShuffleRow
+            }
+            List {
+                ForEach(Array(filteredAndSortedTracks.enumerated()), id: \.element.id) { index, track in
+                    SongRow(
+                        entry: QueueEntry.from(track),
+                        play: {
+                            controller.play(filteredAndSortedTracks.map(QueueEntry.from), at: index)
+                        },
+                        playNext: { controller.playNext(QueueEntry.from(track)) },
+                        addToQueue: { controller.addToQueue(QueueEntry.from(track)) }
+                    )
+                    .listRowInsets(EdgeInsets(top: 2, leading: 24, bottom: 2, trailing: 24))
+                }
+            }
+            .listStyle(.plain)
+        }
+    }
+
+    private var albumsContent: some View {
+        ScrollView {
+            LazyVGrid(columns: [GridItem(.adaptive(minimum: 160), spacing: 18)], spacing: 22) {
+                ForEach(albumGroups, id: \.name) { group in
+                    Button {
+                        controller.play(group.tracks.map(QueueEntry.from), at: 0)
+                    } label: {
+                        VStack(alignment: .leading, spacing: 8) {
+                            ArtworkView(url: nil, data: group.tracks.first?.artwork, side: 160)
+                                .clipShape(.rect(cornerRadius: 10, style: .continuous))
+                                .shadow(color: .black.opacity(0.12), radius: 4, y: 2)
+                            Text(group.name)
+                                .font(.callout.weight(.semibold))
+                                .lineLimit(1)
+                            Text("\(group.artist) • \(group.tracks.count) song\(group.tracks.count == 1 ? "" : "s")")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                                .lineLimit(1)
+                        }
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+            .padding(20)
+        }
+    }
+
+    private var artistsContent: some View {
+        List {
+            ForEach(artistGroups, id: \.name) { group in
+                ArtistGroupRow(group: group)
+                    .listRowInsets(EdgeInsets(top: 4, leading: 24, bottom: 4, trailing: 24))
+            }
+        }
+        .listStyle(.plain)
     }
 }
 
@@ -1022,6 +1338,27 @@ struct LocalMusicView: View {
     var body: some View {
         content
             .navigationTitle("Local Music")
+            #if os(iOS)
+            .navigationBarTitleDisplayMode(.large)
+            .toolbar {
+                ToolbarItemGroup(placement: .topBarTrailing) {
+                    Button {
+                        pickFolder()
+                    } label: {
+                        Image(systemName: "plus")
+                            .font(.system(size: 15, weight: .medium))
+                            .foregroundStyle(.primary)
+                            .frame(width: 34, height: 34)
+                            .background(.ultraThinMaterial, in: Circle())
+                            .overlay(Circle().strokeBorder(Color.white.opacity(0.22), lineWidth: 0.6))
+                    }
+                    .buttonStyle(ProfileCircleButtonStyle())
+                    .accessibilityLabel("Scan a folder")
+
+                    TopBarAccountButton()
+                }
+            }
+            #else
             .toolbar {
                 ToolbarItem(placement: .primaryAction) {
                     Button {
@@ -1035,6 +1372,7 @@ struct LocalMusicView: View {
                     .help("Scan a folder")
                 }
             }
+            #endif
             .fileImporter(isPresented: $pickingFolder, allowedContentTypes: [.folder]) { result in
                 if case .success(let url) = result {
                     local.scanPicked(url)
@@ -1169,40 +1507,73 @@ struct LocalMusicView: View {
 
     @ViewBuilder
     private var songsContent: some View {
-        switch local.viewType {
-        case .list:
-            List {
-                ForEach(Array(local.visibleTracks.enumerated()), id: \.element.id) { index, track in
-                    SongRow(
-                        entry: QueueEntry.from(track),
-                        play: {
-                            let shown = local.visibleTracks
-                            controller.play(shown.map(QueueEntry.from), at: index)
-                        },
-                        playNext: { controller.playNext(QueueEntry.from(track)) },
-                        addToQueue: { controller.addToQueue(QueueEntry.from(track)) }
-                    )
-                    .listRowInsets(EdgeInsets(top: 2, leading: 24, bottom: 2, trailing: 24))
-                }
-            }
-            .listStyle(.plain)
-        case .grid:
-            ScrollView {
-                LazyVGrid(
-                    columns: [GridItem(.adaptive(minimum: 150, maximum: 220), spacing: 16)],
-                    spacing: 20
-                ) {
+        VStack(spacing: 0) {
+            playShuffleBar
+            switch local.viewType {
+            case .list:
+                List {
                     ForEach(Array(local.visibleTracks.enumerated()), id: \.element.id) { index, track in
-                        LocalTrackCard(track: track) {
-                            let shown = local.visibleTracks
-                            controller.play(shown.map(QueueEntry.from), at: index)
-                        }
+                        SongRow(
+                            entry: QueueEntry.from(track),
+                            play: {
+                                let shown = local.visibleTracks
+                                controller.play(shown.map(QueueEntry.from), at: index)
+                            },
+                            playNext: { controller.playNext(QueueEntry.from(track)) },
+                            addToQueue: { controller.addToQueue(QueueEntry.from(track)) }
+                        )
+                        .listRowInsets(EdgeInsets(top: 2, leading: 24, bottom: 2, trailing: 24))
                     }
                 }
-                .padding(.horizontal, 24)
-                .padding(.vertical, 12)
+                .listStyle(.plain)
+            case .grid:
+                ScrollView {
+                    LazyVGrid(
+                        columns: [GridItem(.adaptive(minimum: 150, maximum: 220), spacing: 16)],
+                        spacing: 20
+                    ) {
+                        ForEach(Array(local.visibleTracks.enumerated()), id: \.element.id) { index, track in
+                            LocalTrackCard(track: track) {
+                                let shown = local.visibleTracks
+                                controller.play(shown.map(QueueEntry.from), at: index)
+                            }
+                        }
+                    }
+                    .padding(.horizontal, 24)
+                    .padding(.vertical, 12)
+                }
             }
         }
+    }
+
+    private var playShuffleBar: some View {
+        HStack(spacing: 12) {
+            Button {
+                controller.play(local.visibleTracks.map(QueueEntry.from), at: 0)
+            } label: {
+                Label("Play", systemImage: "play.fill")
+                    .font(.subheadline.weight(.semibold))
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 8)
+            }
+            .buttonStyle(.borderedProminent)
+            .clipShape(Capsule())
+
+            Button {
+                var shuffled = local.visibleTracks.map(QueueEntry.from)
+                shuffled.shuffle()
+                controller.play(shuffled, at: 0)
+            } label: {
+                Label("Shuffle", systemImage: "shuffle")
+                    .font(.subheadline.weight(.semibold))
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 8)
+            }
+            .buttonStyle(.bordered)
+            .clipShape(Capsule())
+        }
+        .padding(.horizontal, 24)
+        .padding(.vertical, 6)
     }
 
     private var albumGrid: some View {
@@ -1360,6 +1731,15 @@ struct HistoryView: View {
                 .listStyle(.plain)
             }
         }
+        .navigationTitle("History")
+        #if os(iOS)
+        .navigationBarTitleDisplayMode(.large)
+        .toolbar {
+            ToolbarItem(placement: .topBarTrailing) {
+                TopBarAccountButton()
+            }
+        }
+        #endif
         .task(id: auth.sessionEpoch) { await load() }
     }
 
@@ -1424,7 +1804,7 @@ private struct YoutubeLibraryView: View {
                                     Spacer()
                                     if shelf.items.count > 5 {
                                         NavigationLink("Show all") {
-                                            LibraryGridView(title: shelf.title, items: shelf.items)
+                                            LibraryGridView(title: shelf.title, items: shelf.items, isPlaylists: isPlaylistsShelf(shelf))
                                         }
                                         .font(.callout)
                                     }
@@ -1612,6 +1992,30 @@ private struct LocalPlaylistsView: View {
                 .listStyle(.plain)
             }
         }
+        .navigationTitle("Playlists")
+        #if os(iOS)
+        .navigationBarTitleDisplayMode(.large)
+        .toolbar {
+            ToolbarItemGroup(placement: .topBarTrailing) {
+                if auth.signedIn {
+                    Button {
+                        appModel.playlistPicker = PlaylistPickerRequest(videoId: "", title: "")
+                    } label: {
+                        Image(systemName: "plus")
+                            .font(.system(size: 15, weight: .medium))
+                            .foregroundStyle(.primary)
+                            .frame(width: 34, height: 34)
+                            .background(.ultraThinMaterial, in: Circle())
+                            .overlay(Circle().strokeBorder(Color.white.opacity(0.22), lineWidth: 0.6))
+                    }
+                    .buttonStyle(ProfileCircleButtonStyle())
+                    .accessibilityLabel("New Playlist")
+                }
+
+                TopBarAccountButton()
+            }
+        }
+        #endif
         .task(id: auth.sessionEpoch) { await load() }
         .onAppear { local.restoreViewPreferences() }
         .refreshable { await load() }
@@ -1715,22 +2119,116 @@ private struct LocalM3uDetailView: View {
         }
         .listStyle(.plain)
         .navigationTitle(playlist.name)
+        #if os(iOS)
+        .toolbar {
+            ToolbarItem(placement: .topBarTrailing) {
+                TopBarAccountButton()
+            }
+        }
+        #endif
     }
 }
 
-struct LibraryGridView: View {    let title: String
+struct LibraryGridView: View {
+    let title: String
     let items: [ShelfCard]
+    var isPlaylists: Bool = false
+
+    @Environment(AppModel.self) private var appModel
+    @State private var searchQuery = ""
+    @State private var sortOrder: SortOrder = .defaultOrder
+
+    enum SortOrder: String, CaseIterable, Identifiable {
+        case defaultOrder = "Default"
+        case titleAsc = "Title (A–Z)"
+        case titleDesc = "Title (Z–A)"
+        var id: String { rawValue }
+    }
+
+    private var sortedAndFilteredItems: [ShelfCard] {
+        var result = items
+        if !searchQuery.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            let q = searchQuery.lowercased()
+            result = result.filter {
+                $0.title.lowercased().contains(q) || ($0.subtitle?.lowercased().contains(q) == true)
+            }
+        }
+        switch sortOrder {
+        case .defaultOrder:
+            let pinned = PlaylistPinning.pinnedIds()
+            if isPlaylists, !pinned.isEmpty {
+                result.sort { a, b in
+                    let ap = pinned.contains(a.browseId ?? "")
+                    let bp = pinned.contains(b.browseId ?? "")
+                    if ap == bp { return false }
+                    return ap && !bp
+                }
+            }
+        case .titleAsc:
+            result.sort { $0.title.localizedCaseInsensitiveCompare($1.title) == .orderedAscending }
+        case .titleDesc:
+            result.sort { $0.title.localizedCaseInsensitiveCompare($1.title) == .orderedDescending }
+        }
+        return result
+    }
 
     var body: some View {
         ScrollView {
-            LazyVGrid(columns: [GridItem(.adaptive(minimum: 140), spacing: 16)], spacing: 16) {
-                ForEach(items) { card in
+            LazyVGrid(columns: [GridItem(.adaptive(minimum: 150, maximum: 180), spacing: 16)], spacing: 20) {
+                if isPlaylists {
+                    NewPlaylistTile {
+                        appModel.playlistPicker = PlaylistPickerRequest(videoId: "", title: "")
+                    }
+                }
+                ForEach(sortedAndFilteredItems) { card in
                     ShelfCardView(card: card)
                 }
             }
-            .padding(24)
+            .padding(.horizontal, 24)
+            .padding(.vertical, 16)
         }
         .navigationTitle(title)
+        #if os(iOS)
+        .navigationBarTitleDisplayMode(.large)
+        .searchable(text: $searchQuery, prompt: "Filter \(title)")
+        .toolbar {
+            ToolbarItemGroup(placement: .topBarTrailing) {
+                Menu {
+                    Picker("Sort by", selection: $sortOrder) {
+                        ForEach(SortOrder.allCases) { order in
+                            Text(order.rawValue).tag(order)
+                        }
+                    }
+                } label: {
+                    Image(systemName: "arrow.up.arrow.down")
+                        .font(.system(size: 14, weight: .medium))
+                        .foregroundStyle(.primary)
+                        .frame(width: 34, height: 34)
+                        .background(.ultraThinMaterial, in: Circle())
+                        .overlay(Circle().strokeBorder(Color.white.opacity(0.22), lineWidth: 0.6))
+                }
+                .buttonStyle(ProfileCircleButtonStyle())
+                .accessibilityLabel("Sort \(title)")
+
+                TopBarAccountButton()
+            }
+        }
+        #else
+        .searchable(text: $searchQuery, prompt: "Filter \(title)")
+        .toolbar {
+            ToolbarItem {
+                Menu {
+                    Picker("Sort by", selection: $sortOrder) {
+                        ForEach(SortOrder.allCases) { order in
+                            Text(order.rawValue).tag(order)
+                        }
+                    }
+                } label: {
+                    Label("Sort", systemImage: "arrow.up.arrow.down")
+                }
+            }
+        }
+        #endif
     }
 }
 

@@ -108,7 +108,8 @@ struct SearchView: View {
     @State private var suggestions: [String] = []
     @State private var searchError: String?
     @State private var attempted = false
-    /// Focus for the fixed in-page field, including tab reselect and deep links.
+    @State private var isSearchPresented = false
+    /// Focus for the native search field, including tab reselect and deep links.
     @FocusState private var searchFieldFocused: Bool
     @State private var suggestTask: Task<Void, Never>?
     /// The in-flight search, so leaving the screen or starting a new one can
@@ -152,19 +153,33 @@ struct SearchView: View {
 
     var body: some View {
         NavigationStack {
-            searchPageContent
+            resultsColumn
                 .navigationTitle("Search")
-                .toolbarTitleDisplayMode(.inline)
                 .toolbar {
                     #if os(iOS)
+                    ToolbarItem(placement: .topBarLeading) {
+                        TopBarLeadingMark()
+                    }
                     ToolbarItem(placement: .topBarTrailing) { TopBarAccountButton() }
                     #endif
                 }
-                #if os(macOS)
+                #if os(iOS)
+                .searchable(
+                    text: $query,
+                    isPresented: $isSearchPresented,
+                    placement: .navigationBarDrawer(displayMode: .always),
+                    prompt: "Artists, Songs, Lyrics, and More"
+                )
+                #else
                 .searchable(text: $query, placement: .toolbar, prompt: "Search")
-                .searchFocused($searchFieldFocused)
-                .onSubmit(of: .search) { Task { await performSearch() } }
                 #endif
+                .searchFocused($searchFieldFocused)
+                .onSubmit(of: .search) {
+                    Task {
+                        await performSearch()
+                        searchFieldFocused = false
+                    }
+                }
                 // Upstream's `searchFocusTrigger`: re-tapping the tab that is
                 // already selected focuses the field instead of doing nothing.
                 // Bound to the counter rather than a flag so a second tap while
@@ -184,6 +199,11 @@ struct SearchView: View {
                         resetToHistory()
                     }
                 }
+                .onChange(of: isSearchPresented) { _, presented in
+                    if !presented && query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                        resetToHistory()
+                    }
+                }
                 .onChange(of: appModel.focusSearch) { _, focus in
                     guard focus else { return }
                     focusTheField()
@@ -197,90 +217,6 @@ struct SearchView: View {
                 }
                 .onDisappear { cancelSuggestions() }
         }
-    }
-
-    @ViewBuilder
-    private var searchPageContent: some View {
-        #if os(iOS)
-        VStack(spacing: 0) {
-            searchField
-                .padding(.horizontal, 16)
-                .padding(.top, 4)
-                .padding(.bottom, 8)
-            resultsColumn
-        }
-        #else
-        resultsColumn
-        #endif
-    }
-
-    /// Upstream's fixed 46dp SearchField below the top bar. Submit is available
-    /// from the leading magnifier and keyboard Search key; clear preserves focus,
-    /// while Cancel clears the query and returns to the recent-search view.
-    private var searchField: some View {
-        HStack(spacing: 4) {
-            Button {
-                Task {
-                    await performSearch()
-                    searchFieldFocused = false
-                }
-            } label: {
-                Image(systemName: "magnifyingglass")
-                    .font(.system(size: 17, weight: .regular))
-                    .foregroundStyle(.secondary)
-                    .frame(width: 32, height: 32)
-                    .contentShape(Circle())
-            }
-            .buttonStyle(.plain)
-            .disabled(term.isEmpty)
-            .accessibilityLabel("Search")
-
-            TextField("Search", text: $query)
-                .font(.body)
-                .textFieldStyle(.plain)
-                #if os(iOS)
-                .textInputAutocapitalization(.never)
-                .autocorrectionDisabled()
-                .submitLabel(.search)
-                #endif
-                .focused($searchFieldFocused)
-                .onSubmit {
-                    Task {
-                        await performSearch()
-                        searchFieldFocused = false
-                    }
-                }
-
-            if !query.isEmpty {
-                Button {
-                    query = ""
-                    searchFieldFocused = true
-                } label: {
-                    Image(systemName: "xmark")
-                        .font(.system(size: 12, weight: .semibold))
-                        .foregroundStyle(.secondary)
-                        .frame(width: 28, height: 28)
-                        .contentShape(Circle())
-                }
-                .buttonStyle(.plain)
-                .accessibilityLabel("Clear search")
-            }
-
-            if searchFieldFocused {
-                Button("Cancel") {
-                    query = ""
-                    resetToHistory()
-                    searchFieldFocused = false
-                }
-                .font(.body)
-                .buttonStyle(.plain)
-                .padding(.leading, 4)
-            }
-        }
-        .padding(.leading, 8)
-        .padding(.trailing, 12)
-        .frame(height: 46)
-        .background(.quaternary.opacity(0.65), in: RoundedRectangle(cornerRadius: 11, style: .continuous))
     }
 
     /// Back to the idle screen: no results, no error, no skeletons, and the
@@ -312,6 +248,9 @@ struct SearchView: View {
     /// yet.
     private func focusTheField() {
         Task { @MainActor in
+            #if os(iOS)
+            isSearchPresented = true
+            #endif
             searchFieldFocused = true
         }
     }
@@ -606,7 +545,9 @@ struct SearchView: View {
                             generator.prepare()
                             generator.selectionChanged()
                             #endif
-                            scope = entry
+                            withAnimation(.snappy(duration: 0.25)) {
+                                scope = entry
+                            }
                         }
                     } label: {
                         Text(entry.label)
@@ -615,7 +556,7 @@ struct SearchView: View {
                             .padding(.vertical, 7)
                             .background(
                                 selected ? Color.primary : Color.secondary.opacity(0.12),
-                                in: RoundedRectangle(cornerRadius: 12, style: .continuous)
+                                in: Capsule()
                             )
                             .foregroundStyle(selected ? pillSelectedTextColor : Color.primary)
                     }
@@ -665,10 +606,20 @@ struct SearchView: View {
     /// entity or plays it directly instead of re-running a text search.
     private func recentEntityRow(_ entity: RecentSearchEntity) -> some View {
         let isArtist = entity.entityType.uppercased() == "ARTIST"
+        let isQuery = entity.entityType.uppercased() == "QUERY" || entity.id.hasPrefix("q:")
         return HStack(spacing: 12) {
             Button { openHistoryEntity(entity) } label: {
                 HStack(spacing: 14) {
-                    if isArtist {
+                    if isQuery {
+                        ZStack {
+                            Circle()
+                                .fill(Color.secondary.opacity(0.12))
+                                .frame(width: 48, height: 48)
+                            Image(systemName: "magnifyingglass")
+                                .font(.system(size: 18, weight: .medium))
+                                .foregroundStyle(.secondary)
+                        }
+                    } else if isArtist {
                         ArtworkView(url: entity.artworkUrl, data: nil, side: 48)
                             .clipShape(Circle())
                     } else {
@@ -679,10 +630,12 @@ struct SearchView: View {
                         Text(entity.title)
                             .font(.body.weight(.medium))
                             .lineLimit(1)
-                        Text(entity.subtitle.isEmpty ? entity.typeLabel : "\(entity.subtitle) · \(entity.typeLabel)")
-                            .font(.subheadline)
-                            .foregroundStyle(.secondary)
-                            .lineLimit(1)
+                        if !isQuery {
+                            Text(entity.subtitle.isEmpty ? entity.typeLabel : "\(entity.subtitle) · \(entity.typeLabel)")
+                                .font(.subheadline)
+                                .foregroundStyle(.secondary)
+                                .lineLimit(1)
+                        }
                     }
                     Spacer(minLength: 0)
                 }

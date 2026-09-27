@@ -1,29 +1,22 @@
 import SwiftUI
+#if os(iOS)
+import UIKit
+#endif
+import BitChordShared
 
-/// Upstream `AccountProfileSelector`: which YouTube identity to listen as.
+/// Account & Settings hub — Apple-style modal account sheet and profile switcher.
 ///
-/// ## Why this is a list and not just a menu
-///
-/// A Google account can own several channels, and the difference between them is
-/// not cosmetic — a brand channel has its own library, its own history and its
-/// own scrobbles. So the choice is worth more than one tap on an avatar, and a
-/// popover that only ever shows the current one hides the alternatives.
-///
-/// ## Why the avatar swipes
-///
-/// Upstream swipes between profiles on the avatar itself. Kept, because the
-/// avatar is already the thing you look at to answer "which account is this",
-/// and a gesture there costs no space on a page that has none. It stops at both
-/// ends rather than wrapping — see `adjacentProfile` in the shared module for
-/// why a swipe past the last channel should do nothing rather than teleport the
-/// listener to their oldest.
+/// Combines the active identity card, YouTube channel/profile switcher,
+/// seamless inline push into Settings, and account actions (Add Account, Sign Out).
 struct AccountProfileSheet: View {
     @Environment(AuthController.self) private var auth
+    @Environment(PlaybackController.self) private var controller
     @Environment(AppModel.self) private var appModel
     @Environment(\.dismiss) private var dismiss
+
+    @State private var showingSignOutConfirm = false
+
     /// The account this sheet is showing, or nil for "whichever is selected".
-    /// Set by the header avatar so a tap on a *non*-selected account's avatar
-    /// still opens the list rather than silently switching.
     let scopedAccountId: String?
 
     init(scopedAccountId: String? = nil) {
@@ -31,77 +24,246 @@ struct AccountProfileSheet: View {
     }
 
     private var accounts: [AccountSummary] {
-        guard scopedAccountId != nil else { return auth.accounts }
-        // A scoped sheet still shows every account — the point is to be able to
-        // change which one — but starts on the one that was tapped.
-        return auth.accounts
+        auth.accounts
     }
 
     var body: some View {
         NavigationStack {
             List {
-                ForEach(accounts) { account in
-                    Section {
-                        if account.profiles.isEmpty {
-                            // An account always has at least one identity in the
-                            // real world, so an empty list is a half-read record
-                            // rather than a state to offer a choice within.
-                            Text("No YouTube channels read for this account yet.")
-                                .font(.callout)
-                                .foregroundStyle(.secondary)
-                        } else {
-                            ForEach(account.profiles) { profile in
-                                row(account: account, profile: profile)
+                // MARK: - Active Account Card / Sign In
+                Section {
+                    if auth.signedIn {
+                        activeAccountCard
+                    } else {
+                        signedOutCard
+                    }
+                }
+
+                // MARK: - Channels / Profiles Switcher
+                if auth.signedIn {
+                    ForEach(accounts) { account in
+                        if !account.profiles.isEmpty {
+                            Section {
+                                ForEach(account.profiles) { profile in
+                                    profileRow(account: account, profile: profile)
+                                }
+                            } header: {
+                                if accounts.count > 1 {
+                                    VStack(alignment: .leading, spacing: 2) {
+                                        Text(account.displayName)
+                                        if !account.email.isEmpty {
+                                            Text(account.email)
+                                                .font(.caption)
+                                                .textCase(nil)
+                                        }
+                                    }
+                                } else {
+                                    Text("Channels")
+                                }
                             }
                         }
-                    } header: {
-                        VStack(alignment: .leading, spacing: 2) {
-                            Text(account.displayName)
-                            if !account.email.isEmpty {
-                                Text(account.email)
+                    }
+                }
+
+                // MARK: - Settings Drill-Down
+                Section {
+                    NavigationLink {
+                        SettingsView(embedded: true)
+                            .environment(controller)
+                            .environment(appModel)
+                            .environment(auth)
+                    } label: {
+                        HStack(spacing: 14) {
+                            ZStack {
+                                RoundedRectangle(cornerRadius: 8, style: .continuous)
+                                    .fill(Color.gray.opacity(0.18))
+                                    .frame(width: 32, height: 32)
+                                Image(systemName: "gearshape.fill")
+                                    .font(.system(size: 16, weight: .medium))
+                                    .foregroundStyle(.primary)
+                            }
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text("Settings")
+                                    .font(.body.weight(.medium))
+                                    .foregroundStyle(.primary)
+                                Text("Audio quality, playback, appearance")
                                     .font(.caption)
-                                    .textCase(nil)
+                                    .foregroundStyle(.secondary)
                             }
                         }
-                    } footer: {
-                        if account.id == auth.listeningAs?.id {
-                            Text("Listening as this account. Signing out removes it and its cookie.")
+                        .padding(.vertical, 2)
+                    }
+                }
+
+                // MARK: - Account Actions
+                if auth.signedIn {
+                    Section {
+                        Button {
+                            dismiss()
+                            Task { @MainActor in auth.loginPresented = true }
+                        } label: {
+                            Label("Add Another Account", systemImage: "person.badge.plus")
+                                .foregroundStyle(Color.accentColor)
+                        }
+
+                        Button(role: .destructive) {
+                            showingSignOutConfirm = true
+                        } label: {
+                            Label("Sign Out", systemImage: "rectangle.portrait.and.arrow.right")
+                                .foregroundStyle(.red)
                         }
                     }
                 }
             }
-            .navigationTitle("Listen As")
+            #if os(iOS)
+            .listStyle(.insetGrouped)
+            #else
+            .listStyle(.inset)
+            #endif
+            .navigationTitle("Account")
+            #if os(iOS)
+            .navigationBarTitleDisplayMode(.inline)
+            #endif
             .toolbar {
-                ToolbarItem(placement: .cancellationAction) {
+                ToolbarItem(placement: .confirmationAction) {
                     Button("Done") { dismiss() }
+                        .fontWeight(.semibold)
                 }
-                ToolbarItem(placement: .primaryAction) {
-                    Button("Settings") {
-                        dismiss()
-                        Task { @MainActor in appModel.settingsPresented = true }
-                    }
+            }
+            .confirmationDialog(
+                "Sign Out",
+                isPresented: $showingSignOutConfirm,
+                titleVisibility: .visible
+            ) {
+                Button("Sign Out", role: .destructive) {
+                    auth.signOut()
                 }
+                Button("Cancel", role: .cancel) {}
+            } message: {
+                Text("Signing out removes your saved YouTube Music session from this device.")
             }
         }
         #if os(iOS)
-        // See `LyricsOffsetSheet`: upstream's player sheets are bottom drawers
-        // with a grab handle, and the platform's own indicator is the handle.
         .presentationDetents([.medium, .large])
         .presentationDragIndicator(.visible)
         #endif
     }
 
-    private func row(account: AccountSummary, profile: AccountProfile) -> some View {
-        let selected = auth.listeningAs?.id == account.id
+    // MARK: - Subviews
+
+    @ViewBuilder
+    private var activeAccountCard: some View {
+        HStack(spacing: 16) {
+            Avatar(
+                url: auth.accountPhotoUrl,
+                name: auth.accountName ?? "Account",
+                side: 54
+            )
+            .overlay(
+                Circle()
+                    .strokeBorder(Color.white.opacity(0.24), lineWidth: 0.8)
+            )
+            .shadow(color: .black.opacity(0.12), radius: 4, x: 0, y: 2)
+
+            VStack(alignment: .leading, spacing: 4) {
+                Text(auth.accountName ?? (auth.listeningAs?.displayName ?? "Signed In"))
+                    .font(.headline.weight(.semibold))
+                    .foregroundStyle(.primary)
+
+                if let email = auth.accountEmail, !email.isEmpty {
+                    Text(email)
+                        .font(.subheadline)
+                        .foregroundStyle(.secondary)
+                } else if let handle = auth.listeningAs?.activeProfile?.handle, !handle.isEmpty {
+                    Text(handle)
+                        .font(.subheadline)
+                        .foregroundStyle(.secondary)
+                }
+
+                HStack(spacing: 4) {
+                    Text("YouTube Music")
+                        .font(.system(size: 11, weight: .semibold))
+                        .foregroundStyle(Color.accentColor)
+                    if let profileName = auth.listeningAs?.activeProfile?.name,
+                       profileName != auth.accountName {
+                        Text("•")
+                            .font(.system(size: 10))
+                            .foregroundStyle(.secondary)
+                        Text(profileName)
+                            .font(.system(size: 11, weight: .regular))
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                    }
+                }
+                .padding(.horizontal, 8)
+                .padding(.vertical, 3)
+                .background(Color.accentColor.opacity(0.12), in: Capsule())
+            }
+        }
+        .padding(.vertical, 6)
+    }
+
+    @ViewBuilder
+    private var signedOutCard: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            HStack(spacing: 14) {
+                ZStack {
+                    Circle()
+                        .fill(.ultraThinMaterial)
+                    Circle()
+                        .strokeBorder(Color.white.opacity(0.25), lineWidth: 0.75)
+                    Image(systemName: "person.fill")
+                        .font(.system(size: 22, weight: .medium))
+                        .foregroundStyle(.secondary)
+                }
+                .frame(width: 50, height: 50)
+
+                VStack(alignment: .leading, spacing: 3) {
+                    Text("Sign In to YouTube Music")
+                        .font(.headline)
+                        .foregroundStyle(.primary)
+                    Text("Access your playlists, library, and personalized mixes.")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                }
+            }
+
+            Button {
+                dismiss()
+                Task { @MainActor in auth.loginPresented = true }
+            } label: {
+                HStack {
+                    Spacer()
+                    Text("Sign In")
+                        .font(.subheadline.weight(.semibold))
+                    Spacer()
+                }
+                .padding(.vertical, 10)
+                .background(Color.accentColor, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+                .foregroundStyle(.white)
+            }
+            .buttonStyle(.plain)
+        }
+        .padding(.vertical, 4)
+    }
+
+    private func profileRow(account: AccountSummary, profile: AccountProfile) -> some View {
+        let isSelected = auth.listeningAs?.id == account.id
             && auth.listeningAs?.activeProfileId == profile.id
+
         return Button {
             auth.select(accountId: account.id, profileId: profile.id)
-            dismiss()
+            #if os(iOS)
+            UIImpactFeedbackGenerator(style: .light).impactOccurred()
+            #endif
         } label: {
             HStack(spacing: 12) {
-                Avatar(url: profile.avatar, name: profile.name, side: 40)
+                Avatar(url: profile.avatar, name: profile.name, side: 38)
+                    .overlay(Circle().strokeBorder(Color.white.opacity(0.18), lineWidth: 0.5))
+
                 VStack(alignment: .leading, spacing: 2) {
                     Text(profile.name)
+                        .font(.body)
                         .foregroundStyle(.primary)
                     if !profile.handle.isEmpty {
                         Text(profile.handle)
@@ -109,10 +271,13 @@ struct AccountProfileSheet: View {
                             .foregroundStyle(.secondary)
                     }
                 }
+
                 Spacer()
-                if selected {
+
+                if isSelected {
                     Image(systemName: "checkmark")
-                        .foregroundStyle(.tint)
+                        .font(.system(size: 14, weight: .semibold))
+                        .foregroundStyle(Color.accentColor)
                         .accessibilityLabel("Listening as this channel")
                 }
             }
@@ -122,54 +287,150 @@ struct AccountProfileSheet: View {
     }
 }
 
-/// The upstream account control in a screen's visible top bar. It is hosted
-/// by each tab's NavigationStack, because a toolbar on the parent TabView is
-/// not reliably shown with nested navigation stacks on iPhone.
+/// The upstream account affordance at the right end of the top bar.
+///
+/// Designed as a pure 34pt glass circle (matching upstream `AVATAR_SIZE = 34.dp`)
+/// with no outer rectangular bounding box, ensuring native iOS navigation bar
+/// chrome treats the circle itself as the glass element.
 struct TopBarAccountButton: View {
     @Environment(AuthController.self) private var auth
+    @Environment(PlaybackController.self) private var controller
     @Environment(AppModel.self) private var appModel
     @State private var showingProfiles = false
 
     var body: some View {
         Button {
-            if auth.signedIn && !auth.accounts.isEmpty {
-                showingProfiles = true
-            } else {
-                appModel.settingsPresented = true
-            }
+            showingProfiles = true
         } label: {
-            Group {
-                if auth.signedIn {
-                    Avatar(
-                        url: auth.accountPhotoUrl,
-                        name: auth.accountName ?? "Account",
-                        side: 32
-                    )
-                } else {
-                    Image(systemName: "person.fill")
-                        .font(.system(size: 17, weight: .medium))
-                        .foregroundStyle(.secondary)
-                        .frame(width: 32, height: 32)
-                        .background(.quaternary, in: Circle())
+            profileCircle
+        }
+        .buttonStyle(ProfileCircleButtonStyle())
+        .accessibilityLabel(auth.signedIn ? "Account and Settings" : "Sign In and Settings")
+        .contextMenu {
+            if auth.signedIn {
+                Button {
+                    showingProfiles = true
+                } label: {
+                    Label("Account & Settings", systemImage: "person.crop.circle")
+                }
+
+                if let currentAccount = auth.listeningAs, currentAccount.profiles.count > 1 {
+                    Menu {
+                        ForEach(currentAccount.profiles) { profile in
+                            Button {
+                                auth.select(accountId: currentAccount.id, profileId: profile.id)
+                            } label: {
+                                if auth.listeningAs?.activeProfileId == profile.id {
+                                    Label(profile.name, systemImage: "checkmark")
+                                } else {
+                                    Text(profile.name)
+                                }
+                            }
+                        }
+                    } label: {
+                        Label("Switch Channel", systemImage: "arrow.triangle.2.circlepath")
+                    }
+                }
+
+                Button {
+                    auth.loginPresented = true
+                } label: {
+                    Label("Add Another Account", systemImage: "person.badge.plus")
+                }
+
+                Divider()
+
+                Button(role: .destructive) {
+                    auth.signOut()
+                } label: {
+                    Label("Sign Out", systemImage: "rectangle.portrait.and.arrow.right")
+                }
+            } else {
+                Button {
+                    auth.loginPresented = true
+                } label: {
+                    Label("Sign In", systemImage: "person.crop.circle.badge.plus")
+                }
+
+                Button {
+                    showingProfiles = true
+                } label: {
+                    Label("Settings", systemImage: "gearshape")
                 }
             }
-            .overlay(Circle().strokeBorder(.primary.opacity(0.12), lineWidth: 1))
-            .frame(width: 44, height: 44)
-            .contentShape(Rectangle())
         }
-        .buttonStyle(.plain)
-        .accessibilityLabel(auth.signedIn ? "Account and Settings" : "Sign in and Settings")
         .gesture(
-            DragGesture(minimumDistance: 28).onEnded { value in
-                guard auth.signedIn,
-                      abs(value.translation.height) > abs(value.translation.width)
-                else { return }
-                auth.stepProfile(forward: value.translation.height > 0)
-            }
+            DragGesture(minimumDistance: 24)
+                .onEnded { value in
+                    guard auth.signedIn,
+                          abs(value.translation.height) > abs(value.translation.width)
+                    else { return }
+                    auth.stepProfile(forward: value.translation.height > 0)
+                }
         )
         .sheet(isPresented: $showingProfiles) {
             AccountProfileSheet(scopedAccountId: auth.listeningAs?.id)
+                .environment(controller)
+                .environment(appModel)
+                .environment(auth)
         }
+    }
+
+    @ViewBuilder
+    private var profileCircle: some View {
+        if auth.signedIn, let photoUrl = auth.accountPhotoUrl {
+            Avatar(
+                url: photoUrl,
+                name: auth.accountName ?? "Account",
+                side: 34
+            )
+            .clipShape(Circle())
+            .overlay(
+                Circle()
+                    .strokeBorder(Color.white.opacity(0.24), lineWidth: 0.6)
+            )
+            .contentShape(Circle())
+            .shadow(color: .black.opacity(0.12), radius: 2, x: 0, y: 1)
+        } else if auth.signedIn, let name = auth.accountName, !name.isEmpty {
+            Avatar(
+                url: nil,
+                name: name,
+                side: 34
+            )
+            .clipShape(Circle())
+            .overlay(
+                Circle()
+                    .strokeBorder(Color.white.opacity(0.24), lineWidth: 0.6)
+            )
+            .contentShape(Circle())
+        } else {
+            // Pure glass circle — "the glass thing itself"
+            ZStack {
+                Circle()
+                    .fill(.ultraThinMaterial)
+                Circle()
+                    .strokeBorder(Color.white.opacity(0.28), lineWidth: 0.7)
+                Image(systemName: "person.fill")
+                    .font(.system(size: 14, weight: .semibold))
+                    .foregroundStyle(.primary.opacity(0.65))
+            }
+            .frame(width: 34, height: 34)
+            .clipShape(Circle())
+            .contentShape(Circle())
+            .shadow(color: .black.opacity(0.08), radius: 2, x: 0, y: 1)
+        }
+    }
+}
+
+/// Custom button style for the top bar profile circle that prevents iOS toolbar
+/// from wrapping the button in a rectangular or pill glass chrome, providing
+/// smooth interactive spring feedback on press.
+struct ProfileCircleButtonStyle: ButtonStyle {
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .scaleEffect(configuration.isPressed ? 0.90 : 1.0)
+            .opacity(configuration.isPressed ? 0.82 : 1.0)
+            .animation(.spring(response: 0.22, dampingFraction: 0.7), value: configuration.isPressed)
     }
 }
 
@@ -177,10 +438,9 @@ struct TopBarAccountButton: View {
 /// a swipe. The compact control upstream puts on every visible account avatar.
 struct AccountAvatarButton: View {
     @Environment(AuthController.self) private var auth
+    @Environment(PlaybackController.self) private var controller
+    @Environment(AppModel.self) private var appModel
     @State private var showingSheet = false
-    /// How far the last swipe went, so the gesture can be undone by swiping
-    /// back without the list having to be consulted.
-    @State private var swipeHint: Int = 0
 
     private var profile: AccountProfile? { auth.listeningAs?.activeProfile }
 
@@ -190,9 +450,6 @@ struct AccountAvatarButton: View {
         } label: {
             Avatar(url: profile?.avatar, name: profile?.name ?? "Account", side: 34)
                 .overlay(alignment: .bottomTrailing) {
-                    // A small mark rather than a chevron: this opens a list, and a
-                    // chevron here reads as "go deeper into the account", which is
-                    // a different thing.
                     Image(systemName: "person.crop.circle.badge.checkmark")
                         .font(.system(size: 11, weight: .semibold))
                         .foregroundStyle(.white, .black.opacity(0.55))
@@ -206,38 +463,43 @@ struct AccountAvatarButton: View {
         .accessibilityHint("Choose which YouTube channel to listen as")
         .sheet(isPresented: $showingSheet) {
             AccountProfileSheet(scopedAccountId: auth.listeningAs?.id)
+                .environment(controller)
+                .environment(appModel)
+                .environment(auth)
         }
         .gesture(
             DragGesture(minimumDistance: 24)
                 .onEnded { value in
                     guard abs(value.translation.width) > abs(value.translation.height) else { return }
-                    // Right is "back", which is the direction a list reads
-                    // backwards in, so forward is a leftward swipe.
                     auth.stepProfile(forward: value.translation.width < 0)
                 }
         )
     }
 }
 
-/// A round image that falls back to a monogram, so an account without a picture
-/// is still distinguishable from one with it.
+/// A round image that falls back to a monogram, with ultraThinMaterial backing.
 struct Avatar: View {
     let url: String?
     let name: String
     let side: CGFloat
 
     var body: some View {
-        Group {
-            if let url, let address = URL(string: url) {
-                AsyncImage(url: address) { phase in
-                    if case .success(let image) = phase {
-                        image.resizable().aspectRatio(contentMode: .fill)
-                    } else {
-                        monogram
+        ZStack {
+            Circle()
+                .fill(.ultraThinMaterial)
+
+            Group {
+                if let url, let address = URL(string: url) {
+                    AsyncImage(url: address) { phase in
+                        if case .success(let image) = phase {
+                            image.resizable().aspectRatio(contentMode: .fill)
+                        } else {
+                            monogram
+                        }
                     }
+                } else {
+                    monogram
                 }
-            } else {
-                monogram
             }
         }
         .frame(width: side, height: side)
@@ -252,3 +514,16 @@ struct Avatar: View {
             .background(.white.opacity(0.14))
     }
 }
+
+/// Root-page brand mark: upstream FrostedTopBar's leading BitChord logo,
+/// sized and positioned for native Apple navigation bars across all primary tabs.
+struct TopBarLeadingMark: View {
+    var body: some View {
+        Image(.bchLogo)
+            .resizable()
+            .scaledToFit()
+            .frame(width: 28, height: 18)
+            .accessibilityHidden(true)
+    }
+}
+

@@ -44,6 +44,7 @@ struct DetailView: View {
     @State private var canvasURL: URL?
     @State private var canvasFallbackURL: URL?
     @State private var pinned = false
+    @State private var scrolledPastHeader = false
     /// Narrows the track list in place, like upstream's search circle in the
     /// release header. Off until tapped, so a long list reads as a list first.
     @State private var searching = false
@@ -60,9 +61,15 @@ struct DetailView: View {
                 loadedPage(page)
             }
         }
-        .navigationTitle(page?.title.isEmpty == false ? page!.title : initialTitle)
+        .navigationTitle(scrolledPastHeader ? (page?.title.isEmpty == false ? page!.title : initialTitle) : "")
         #if os(iOS)
         .navigationBarTitleDisplayMode(.inline)
+        .toolbar {
+            ToolbarItemGroup(placement: .topBarTrailing) {
+                detailActionsMenu(page: page)
+                TopBarAccountButton()
+            }
+        }
         #endif
         .alert("Rename Playlist", isPresented: $renamePresented) {
             TextField("Title", text: $renameTitle)
@@ -163,6 +170,15 @@ struct DetailView: View {
                 }
                 .padding(.bottom, 36)
             }
+            .onScrollGeometryChange(for: Bool.self) { geo in
+                geo.contentOffset.y > (artHeight - 50)
+            } action: { _, isScrolled in
+                if scrolledPastHeader != isScrolled {
+                    withAnimation(.easeInOut(duration: 0.2)) {
+                        scrolledPastHeader = isScrolled
+                    }
+                }
+            }
             #if os(iOS)
             .ignoresSafeArea(edges: .top)
             #endif
@@ -173,6 +189,60 @@ struct DetailView: View {
         .task(id: page.thumbnailUrl) {
             headerArt = await loadHeaderArt(page.thumbnailUrl)
             await loadCanvas(page)
+        }
+    }
+
+    @ViewBuilder
+    private func detailActionsMenu(page: DetailPageModel?) -> some View {
+        if let page {
+            Menu {
+                if let urlString = page.url, let url = URL(string: urlString) {
+                    ShareLink(item: url) {
+                        Label("Share", systemImage: "square.and.arrow.up")
+                    }
+                }
+                if !pinned {
+                    Button {
+                        if PlaylistPinning.toggle(browseId: browseId) {
+                            pinned = true
+                        } else {
+                            appModel.pinLimitAlert = true
+                        }
+                    } label: {
+                        Label("Pin to Library", systemImage: "pin")
+                    }
+                } else {
+                    Button {
+                        if PlaylistPinning.toggle(browseId: browseId) {
+                            pinned = false
+                        }
+                    } label: {
+                        Label("Unpin from Library", systemImage: "pin.slash")
+                    }
+                }
+                if kind(of: page) == .playlist, page.playlistOwned == true {
+                    Button {
+                        renameTitle = page.title
+                        renamePresented = true
+                    } label: {
+                        Label("Rename Playlist", systemImage: "pencil")
+                    }
+                    Button {
+                        privacyPresented = true
+                    } label: {
+                        Label("Playlist Privacy…", systemImage: "lock")
+                    }
+                }
+            } label: {
+                Image(systemName: "ellipsis")
+                    .font(.system(size: 14, weight: .semibold))
+                    .foregroundStyle(.primary)
+                    .frame(width: 34, height: 34)
+                    .background(.ultraThinMaterial, in: Circle())
+                    .overlay(Circle().strokeBorder(Color.white.opacity(0.22), lineWidth: 0.6))
+            }
+            .buttonStyle(ProfileCircleButtonStyle())
+            .accessibilityLabel("More Options")
         }
     }
 
