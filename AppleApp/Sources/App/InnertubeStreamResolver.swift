@@ -8,6 +8,9 @@ struct ResolvedYouTubeStream {
     let kbps: Int
     let mimeType: String
     let headers: [String: String]
+    /// Player-response loudness figure for the engine's normalization stage
+    /// (nil when the response carried none, or the payload predates it).
+    let loudnessDb: Double?
 }
 
 /// Swift bridge over the shared module's `StreamResolver` (via `PlayerBridge`):
@@ -34,7 +37,8 @@ final class InnertubeStreamResolver: Sendable {
                                 url: decoded.url,
                                 kbps: decoded.kbps,
                                 mimeType: decoded.mimeType,
-                                headers: decoded.headers
+                                headers: decoded.headers,
+                                loudnessDb: decoded.loudnessDb
                             ))
                         } catch {
                             continuation.resume(throwing: error)
@@ -63,7 +67,8 @@ final class InnertubeStreamResolver: Sendable {
         let deobfuscated = await YouTubePlayerJs.shared.deobfuscateN(url: payload.url, videoId: videoId)
         guard deobfuscated != payload.url else { return payload }
         return ResolvedYouTubeStream(
-            url: deobfuscated, kbps: payload.kbps, mimeType: payload.mimeType, headers: payload.headers
+            url: deobfuscated, kbps: payload.kbps, mimeType: payload.mimeType,
+            headers: payload.headers, loudnessDb: payload.loudnessDb
         )
     }
 
@@ -120,6 +125,8 @@ private struct StreamPayload: Codable {
     let kbps: Int
     let mimeType: String
     let headers: [String: String]
+    /// Nil on payloads minted before the shared module parsed the figure.
+    let loudnessDb: Double?
 }
 
 private final class ResolveCallbackAdapter: PlayerBridgeResolveCallback {

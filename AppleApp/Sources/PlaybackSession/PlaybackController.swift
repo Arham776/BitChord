@@ -54,6 +54,24 @@ struct QueueEntry: Identifiable, Hashable, Sendable {
         return id
     }
 
+    /// "title artist album" for the Automix speech/live guard (upstream
+    /// `TransitionPlanner.itemText`).
+    var itemText: String {
+        [title, artist, albumName ?? ""]
+            .filter { !$0.isEmpty }
+            .joined(separator: " ")
+    }
+
+    /// Upstream `TransitionPlanner.sameAlbum` — the two rows are the same
+    /// recording by album id, or by album name + artist.
+    func sameAlbum(as other: QueueEntry) -> Bool {
+        if let a = albumId, let b = other.albumId, !a.isEmpty, a == b { return true }
+        if let a = albumName, let b = other.albumName, !a.isEmpty, a == b, artist == other.artist {
+            return true
+        }
+        return false
+    }
+
     static func youtube(
         videoId: String,
         title: String,
@@ -177,6 +195,8 @@ final class PlaybackController {
 
     private(set) var state: PlaybackState = .stopped
     private(set) var current: QueueEntry?
+    /// Shelf or collection that started this queue, for the player caption.
+    private(set) var playbackContext: String?
     private(set) var queue: [QueueEntry] = []
     private(set) var playingIndex: Int = 0
     private(set) var position: Double = 0
@@ -234,11 +254,15 @@ final class PlaybackController {
     private(set) var attemptedLyrics = false
     private(set) var canvasURL: URL?
     private(set) var canvasFallbackURL: URL?
+    /// Source returned with the active canvas payload (`SPOTIFY` or another
+    /// provider). Kept with the clip so a version change does not lose it.
+    private(set) var canvasSource: String?
+    private var canvasLookupGeneration: UInt64 = 0
+    private var canvasIdentity: String?
     private(set) var nerd: NerdStatsRec?
     /// True while a lossless/module lookup is still running for the playing track
     /// (upstream `NerdStats.racingLossless`).
-    private(set) var racingLossless = false
-    /// Automix analysis tier for stats-for-nerds: `beatmatched`, `dj`, or `plain`.
+    private(set) var racingLossless = false    /// Automix analysis tier for stats-for-nerds: `beatmatched`, `dj`, or `plain`.
     private(set) var analysisTier: String?
     /// Beat-grid confidence when native-core exposes it. Nil until then.
     private(set) var analysisConfidence: Double?
@@ -251,8 +275,45 @@ final class PlaybackController {
     private(set) var autoplayEnabled = PlatformSettings.shared.getBoolean(key: "autoplay", default: true)
     private(set) var automixEnabled = PlatformSettings.shared.getBoolean(key: "smart_fade_enabled", default: false)
     var hideVolumeBar = PlatformSettings.shared.getBoolean(key: "hide_volume_bar", default: false)
+    /// Hides the "Playing from" / "Played by" caption on the main player.
+    /// Read by the player UI; persisted here so the choice survives restarts.
+    var hideSongStatus = PlatformSettings.shared.getBoolean(key: "hide_song_status", default: false)
+    /// Requested PCM word length at the output boundary (`PCM_16` /
+    /// `FLOAT_32`, upstream's two rungs). The engine opens the unit as int16
+    /// or float to match; the Audio Pipeline readout reports what is actually
+    /// in effect.
+    var outputPcmMode = migrateOutputPcmMode()
+    /// Prefer an attached USB audio output over the system's normal route.
+    /// The engine picks the USB device at (re)build; on iOS the session owns
+    /// the route, so there it stays advisory and the readout says which route
+    /// is in effect.
+    var preferUsbDac = PlatformSettings.shared.getBoolean(key: "prefer_usb_dac", default: false)
+    /// Level every track to the same loudness. The engine applies the
+    /// catalogue figure per track (upstream's clamp); tracks without one play
+    /// at unity and the readout says so.
+    var loudnessNormalization = PlatformSettings.shared.getBoolean(key: "loudness_normalization", default: true)
+    /// CPU budget for Automix's background analysis (EFFICIENT / BALANCED /
+    /// PERFORMANCE). EFFICIENT skips the vocal model; the 1 / 2 / 4 thread
+    /// counts are upstream's ORT numbers, reported for the analysis path.
+    var automixPerformanceMode = PlatformSettings.shared.getString(key: "automix_performance", default: "BALANCED")
+    /// Whether a manual version switch keeps the playback position.
+    /// Upstream aligns the matching moment by waveform; this port has no
+    /// analyser, so "aligned" means resuming where the listener was. Off
+    /// restarts from the top, since no alignment is attempted at all.
+    var smartVersionAlignment = PlatformSettings.shared.getBoolean(key: "smart_version_alignment", default: true)
+    /// Prefer the catalogue audio release when the queued result is a music
+    /// video. Applied in the resolve race: a video entry waits for the
+    /// substitute lookup instead of taking YouTube's own upload first.
+    var preferMusicOnly = PlatformSettings.shared.getBoolean(key: "prefer_music_only", default: false)
+    /// Which artist a scrobble credits: the full track credit ("track") or the
+    /// lead name alone ("album"). Applied to every scrobble payload below.
+    var scrobblePrimaryArtist = PlatformSettings.shared.getString(key: "scrobble_primary_artist", default: "track")
     private var scrobbleArmed = false
     private var scrobbleSent = false
+    /// Loudness figure of the track the engine has loaded. Kept so a
+    /// mid-track quality upgrade (same recording, new file) can carry the
+    /// correction across instead of dropping to unity mid-song.
+    private var currentLoudnessDb: Double?
     /// Upstream `BACK_RESTARTS_AFTER_MS = 10_000`.
     static let backRestartsAfter: TimeInterval = 10
 
@@ -279,13 +340,22 @@ final class PlaybackController {
     /// Id the engine currently has loaded — nil after a cold restore until Play.
     private var engineLoadedId: String?
     private var restoredStart: Double?
+    private var audioHealthLogUntil = Date.distantPast
+    private var lastAudioHealthLog = Date.distantPast
     private var lastPersistAt = Date.distantPast
 
     private var positionTimer: Timer?
     private var started = false
+    /// The output stream must exist before a restored track is loaded into the
+    /// engine. Keeping the startup task lets each load await that one boot
+    /// instead of racing it on a second detached task.
+    private var engineStartupTask: Task<Void, Error>?
     /// Incremented on every user-initiated load so in-flight resolves/downloads
     /// from a previous tap cannot `loadTrack`/`queueNext` into the new song.
     private var playGeneration: UInt64 = 0
+    /// Invalidates an in-flight audio-session reactivation when another
+    /// transport command arrives before it finishes.
+    private var resumeGeneration: UInt64 = 0
     private let nowPlaying = NowPlayingController()
     private let widgetPublisher = WidgetStatePublisher()
     private let headTracker = HeadTracker()
@@ -326,13 +396,23 @@ final class PlaybackController {
         let spatial = PlatformSettings.shared.getBoolean(key: "spatial_audio", default: false)
         let skip = PlatformSettings.shared.getBoolean(key: "skip_silence", default: false)
         let speed = PlatformSettings.shared.getFloat(key: "playback_speed", default: 1)
-        let eq = EqualizerView.load().map { Float($0) }
-        Task.detached(priority: .utility) {
+        let eq = Self.currentEqTuning()
+        engineStartupTask = Task.detached(priority: .utility) { [weak self] in
             do {
                 // The session has to be up before the output stream exists, and
                 // the iOS session owns the hardware format — so this is awaited,
                 // and its answer is what the engine is told to open at.
                 let format = await AudioSessionManager.activate()
+                // Configure device choice and sample format before opening the
+                // stream. Applying them just after start caused a second output
+                // build while the first track could already be playing.
+                try eng.setOutputPcmMode(mode: Self.migrateOutputPcmMode())
+                try eng.setPreferUsbDac(
+                    enabled: PlatformSettings.shared.getBoolean(key: "prefer_usb_dac", default: false)
+                )
+                eng.setAutomixPerformance(
+                    mode: PlatformSettings.shared.getString(key: "automix_performance", default: "BALANCED")
+                )
                 try eng.start(
                     rate: format?.rate,
                     channels: format?.channels
@@ -341,12 +421,27 @@ final class PlaybackController {
                 try eng.setSpatialEnabled(enabled: spatial)
                 try eng.setSkipSilence(enabled: skip)
                 try eng.setPlaybackSpeed(speed: speed)
-                try eng.setEqGains(gainsDb: eq)
+                try eng.setEqTuning(
+                    enabled: eq.enabled,
+                    gainsDb: eq.gains,
+                    qs: eq.qs,
+                    balance: eq.balance
+                )
+                try eng.setLoudnessEnabled(
+                    enabled: PlatformSettings.shared.getBoolean(key: "loudness_normalization", default: true)
+                )
                 if spatial {
-                    await MainActor.run { self.headTracker.start(engine: eng) }
+                    await MainActor.run { [weak self] in self?.headTracker.start(engine: eng) }
                 }
             } catch {
-                await MainActor.run { self.lastError = "Audio engine failed to start: \(error)" }
+                await MainActor.run { [weak self] in
+                    guard let self else { return }
+                    self.started = false
+                    self.positionTimer?.invalidate()
+                    self.positionTimer = nil
+                    self.lastError = "Audio engine failed to start: \(error)"
+                }
+                throw error
             }
         }
         positionTimer = Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { [weak self] _ in
@@ -356,6 +451,18 @@ final class PlaybackController {
                 guard self.state == .playing else { return }
                 self.position = self.engine.positionSeconds()
                 self.nowPlaying.update(position: self.position)
+                let now = Date()
+                if now < self.audioHealthLogUntil, now.timeIntervalSince(self.lastAudioHealthLog) >= 5 {
+                    self.lastAudioHealthLog = now
+                    let health = self.engine.outputHealth()
+                    // `peak` is what actually left the device callback: a
+                    // non-zero peak with no audible sound points at the route /
+                    // session, while a zero peak points at the mix itself.
+                    NSLog("[BitChord] output position=%.2f buffer=%llu underruns=%llu rebuilds=%llu xruns=%llu volume=%.2f peak=%.4f",
+                          self.position, health.bufferedFrames, health.callbackUnderruns,
+                          health.outputRebuilds, health.outputXruns, self.volume,
+                          health.outputPeak)
+                }
                 self.tickSleep()
                 self.tickScrobble()
                 self.tickHistory()
@@ -368,10 +475,22 @@ final class PlaybackController {
         }
     }
 
+    /// A running output can survive in the background while iOS temporarily
+    /// deactivates its audio session. Reassert playback activation on return
+    /// when there is an active or resumable track; leave an idle app alone.
+    func reactivateAudioSessionAfterForeground() {
+        guard started,
+              state == .playing || (state == .paused && engineLoadedId != nil)
+        else { return }
+        Task.detached(priority: .userInitiated) {
+            _ = await AudioSessionManager.activate()
+        }
+    }
+
     // ---- Queue operations ---------------------------------------------------
 
     /// Plays `entries`, starting at `index`. Replaces the queue.
-    func play(_ entries: [QueueEntry], at index: Int = 0) {
+    func play(_ entries: [QueueEntry], at index: Int = 0, context: String? = nil) {
         noteLocalIntent()
         guard entries.indices.contains(index) else { return }
         let entry = entries[index]
@@ -388,6 +507,7 @@ final class PlaybackController {
             return
         }
         queue = entries
+        playbackContext = context
         unshuffledQueue = nil
         shuffleEnabled = false
         restoredStart = nil
@@ -443,7 +563,9 @@ final class PlaybackController {
         Task { await StreamFileCache.shared.forget(videoId: id) }
         QualityUpgrade.forget(id)
         debugLog.record("reverted to YouTube's own upload", about: id)
-        restartCurrent(keepingPosition: true)
+        // Aligned only when version alignment is on: with it off no alignment
+        // is attempted, so the reverted cut starts from the top.
+        restartCurrent(keepingPosition: smartVersionAlignment)
     }
 
     /// Releases the hold and asks again, by hand, for a better copy.
@@ -457,7 +579,7 @@ final class PlaybackController {
         OriginalVersion.shared.unpin(videoId: id)
         QualityUpgrade.askByHand(id)
         debugLog.record("asked again for a better copy", about: id)
-        restartCurrent(keepingPosition: true)
+        restartCurrent(keepingPosition: smartVersionAlignment)
     }
 
     /// Reloads the playing entry so a new pin takes effect now rather than the
@@ -477,9 +599,11 @@ final class PlaybackController {
     /// observed: a panel that has to be told the device changed would be a
     /// panel nobody trusts.
     var outputDevice: OutputDeviceRec { engine.outputDevice() }
+    var outputHealth: OutputHealthRec { engine.outputHealth() }
 
     func persistSession() {
         guard !queue.isEmpty, queue.indices.contains(playingIndex) else { return }
+        PlatformSettings.shared.putString(key: "last_playback_context", value: playbackContext ?? "")
         var tracks = queue
         if duration > 0, tracks.indices.contains(playingIndex) {
             tracks[playingIndex].durationText = QueueEntry.formatDuration(duration)
@@ -496,6 +620,8 @@ final class PlaybackController {
 
     func restoreSession() {
         guard let snap = LastPlayed.load() else { return }
+        let savedContext = PlatformSettings.shared.getString(key: "last_playback_context", default: "")
+        playbackContext = savedContext.isEmpty ? nil : savedContext
         queue = snap.tracks
         playingIndex = snap.index
         current = queue[snap.index]
@@ -532,8 +658,8 @@ final class PlaybackController {
     }
 
     /// Upstream `playRadio`: seed plus related mix via `next` + QueueBuilder.
-    func playRadio(_ entry: QueueEntry) {
-        play([entry], at: 0)
+    func playRadio(_ entry: QueueEntry, context: String? = nil) {
+        play([entry], at: 0, context: context)
         maybeAutoplay(force: true)
     }
 
@@ -638,14 +764,35 @@ final class PlaybackController {
             return
         }
         if isPlaying {
+            resumeGeneration &+= 1
             // Flip the control immediately — the engine also silences the
             // device callback before the mixer thread runs Pause.
             state = .paused
             try? engine.pause()
             persistSession()
         } else {
-            state = .playing
-            try? engine.play()
+            // The session may have been interrupted or deactivated while this
+            // loaded track was paused. Reactivate it off the main thread before
+            // releasing the output callback; a cold restored track takes the
+            // load path above, which already waits for activation before open.
+            resumeGeneration &+= 1
+            let generation = resumeGeneration
+            let engine = self.engine
+            Task.detached(priority: .userInitiated) { [weak self] in
+                _ = await AudioSessionManager.activate()
+                await MainActor.run { [weak self] in
+                    guard let self,
+                          self.resumeGeneration == generation,
+                          self.current?.id == self.engineLoadedId
+                    else { return }
+                    do {
+                        try engine.play()
+                        self.state = .playing
+                    } catch {
+                        self.lastError = "Audio output could not resume: \(error)"
+                    }
+                }
+            }
         }
     }
 
@@ -755,8 +902,141 @@ final class PlaybackController {
         try? engine.setSkipSilence(enabled: enabled)
     }
 
-    func updateEq(_ gains: [Float]) {
-        try? engine.setEqGains(gainsDb: gains)
+    /// Inference threads for the Automix analysis tier: 1 / 2 / 4, upstream's
+    /// own numbers for EFFICIENT / BALANCED / PERFORMANCE.
+    var automixInferenceThreads: Int {
+        switch automixPerformanceMode {
+        case "EFFICIENT": return 1
+        case "PERFORMANCE": return 4
+        default: return 2
+        }
+    }
+
+    func updateOutputPcmMode(_ mode: String) {
+        let valid = Self.migrateOutputPcmMode(mode)
+        outputPcmMode = valid
+        // PlatformSettings directly: the typed shared setter only exists in
+        // source until the shared framework is rebuilt (see AppSettings.kt).
+        PlatformSettings.shared.putString(key: "output_pcm_mode", value: valid)
+        try? engine.setOutputPcmMode(mode: valid)
+    }
+
+    /// The stored PCM mode with the removed rung migrated away.
+    ///
+    /// Upstream's enum never had PCM_24 (Media3's sink has no packed-24 path);
+    /// the three-way picker did. Anything stored from then maps to the
+    /// lossless path rather than the lossy one.
+    nonisolated static func migrateOutputPcmMode(_ mode: String? = nil) -> String {
+        #if os(iOS)
+        // iOS CoreAudio RemoteIO operates exclusively with 32-bit float streams.
+        // Normalize any persisted legacy value so all layers agree.
+        let currentStored = PlatformSettings.shared.getString(key: "output_pcm_mode", default: "FLOAT_32")
+        if currentStored != "FLOAT_32" {
+            PlatformSettings.shared.putString(key: "output_pcm_mode", value: "FLOAT_32")
+        }
+        return "FLOAT_32"
+        #else
+        let stored = mode ?? PlatformSettings.shared.getString(key: "output_pcm_mode", default: "FLOAT_32")
+        let migrated: String
+        switch stored {
+        case "FLOAT_32", "PCM_24": migrated = "FLOAT_32"
+        default: migrated = "FLOAT_32"
+        }
+        // A stored PCM_24 or legacy default is rewritten once, here, so every later read —
+        // the picker, the engine sync, the pipeline readout — agrees.
+        if migrated != stored, mode == nil {
+            PlatformSettings.shared.putString(key: "output_pcm_mode", value: migrated)
+        }
+        return migrated
+        #endif
+    }
+
+    func updatePreferUsbDac(_ enabled: Bool) {
+        preferUsbDac = enabled
+        PlatformSettings.shared.putBoolean(key: "prefer_usb_dac", value: enabled)
+        try? engine.setPreferUsbDac(enabled: enabled)
+    }
+
+    func updateLoudnessNormalization(_ enabled: Bool) {
+        loudnessNormalization = enabled
+        PlatformSettings.shared.putBoolean(key: "loudness_normalization", value: enabled)
+        try? engine.setLoudnessEnabled(enabled: enabled)
+    }
+
+    func setAutomixPerformanceMode(_ mode: String) {
+        let valid = mode == "EFFICIENT" || mode == "PERFORMANCE" ? mode : "BALANCED"
+        automixPerformanceMode = valid
+        PlatformSettings.shared.putString(key: "automix_performance", value: valid)
+        engine.setAutomixPerformance(mode: valid)
+    }
+
+    func setSmartVersionAlignment(_ enabled: Bool) {
+        smartVersionAlignment = enabled
+        PlatformSettings.shared.putBoolean(key: "smart_version_alignment", value: enabled)
+    }
+
+    func updateHideSongStatus(_ hidden: Bool) {
+        hideSongStatus = hidden
+        PlatformSettings.shared.putBoolean(key: "hide_song_status", value: hidden)
+    }
+
+    func updatePreferMusicOnly(_ enabled: Bool) {
+        preferMusicOnly = enabled
+        PlatformSettings.shared.putBoolean(key: "prefer_music_only", value: enabled)
+    }
+
+    func updateScrobblePrimaryArtist(_ mode: String) {
+        let valid = mode == "album" ? "album" : "track"
+        scrobblePrimaryArtist = valid
+        PlatformSettings.shared.putString(key: "scrobble_primary_artist", value: valid)
+    }
+
+    /// The artist a scrobble credits for `entry`.
+    ///
+    /// "track" sends the full credit as the catalogue gave it. "album" sends
+    /// the lead name alone — upstream `PrimaryArtist`, which splits on ",",
+    /// "&" and "＆" and takes the first part, so "A, B & C" scrobbles as "A".
+    func scrobbleArtist(for entry: QueueEntry) -> String {
+        guard scrobblePrimaryArtist == "album" else { return entry.artist }
+        let commaFirst = entry.artist.components(separatedBy: ",").first ?? entry.artist
+        let ampSplit = commaFirst.components(separatedBy: " & ").first ?? commaFirst
+        let fullWidthSplit = ampSplit.components(separatedBy: " ＆ ").first ?? ampSplit
+        let lead = fullWidthSplit.trimmingCharacters(in: .whitespaces)
+        return lead.isEmpty ? entry.artist : lead
+    }
+
+    /// Renders the equaliser settings into the ten-slot curve and hands it to
+    /// the engine (upstream `PlaybackService.applyEqualizer`). The make-up
+    /// preamp is computed inside the engine, never here.
+    func applyEqualizer() {
+        let tuning = Self.currentEqTuning()
+        try? engine.setEqTuning(
+            enabled: tuning.enabled,
+            gainsDb: tuning.gains,
+            qs: tuning.qs,
+            balance: tuning.balance
+        )
+    }
+
+    /// The equaliser settings as the engine's ten-slot tuning. Reads only
+    /// `PlatformSettings`, so it is safe from the engine-startup task.
+    nonisolated static func currentEqTuning() -> (enabled: Bool, gains: [Float], qs: [Float], balance: Float) {
+        let enabled = PlatformSettings.shared.getBoolean(key: "equalizer_enabled", default: false)
+        let dynamic = PlatformSettings.shared.getString(key: "equalizer_mode", default: "Dynamic") == "Dynamic"
+        let bands = EqualizerTuning.loadBands()
+        let toneX = Int(PlatformSettings.shared.getInt(key: "equalizer_tone_x", default: 0))
+        let toneY = Int(PlatformSettings.shared.getInt(key: "equalizer_tone_y", default: 0))
+        let focused = PlatformSettings.shared.getBoolean(key: "equalizer_focused", default: false)
+        let balance = PlatformSettings.shared.getFloat(key: "equalizer_balance", default: 0)
+        let curve = dynamic
+            ? EqualizerTuning.toneCurve(x: toneX, y: toneY, focused: focused)
+            : EqualizerTuning.manualCurve(bands)
+        return (
+            enabled: enabled,
+            gains: curve.gains.map { Float($0) },
+            qs: curve.qs.map { Float($0) },
+            balance: balance
+        )
     }
 
     func startSleep(minutes: Int) {
@@ -774,9 +1054,9 @@ final class PlaybackController {
         sleepAfterTrack = false
     }
 
-    func downloadCurrent() {
-        guard let current else { return }
-        DownloadStore.shared.download(current)
+    func downloadCurrent() -> DownloadStore.RequestResult? {
+        guard let current else { return nil }
+        return DownloadStore.shared.download(current)
     }
 
     func playQueueItem(at index: Int) {
@@ -832,6 +1112,8 @@ final class PlaybackController {
 
     private func loadCurrent(_ index: Int, startAt: Double? = nil) {
         guard queue.indices.contains(index) else { return }
+        startEngineIfNeeded()
+        let engineStartupTask = self.engineStartupTask
         let entry = queue[index]
         if current?.id == entry.id, playingIndex == index, engineLoadedId == entry.id,
            state == .buffering || state == .playing {
@@ -849,6 +1131,11 @@ final class PlaybackController {
         analysisConfidence = nil
         let wasAudible = state == .playing || (state == .paused && engineLoadedId != nil)
         let previousPath = current?.isLocal == true ? current?.source : nil
+        let previousText = current?.itemText ?? ""
+        let previousEntry = current
+        // An album genuinely being played through in order (not shuffled) earns
+        // a gapless handoff; a manual selection or shuffle is a mix.
+        let albumSequential = !shuffleEnabled && (previousEntry?.sameAlbum(as: entry) ?? false)
         playingIndex = index
         current = entry
         let outgoingPosition = position
@@ -875,6 +1162,11 @@ final class PlaybackController {
         let resume = startAt ?? 0
         Task.detached(priority: .utility) {
             do {
+                // In particular, after a cold restore the output task and the
+                // track resolver used to race. A quick local/cache resolve
+                // could send LoadTrack before the engine had an output stream;
+                // the UI then had lyrics and a playing state without audio.
+                try await engineStartupTask?.value
                 let outcome = try await Self.resolveSource(entry, prefs: prefs)
                 let stillCurrent = await MainActor.run { [weak self] in
                     self?.playGeneration == generation
@@ -891,10 +1183,21 @@ final class PlaybackController {
                     plan = engine.planAutomix(
                         outgoingPath: previousPath,
                         incomingPath: resolved.source,
+                        outgoingText: previousText,
+                        incomingText: entry.itemText,
+                        albumSequential: albumSequential,
                         crossfadeSeconds: fade
                     )
                     start = plan?.cueSeconds ?? 0
                 }
+                // The output unit was built at launch, when `startEngineIfNeeded`
+                // activated the session. A track that starts minutes later can
+                // find that session deactivated again — an interruption, a route
+                // change, a foreground/background cycle — while the unit keeps
+                // running and silently swallowing the mix. Reassert activation
+                // before the first buffer. Cheap and idempotent when the session
+                // is already what it should be.
+                _ = await AudioSessionManager.activate()
                 let info = try engine.loadTrack(request: LoadRequest(
                     source: resolved.source,
                     title: entry.title,
@@ -902,10 +1205,12 @@ final class PlaybackController {
                     startSeconds: start,
                     plan: plan,
                     headers: resolved.headers,
-                    claimedKbps: Swift.UInt32(resolved.kbps)
+                    claimedKbps: Swift.UInt32(resolved.kbps),
+                    loudnessDb: resolved.loudnessDb
                 ))
                 await MainActor.run { [weak self] in
                     guard let self, self.playGeneration == generation else { return }
+                    self.currentLoudnessDb = resolved.loudnessDb
                     self.loadDidSucceed(entry: entry, index: index, info: info, startAt: resume)
                 }
             } catch {
@@ -937,6 +1242,10 @@ final class PlaybackController {
         let kbps: Int
         var lossless: Bool = false
         var durationSec: Int? = nil
+        /// Player-response loudness figure (YouTube only; substitutes, cache
+        /// hits and local files carry none). Rides to the engine's
+        /// normalization stage with the load.
+        var loudnessDb: Double? = nil
         var origin: Origin = .other
 
         enum Origin: Sendable { case local, cache, youtube, substitute, other }
@@ -966,16 +1275,18 @@ final class PlaybackController {
         let wantLossless: Bool
         let jiosaavn: Bool
         let canSubstitute: Bool
+        let preferMusicOnly: Bool
 
         @MainActor
         static func current() -> ResolvePrefs {
-            let quality = PlatformSettings.shared.getString(key: "download_quality", default: "LOSSLESS")
-            let wifi = PlatformSettings.shared.getString(key: "audio_quality_wifi", default: "HIGH")
+            let qualityKey = NetworkQuality.shared.metered ? "audio_quality_cellular" : "audio_quality_wifi"
+            let streamQuality = PlatformSettings.shared.getString(key: qualityKey, default: "LOSSLESS")
             return ResolvePrefs(
                 maxKbps: Int(NetworkQuality.shared.maxKbps),
-                wantLossless: quality == "LOSSLESS" || wifi == "HIGH",
+                wantLossless: streamQuality == "LOSSLESS",
                 jiosaavn: PlatformSettings.shared.getBoolean(key: "jiosaavn_enabled", default: true),
-                canSubstitute: QualityUpgrade.canSubstituteForYouTube()
+                canSubstitute: QualityUpgrade.canSubstituteForYouTube(),
+                preferMusicOnly: PlatformSettings.shared.getBoolean(key: "prefer_music_only", default: false)
             )
         }
     }
@@ -1043,6 +1354,32 @@ final class PlaybackController {
         }
         let fallback = Task<ResolvedSource?, Never> {
             try? await Self.resolveYouTube(videoId: videoId, prefs: prefs)
+        }
+
+        // Prefer-music-only for a music video: the video's own upload is the
+        // wrong answer when the catalogue audio was asked for, so the race is
+        // not run at all — the substitute lookup is awaited, and YouTube's
+        // upload is only the fallback when the lookup misses. Upstream does the
+        // same switch after the fact (`switchToMusicOnly`); here the wait
+        // happens before anything starts, so the video never plays first.
+        if prefs.preferMusicOnly, entry.isVideo {
+            if let stream = await lookup.value {
+                fallback.cancel()
+                return ResolveOutcome(
+                    source: ResolvedSource(
+                        source: stream.url, headers: stream.headers,
+                        kbps: stream.format.kbps ?? 0,
+                        lossless: stream.format.lossless,
+                        durationSec: stream.durationSec,
+                        origin: .substitute
+                    ),
+                    leftover: nil
+                )
+            }
+            if let yt = await fallback.value {
+                return ResolveOutcome(source: yt, leftover: nil)
+            }
+            throw InnertubeStreamResolver.StreamError(message: "No stream")
         }
 
         enum Leg { case lookup(QualityUpgrade.Candidate?); case fallback(ResolvedSource?) }
@@ -1146,7 +1483,8 @@ final class PlaybackController {
             let localPath = try await streamViaKtor(
                 videoId: videoId, url: stream.url, headers: stream.headers)
             return ResolvedSource(
-                source: localPath, headers: [:], kbps: stream.kbps, origin: .youtube
+                source: localPath, headers: [:], kbps: stream.kbps,
+                loudnessDb: stream.loudnessDb, origin: .youtube
             )
         } catch {
             let reason = (error as? InnertubeStreamResolver.StreamError)?.message
@@ -1164,7 +1502,8 @@ final class PlaybackController {
                     let localPath = try await streamViaKtor(
                         videoId: videoId, url: fresh.url, headers: fresh.headers)
                     return ResolvedSource(
-                        source: localPath, headers: [:], kbps: fresh.kbps, origin: .youtube
+                        source: localPath, headers: [:], kbps: fresh.kbps,
+                        loudnessDb: fresh.loudnessDb, origin: .youtube
                     )
                 } catch {
                     // Refused again, or never served. Say so rather than handing
@@ -1177,7 +1516,8 @@ final class PlaybackController {
             }
             DebugLog.shared.d(message: "\(videoId): stream failed: \(reason ?? "\(error)")")
             return ResolvedSource(
-                source: stream.url, headers: stream.headers, kbps: stream.kbps, origin: .youtube
+                source: stream.url, headers: stream.headers, kbps: stream.kbps,
+                loudnessDb: stream.loudnessDb, origin: .youtube
             )
         }
     }
@@ -1287,6 +1627,9 @@ final class PlaybackController {
     }
 
     private func loadDidSucceed(entry: QueueEntry, index: Int, info: TrackInfoRec, startAt: Double = 0) {
+        audioHealthLogUntil = Date().addingTimeInterval(30)
+        lastAudioHealthLog = .distantPast
+        NSLog("[BitChord] loaded track at %.2fs (duration %.2fs)", startAt, info.durationSeconds)
         playingIndex = index
         current = entry
         engineLoadedId = entry.id
@@ -1307,7 +1650,7 @@ final class PlaybackController {
         }
         publishPresence()
         ScrobbleBridge.shared.nowPlaying(
-            artist: entry.artist, title: entry.title, album: entry.albumName,
+            artist: scrobbleArtist(for: entry), title: entry.title, album: entry.albumName,
             durationSec: Swift.Int32(info.durationSeconds), positionMs: Swift.Int64(0)
         )
         nowPlaying.update(
@@ -1349,7 +1692,8 @@ final class PlaybackController {
     private func syncEngineQueueNext() {
         if repeatMode == .one {
             try? engine.queueNext(request: LoadRequest(
-                source: "", title: "", artist: "", startSeconds: 0, plan: nil, headers: [:], claimedKbps: 0
+                source: "", title: "", artist: "", startSeconds: 0, plan: nil,
+                headers: [:], claimedKbps: 0, loudnessDb: nil
             ))
             return
         }
@@ -1363,6 +1707,9 @@ final class PlaybackController {
         let engine = self.engine
         let automix = automixEnabled
         let currentSource = current?.source ?? ""
+        let currentText = current?.itemText ?? ""
+        let nextText = next.itemText
+        let albumSequential = !shuffleEnabled && (current?.sameAlbum(as: next) ?? false)
         let prefs = ResolvePrefs.current()
         Task.detached(priority: .utility) {
             do {
@@ -1384,6 +1731,9 @@ final class PlaybackController {
                     plan = engine.planAutomix(
                         outgoingPath: currentSource,
                         incomingPath: resolved.source,
+                        outgoingText: currentText,
+                        incomingText: nextText,
+                        albumSequential: albumSequential,
                         crossfadeSeconds: fade
                     )
                     start = plan?.cueSeconds ?? 0
@@ -1395,7 +1745,8 @@ final class PlaybackController {
                     startSeconds: start,
                     plan: plan,
                     headers: resolved.headers,
-                    claimedKbps: Swift.UInt32(resolved.kbps)
+                    claimedKbps: Swift.UInt32(resolved.kbps),
+                    loudnessDb: resolved.loudnessDb
                 ))
                 if let plan {
                     await MainActor.run { [weak self] in
@@ -1476,7 +1827,7 @@ final class PlaybackController {
         }
         if let current, !scrobbleSent {
             ScrobbleBridge.shared.scrobble(
-                artist: current.artist, title: current.title, album: current.albumName,
+                artist: scrobbleArtist(for: current), title: current.title, album: current.albumName,
                 durationSec: Swift.Int32(duration)
             )
             scrobbleSent = true
@@ -1562,20 +1913,72 @@ final class PlaybackController {
         )
     }
 
+    /// Re-read the feature/network preferences and run the same lookup used
+    /// when a track starts. Settings surfaces call this after changing a
+    /// canvas preference.
+    func refreshCanvasLookup() {
+        guard let current else { return }
+        fetchCanvas(for: current)
+    }
+
     private func fetchCanvas(for entry: QueueEntry) {
-        canvasURL = nil
-        canvasFallbackURL = nil
-        guard NetworkQuality.shared.canvasAllowed, !entry.isLocal else { return }
+        let titleKey = entry.title.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let artistKey = entry.artist.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let identity = "\(titleKey)|\(artistKey)"
+        if canvasIdentity != identity {
+            canvasURL = nil
+            canvasFallbackURL = nil
+            canvasSource = nil
+            canvasIdentity = identity
+        }
+        canvasLookupGeneration &+= 1
+        let generation = canvasLookupGeneration
+        guard NetworkQuality.shared.canvasAllowed,
+              // A catalogue track can have a local downloaded file while
+              // retaining its catalogue id. A true library file uses its
+              // path as both id and source and has no catalogue lookup.
+              !(entry.isLocal && entry.id == entry.source) else {
+            canvasURL = nil
+            canvasFallbackURL = nil
+            canvasSource = nil
+            return
+        }
         CanvasBridge.shared.lookup(title: entry.title, artist: entry.artist, album: entry.albumName, callback: CanvasAdapter { [weak self] json in
             Task { @MainActor in
-                guard let self, self.current?.id == entry.id, let json,
-                      let data = json.data(using: .utf8),
+                guard let self, self.canvasLookupGeneration == generation,
+                      let active = self.current,
+                      active.title.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == titleKey,
+                      active.artist.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == artistKey,
+                      let json, let data = json.data(using: .utf8),
                       let payload = try? JSONDecoder().decode(CanvasPayload.self, from: data),
                       let url = URL(string: payload.url) else { return }
                 self.canvasURL = url
                 self.canvasFallbackURL = payload.fallbackUrl.flatMap(URL.init(string:))
+                self.canvasSource = payload.source
             }
         })
+        if entry.albumName == nil {
+            Task { @MainActor [weak self] in
+                try? await Task.sleep(for: .milliseconds(350))
+                guard let self, self.canvasLookupGeneration == generation,
+                      let latest = self.current, latest.id == entry.id,
+                      let album = latest.albumName else { return }
+                self.canvasLookupGeneration &+= 1
+                let retryGeneration = self.canvasLookupGeneration
+                CanvasBridge.shared.lookup(title: latest.title, artist: latest.artist, album: album, callback: CanvasAdapter { [weak self] json in
+                    Task { @MainActor in
+                        guard let self, self.canvasLookupGeneration == retryGeneration,
+                              self.current?.id == latest.id, let json,
+                              let data = json.data(using: .utf8),
+                              let payload = try? JSONDecoder().decode(CanvasPayload.self, from: data),
+                              let url = URL(string: payload.url) else { return }
+                        self.canvasURL = url
+                        self.canvasFallbackURL = payload.fallbackUrl.flatMap(URL.init(string:))
+                        self.canvasSource = payload.source
+                    }
+                })
+            }
+        }
     }
 
     private struct CanvasPayload: Codable {
@@ -1615,7 +2018,7 @@ final class PlaybackController {
         }
         if scrobbleArmed, !scrobbleSent, position >= threshold {
             ScrobbleBridge.shared.scrobble(
-                artist: current.artist, title: current.title, album: current.albumName,
+                artist: scrobbleArtist(for: current), title: current.title, album: current.albumName,
                 durationSec: Swift.Int32(duration)
             )
             scrobbleSent = true
@@ -1937,40 +2340,66 @@ final class PlaybackController {
             log.record("upgrade audition failed", about: mediaId)
             return
         }
-        let again = await MainActor.run { () -> (Double, Bool)? in
+        let again = await MainActor.run { () -> (Double, Bool, Double?)? in
             guard self.playGeneration == generation, self.current?.id == mediaId else { return nil }
             if self.smartMixInProgress { return nil }
-            return (self.position, self.isPlaying)
+            return (self.position, self.isPlaying, self.currentLoudnessDb)
         }
-        guard let (nowPos, playing) = again else {
+        guard let (nowPos, playing, loudnessDb) = again else {
             QualityUpgrade.shelve(mediaId, stream: stream)
             log.record("upgrade proved but the queue moved on; shelved", about: mediaId)
             return
         }
         do {
-            let info = try engine.loadTrack(request: LoadRequest(
-                source: path,
-                title: entry.title,
-                artist: entry.artist,
-                startSeconds: nowPos,
-                plan: nil,
-                headers: stream.headers,
-                claimedKbps: Swift.UInt32(stream.format.kbps ?? 0)
-            ))
+            // Same track, better source: the engine opens the replacement and
+            // equal-power crossfades into it *in place* (upstream
+            // `swapCurrentToVersion`) instead of reloading the track. A reload
+            // stops the voice, opens the file and seeks — which is heard as a
+            // hole in the song — and it cannot align the two copies, so even a
+            // fade would double the vocal.
+            //
+            // `startSeconds` is ignored on this path on purpose: the caller
+            // only knows the audible playhead, which trails the decoder by the
+            // whole output ring, and the engine is the only side that knows
+            // where the samples it is about to replace actually are.
+            let info = try engine.swapSource(
+                request: LoadRequest(
+                    source: path,
+                    title: entry.title,
+                    artist: entry.artist,
+                    startSeconds: nowPos,
+                    plan: nil,
+                    headers: stream.headers,
+                    claimedKbps: Swift.UInt32(stream.format.kbps ?? 0),
+                    // Same recording, new file: the figure belongs to the track,
+                    // not the URL, so the upgrade keeps the current correction
+                    // instead of dropping to unity mid-song.
+                    loudnessDb: loudnessDb
+                ),
+                crossfadeSeconds: QualityUpgrade.swapCrossfadeSeconds
+            )
             await MainActor.run {
                 guard self.playGeneration == generation, self.current?.id == mediaId else { return }
                 QualityUpgrade.unshelve(mediaId)
                 self.engineLoadedId = entry.id
                 self.duration = info.durationSeconds
+                // The playhead is continuous across a swap; the engine keeps it.
                 self.position = nowPos
                 self.nerd = engine.nerdStats()
                 self.racingLossless = false
                 if playing { self.state = .playing }
                 log.record(
-                    "upgraded to \(stream.format.summary) at \(Int(nowPos * 1000))ms",
+                    "upgraded to \(stream.format.summary) in place at \(Int(nowPos * 1000))ms",
                     about: mediaId
                 )
             }
+        } catch EngineError.LoadFailed(let message)
+            where message.contains("transition is already running") {
+            // A crossfade reached the engine before the swap did. That is a
+            // race, not a verdict — keep the candidate and try again instead of
+            // writing the track off.
+            QualityUpgrade.shelve(mediaId, stream: stream)
+            log.record("upgrade deferred: \(message)", about: mediaId)
         } catch {
             QualityUpgrade.refuseUpgrades(mediaId)
             QualityUpgrade.forget(mediaId)

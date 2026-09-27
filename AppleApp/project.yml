@@ -73,6 +73,16 @@ targets:
             CFBundleURLSchemes: [bitchord]
         UIBackgroundModes:
           - audio
+        UISupportedInterfaceOrientations:
+          - UIInterfaceOrientationPortrait
+          - UIInterfaceOrientationPortraitUpsideDown
+          - UIInterfaceOrientationLandscapeLeft
+          - UIInterfaceOrientationLandscapeRight
+        UISupportedInterfaceOrientations~ipad:
+          - UIInterfaceOrientationPortrait
+          - UIInterfaceOrientationPortraitUpsideDown
+          - UIInterfaceOrientationLandscapeLeft
+          - UIInterfaceOrientationLandscapeRight
         UILaunchScreen: {}
         NSMotionUsageDescription: BitChord uses headphone motion to keep spatial audio anchored when you turn your head.
     entitlements:

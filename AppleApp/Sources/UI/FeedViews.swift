@@ -62,6 +62,47 @@ final class FeedLoader {
     }
 }
 
+/// Shared shelf heading: bold headline over a subtitle, with an optional
+/// "Show all" chevron link. One shape for Home, Explore and Library so the
+/// headings line up across tabs. `onShowAll` is only ever set on Library,
+/// whose rows stop at five cards rather than running the shelf's whole
+/// length — Home and Explore never pass it.
+struct FeedSectionHeader: View {
+    let title: String
+    var subtitle: String? = nil
+    var onShowAll: (() -> Void)? = nil
+
+    var body: some View {
+        HStack(alignment: .center) {
+            VStack(alignment: .leading, spacing: 2) {
+                Text(title)
+                    .font(.headline)
+                    .lineLimit(2)
+                if let subtitle, !subtitle.isEmpty {
+                    Text(subtitle)
+                        .font(.subheadline)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                }
+            }
+            Spacer(minLength: 8)
+            if let onShowAll {
+                Button(action: onShowAll) {
+                    HStack(spacing: 2) {
+                        Text("Show all")
+                        Image(systemName: "chevron.right")
+                            .font(.caption.weight(.semibold))
+                    }
+                    .font(.callout)
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(.tint)
+                .accessibilityLabel("Show all \(title)")
+            }
+        }
+    }
+}
+
 /// Upstream's shelf carousel: bold heading over a horizontal run of cards.
 /// Cards are tappable — a track card plays immediately, an album/playlist/artist
 /// card navigates to its detail page (spec parity with upstream's two-row cards).
@@ -70,12 +111,12 @@ struct ShelfCarousel: View {
     /// Flips which end of a card that has *both* ids wins. See
     /// [ShelfCardView] for why the two orders are not interchangeable.
     var preferTrack: Bool = false
+    var onShowAll: (() -> Void)? = nil
     @Environment(PlaybackController.self) private var controller
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
-            Text(shelf.title)
-                .font(.title3.weight(.bold))
+            FeedSectionHeader(title: shelf.title, subtitle: shelf.subtitle, onShowAll: onShowAll)
             ScrollView(.horizontal, showsIndicators: false) {
                 LazyHStack(alignment: .top, spacing: 14) {
                     ForEach(shelf.items) { card in
@@ -101,6 +142,13 @@ struct ShelfCardView: View {
     /// it is the more specific thing the listener aimed at, since the category
     /// page is a list of things to *start*, not things to read.
     var preferTrack: Bool = false
+
+    /// Whether this card's collection is in `pinned_playlists`. Read live so a
+    /// pin toggled from a detail page or menu shows without a feed reload.
+    private var isPinned: Bool {
+        guard let browseId = card.browseId, !browseId.isEmpty else { return false }
+        return PlaylistPinning.pinnedIds().contains(browseId)
+    }
 
     var body: some View {
         Group {
@@ -140,9 +188,20 @@ struct ShelfCardView: View {
 
     private var cardContent: some View {
         VStack(alignment: .leading, spacing: 8) {
-            ArtworkView(url: card.thumbnailUrl, data: nil, side: 160)
-                .clipShape(.rect(cornerRadius: 10, style: .continuous))
-                .shadow(color: .black.opacity(0.15), radius: 5, y: 2)
+            ZStack(alignment: .topTrailing) {
+                ArtworkView(url: card.thumbnailUrl, data: nil, side: 160)
+                    .clipShape(.rect(cornerRadius: 10, style: .continuous))
+                    .shadow(color: .black.opacity(0.15), radius: 5, y: 2)
+                if isPinned {
+                    Image(systemName: "pin.fill")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .padding(6)
+                        .background(.thinMaterial, in: Circle())
+                        .padding(6)
+                        .accessibilityLabel("Pinned")
+                }
+            }
             Text(card.title)
                 .font(.callout.weight(.semibold))
                 .lineLimit(1)

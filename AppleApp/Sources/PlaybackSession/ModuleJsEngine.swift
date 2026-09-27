@@ -327,25 +327,13 @@ final class ModuleJsEngine: NSObject, ModuleEngineImpl {
         pool.lock.unlock()
 
         if claimed {
-            do {
-                let engine = Engine(
-                    moduleId: moduleId, script: pool.script, fetchBase: pool.fetchBase
-                )
-                pool.lock.lock()
-                pool.made.append(engine)
-                pool.lock.unlock()
-                return engine
-            } catch {
-                // The claim is released, or a module whose script fails to
-                // evaluate permanently consumes a pool slot it never joined.
-                pool.lock.lock()
-                pool.started -= 1
-                pool.lock.unlock()
-                DebugLog.shared.d(
-                    message: "module \(moduleId) could not be loaded: \(error.localizedDescription)"
-                )
-                return nil
-            }
+            let engine = Engine(
+                moduleId: moduleId, script: pool.script, fetchBase: pool.fetchBase
+            )
+            pool.lock.lock()
+            pool.made.append(engine)
+            pool.lock.unlock()
+            return engine
         }
         // Every engine is in use. Wait for one rather than refuse: a download
         // queue asking for a second copy of a track is not an error.

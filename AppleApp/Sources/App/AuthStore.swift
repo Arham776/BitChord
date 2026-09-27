@@ -12,18 +12,22 @@ enum AuthStore {
 
     static var cookie: String? {
         get { Keychain.get(account) }
-        set { Keychain.put(account, newValue) }
     }
+
+    @discardableResult
+    static func save(_ cookie: String) -> Bool { Keychain.put(account, cookie) }
 
     /// Whether a cookie exists but cannot be read yet — a device that has not
     /// been unlocked since boot. Distinguishable from "not signed in", and worth
     /// distinguishing: they call for opposite actions.
-    static var isLocked: Bool { Keychain.isLocked(account) }
-
-    /// Drop the session. Used on sign-out and when a cookie is rejected.
-    static func clear() {
-        Keychain.clear(account)
+    static var isLocked: Bool {
+        Keychain.isLocked(account) || Keychain.isLocked("account_sessions")
     }
+
+    /// Drop the legacy mirror before removing the account record at sign-out.
+    /// A failed delete must not masquerade as a durable sign-out.
+    @discardableResult
+    static func clear() -> Bool { Keychain.clear(account) }
 }
 
 /// Wires the shared module's Keychain seam to [Keychain] at launch.

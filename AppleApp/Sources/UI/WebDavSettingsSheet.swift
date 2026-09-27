@@ -28,7 +28,7 @@ struct WebDavSettingsSheet: View {
     /// say so rather than leaving the listener to assume.
     @State private var tested = false
 
-    init(store: WebDavStore = .shared) {
+    @MainActor init() {
         let store = WebDavStore.shared
         _url = State(initialValue: store.url)
         _username = State(initialValue: store.username)

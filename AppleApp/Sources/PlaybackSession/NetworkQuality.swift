@@ -19,9 +19,8 @@ final class NetworkQuality {
 
     var maxKbps: Swift.Int32 {
         let key = metered ? "audio_quality_cellular" : "audio_quality_wifi"
-        switch PlatformSettings.shared.getString(key: key, default: "HIGH") {
+        switch PlatformSettings.shared.getString(key: key, default: "LOSSLESS") {
         case "LOW": return 64
-        case "MEDIUM": return 128
         default: return Swift.Int32.max
         }
     }

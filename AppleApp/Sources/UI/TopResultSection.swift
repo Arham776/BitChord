@@ -9,6 +9,7 @@ import BitChordShared
 /// words, not a continuation of this one.
 struct TopResultSection: View {
     @Environment(PlaybackController.self) private var controller
+    @Environment(AppModel.self) private var appModel
 
     let hit: SearchHitDTO
     let scope: SearchView.Scope
@@ -31,16 +32,28 @@ struct TopResultSection: View {
     }
 
     private var card: some View {
-        HStack(spacing: 16) {
-            artwork
-            details
-            playButton
+        VStack(alignment: .leading, spacing: 14) {
+            HStack(spacing: 14) {
+                artwork
+                details
+                Menu {
+                    menu
+                } label: {
+                    Image(systemName: "ellipsis")
+                        .font(.system(size: 16, weight: .semibold))
+                        .foregroundStyle(.secondary)
+                        .frame(width: 36, height: 36)
+                        .contentShape(.rect)
+                }
+                .buttonStyle(.plain)
+            }
+            actionsRow
         }
         .padding(14)
         .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
         .overlay(
             RoundedRectangle(cornerRadius: 14, style: .continuous)
-                .strokeBorder(.separator, lineWidth: 0.5)
+                .strokeBorder(.separator.opacity(0.5), lineWidth: 0.5)
         )
         .contentShape(Rectangle())
         .onTapGesture(perform: play)
@@ -52,6 +65,7 @@ struct TopResultSection: View {
 
     @ViewBuilder
     private var artwork: some View {
+        let isArtist = hit.browseType?.uppercased() == "ARTIST"
         if let url = hit.thumbnailUrl, !url.isEmpty {
             AsyncImage(url: URL(string: url)) { phase in
                 if let image = phase.image {
@@ -60,16 +74,27 @@ struct TopResultSection: View {
                     artworkPlaceholder
                 }
             }
-            .frame(width: 92, height: 92)
-            .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+            .frame(width: 72, height: 72)
+            .modifier(ArtworkClipModifier(isArtist: isArtist))
         } else {
             artworkPlaceholder
-                .frame(width: 92, height: 92)
+                .frame(width: 72, height: 72)
+        }
+    }
+
+    private struct ArtworkClipModifier: ViewModifier {
+        let isArtist: Bool
+        func body(content: Content) -> some View {
+            if isArtist {
+                content.clipShape(Circle())
+            } else {
+                content.clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+            }
         }
     }
 
     private var artworkPlaceholder: some View {
-        RoundedRectangle(cornerRadius: 8, style: .continuous)
+        RoundedRectangle(cornerRadius: 10, style: .continuous)
             .fill(.quaternary)
             .overlay(
                 Image(systemName: "music.note")
@@ -81,7 +106,7 @@ struct TopResultSection: View {
     private var details: some View {
         VStack(alignment: .leading, spacing: 3) {
             Text(hit.title)
-                .font(.title3.weight(.semibold))
+                .font(.headline.weight(.semibold))
                 .lineLimit(2)
                 .multilineTextAlignment(.leading)
             if let subtitle = hit.subtitle, !subtitle.isEmpty {
@@ -101,16 +126,33 @@ struct TopResultSection: View {
         .frame(maxWidth: .infinity, alignment: .leading)
     }
 
-    private var playButton: some View {
-        Button(action: play) {
-            Image(systemName: "play.fill")
-                .font(.title3)
-                .frame(width: 44, height: 44)
-                .background(.tint, in: Circle())
-                .foregroundStyle(.white)
+    /// Upstream's `TopResultCard` button pair: Play and Add to Playlist.
+    private var actionsRow: some View {
+        HStack(spacing: 10) {
+            Button(action: play) {
+                Label("Play", systemImage: "play.fill")
+                    .font(.callout.weight(.semibold))
+            }
+            .buttonStyle(.bordered)
+            Button {
+                if let videoId = hit.videoId {
+                    RecentSearchStore.record(RecentSearchEntity(
+                        id: videoId, title: hit.title,
+                        subtitle: hit.subtitle ?? "",
+                        artworkUrl: hit.thumbnailUrl,
+                        entityType: "TRACK"
+                    ))
+                    appModel.playlistPicker = PlaylistPickerRequest(
+                        videoId: videoId, title: hit.title
+                    )
+                }
+            } label: {
+                Label("Add to Playlist", systemImage: "text.badge.plus")
+                    .font(.callout.weight(.semibold))
+            }
+            .buttonStyle(.bordered)
+            .disabled(hit.videoId == nil)
         }
-        .buttonStyle(.plain)
-        .help("Play the top result")
     }
 
     @ViewBuilder
@@ -129,6 +171,14 @@ struct TopResultSection: View {
     /// and tapping it should play *that*, the way a link does. A listener who
     /// wants the list presses the first row.
     private func play() {
+        if let videoId = hit.videoId {
+            RecentSearchStore.record(RecentSearchEntity(
+                id: videoId, title: hit.title,
+                subtitle: hit.subtitle ?? "",
+                artworkUrl: hit.thumbnailUrl,
+                entityType: "TRACK"
+            ))
+        }
         controller.playRadio(hit.asEntry())
     }
 }

@@ -18,7 +18,22 @@ struct HomeView: View {
     var body: some View {
         NavigationStack {
             content
-                .navigationTitle("Home")
+                .navigationTitle("Listen Now")
+                .toolbar {
+                    #if os(iOS)
+                    // Match upstream FrostedTopBar's root-page leading mark.
+                    // Keep Home as the large in-feed title while the brand mark
+                    // occupies the top bar's leading position.
+                    ToolbarItem(placement: .topBarLeading) {
+                        Image(.bchLogo)
+                            .resizable()
+                            .scaledToFit()
+                            .frame(width: 28, height: 18)
+                            .accessibilityHidden(true)
+                    }
+                    ToolbarItem(placement: .topBarTrailing) { TopBarAccountButton() }
+                    #endif
+                }
                 .refreshable { await feed.load(force: true, epoch: auth.sessionEpoch) }
                 .task(id: auth.sessionEpoch) { await feed.load(force: false, epoch: auth.sessionEpoch) }
         }
@@ -28,7 +43,7 @@ struct HomeView: View {
     private var content: some View {
         switch feed.phase {
         case .loading:
-            ScrollView { FeedSkeleton() }
+            ScrollView { HomeFeedSkeleton() }
         case .failed(let message):
             EmptyStateView(
                 icon: Image(.bchMusicNote),
@@ -43,7 +58,12 @@ struct HomeView: View {
                         SignInBanner { auth.loginPresented = true }
                     }
                     ForEach(Array(shelves.enumerated()), id: \.element.id) { index, shelf in
-                        if index == 0, shelf.items.count > 2 {
+                        if index == 0, isRecentsShelf(shelf) {
+                            RecentShelf(shelf: shelf)
+                                .onAppear {
+                                    if shelf.id == shelves.last?.id { Task { await feed.loadMore() } }
+                                }
+                        } else if index == 0, shelf.items.count > 2 {
                             HeroShelf(shelf: shelf)
                                 .onAppear {
                                     if shelf.id == shelves.last?.id { Task { await feed.loadMore() } }
@@ -63,26 +83,292 @@ struct HomeView: View {
             }
         }
     }
+
+    /// Upstream's `RECENTS_TITLE` — the first shelf is a recents rail when the
+    /// service titles it so, matched case-insensitively like upstream.
+    private func isRecentsShelf(_ shelf: FeedShelf) -> Bool {
+        let title = shelf.title.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        // Accept the earlier Apple bridge title as well as upstream's canonical
+        // "Recents" so a cached feed still gets the four-row treatment.
+        return title == "recents" || title == "recently played"
+    }
 }
 
-/// Explore tab — the same shelf rendering as Home over upstream's
-/// FEmusic_explore + FEmusic_charts pairing; no sign-in banner here.
-struct ExploreView: View {
-    @Bindable var feed: FeedLoader
+/// The upstream Home loading state reserves the Recents shelf and matches the
+/// saved list/grid layout so content does not jump when the feed arrives.
+private struct HomeFeedSkeleton: View {
+    @State private var viewType = PlatformSettings.shared.getString(
+        key: "home_recents_view_type", default: "LIST"
+    )
+
+    private var isList: Bool { viewType.uppercased() != "GRID" }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 26) {
+            VStack(alignment: .leading, spacing: 10) {
+                HStack {
+                    RecentsSkeletonBlock(height: 22, cornerRadius: 6).frame(width: 112)
+                    Spacer(minLength: 8)
+                    RecentsSkeletonBlock(height: 32, cornerRadius: 16).frame(width: 32)
+                }
+                if isList {
+                    GeometryReader { geometry in
+                        VStack(spacing: 0) {
+                            ForEach(0..<4, id: \.self) { index in
+                                HStack(spacing: 12) {
+                                    RecentsSkeletonBlock(height: 48, cornerRadius: 7).frame(width: 48)
+                                    VStack(alignment: .leading, spacing: 7) {
+                                        RecentsSkeletonBlock(height: 14, cornerRadius: 4)
+                                            .frame(width: [150.0, 112.0, 134.0, 96.0][index])
+                                        RecentsSkeletonBlock(height: 12, cornerRadius: 4)
+                                            .frame(width: [92.0, 122.0, 78.0, 106.0][index])
+                                    }
+                                    Spacer(minLength: 4)
+                                    RecentsSkeletonBlock(height: 20, cornerRadius: 10).frame(width: 20)
+                                }
+                                .frame(height: 56)
+                            }
+                        }
+                        .frame(width: min(geometry.size.width * 0.88, 400), alignment: .leading)
+                    }
+                    .frame(height: 4 * 56)
+                } else {
+                    GeometryReader { geometry in
+                        let cardWidth = min(geometry.size.width * 0.70, 320.0)
+                        HStack(spacing: 14) {
+                            ForEach(0..<2, id: \.self) { _ in
+                                RecentsSkeletonBlock(height: cardWidth / 0.92, cornerRadius: 18)
+                                    .frame(width: cardWidth)
+                            }
+                        }
+                    }
+                    .frame(maxWidth: 320 / 0.70)
+                    .aspectRatio(0.92 / 0.70, contentMode: .fit)
+                }
+            }
+            ForEach(0..<2, id: \.self) { shelf in
+                VStack(alignment: .leading, spacing: 10) {
+                    SkeletonBlock(height: 22, cornerRadius: 6).frame(width: shelf == 0 ? 140 : 110)
+                    ScrollView(.horizontal, showsIndicators: false) {
+                        HStack(spacing: 14) {
+                            ForEach(0..<4, id: \.self) { _ in
+                                VStack(alignment: .leading, spacing: 8) {
+                                    SkeletonBlock(height: 156, cornerRadius: 12).frame(width: 156)
+                                    SkeletonBlock(height: 14, cornerRadius: 4).frame(width: 118)
+                                    SkeletonBlock(height: 12, cornerRadius: 4).frame(width: 82)
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        .padding(.horizontal, 24)
+        .padding(.vertical, 20)
+    }
+}
+
+/// The Recents placeholder uses the same moving highlight sweep as upstream's
+/// shimmer blocks, while respecting the listener's Reduce Motion setting.
+private struct RecentsSkeletonBlock: View {
+    let height: CGFloat
+    var cornerRadius: CGFloat = 6
+    @State private var sweep = false
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+    var body: some View {
+        GeometryReader { geometry in
+            ZStack(alignment: .leading) {
+                RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
+                    .fill(.quaternary)
+                if !reduceMotion {
+                    LinearGradient(
+                        colors: [.clear, .white.opacity(0.22), .clear],
+                        startPoint: .leading,
+                        endPoint: .trailing
+                    )
+                    .frame(width: geometry.size.width * 0.55)
+                    .offset(x: sweep ? geometry.size.width : -geometry.size.width * 0.55)
+                }
+            }
+            .clipShape(RoundedRectangle(cornerRadius: cornerRadius, style: .continuous))
+        }
+        .frame(height: height)
+        .onAppear { sweep = true }
+        .animation(
+            reduceMotion ? nil : .linear(duration: 1.4).repeatForever(autoreverses: false),
+            value: sweep
+        )
+        .accessibilityHidden(true)
+    }
+}
+
+/// Upstream's `RecentShelf`: the first Home shelf when titled "Recents".
+/// LIST mode is a horizontal rail of two columns × four track rows;
+/// GRID mode is the ordinary card carousel. The choice persists in
+/// `home_recents_view_type` like upstream's `homeRecentsViewType`.
+struct RecentShelf: View {
+    let shelf: FeedShelf
     @Environment(PlaybackController.self) private var controller
-    @Environment(AuthController.self) private var auth
+
+    /// LIST or GRID, persisted. Read off `PlatformSettings` rather than
+    /// `@AppStorage` so the value is the same store the Android side reads.
+    @State private var viewType: String = PlatformSettings.shared.getString(
+        key: "home_recents_view_type", default: "LIST"
+    )
+
+    private var isList: Bool { viewType.uppercased() != "GRID" }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(alignment: .center) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Recents").font(.title2.weight(.bold)).lineLimit(1)
+                    if let subtitle = shelf.subtitle, !subtitle.isEmpty {
+                        Text(subtitle).font(.subheadline).foregroundStyle(.secondary).lineLimit(1)
+                    }
+                }
+                Spacer(minLength: 8)
+                Button {
+                    viewType = isList ? "GRID" : "LIST"
+                    PlatformSettings.shared.putString(key: "home_recents_view_type", value: viewType)
+                } label: {
+                    Image(isList ? .bchGridView : .bchListView)
+                        .resizable()
+                        .scaledToFit()
+                        .foregroundStyle(.secondary)
+                        .frame(width: 19, height: 19)
+                        .frame(width: 32, height: 32)
+                }
+                .buttonStyle(.plain)
+                .help(isList ? "Switch to grid view" : "Switch to list view")
+                .accessibilityLabel(isList ? "Switch to grid view" : "Switch to list view")
+            }
+            if isList {
+                GeometryReader { geometry in
+                    ScrollView(.horizontal, showsIndicators: false) {
+                        LazyHStack(alignment: .top, spacing: 12) {
+                            ForEach(Array(shelf.items.chunked(4).enumerated()), id: \.offset) { _, column in
+                                VStack(spacing: 0) {
+                                    ForEach(column) { card in
+                                        RecentTrackRow(card: card)
+                                    }
+                                }
+                                // Upstream's trackColumnWidth is 88% of the
+                                // viewport, capped at 400 points.
+                                .frame(width: min(geometry.size.width * 0.88, 400), alignment: .leading)
+                            }
+                        }
+                        .padding(.horizontal, 24)
+                        .padding(.vertical, 2)
+                    }
+                }
+                .frame(height: 4 * 56 + 4)
+                .padding(.horizontal, -24)
+            } else {
+                ScrollView(.horizontal, showsIndicators: false) {
+                    LazyHStack(alignment: .top, spacing: 14) {
+                        ForEach(shelf.items) { card in
+                            ShelfCardView(card: card)
+                        }
+                    }
+                    .padding(.vertical, 2)
+                }
+            }
+        }
+    }
+}
+
+/// One recent track: 48pt sleeve, title/artist, overflow menu. Matches
+/// upstream's `RecentTrackRow` (artwork + two lines + more button).
+private struct RecentTrackRow: View {
+    let card: ShelfCard
+    @Environment(PlaybackController.self) private var controller
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Button {
+                if let videoId = card.videoId, !videoId.isEmpty {
+                    controller.playRadio(QueueEntry.youtube(
+                        videoId: videoId, title: card.title, artist: card.subtitle ?? "",
+                        thumbnailUrl: card.thumbnailUrl
+                    ), context: "Recents")
+                }
+            } label: {
+                HStack(spacing: 12) {
+                    ArtworkView(url: card.thumbnailUrl, data: nil, side: 48)
+                        .clipShape(.rect(cornerRadius: 7, style: .continuous))
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(card.title).font(.body.weight(.medium)).lineLimit(1)
+                        if let subtitle = card.subtitle, !subtitle.isEmpty {
+                            Text(subtitle).font(.subheadline).foregroundStyle(.secondary).lineLimit(1)
+                        }
+                    }
+                    Spacer(minLength: 4)
+                }
+                .contentShape(.rect)
+            }
+            .buttonStyle(.plain)
+            .contextMenu { actionMenu }
+
+            Menu { actionMenu } label: {
+                Image(systemName: "ellipsis")
+                    .font(.body.weight(.semibold))
+                    .foregroundStyle(.secondary)
+                    .frame(width: 36, height: 36)
+                    .contentShape(Circle())
+            }
+            .tint(.gray)
+            .accessibilityLabel("More actions for \(card.title)")
+        }
+        .padding(.vertical, 4)
+    }
+
+    @ViewBuilder
+    private var actionMenu: some View {
+        if let videoId = card.videoId, !videoId.isEmpty {
+            SongActionButtons(entry: QueueEntry.youtube(
+                videoId: videoId, title: card.title, artist: card.subtitle ?? "",
+                thumbnailUrl: card.thumbnailUrl
+            ))
+        } else {
+            BrowseActionButtons(card: card)
+        }
+    }
+}
+
+private extension Array {
+    /// Splits into consecutive runs of `size`, like Kotlin's `chunked`.
+    func chunked(_ size: Int) -> [[Element]] {
+        guard size > 0 else { return [self] }
+        var out: [[Element]] = []
+        var index = startIndex
+        while index < endIndex {
+            let end = self.index(index, offsetBy: size, limitedBy: endIndex) ?? endIndex
+            out.append(Array(self[index..<end]))
+            index = end
+        }
+        return out
+    }
+}
+
+/// Explore tab — upstream shows mood and genre categories here.
+struct ExploreView: View {
     @State private var moods = MoodGenreLoader()
 
     var body: some View {
         NavigationStack {
             content
                 .navigationTitle("Explore")
+                .toolbar {
+                    #if os(iOS)
+                    ToolbarItem(placement: .topBarTrailing) { TopBarAccountButton() }
+                    #endif
+                }
                 .refreshable {
-                    await feed.load(force: true, epoch: auth.sessionEpoch)
                     await moods.load(force: true)
                 }
-                .task(id: auth.sessionEpoch) {
-                    await feed.load(force: false, epoch: auth.sessionEpoch)
+                .task {
                     await moods.load(force: false)
                 }
         }
@@ -90,33 +376,19 @@ struct ExploreView: View {
 
     @ViewBuilder
     private var content: some View {
-        switch feed.phase {
+        switch moods.phase {
         case .loading:
-            ScrollView { FeedSkeleton() }
+            ScrollView { moodGrid.padding(.horizontal, 24).padding(.vertical, 20) }
         case .failed(let message):
             EmptyStateView(
                 icon: Image(.bchExplore),
                 title: "Nothing to explore right now",
                 subtitle: message,
                 buttonTitle: "Retry"
-            ) { Task { await feed.load() } }
-        case .loaded(let shelves):
+            ) { Task { await moods.load(force: true) } }
+        case .loaded:
             ScrollView {
-                VStack(alignment: .leading, spacing: 28) {
-                    // The shelves first: they are what Explore is for, and they
-                    // arrive from a call the tab already makes. The categories
-                    // are a second browse response, so they fill in underneath
-                    // rather than holding the page at a skeleton.
-                    ForEach(shelves) { shelf in
-                        ShelfCarousel(shelf: shelf)
-                            .onAppear {
-                                if shelf.id == shelves.last?.id {
-                                    Task { await feed.loadMore() }
-                                }
-                            }
-                    }
-                    moodGrid
-                }
+                moodGrid
                 .padding(.horizontal, 24)
                 .padding(.vertical, 20)
             }
@@ -136,14 +408,11 @@ struct ExploreView: View {
                     ForEach(0..<10, id: \.self) { _ in
                         RoundedRectangle(cornerRadius: 10, style: .continuous)
                             .fill(.white.opacity(0.08))
-                            .frame(height: 44)
+                            .frame(height: 100)
                     }
                 }
             }
         case .failed:
-            // Upstream's grid is supplementary, so a refusal here is not the
-            // page's failure and gets no error state of its own — the shelves
-            // above are still perfectly good Explore.
             EmptyView()
         case .loaded(let sections):
             ForEach(sections) { section in
@@ -166,51 +435,89 @@ struct ExploreView: View {
         }
     }
 
-    /// Three across on a phone, six on a Mac. Upstream's grid is a fixed
-    /// column count rather than a width, and matching it matters more than the
-    /// arithmetic: the tiles are meant to read as a dense index of categories,
-    /// which a two-across layout on a wide window turns into a list.
-    private static let moodColumns = [GridItem(.adaptive(minimum: 104, maximum: 160), spacing: 12)]
+    /// Two across on iPhone like upstream's `MoodGenreGrid` (pairs chunked by
+    /// two at half the guttered width); adaptive on Mac, where a fixed pair
+    /// would read as a list in a wide window.
+    #if os(iOS)
+    private static let moodColumns = [
+        GridItem(.flexible(), spacing: 12),
+        GridItem(.flexible(), spacing: 12),
+    ]
+    #else
+    private static let moodColumns = [GridItem(.adaptive(minimum: 180, maximum: 260), spacing: 12)]
+    #endif
 }
 
-/// One category button. A tile rather than a chip because the category's own
-/// artwork is what makes "Chill" mean something, and a grid of words is a list.
+/// One category button: a 100pt gradient card with a rotated sleeve cropped
+/// past the bottom-end corner and the title at the top-start — upstream's
+/// `MoodGenreCard` (16° rotation, 82pt art, bold white title).
 private struct MoodTile: View {
     let category: MoodGenre
 
+    /// Kotlin String.hashCode uses UTF-16 units and a 31 multiplier.
+    private var colorIndex: Int {
+        let hash = category.title.utf16.reduce(Int32(0)) { value, unit in
+            value &* 31 &+ Int32(unit)
+        }
+        return Int((UInt32(bitPattern: hash) & 0x7fff_ffff) % 8)
+    }
+
+    private var baseRGB: (Double, Double, Double) {
+        let colors: [(Int, Int, Int)] = [
+            (0xE6, 0x4A, 0x19), (0xEC, 0x0B, 0x65),
+            (0x86, 0x64, 0xAC), (0x6B, 0x4E, 0xFF),
+            (0xBE, 0x61, 0x00), (0x23, 0x3C, 0x78),
+            (0x4D, 0x97, 0xE5), (0xAA, 0x26, 0x7E),
+        ]
+        let (r, g, b) = colors[colorIndex]
+        return (Double(r) / 255, Double(g) / 255, Double(b) / 255)
+    }
+
     var body: some View {
-        ZStack {
-            RoundedRectangle(cornerRadius: 10, style: .continuous)
-                .fill(.white.opacity(0.12))
-            if let url = category.thumbnailUrl {
-                AsyncImage(url: URL(string: url)) { phase in
-                    if case .success(let image) = phase {
-                        image.resizable().aspectRatio(contentMode: .fill)
+        ZStack(alignment: .topLeading) {
+            let (r, g, b) = baseRGB
+            LinearGradient(
+                colors: [
+                    Color(red: r, green: g, blue: b),
+                    Color(red: r * 0.68, green: g * 0.68, blue: b * 0.68),
+                ],
+                startPoint: .topLeading,
+                endPoint: .bottomTrailing
+            )
+            // A rotated sleeve cropped past the corner, like a cropped album
+            // sleeve rather than a floating rectangle.
+            GeometryReader { _ in
+                Color.clear
+            }
+            .overlay(alignment: .bottomTrailing) {
+                ZStack {
+                    RoundedRectangle(cornerRadius: 7, style: .continuous)
+                        .fill(.white.opacity(0.22))
+                    if let url = category.thumbnailUrl, let endpoint = URL(string: url) {
+                        AsyncImage(url: endpoint) { phase in
+                            if case .success(let image) = phase {
+                                image.resizable().aspectRatio(contentMode: .fill)
+                            }
+                        }
+                        .clipShape(RoundedRectangle(cornerRadius: 7, style: .continuous))
                     }
                 }
-                .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+                .frame(width: 82, height: 82)
+                .rotationEffect(.degrees(16))
+                .offset(x: 10, y: 12)
             }
-            // A scrim rather than a plain label: the artwork is arbitrary, and
-            // a white title on a pale cover is unreadable in a way no amount of
-            // font weight fixes.
-            LinearGradient(
-                colors: [.clear, .black.opacity(0.62)],
-                startPoint: .center,
-                endPoint: .bottom
-            )
-            .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+            .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
             Text(category.title)
-                .font(.subheadline.weight(.semibold))
+                .font(.callout.weight(.bold))
                 .foregroundStyle(.white)
-                .multilineTextAlignment(.center)
                 .lineLimit(2)
-                .padding(.horizontal, 8)
-                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottom)
-                .padding(.bottom, 6)
+                .padding(12)
+                .padding(.trailing, 48)
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         }
-        .frame(height: 72)
-        .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
-        .contentShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+        .frame(height: 100)
+        .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+        .contentShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
         .accessibilityLabel(category.title)
     }
 }
@@ -322,21 +629,19 @@ final class MoodGenreLoader {
     }
 }
 
-/// Library tab — library sub-destinations group in the sidebar on macOS
-/// (UI spec §2 TabSection) and list on iOS: Songs, Albums, Artists, Downloads
-/// from the local scan, plus History.
+/// Library tab — on iOS, renders upstream's unified LibraryScreen (Replay banner,
+/// On Device cards, signed-in shelves). On macOS, when lockedSection is set from
+/// the sidebar, directly displays that destination.
 struct LibraryView: View {
     @Environment(PlaybackController.self) private var controller
     @Environment(AuthController.self) private var auth
     @Environment(AppModel.self) private var appModel
     @State private var local = LocalLibrary.shared
-    @State private var section: Section = .songs
-    /// When set (macOS sidebar `TabSection` rows), the picker is hidden and
-    /// this destination is shown directly.
+    /// When set (macOS sidebar `TabSection` rows), this destination is shown directly.
     var lockedSection: Section? = nil
 
     enum Section: String, CaseIterable, Identifiable {
-        case youtube, songs, albums, artists, downloads, history, webdav
+        case youtube, songs, albums, artists, playlists, downloads, history, webdav
         var id: String { rawValue }
         var label: String {
             switch self {
@@ -365,18 +670,12 @@ struct LibraryView: View {
                         }
                         .help("Scan a folder")
                     }
+                    #if os(iOS)
+                    ToolbarItem(placement: .topBarTrailing) { TopBarAccountButton() }
+                    #endif
                 }
                 .onAppear {
                     local.restoreViewPreferences()
-                    if lockedSection != nil { return }
-                    if auth.signedIn, section == .songs {
-                        section = .youtube
-                    }
-                }
-                .onChange(of: auth.signedIn) { _, signedIn in
-                    guard lockedSection == nil else { return }
-                    if signedIn { section = .youtube }
-                    else if section == .youtube { section = .songs }
                 }
                 .fileImporter(isPresented: $pickingFolder, allowedContentTypes: [.folder]) { result in
                     if case .success(let url) = result {
@@ -388,69 +687,282 @@ struct LibraryView: View {
 
     @ViewBuilder
     private var content: some View {
-        switch lockedSection ?? section {
-        case .youtube: youtubeLibrary
-        case .songs: songsList
-        case .albums: albumGrid
-        case .artists: artistList
-        case .downloads: downloadsList
-        case .webdav:
-            WebDavLibraryView()
-                .safeAreaInset(edge: .top, spacing: 0) { if showsPicker { picker } }
-        case .history:
-            HistoryView()
-                .safeAreaInset(edge: .top, spacing: 0) { if showsPicker { picker } }
-        }
-    }
-
-    private var showsPicker: Bool { lockedSection == nil }
-
-    private var picker: some View {
-        HStack {
-            Picker("Section", selection: $section) {
-                ForEach(visibleSections) { Text($0.label).tag($0) }
+        if let locked = lockedSection {
+            switch locked {
+            case .youtube: YoutubeLibraryView()
+            case .songs: LocalMusicView(initialTab: .songs, onPickFolder: { pickFolder() })
+            case .albums: LocalMusicView(initialTab: .albums, onPickFolder: { pickFolder() })
+            case .artists: LocalMusicView(initialTab: .artists, onPickFolder: { pickFolder() })
+            case .playlists: LocalPlaylistsView()
+            case .downloads: DownloadsView()
+            case .webdav: WebDavLibraryView()
+            case .history: HistoryView()
             }
-            .pickerStyle(.segmented)
-            .labelsHidden()
-            .frame(maxWidth: 420, alignment: .leading)
-            Spacer(minLength: 0)
+        } else {
+            LibraryLandingView(onPickFolder: { pickFolder() })
         }
-        .padding(.horizontal, 24)
-        .padding(.top, 8)
-    }
-
-    /// The sections the picker offers, which is not all of them.
-    ///
-    /// `Recent` needs a signed-in account and `WebDAV` needs a configured share, and
-    /// a picker that offers a section which then says "not set up" is a control that
-    /// exists to be disappointing. The way in for both is elsewhere — Account, and
-    /// Sources respectively — and the toast after saving a share says where it went.
-    private var visibleSections: [Section] {
-        Section.allCases.filter { section in
-            switch section {
-            case .youtube: return auth.signedIn
-            case .webdav: return WebDavStore.shared.isConfigured
-            default: return true
-            }
-        }
-    }
-
-    private var youtubeLibrary: some View {
-        YoutubeLibraryView()
-            .safeAreaInset(edge: .top, spacing: 0) { if showsPicker { picker } }
     }
 
     private func pickFolder() {
-#if os(macOS)
+        #if os(macOS)
         local.chooseFolder()
-#else
+        #else
         pickingFolder = true
-#endif
+        #endif
+    }
+}
+
+/// Upstream's unified Library landing page (`LibraryScreen.kt`):
+/// 1. Replay hero banner
+/// 2. "On device" shelf: horizontal scroll with cards for Downloads, Local Music, WebDAV, History
+/// 3. Signed-out prompt (if signed out)
+/// 4. Signed-in shelves (if signed in): Playlists (with NewPlaylistTile and pinned first), Albums, Artists
+struct LibraryLandingView: View {
+    var onPickFolder: () -> Void
+    @Environment(AuthController.self) private var auth
+    @Environment(AppModel.self) private var appModel
+    @Environment(PlaybackController.self) private var controller
+    @State private var downloadStore = DownloadStore.shared
+    @State private var local = LocalLibrary.shared
+    @State private var shelves: [FeedShelf] = []
+    @State private var loading = true
+    @State private var error: String?
+
+    var body: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 26) {
+                // 1. Replay Banner
+                ReplayBanner { appModel.replayPresented = true }
+
+                // 2. On Device Shelf
+                onDeviceShelf
+
+                // 3. Signed-out prompt or Signed-in shelves
+                if !auth.signedIn {
+                    signedInPrompt
+                } else if loading {
+                    FeedSkeleton()
+                } else if let error {
+                    EmptyStateView(
+                        icon: Image(.bchLibrary),
+                        title: "Library couldn't load",
+                        subtitle: error,
+                        buttonTitle: "Retry"
+                    ) { Task { await loadShelves() } }
+                } else {
+                    signedInShelves
+                }
+            }
+            .padding(.horizontal, 24)
+            .padding(.vertical, 16)
+        }
+        .refreshable {
+            downloadStore.refresh()
+            await loadShelves()
+        }
+        .task(id: auth.sessionEpoch) {
+            downloadStore.refresh()
+            await loadShelves()
+        }
     }
 
-    private var downloadsList: some View {
-        let store = DownloadStore.shared
-        return Group {
+    private var onDeviceShelf: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("On device")
+                .font(.title3.weight(.bold))
+
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 14) {
+                    OnDeviceCard(
+                        title: "Downloads",
+                        subtitle: "\(downloadStore.items.count) downloaded song\(downloadStore.items.count == 1 ? "" : "s")",
+                        systemImage: "arrow.down.circle.fill",
+                        tintColor: .accentColor,
+                        destination: DownloadsView()
+                    )
+
+                    OnDeviceCard(
+                        title: "Local Music",
+                        subtitle: local.scanned ? "\(local.tracks.count) song\(local.tracks.count == 1 ? "" : "s")" : "Choose folder",
+                        systemImage: "folder.fill",
+                        tintColor: .indigo,
+                        destination: LocalMusicView(onPickFolder: onPickFolder)
+                    )
+
+                    OnDeviceCard(
+                        title: "WebDAV",
+                        subtitle: WebDavStore.shared.isConfigured ? "Connected" : "Not configured",
+                        systemImage: "cloud.fill",
+                        tintColor: .teal,
+                        destination: WebDavLibraryView()
+                    )
+
+                    OnDeviceCard(
+                        title: "History",
+                        subtitle: "Listening history",
+                        systemImage: "clock.fill",
+                        tintColor: .orange,
+                        destination: HistoryView()
+                    )
+                }
+                .padding(.vertical, 2)
+            }
+        }
+    }
+
+    private var signedInPrompt: some View {
+        VStack(spacing: 14) {
+            ZStack {
+                Circle()
+                    .fill(Color.accentColor.opacity(0.12))
+                    .frame(width: 56, height: 56)
+                Image(systemName: "person.crop.circle.badge.plus")
+                    .font(.system(size: 26, weight: .semibold))
+                    .foregroundStyle(.tint)
+            }
+            Text("Sign in for your library")
+                .font(.headline)
+            Text("Liked playlists, albums and artists you save show up here.")
+                .font(.subheadline)
+                .foregroundStyle(.secondary)
+                .multilineTextAlignment(.center)
+            Button("Sign In") {
+                auth.loginPresented = true
+            }
+            .buttonStyle(.borderedProminent)
+            .controlSize(.regular)
+            .padding(.top, 4)
+        }
+        .frame(maxWidth: .infinity)
+        .padding(.vertical, 28)
+        .padding(.horizontal, 20)
+        .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: 16, style: .continuous)
+                .strokeBorder(.separator.opacity(0.5), lineWidth: 0.5)
+        )
+    }
+
+    private var signedInShelves: some View {
+        VStack(alignment: .leading, spacing: 26) {
+            ForEach(pinnedShelves(shelves)) { shelf in
+                VStack(alignment: .leading, spacing: 10) {
+                    HStack {
+                        Text(shelf.title).font(.title3.weight(.bold))
+                        Spacer()
+                        if shelf.items.count > 5 {
+                            NavigationLink("Show all") {
+                                LibraryGridView(title: shelf.title, items: shelf.items)
+                            }
+                            .font(.callout)
+                        }
+                    }
+                    ScrollView(.horizontal, showsIndicators: false) {
+                        LazyHStack(alignment: .top, spacing: 14) {
+                            if isPlaylistsShelf(shelf) {
+                                NewPlaylistTile {
+                                    appModel.playlistPicker = PlaylistPickerRequest(videoId: "", title: "")
+                                }
+                            }
+                            ForEach(displayItems(shelf)) { card in
+                                ShelfCardView(card: card)
+                            }
+                        }
+                        .padding(.vertical, 2)
+                    }
+                }
+            }
+        }
+    }
+
+    private func pinnedShelves(_ shelves: [FeedShelf]) -> [FeedShelf] {
+        let pinned = PlatformSettings.shared.getString(key: "pinned_playlists", default: "")
+            .split(separator: ",").map(String.init)
+        return shelves.map { shelf in
+            let items = shelf.items.sorted { a, b in
+                let ap = pinned.contains(a.browseId ?? "")
+                let bp = pinned.contains(b.browseId ?? "")
+                if ap == bp { return false }
+                return ap && !bp
+            }
+            return FeedShelf(title: shelf.title, items: items, subtitle: shelf.subtitle)
+        }
+    }
+
+    private func displayItems(_ shelf: FeedShelf) -> [ShelfCard] {
+        let cap = isPlaylistsShelf(shelf) ? 4 : 5
+        return Array(shelf.items.prefix(cap))
+    }
+
+    private func isPlaylistsShelf(_ shelf: FeedShelf) -> Bool {
+        shelf.title.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == "playlists"
+    }
+
+    private func loadShelves() async {
+        guard auth.signedIn else {
+            loading = false
+            shelves = []
+            return
+        }
+        loading = true
+        error = nil
+        do {
+            shelves = try await InnertubeFeed.shared.library()
+        } catch {
+            self.error = error.localizedDescription
+        }
+        loading = false
+    }
+}
+
+/// Upstream's card representation on the "On device" shelf.
+struct OnDeviceCard<Destination: View>: View {
+    let title: String
+    let subtitle: String
+    let systemImage: String
+    let tintColor: Color
+    let destination: Destination
+
+    var body: some View {
+        NavigationLink(destination: destination) {
+            VStack(alignment: .leading, spacing: 8) {
+                ZStack {
+                    RoundedRectangle(cornerRadius: 12, style: .continuous)
+                        .fill(tintColor.opacity(0.12))
+                        .frame(width: 156, height: 156)
+                    Image(systemName: systemImage)
+                        .font(.system(size: 44, weight: .medium))
+                        .foregroundStyle(tintColor)
+                }
+                .overlay(
+                    RoundedRectangle(cornerRadius: 12, style: .continuous)
+                        .strokeBorder(.separator.opacity(0.4), lineWidth: 0.5)
+                )
+
+                Text(title)
+                    .font(.callout.weight(.semibold))
+                    .foregroundStyle(.primary)
+                    .lineLimit(1)
+
+                Text(subtitle)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+            }
+            .frame(width: 156, alignment: .leading)
+            .contentShape(.rect)
+        }
+        .buttonStyle(.plain)
+    }
+}
+
+/// Dedicated Downloads destination.
+struct DownloadsView: View {
+    @Environment(PlaybackController.self) private var controller
+    @State private var store = DownloadStore.shared
+
+    var body: some View {
+        Group {
             if store.items.isEmpty {
                 EmptyStateView(
                     icon: Image(.bchLibrary),
@@ -480,62 +992,128 @@ struct LibraryView: View {
                 .listStyle(.plain)
             }
         }
-        .safeAreaInset(edge: .top, spacing: 0) { if showsPicker { picker } }
+        .navigationTitle("Downloads")
         .onAppear { store.refresh() }
     }
+}
 
-    private var songsList: some View {
-        Group {
-            if !local.scanned {
-                VStack(spacing: 16) {
-                    if lockedSection == nil {
-                        ReplayBanner { appModel.replayPresented = true }
-                            .padding(.horizontal, 24)
+/// Dedicated Local Music destination supporting Songs, Albums, and Artists tabs.
+struct LocalMusicView: View {
+    var initialTab: Tab = .songs
+    var onPickFolder: (() -> Void)? = nil
+    @Environment(PlaybackController.self) private var controller
+    @State private var local = LocalLibrary.shared
+    @State private var selectedTab: Tab = .songs
+    @State private var pickingFolder = false
+
+    enum Tab: String, CaseIterable, Identifiable {
+        case songs = "Songs"
+        case albums = "Albums"
+        case artists = "Artists"
+        var id: String { rawValue }
+    }
+
+    init(initialTab: Tab = .songs, onPickFolder: (() -> Void)? = nil) {
+        self.initialTab = initialTab
+        self.onPickFolder = onPickFolder
+        _selectedTab = State(initialValue: initialTab)
+    }
+
+    var body: some View {
+        content
+            .navigationTitle("Local Music")
+            .toolbar {
+                ToolbarItem(placement: .primaryAction) {
+                    Button {
+                        pickFolder()
+                    } label: {
+                        Image(.bchPlus)
+                            .resizable()
+                            .scaledToFit()
+                            .frame(width: 15)
                     }
-                    EmptyStateView(
-                        icon: Image(.bchLibrary),
-                        title: "Scan your music",
-                        subtitle: "Pick a folder — BitChord reads its tags, artwork and plays it with gapless and crossfade.",
-                        buttonTitle: "Choose Folder"
-                    ) { pickFolder() }
+                    .help("Scan a folder")
                 }
-            } else if local.tracks.isEmpty {
-                EmptyStateView(
-                    icon: Image(.bchMusicNote),
-                    title: "No audio files here",
-                    subtitle: "The folder you selected didn't contain any supported audio files.",
-                    buttonTitle: "Choose Another Folder"
-                ) { pickFolder() }
-            } else if local.visibleTracks.isEmpty {
-                // A search that matched nothing is not the same as a library with
-                // nothing in it, and the empty state says which.
-                EmptyStateView(
-                    icon: Image(.bchSearch),
-                    title: local.query.isEmpty ? "No audio files here" : "Nothing matches",
-                    subtitle: local.query.isEmpty
-                        ? "The folder you selected didn't contain any supported audio files."
-                        : "No track in this library matches \u{201C}\(local.query)\u{201D}.",
-                    buttonTitle: local.query.isEmpty ? "Choose Another Folder" : nil,
-                    action: local.query.isEmpty ? { pickFolder() } : nil
-                )
-            } else {
-                songsContent
+            }
+            .fileImporter(isPresented: $pickingFolder, allowedContentTypes: [.folder]) { result in
+                if case .success(let url) = result {
+                    local.scanPicked(url)
+                }
+            }
+            .safeAreaInset(edge: .top, spacing: 0) {
+                if local.scanned {
+                    VStack(spacing: 0) {
+                        tabPicker
+                        if selectedTab == .songs {
+                            songsToolbar
+                        }
+                    }
+                    .background(.ultraThinMaterial)
+                }
+            }
+    }
+
+    private var tabPicker: some View {
+        Picker("Category", selection: $selectedTab) {
+            ForEach(Tab.allCases) { tab in
+                Text(tab.rawValue).tag(tab)
             }
         }
-        .safeAreaInset(edge: .top, spacing: 0) {
-            VStack(spacing: 0) {
-                if showsPicker { picker }
-                if local.scanned { songsToolbar }
+        .pickerStyle(.segmented)
+        .padding(.horizontal, 24)
+        .padding(.vertical, 8)
+        .frame(maxWidth: 380)
+    }
+
+    private func pickFolder() {
+        if let onPickFolder {
+            onPickFolder()
+        } else {
+            #if os(macOS)
+            local.chooseFolder()
+            #else
+            pickingFolder = true
+            #endif
+        }
+    }
+
+    @ViewBuilder
+    private var content: some View {
+        if !local.scanned {
+            EmptyStateView(
+                icon: Image(.bchLibrary),
+                title: "Scan your music",
+                subtitle: "Pick a folder — BitChord reads its tags, artwork and plays it with gapless and crossfade.",
+                buttonTitle: "Choose Folder"
+            ) { pickFolder() }
+        } else if local.tracks.isEmpty {
+            EmptyStateView(
+                icon: Image(.bchMusicNote),
+                title: "No audio files here",
+                subtitle: "The folder you selected didn't contain any supported audio files.",
+                buttonTitle: "Choose Another Folder"
+            ) { pickFolder() }
+        } else {
+            switch selectedTab {
+            case .songs:
+                if local.visibleTracks.isEmpty {
+                    EmptyStateView(
+                        icon: Image(.bchSearch),
+                        title: "Nothing matches",
+                        subtitle: "No track in this library matches \u{201C}\(local.query)\u{201D}.",
+                        buttonTitle: nil, action: nil
+                    )
+                } else {
+                    songsContent
+                }
+            case .albums:
+                albumGrid
+            case .artists:
+                artistList
             }
         }
     }
 
-    /// The search field, the sort menu and the list/grid toggle.
-    ///
-    /// In a `safeAreaInset` rather than inside the scroll view, so it stays put
-    /// while a long library moves under it — the same place a Mac user expects a
-    /// filter to be, and the only arrangement where it is reachable without
-    /// scrolling back to the top.
     private var songsToolbar: some View {
         HStack(spacing: 10) {
             HStack(spacing: 6) {
@@ -598,10 +1176,6 @@ struct LibraryView: View {
                     SongRow(
                         entry: QueueEntry.from(track),
                         play: {
-                            // The queue is what is on screen, in the order on
-                            // screen — playing from `tracks` instead would start at
-                            // whichever track the sort put first rather than the one
-                            // tapped.
                             let shown = local.visibleTracks
                             controller.play(shown.map(QueueEntry.from), at: index)
                         },
@@ -618,9 +1192,10 @@ struct LibraryView: View {
                     columns: [GridItem(.adaptive(minimum: 150, maximum: 220), spacing: 16)],
                     spacing: 20
                 ) {
-                    ForEach(local.visibleTracks) { track in
+                    ForEach(Array(local.visibleTracks.enumerated()), id: \.element.id) { index, track in
                         LocalTrackCard(track: track) {
-                            controller.play(local.visibleTracks.map(QueueEntry.from))
+                            let shown = local.visibleTracks
+                            controller.play(shown.map(QueueEntry.from), at: index)
                         }
                     }
                 }
@@ -663,7 +1238,6 @@ struct LibraryView: View {
                     }
                     .padding(20)
                 }
-                .safeAreaInset(edge: .top, spacing: 0) { if showsPicker { picker } }
             }
         }
     }
@@ -687,7 +1261,6 @@ struct LibraryView: View {
                 .listStyle(.plain)
             }
         }
-        .safeAreaInset(edge: .top, spacing: 0) { if showsPicker { picker } }
     }
 }
 
@@ -844,23 +1417,31 @@ private struct YoutubeLibraryView: View {
                 ScrollView {
                     VStack(alignment: .leading, spacing: 28) {
                         ReplayBanner { appModel.replayPresented = true }
-                        Button("New Playlist") {
-                            appModel.playlistPicker = PlaylistPickerRequest(videoId: "", title: "")
-                        }
-                        .buttonStyle(.bordered)
                         ForEach(pinnedShelves(shelves)) { shelf in
                             VStack(alignment: .leading, spacing: 8) {
                                 HStack {
                                     Text(shelf.title).font(.title3.weight(.bold))
                                     Spacer()
-                                    if shelf.items.count > 8 {
+                                    if shelf.items.count > 5 {
                                         NavigationLink("Show all") {
                                             LibraryGridView(title: shelf.title, items: shelf.items)
                                         }
                                         .font(.callout)
                                     }
                                 }
-                                ShelfCarousel(shelf: FeedShelf(title: "", items: shelf.items, subtitle: nil))
+                                ScrollView(.horizontal, showsIndicators: false) {
+                                    LazyHStack(alignment: .top, spacing: 14) {
+                                        if isPlaylistsShelf(shelf) {
+                                            NewPlaylistTile {
+                                                appModel.playlistPicker = PlaylistPickerRequest(videoId: "", title: "")
+                                            }
+                                        }
+                                        ForEach(displayItems(shelf)) { card in
+                                            ShelfCardView(card: card)
+                                        }
+                                    }
+                                    .padding(.vertical, 2)
+                                }
                             }
                         }
                     }
@@ -887,6 +1468,19 @@ private struct YoutubeLibraryView: View {
         }
     }
 
+    /// Upstream's `LIBRARY_ROW_MAX_ITEMS`: a Library row stops at five cards,
+    /// with "Show all" opening the rest as a grid. The leading New Playlist
+    /// tile counts against the cap.
+    private func displayItems(_ shelf: FeedShelf) -> [ShelfCard] {
+        let cap = isPlaylistsShelf(shelf) ? 4 : 5
+        return Array(shelf.items.prefix(cap))
+    }
+
+    private func isPlaylistsShelf(_ shelf: FeedShelf) -> Bool {
+        let t = shelf.title.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return t == "playlists"
+    }
+
     private func load() async {
         guard auth.signedIn else {
             loading = false
@@ -904,8 +1498,227 @@ private struct YoutubeLibraryView: View {
     }
 }
 
-struct LibraryGridView: View {
-    let title: String
+/// Upstream's `NewShelfCard` on the Library's playlist row: a dashed tile that
+/// creates a playlist, sized to sit in line with the covers beside it.
+private struct NewPlaylistTile: View {
+    var onCreate: () -> Void
+
+    var body: some View {
+        Button(action: onCreate) {
+            VStack(alignment: .leading, spacing: 8) {
+                ZStack {
+                    RoundedRectangle(cornerRadius: 10, style: .continuous)
+                        .strokeBorder(style: StrokeStyle(lineWidth: 1.5, dash: [6, 4]))
+                        .foregroundStyle(.secondary)
+                        .frame(width: 160, height: 160)
+                    Image(systemName: "plus")
+                        .font(.title2)
+                        .foregroundStyle(.tint)
+                }
+                Text("New Playlist")
+                    .font(.callout.weight(.semibold))
+                    .lineLimit(1)
+                Text("Saved to YouTube Music")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+            }
+            .frame(width: 160, alignment: .leading)
+            .contentShape(.rect)
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel("New playlist")
+        .accessibilityHint("Creates a playlist")
+    }
+}
+
+/// Local Playlists tab: real `.m3u`/`.m3u8` files from the scanned folder,
+/// resolved against the scanned tracks, plus the signed-in account's own
+/// YouTube playlists. No mock data — an empty folder means an empty list.
+private struct LocalPlaylistsView: View {
+    @Environment(PlaybackController.self) private var controller
+    @Environment(AuthController.self) private var auth
+    @Environment(AppModel.self) private var appModel
+    @State private var local = LocalLibrary.shared
+    @State private var files: [LocalM3uPlaylist] = []
+    @State private var user: [UserPlaylistDTO] = []
+    @State private var loading = true
+
+    var body: some View {
+        Group {
+            if loading {
+                ProgressView().frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else if files.isEmpty && user.isEmpty {
+                VStack(spacing: 16) {
+                    EmptyStateView(
+                        icon: Image(.bchLibrary),
+                        title: "No playlists yet",
+                        subtitle: auth.signedIn
+                            ? "Save a playlist on YouTube Music, or drop an .m3u file in your music folder."
+                            : "Drop an .m3u file in your music folder — or sign in for your YouTube playlists.",
+                        buttonTitle: auth.signedIn ? "New Playlist" : nil,
+                        action: auth.signedIn ? {
+                            appModel.playlistPicker = PlaylistPickerRequest(videoId: "", title: "")
+                        } : nil
+                    )
+                }
+            } else {
+                List {
+                    if !files.isEmpty {
+                        Section("On This Device") {
+                            ForEach(files) { playlist in
+                                NavigationLink {
+                                    LocalM3uDetailView(playlist: playlist)
+                                } label: {
+                                    HStack {
+                                        Image(systemName: "music.note.list")
+                                            .foregroundStyle(.secondary)
+                                        VStack(alignment: .leading, spacing: 2) {
+                                            Text(playlist.name).lineLimit(1)
+                                            Text("\(playlist.tracks.count) \(playlist.tracks.count == 1 ? "song" : "songs")")
+                                                .font(.caption)
+                                                .foregroundStyle(.secondary)
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if !user.isEmpty {
+                        Section("YouTube Music") {
+                            ForEach(user) { list in
+                                NavigationLink {
+                                    DetailView(browseId: list.browseId, initialTitle: list.title)
+                                } label: {
+                                    HStack(spacing: 12) {
+                                        ArtworkView(url: list.thumbnailUrl, data: nil, side: 44)
+                                            .clipShape(.rect(cornerRadius: 6, style: .continuous))
+                                        VStack(alignment: .leading, spacing: 2) {
+                                            Text(list.title).lineLimit(1)
+                                            if !list.subtitle.isEmpty {
+                                                Text(list.subtitle)
+                                                    .font(.caption)
+                                                    .foregroundStyle(.secondary)
+                                                    .lineLimit(1)
+                                            }
+                                        }
+                                    }
+                                    .padding(.vertical, 4)
+                                }
+                            }
+                        }
+                    }
+                }
+                .listStyle(.plain)
+            }
+        }
+        .task(id: auth.sessionEpoch) { await load() }
+        .onAppear { local.restoreViewPreferences() }
+        .refreshable { await load() }
+    }
+
+    private func load() async {
+        loading = true
+        files = Self.localM3uPlaylists(tracks: local.tracks)
+        if auth.signedIn {
+            user = await LibraryActions.userPlaylists()
+        } else {
+            user = []
+        }
+        loading = false
+    }
+
+    /// Reads `.m3u`/`.m3u8` files from the scanned folder and resolves their
+    /// entries against the scanned tracks by absolute path, then by filename.
+    static func localM3uPlaylists(tracks: [LocalTrack]) -> [LocalM3uPlaylist] {
+        guard let folder = Self.libraryFolder() else { return [] }
+        let fm = FileManager.default
+        guard let enumerator = fm.enumerator(
+            at: folder,
+            includingPropertiesForKeys: [.isRegularFileKey],
+            options: [.skipsHiddenFiles, .skipsPackageDescendants]
+        ) else { return [] }
+        let m3uURLs = enumerator.compactMap { $0 as? URL }.filter {
+            ["m3u", "m3u8"].contains($0.pathExtension.lowercased())
+        }
+        let byPath = Dictionary(tracks.map { ($0.path, $0) }, uniquingKeysWith: { first, _ in first })
+        let byName = Dictionary(
+            tracks.map { (URL(fileURLWithPath: $0.path).lastPathComponent.lowercased(), $0) },
+            uniquingKeysWith: { first, _ in first }
+        )
+        return m3uURLs.compactMap { url in
+            guard let text = try? String(contentsOf: url, encoding: .utf8) else { return nil }
+            let base = url.deletingLastPathComponent()
+            var resolved: [LocalTrack] = []
+            for line in text.components(separatedBy: .newlines) {
+                let entry = line.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !entry.isEmpty, !entry.hasPrefix("#") else { continue }
+                let candidate: URL = entry.hasPrefix("/")
+                    ? URL(fileURLWithPath: entry)
+                    : base.appendingPathComponent(entry)
+                let standardized = candidate.standardized.path
+                if let track = byPath[standardized] ?? byPath[candidate.path] {
+                    resolved.append(track)
+                } else if let track = byName[candidate.lastPathComponent.lowercased()] {
+                    resolved.append(track)
+                }
+            }
+            guard !resolved.isEmpty else { return nil }
+            return LocalM3uPlaylist(
+                id: url.path,
+                name: url.deletingPathExtension().lastPathComponent,
+                tracks: resolved
+            )
+        }
+        .sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+    }
+
+    /// The scanned folder, resolved from the persisted bookmark — the same
+    /// bookmark `LocalLibrary` restores, read here because the store does not
+    /// expose the folder itself.
+    static func libraryFolder() -> URL? {
+        let stored = PlatformSettings.shared.getString(key: "local_library_path", default: "")
+        guard !stored.isEmpty, let data = Data(base64Encoded: stored) else { return nil }
+        var stale = false
+        guard let url = try? URL(
+            resolvingBookmarkData: data, options: [],
+            relativeTo: nil, bookmarkDataIsStale: &stale
+        ) else { return nil }
+        return url
+    }
+}
+
+private struct LocalM3uPlaylist: Identifiable {
+    let id: String
+    let name: String
+    let tracks: [LocalTrack]
+}
+
+/// The tracks of one local `.m3u` playlist.
+private struct LocalM3uDetailView: View {
+    let playlist: LocalM3uPlaylist
+    @Environment(PlaybackController.self) private var controller
+
+    var body: some View {
+        List {
+            ForEach(Array(playlist.tracks.enumerated()), id: \.element.id) { index, track in
+                SongRow(
+                    entry: QueueEntry.from(track),
+                    play: {
+                        controller.play(playlist.tracks.map(QueueEntry.from), at: index)
+                    },
+                    playNext: { controller.playNext(QueueEntry.from(track)) },
+                    addToQueue: { controller.addToQueue(QueueEntry.from(track)) }
+                )
+                .listRowInsets(EdgeInsets(top: 2, leading: 24, bottom: 2, trailing: 24))
+            }
+        }
+        .listStyle(.plain)
+        .navigationTitle(playlist.name)
+    }
+}
+
+struct LibraryGridView: View {    let title: String
     let items: [ShelfCard]
 
     var body: some View {

@@ -23,23 +23,55 @@ struct PlaybackPill: View {
     // ---- iOS: mini-player above the tab bar --------------------------------
     #if os(iOS)
     private var iOSPill: some View {
-        HStack(spacing: 12) {
-            artworkOrPlaceholder
-            info
-            Spacer(minLength: 4)
+        HStack(spacing: 10) {
+            Button {
+                appModel.nowPlayingPresented = true
+            } label: {
+                HStack(spacing: 10) {
+                    artworkOrPlaceholder
+                    info
+                    Spacer(minLength: 4)
+                }
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("\(controller.current?.title ?? "Not Playing"), \(controller.current?.artist ?? "")")
+            .accessibilityHint("Opens Now Playing")
             buttons
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 8)
         .background {
-            RoundedRectangle(cornerRadius: 14, style: .continuous)
-                .fill(chromeFill)
+            Capsule().fill(chromeFill)
         }
+        .overlay { Capsule().stroke(.white.opacity(0.10), lineWidth: 0.5) }
         .overlay(alignment: .bottom) { progressHairline }
-        .clipShape(.rect(cornerRadius: 14, style: .continuous))
+        .clipShape(Capsule())
         .contentShape(.rect)
         .modifier(NowPlayingZoomSource())
-        .onTapGesture { appModel.nowPlayingPresented = true }
+        // Horizontal swipe to skip, matching upstream MiniPlayer's 72dp fling:
+        // left for next, right for previous.
+        // `minimumDistance: 20` keeps ordinary taps on the tap-to-expand path.
+        .gesture(
+            DragGesture(minimumDistance: 20)
+                .onEnded { value in
+                    let dx = value.translation.width
+                    guard abs(dx) >= 72 else { return }
+                    guard !PartyStore.shared.state.controlsLocked else {
+                        Haptics.play(.tap)
+                        return
+                    }
+                    if dx < 0 {
+                        guard controller.canPlayNext else { return }
+                        Haptics.play(.skipNext)
+                        controller.next()
+                    } else {
+                        guard controller.canPlayPrevious else { return }
+                        Haptics.play(.skipPrevious)
+                        controller.previous()
+                    }
+                }
+        )
     }
     #endif
 
@@ -164,19 +196,23 @@ struct PlaybackPill: View {
     @ViewBuilder
     private var artworkOrPlaceholder: some View {
         if controller.current != nil {
-            ArtworkView(entry: controller.current, side: 34)
-                .clipShape(.rect(cornerRadius: 6, style: .continuous))
+            ArtworkView(entry: controller.current, side: 40)
+                .clipShape(.rect(cornerRadius: 8, style: .continuous))
+                .overlay {
+                    RoundedRectangle(cornerRadius: 8, style: .continuous)
+                        .stroke(.white.opacity(0.10), lineWidth: 0.5)
+                }
                 .id(controller.current?.id)
         } else {
-            RoundedRectangle(cornerRadius: 6, style: .continuous)
+            RoundedRectangle(cornerRadius: 8, style: .continuous)
                 .fill(.quaternary.opacity(0.6))
-                .frame(width: 34, height: 34)
+                .frame(width: 40, height: 40)
                 .overlay {
-                    Image(.bchMusicNote)
-                        .resizable()
-                        .scaledToFit()
-                        .frame(width: 15)
-                        .foregroundStyle(.secondary)
+                        Image(.bchMusicNote)
+                            .resizable()
+                            .scaledToFit()
+                            .frame(width: 17)
+                            .foregroundStyle(.secondary)
                 }
         }
     }
@@ -188,7 +224,7 @@ struct PlaybackPill: View {
                 .foregroundStyle(controller.current == nil ? .secondary : .primary)
                 .lineLimit(1)
             Text(controller.current?.artist ?? "Music you start appears here")
-                .font(.caption)
+                .font(.subheadline)
                 .foregroundStyle(.secondary)
                 .lineLimit(1)
         }
@@ -287,30 +323,37 @@ struct PlaybackPill: View {
 
     #if os(iOS)
     private var buttons: some View {
-        HStack(spacing: 18) {
+        HStack(spacing: 8) {
             Button {
+                Haptics.play(controller.isPlaying ? .pause : .resume)
                 controller.togglePlayPause()
             } label: {
                 if controller.isBuffering {
-                    ProgressView().controlSize(.small)
+                    ProgressView().controlSize(.small).frame(width: 22, height: 22)
                 } else {
                     Image(systemName: controller.isPlaying ? "pause.fill" : "play.fill")
-                        .font(.system(size: 16, weight: .bold))
+                        .font(.system(size: 20, weight: .semibold))
                 }
             }
             .buttonStyle(.plain)
+            .frame(width: 40, height: 40)
             .disabled(controller.current == nil && !controller.isBuffering)
 
             Button {
+                Haptics.play(.skipNext)
                 controller.next()
             } label: {
                 Image(systemName: "forward.fill")
-                    .font(.system(size: 14, weight: .bold))
+                    .font(.system(size: 19, weight: .semibold))
             }
             .buttonStyle(.plain)
-            .disabled(!controller.canPlayNext)
+            .frame(width: 40, height: 40)
+            .foregroundStyle(
+                PartyStore.shared.state.controlsLocked ? Color.primary.opacity(0.3) : Color.primary
+            )
+            .disabled(!controller.canPlayNext || PartyStore.shared.state.controlsLocked)
 
-            partyButton
+            partyButton.frame(width: 40, height: 40)
         }
         .foregroundStyle(.primary)
     }
@@ -487,4 +530,3 @@ private struct NowPlayingZoomSource: ViewModifier {
     }
 }
 #endif
-

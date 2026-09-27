@@ -19,6 +19,13 @@ import Foundation
 /// window is wider than it is tall, plus a floor below which the columns stop
 /// working.
 enum PlayerLayout {
+    /// Tall non-Spotify clips fit within the player, aligned at its top.
+    static func containedCanvasSize(bounds: CGSize, aspect: CGFloat) -> CGSize {
+        guard bounds.width > 0, bounds.height > 0, aspect > 0, aspect.isFinite else { return .zero }
+        let width = min(bounds.width, bounds.height * aspect)
+        return CGSize(width: width, height: width / aspect)
+    }
+
 
     // ---- the landscape shape -----------------------------------------------
 
@@ -86,5 +93,37 @@ enum PlayerLayout {
     static func portraitArtworkSide(stageWidth: CGFloat, stageHeight: CGFloat) -> CGFloat {
         let fitted = min(stageWidth - 48, stageHeight - 20)
         return max(sleeveCollapsedSide, fitted)
+    }
+
+    // ---- full-bleed artwork --------------------------------------------------
+
+    /// The widest a player given the whole window can be and still run its
+    /// artwork edge to edge. Upstream's `PLAYER_MAX_WIDTH + PLAYER_GUTTER * 2`.
+    static let fullBleedMaxWidth: CGFloat = 620
+
+    /// The width from which the player counts as tablet-sized. Upstream's
+    /// `TABLET_PLAYER_MIN_WIDTH`: a 360pt page beside a 340pt pane.
+    static let tabletMinWidth: CGFloat = 700
+
+    /// Whether this window can use the full-bleed art treatment: phone-width
+    /// windows use it as their main-player shape, while tablet-sized windows
+    /// can opt into it. Mirrors upstream `fullBleedArtworkAvailable`.
+    static func fullBleedArtworkAvailable(width: CGFloat) -> Bool {
+        width <= fullBleedMaxWidth || width >= tabletMinWidth
+    }
+
+    /// The artwork setting applies at phone width too, as it does upstream.
+    static func usesFullBleedArtwork(width: CGFloat, preferenceEnabled: Bool) -> Bool {
+        preferenceEnabled && fullBleedArtworkAvailable(width: width)
+    }
+
+    // ---- iPad panel drawer ---------------------------------------------------
+
+    /// Whether an open lyrics/queue panel presents as a bottom drawer: iPad
+    /// portrait — regular width of at least 560pt in a portrait shape — where
+    /// a full-height panel would leave the collapsed sleeve floating in a tall
+    /// column. Mirrors upstream `PlayerDrawer`'s tablet treatment.
+    static func presentsPanelDrawer(width: CGFloat, height: CGFloat) -> Bool {
+        width >= landscapeMinWidth && height > width
     }
 }

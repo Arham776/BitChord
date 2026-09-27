@@ -3,11 +3,13 @@ import BitChordShared
 
 /// Detail page for an album / artist / playlist browseId.
 ///
-/// Layout follows macOS Music: large sleeve beside the title, accent-coloured
-/// credit, Play / Shuffle capsules, then a track list. Every row shows art —
-/// album tracks that omit a thumbnail inherit the page sleeve, same as
-/// upstream (`song.thumbnailUrl ?: page.thumbnailUrl`), so the player cover
-/// is never empty either.
+/// Port of upstream `DetailScreen.kt`:
+/// Three-layer architecture:
+/// 1. Page background: Artwork wash tint + edge-to-edge hero sleeve/photo cropped across top.
+/// 2. MergeBand: Glass blur across the artwork foot, dissolving the cover into the wash.
+/// 3. Scrollable content: Centered title, accent credit, metadata, and a clean action row
+///    of circular controls (Save/Subscribe, Shuffle, Play pill, Search, More), followed
+///    by the search filter, track list, and playtime summary.
 struct DetailView: View {
     let browseId: String
     let initialTitle: String
@@ -32,6 +34,9 @@ struct DetailView: View {
     @State private var suggested: [DetailPageModel.SongPayload] = []
     @Environment(AuthController.self) private var auth
     @Environment(AppModel.self) private var appModel
+    @Environment(ToastCenter.self) private var toast
+    @State private var subscriptionOverride: Bool?
+    @State private var subscribing = false
     @State private var renameTitle = ""
     @State private var renamePresented = false
     @State private var privacy = "PRIVATE"
@@ -39,6 +44,9 @@ struct DetailView: View {
     @State private var canvasURL: URL?
     @State private var canvasFallbackURL: URL?
     @State private var pinned = false
+    /// Narrows the track list in place, like upstream's search circle in the
+    /// release header. Off until tapped, so a long list reads as a list first.
+    @State private var searching = false
 
     var body: some View {
         Group {
@@ -53,6 +61,9 @@ struct DetailView: View {
             }
         }
         .navigationTitle(page?.title.isEmpty == false ? page!.title : initialTitle)
+        #if os(iOS)
+        .navigationBarTitleDisplayMode(.inline)
+        #endif
         .alert("Rename Playlist", isPresented: $renamePresented) {
             TextField("Title", text: $renameTitle)
             Button("Save") {
@@ -76,66 +87,431 @@ struct DetailView: View {
 
     private func loadedPage(_ page: DetailPageModel) -> some View {
         let tint = ArtworkPalette.pageTint(from: headerArt, seed: page.title.hashValue, dark: colorScheme == .dark)
-        return ScrollView {
-            VStack(alignment: .leading, spacing: 0) {
-                header(page, tint: tint)
-                    .padding(.horizontal, 28)
-                    .padding(.top, 12)
-                    .padding(.bottom, 22)
+        let isArtist = kind(of: page) == .artist
 
-                if !page.songs.isEmpty {
-                    TextField("Filter songs", text: $filter)
-                        .textFieldStyle(.roundedBorder)
-                        .padding(.horizontal, 28)
-                        .padding(.bottom, 8)
-                    trackList(page)
-                        .padding(.horizontal, 16)
-                } else if page.sections.isEmpty {
-                    EmptyStateView(icon: Image(.bchMusicNote), title: "No tracks", subtitle: "This page has no playable tracks.", buttonTitle: nil, action: nil)
-                }
+        return GeometryReader { geo in
+            let width = geo.size.width
+            let height = geo.size.height
+            // Upstream's ratio math: ARTIST_PHOTO_RATIO = 0.95, SLEEVE_RATIO = 0.92
+            // Capped against window height (0.55) so the tracks aren't buried
+            let rawRatio: CGFloat = isArtist ? 0.95 : 0.92
+            let artHeight = min(width / rawRatio, height * 0.55)
 
-                if !suggested.isEmpty {
-                    Text("Suggested")
-                        .font(.headline)
-                        .padding(.horizontal, 28)
-                        .padding(.top, 20)
-                    ForEach(suggested, id: \.videoId) { song in
-                        SongRow(
-                            entry: toEntry(song, fallbackArt: fallbackArt(page)),
-                            play: { controller.playRadio(toEntry(song, fallbackArt: fallbackArt(page))) },
-                            playNext: { controller.playNext(toEntry(song, fallbackArt: fallbackArt(page))) },
-                            addToQueue: { controller.addToQueue(toEntry(song, fallbackArt: fallbackArt(page))) }
-                        )
-                        .padding(.horizontal, 16)
+            ScrollView {
+                VStack(spacing: 0) {
+                    headerView(page, tint: tint, isArtist: isArtist, artHeight: artHeight)
+
+                    VStack(alignment: .leading, spacing: 0) {
+                        if !page.songs.isEmpty {
+                            if searching {
+                                searchField(tint: tint)
+                            }
+                            trackList(page)
+                                .padding(.horizontal, 16)
+
+                            if !isArtist {
+                                Text(playtimeSummary(page.songs))
+                                    .font(.footnote.weight(.medium))
+                                    .foregroundStyle(.secondary)
+                                    .frame(maxWidth: .infinity, alignment: .center)
+                                    .padding(.top, 16)
+                                    .padding(.bottom, 8)
+                            }
+                        } else if page.sections.isEmpty {
+                            EmptyStateView(icon: Image(.bchMusicNote), title: "No tracks", subtitle: "This page has no playable tracks.", buttonTitle: nil, action: nil)
+                        }
+
+                        if !suggested.isEmpty {
+                            VStack(alignment: .leading, spacing: 10) {
+                                Text("Suggested")
+                                    .font(.headline)
+                                    .padding(.horizontal, 28)
+                                    .padding(.top, 20)
+                                ForEach(suggested, id: \.videoId) { song in
+                                    SongRow(
+                                        entry: toEntry(song, fallbackArt: fallbackArt(page)),
+                                        play: { controller.playRadio(toEntry(song, fallbackArt: fallbackArt(page))) },
+                                        playNext: { controller.playNext(toEntry(song, fallbackArt: fallbackArt(page))) },
+                                        addToQueue: { controller.addToQueue(toEntry(song, fallbackArt: fallbackArt(page))) }
+                                    )
+                                    .padding(.horizontal, 16)
+                                }
+                            }
+                        }
+
+                        if let desc = page.description, !desc.isEmpty, kind(of: page) != .playlist {
+                            VStack(alignment: .leading, spacing: 8) {
+                                Text(isArtist ? "About the artist" : "About the album")
+                                    .font(.headline)
+                                Text(desc)
+                                    .font(.callout)
+                                    .foregroundStyle(.secondary)
+                            }
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .padding(.horizontal, 28)
+                            .padding(.top, 28)
+                        }
+
+                        ForEach(page.sections) { shelf in
+                            ShelfCarousel(shelf: shelf)
+                                .padding(.horizontal, 28)
+                                .padding(.top, 28)
+                        }
                     }
+                    .frame(maxWidth: 860)
+                    .frame(maxWidth: .infinity)
                 }
-
-                if let desc = page.description, !desc.isEmpty, kind(of: page) != .playlist {
-                    VStack(alignment: .leading, spacing: 8) {
-                        Text(kind(of: page) == .artist ? "About the artist" : "About the album")
-                            .font(.headline)
-                        Text(desc)
-                            .font(.callout)
-                            .foregroundStyle(.secondary)
-                    }
-                    .padding(.horizontal, 28)
-                    .padding(.top, 28)
-                }
-
-                ForEach(page.sections) { shelf in
-                    ShelfCarousel(shelf: shelf)
-                        .padding(.horizontal, 28)
-                        .padding(.top, 28)
-                }
+                .padding(.bottom, 36)
             }
-            .padding(.bottom, 28)
-        }
-        .background {
-            pageWash(tint: tint)
+            #if os(iOS)
+            .ignoresSafeArea(edges: .top)
+            #endif
+            .background {
+                pageWash(tint: tint)
+            }
         }
         .task(id: page.thumbnailUrl) {
             headerArt = await loadHeaderArt(page.thumbnailUrl)
             await loadCanvas(page)
+        }
+    }
+
+    /// Header zone: hero artwork with gradient fade, MergeBand glass, and pinned title/credit/actions.
+    private func headerView(
+        _ page: DetailPageModel,
+        tint: ArtworkPalette.PageTint,
+        isArtist: Bool,
+        artHeight: CGFloat
+    ) -> some View {
+        let lines = headerLines(page)
+        let credit = lines.credit.isEmpty ? (page.songs.first?.artist ?? "") : lines.credit
+        let artistId = page.songs.first?.artistId
+
+        return ZStack(alignment: .bottom) {
+            // Hero artwork at the top
+            ZStack(alignment: .top) {
+                heroImage(url: page.thumbnailUrl, data: headerArt, height: artHeight)
+
+                if let canvasURL {
+                    CanvasPlayer(url: canvasURL, fallbackURL: canvasFallbackURL, isPlaying: true)
+                        .frame(height: artHeight)
+                        .clipped()
+                }
+
+                // Upstream's gradient: settling the foot of the picture onto the wash colour
+                LinearGradient(
+                    stops: [
+                        .init(color: .clear, location: 0.35),
+                        .init(color: tint.wash.opacity(0.92), location: 1.0)
+                    ],
+                    startPoint: .top,
+                    endPoint: .bottom
+                )
+                .frame(height: artHeight)
+                .allowsHitTesting(false)
+            }
+            .frame(height: artHeight)
+            .frame(maxHeight: .infinity, alignment: .top)
+            .overlay(alignment: .bottom) {
+                mergeBand(tint: tint)
+                    .frame(height: 80)
+                    .offset(y: 20)
+                    .allowsHitTesting(false)
+            }
+
+            // Foreground Text and Actions pinned to the bottom of the header
+            VStack(spacing: 6) {
+                Text(page.title.isEmpty ? initialTitle : page.title)
+                    .font(isArtist ? .system(size: 32, weight: .bold) : .title2.weight(.bold))
+                    .multilineTextAlignment(.center)
+                    .lineLimit(2)
+                    .minimumScaleFactor(0.8)
+                    .padding(.horizontal, 24)
+
+                if !credit.isEmpty {
+                    if let artistId, kind(of: page) != .artist {
+                        NavigationLink(destination: DetailView(browseId: artistId, initialTitle: credit)) {
+                            Text(credit)
+                                .font(.headline.weight(.semibold))
+                                .foregroundStyle(tint.accent)
+                                .multilineTextAlignment(.center)
+                                .lineLimit(1)
+                        }
+                        .buttonStyle(.plain)
+                        .padding(.horizontal, 24)
+                    } else {
+                        Text(credit)
+                            .font(.headline.weight(.semibold))
+                            .foregroundStyle(tint.accent)
+                            .multilineTextAlignment(.center)
+                            .lineLimit(1)
+                            .padding(.horizontal, 24)
+                    }
+                }
+
+                if !lines.meta.isEmpty {
+                    Text(lines.meta)
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(.secondary)
+                        .tracking(0.7)
+                        .textCase(.uppercase)
+                        .multilineTextAlignment(.center)
+                        .lineLimit(1)
+                        .padding(.horizontal, 24)
+                }
+
+                if isArtist, page.subscriberCountText != nil || page.monthlyListenerCount != nil {
+                    artistStatsRow(page: page, tint: tint)
+                        .padding(.top, 4)
+                }
+
+                if !page.songs.isEmpty {
+                    actionRow(page, tint: tint, isArtist: isArtist)
+                        .padding(.top, 10)
+                }
+            }
+            .padding(.bottom, 12)
+            .frame(maxWidth: 860)
+        }
+        .frame(height: artHeight + 44) // Upstream's HEADER_DROP = 44dp
+    }
+
+    /// Single horizontal row of circular action buttons, matching upstream's ReleaseHeader and ActionRow.
+    private func actionRow(
+        _ page: DetailPageModel,
+        tint: ArtworkPalette.PageTint,
+        isArtist: Bool
+    ) -> some View {
+        HStack(spacing: 12) {
+            if isArtist {
+                if auth.signedIn, let subscription = page.subscription {
+                    let isSub = subscriptionOverride ?? subscription.subscribed
+                    CircleIconButton(
+                        icon: Image(systemName: isSub ? "checkmark" : "plus"),
+                        label: isSub ? "Unsubscribe" : "Subscribe",
+                        active: isSub,
+                        activeColor: tint.accent,
+                        disabled: subscribing
+                    ) {
+                        Task { await toggleSubscription(subscription, artistName: page.title) }
+                    }
+                }
+
+                PlayPill(iconOnly: false) {
+                    controller.play(page.songs.map { toEntry($0, fallbackArt: fallbackArt(page)) }, at: 0)
+                }
+
+                CircleIconButton(
+                    icon: Image(.bchShuffle),
+                    label: "Shuffle"
+                ) {
+                    var shuffled = page.songs.map { toEntry($0, fallbackArt: fallbackArt(page)) }
+                    shuffled.shuffle()
+                    controller.play(shuffled, at: 0)
+                }
+            } else {
+                if auth.signedIn, page.libraryPlaylistId != nil {
+                    CircleIconButton(
+                        icon: Image(systemName: saved ? "checkmark" : "plus"),
+                        label: saved ? "Remove from Library" : "Add to Library",
+                        active: saved,
+                        activeColor: tint.accent,
+                        disabled: saving
+                    ) {
+                        Task { await toggleSave(page) }
+                    }
+                }
+
+                CircleIconButton(
+                    icon: Image(.bchShuffle),
+                    label: "Shuffle"
+                ) {
+                    var shuffled = page.songs.map { toEntry($0, fallbackArt: fallbackArt(page)) }
+                    shuffled.shuffle()
+                    controller.play(shuffled, at: 0)
+                }
+
+                PlayPill(iconOnly: true) {
+                    controller.play(page.songs.map { toEntry($0, fallbackArt: fallbackArt(page)) }, at: 0)
+                }
+
+                CircleIconButton(
+                    icon: Image(systemName: searching ? "xmark" : "magnifyingglass"),
+                    label: searching ? "Close search" : "Search this list",
+                    active: searching,
+                    activeColor: tint.accent
+                ) {
+                    withAnimation(.easeInOut(duration: 0.2)) {
+                        if searching { filter = "" }
+                        searching.toggle()
+                    }
+                }
+
+                CircleMenuButton(label: "More actions") {
+                    Button(pinned ? "Unpin" : "Pin") {
+                        if PlaylistPinning.toggle(browseId: browseId) {
+                            pinned.toggle()
+                        } else {
+                            appModel.pinLimitAlert = true
+                        }
+                    }
+                    Button("Download") {
+                        Task {
+                            switch await DownloadStore.shared.downloadCollection(browseId: browseId) {
+                            case .started:
+                                toast.show("Downloading \(page.title)")
+                            case .blockedByWifiOnly:
+                                toast.show("Downloads are limited to Wi-Fi. Turn that off in Settings to use mobile data.", kind: .failure)
+                            case .alreadyExists:
+                                toast.show("This collection is already downloading or downloaded", kind: .info)
+                            case .ignoredLocalTrack:
+                                break
+                            }
+                        }
+                    }
+                    if kind(of: page) == .playlist, page.playlistOwned == true {
+                        Button("Rename Playlist…") {
+                            renameTitle = page.title
+                            renamePresented = true
+                        }
+                        Button("Privacy: \(privacy.capitalized)") {
+                            privacyPresented = true
+                        }
+                        Button("Remove Duplicates") {
+                            Task { await removeDuplicates(page) }
+                        }
+                    }
+                }
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .center)
+    }
+
+    /// Sleek inline filter bar displayed when searching is toggled on.
+    private func searchField(tint: ArtworkPalette.PageTint) -> some View {
+        HStack(spacing: 8) {
+            Image(systemName: "magnifyingglass")
+                .foregroundStyle(.secondary)
+                .frame(width: 16, height: 16)
+            TextField("Search this list", text: $filter)
+                .textFieldStyle(.plain)
+            if !filter.isEmpty {
+                Button {
+                    filter = ""
+                } label: {
+                    Image(systemName: "xmark.circle.fill")
+                        .foregroundStyle(.secondary)
+                }
+                .buttonStyle(.plain)
+            }
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 10)
+        .background {
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .fill(.ultraThinMaterial)
+                .overlay(
+                    RoundedRectangle(cornerRadius: 12, style: .continuous)
+                        .stroke(Color.primary.opacity(0.08), lineWidth: 0.5)
+                )
+        }
+        .padding(.horizontal, 24)
+        .padding(.bottom, 12)
+    }
+
+    private func artistStatsRow(page: DetailPageModel, tint: ArtworkPalette.PageTint) -> some View {
+        HStack(spacing: 8) {
+            if let sub = page.subscriberCountText, !sub.isEmpty {
+                let text = sub.components(separatedBy: " ").first ?? sub
+                statChip(icon: "person.2.fill", text: "\(text) subscribers")
+            }
+            if let monthly = page.monthlyListenerCount, !monthly.isEmpty {
+                let text = monthly.components(separatedBy: " ").first ?? monthly
+                statChip(icon: "waveform", text: "\(text) monthly listeners")
+            }
+        }
+    }
+
+    private func statChip(icon: String, text: String) -> some View {
+        HStack(spacing: 5) {
+            Image(systemName: icon)
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+            Text(text)
+                .font(.caption2.weight(.medium))
+                .foregroundStyle(.secondary)
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 5)
+        .background {
+            Capsule()
+                .fill(.ultraThinMaterial)
+                .overlay(Capsule().stroke(Color.primary.opacity(0.08), lineWidth: 0.5))
+        }
+    }
+
+    @ViewBuilder
+    private func heroImage(url: String?, data: Data?, height: CGFloat) -> some View {
+        Group {
+            if let data, let image = PlatformImage(data: data) {
+                #if os(iOS)
+                Image(uiImage: image)
+                    .resizable()
+                    .scaledToFill()
+                #else
+                Image(nsImage: image)
+                    .resizable()
+                    .scaledToFill()
+                #endif
+            } else if let url, let image = ArtworkCache.shared.get(url) {
+                #if os(iOS)
+                Image(uiImage: image)
+                    .resizable()
+                    .scaledToFill()
+                #else
+                Image(nsImage: image)
+                    .resizable()
+                    .scaledToFill()
+                #endif
+            } else if let url, let imageURL = URL(string: SharedArtwork.sized(url, 720) ?? url) {
+                AsyncImage(url: imageURL) { phase in
+                    if let image = phase.image {
+                        image.resizable().scaledToFill()
+                    } else {
+                        Rectangle().fill(Color.secondary.opacity(0.15))
+                    }
+                }
+            } else {
+                Rectangle().fill(Color.secondary.opacity(0.15))
+            }
+        }
+        .frame(height: height)
+        .clipped()
+    }
+
+    /// One pane of glass across the artwork/page join, masked to arrive from
+    /// nothing and leave to nothing so neither of its own edges shows.
+    /// Skipped with Reduce Motion's blur sibling (`reduce_dynamic_blur`), like
+    /// upstream, leaving the wash gradient to settle the join on its own.
+    private func mergeBand(tint: ArtworkPalette.PageTint) -> some View {
+        Group {
+            if PlatformSettings.shared.getBoolean(key: "reduce_dynamic_blur", default: false) {
+                EmptyView()
+            } else {
+                Rectangle()
+                    .fill(.ultraThinMaterial)
+                    .mask(
+                        LinearGradient(
+                            stops: [
+                                .init(color: .clear, location: 0),
+                                .init(color: .black, location: 0.5),
+                                .init(color: .clear, location: 1),
+                            ],
+                            startPoint: .top,
+                            endPoint: .bottom
+                        )
+                    )
+            }
         }
     }
 
@@ -147,133 +523,37 @@ struct DetailView: View {
                 startPoint: .top,
                 endPoint: .bottom
             )
-            .frame(height: 420)
+            .frame(height: 520)
             .allowsHitTesting(false)
         }
         .ignoresSafeArea()
     }
 
-    private func header(_ page: DetailPageModel, tint: ArtworkPalette.PageTint) -> some View {
-        let lines = headerLines(page)
-        let artSide: CGFloat = kind(of: page) == .artist ? 180 : 200
-        return HStack(alignment: .bottom, spacing: 24) {
-            ZStack {
-                ArtworkView(url: page.thumbnailUrl, data: headerArt, side: artSide)
-                if let canvasURL {
-                    CanvasPlayer(url: canvasURL, fallbackURL: canvasFallbackURL, isPlaying: true)
-                }
-            }
-            .frame(width: artSide, height: artSide)
-            .clipShape(.rect(cornerRadius: kind(of: page) == .artist ? artSide / 2 : 12, style: .continuous))
-            .shadow(color: .black.opacity(0.38), radius: 22, y: 10)
+    /// Upstream's `playtimeSummary`: "16 songs, 48 minutes"
+    private func playtimeSummary(_ songs: [DetailPageModel.SongPayload]) -> String {
+        let count = "\(songs.count) \(songs.count == 1 ? "song" : "songs")"
+        let totalSeconds = songs.reduce(0) { sum, s in
+            sum + durationToSeconds(s.durationText)
+        }
+        let minutes = totalSeconds / 60
+        guard minutes > 0 else { return count }
+        if minutes < 60 {
+            return "\(count), \(minutes) minutes"
+        } else {
+            let hours = minutes / 60
+            let rest = minutes % 60
+            let hourLabel = "\(hours) \(hours == 1 ? "hour" : "hours")"
+            return rest == 0 ? "\(count), \(hourLabel)" : "\(count), \(hourLabel) \(rest) minutes"
+        }
+    }
 
-            VStack(alignment: .leading, spacing: 6) {
-                Text(page.title.isEmpty ? initialTitle : page.title)
-                    // A semantic large title rather than a fixed 32pt, so this
-                    // grows with the reader's text size. The clamp is the same one
-                    // Music applies to an artwork-page title: past `accessibility3`
-                    // it stops competing with the artwork for the page.
-                    .font(.largeTitle.weight(.bold))
-                    .dynamicTypeSize(...DynamicTypeSize.accessibility2)
-                    .lineLimit(2)
-                    .minimumScaleFactor(0.7)
-
-                if !lines.credit.isEmpty {
-                    Text(lines.credit)
-                        .font(.title3.weight(.semibold))
-                        .foregroundStyle(tint.accent)
-                        .lineLimit(1)
-                }
-
-                if !lines.meta.isEmpty {
-                    Text(lines.meta)
-                        .font(.caption.weight(.semibold))
-                        .foregroundStyle(.secondary)
-                        .tracking(0.5)
-                        .textCase(.uppercase)
-                }
-
-                if let sub = page.subscriberCountText, !sub.isEmpty, kind(of: page) == .artist {
-                    Text(sub)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
-
-                if page.songs.count > 0 {
-                    HStack(spacing: 10) {
-                        Button {
-                            controller.play(page.songs.map { toEntry($0, fallbackArt: fallbackArt(page)) }, at: 0)
-                        } label: {
-                            Label("Play", systemImage: "play.fill")
-                                .font(.body.weight(.semibold))
-                                .frame(maxWidth: .infinity)
-                        }
-                        .buttonStyle(.borderedProminent)
-                        .tint(tint.accent)
-                        .controlSize(.large)
-
-                        Button {
-                            var shuffled = page.songs.map { toEntry($0, fallbackArt: fallbackArt(page)) }
-                            shuffled.shuffle()
-                            controller.play(shuffled, at: 0)
-                        } label: {
-                            Label {
-                                Text("Shuffle")
-                            } icon: {
-                                Image(.bchShuffle)
-                                    .resizable()
-                                    .scaledToFit()
-                                    .frame(width: 13, height: 13)
-                            }
-                            .font(.body.weight(.semibold))
-                            .frame(maxWidth: .infinity)
-                        }
-                        .buttonStyle(.bordered)
-                        .tint(tint.accent)
-                        .controlSize(.large)
-                    }
-                    .frame(maxWidth: 340)
-                    .padding(.top, 10)
-
-                    if auth.signedIn, kind(of: page) != .artist {
-                        Button {
-                            Task { await toggleSave(page) }
-                        } label: {
-                            Label(saved ? "Saved" : "Save to Library", systemImage: saved ? "bookmark.fill" : "bookmark")
-                        }
-                        .buttonStyle(.bordered)
-                        .disabled(saving)
-                        Button(pinned ? "Unpin" : "Pin") {
-                            if PlaylistPinning.toggle(browseId: browseId) {
-                                pinned.toggle()
-                            } else {
-                                appModel.pinLimitAlert = true
-                            }
-                        }
-                        .buttonStyle(.bordered)
-                    }
-                    if kind(of: page) == .playlist, page.playlistOwned == true {
-                        Button("Rename Playlist…") {
-                            renameTitle = page.title
-                            renamePresented = true
-                        }
-                        .buttonStyle(.bordered)
-                        Button("Privacy: \(privacy.capitalized)") {
-                            privacyPresented = true
-                        }
-                        .buttonStyle(.bordered)
-                        Button("Remove Duplicates") {
-                            Task { await removeDuplicates(page) }
-                        }
-                        .buttonStyle(.bordered)
-                    }
-                    Button("Download") {
-                        Task { await DownloadStore.shared.downloadCollection(browseId: browseId) }
-                    }
-                    .buttonStyle(.bordered)
-                }
-            }
-            Spacer(minLength: 0)
+    private func durationToSeconds(_ text: String?) -> Int {
+        guard let text else { return 0 }
+        let parts = text.split(separator: ":").compactMap { Int($0.trimmingCharacters(in: .whitespaces)) }
+        switch parts.count {
+        case 2: return parts[0] * 60 + parts[1]
+        case 3: return parts[0] * 3600 + parts[1] * 60 + parts[2]
+        default: return 0
         }
     }
 
@@ -410,6 +690,7 @@ struct DetailView: View {
     private func load() async {
         loading = true
         error = nil
+        subscriptionOverride = nil
         do {
             if browseId.hasPrefix("UC") {
                 page = try await InnertubeDetail.shared.browseArtist(browseId: browseId)
@@ -447,6 +728,21 @@ struct DetailView: View {
             saved = next
         }
         saving = false
+    }
+
+    private func toggleSubscription(_ subscription: ArtistSubscriptionPayload, artistName: String) async {
+        guard !subscribing else { return }
+        subscribing = true
+        let wasSubscribed = subscriptionOverride ?? subscription.subscribed
+        let next = !wasSubscribed
+        subscriptionOverride = next
+        if let failure = await LibraryActions.setSubscribed(channelId: subscription.channelId, subscribed: next) {
+            subscriptionOverride = wasSubscribed
+            toast.show("Couldn’t update subscription: \(failure)", kind: .failure)
+        } else {
+            toast.show(next ? "Subscribed to \(artistName)" : "Unsubscribed from \(artistName)")
+        }
+        subscribing = false
     }
 
     private func setPrivacy(_ value: String) async {
@@ -512,3 +808,102 @@ private final class DetailCanvasCB: CanvasBridgeCanvasCallback {
     init(_ handler: @escaping (String?) -> Void) { self.handler = handler }
     func onResult(json: String?) { handler(json) }
 }
+
+// MARK: - Circular Action Buttons
+
+private struct CircleIconButton: View {
+    let icon: Image
+    let label: String
+    var size: CGFloat = 46
+    var active: Bool = false
+    var activeColor: Color? = nil
+    var disabled: Bool = false
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            Circle()
+                .fill(active ? (activeColor ?? .accentColor) : Color.primary.opacity(0.12))
+                .overlay {
+                    icon
+                        .renderingMode(.template)
+                        .resizable()
+                        .scaledToFit()
+                        .frame(width: size * 0.44, height: size * 0.44)
+                        .foregroundStyle(active ? Color.white : Color.primary)
+                }
+                .frame(width: size, height: size)
+        }
+        .buttonStyle(.plain)
+        .disabled(disabled)
+        .accessibilityLabel(label)
+        .help(label)
+    }
+}
+
+private struct PlayPill: View {
+    var iconOnly: Bool = true
+    var size: CGFloat = 46
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            Group {
+                if iconOnly {
+                    Circle()
+                        .fill(Color.white)
+                        .overlay {
+                            Image(systemName: "play.fill")
+                                .resizable()
+                                .scaledToFit()
+                                .frame(width: size * 0.40, height: size * 0.40)
+                                .offset(x: 1.5)
+                                .foregroundStyle(Color.black)
+                        }
+                        .frame(width: size, height: size)
+                } else {
+                    HStack(spacing: 8) {
+                        Image(systemName: "play.fill")
+                            .font(.body.weight(.bold))
+                            .foregroundStyle(Color.black)
+                        Text("Play")
+                            .font(.body.weight(.semibold))
+                            .foregroundStyle(Color.black)
+                    }
+                    .padding(.horizontal, 24)
+                    .frame(height: size)
+                    .background(Color.white, in: Capsule())
+                }
+            }
+            .shadow(color: .black.opacity(0.20), radius: 6, y: 3)
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel("Play")
+    }
+}
+
+private struct CircleMenuButton<Content: View>: View {
+    let label: String
+    var size: CGFloat = 46
+    @ViewBuilder let content: () -> Content
+
+    var body: some View {
+        Menu {
+            content()
+        } label: {
+            Circle()
+                .fill(Color.primary.opacity(0.12))
+                .overlay {
+                    Image(systemName: "ellipsis")
+                        .font(.system(size: size * 0.42, weight: .semibold))
+                        .foregroundStyle(Color.primary)
+                }
+                .frame(width: size, height: size)
+        }
+        .buttonStyle(.plain)
+        .menuStyle(.borderlessButton)
+        .accessibilityLabel(label)
+        .help(label)
+    }
+}
+

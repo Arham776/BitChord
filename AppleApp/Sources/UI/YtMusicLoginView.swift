@@ -7,12 +7,12 @@ import BitChordShared
 ///
 /// ## Flow
 ///
-/// Load Google's real login with `continue=music.youtube.com`. The user
-/// authenticates against accounts.google.com (2FA, passkeys, etc.). When Google
+/// Load Google's real login with `continue=music.youtube.com`. When Google
 /// redirects to music.youtube.com the session cookies land in an isolated
 /// `WKWebsiteDataStore` (not Safari, not `URLSession.shared`), and the listener
 /// confirms the profile shown by the live page. The password never passes through
-/// app code.
+/// app code. Google may refuse embedded sign-in and third-party passkeys are
+/// unavailable here; the explicit Safari/import route below covers that case.
 ///
 /// Do not replace this with `ASWebAuthenticationSession`: that uses Safari and
 /// never returns a music.youtube.com cookie jar to the app.
@@ -53,6 +53,7 @@ struct YtMusicLoginView: View {
     var onDismiss: () -> Void
 
     @State private var flow = LoginFlow()
+    @State private var importPresented = false
 
     var body: some View {
         // Upstream's `MainActivity` structure, in Apple form: a header (here the
@@ -79,6 +80,13 @@ struct YtMusicLoginView: View {
                 onCaptured: onCaptured,
                 onUnavailable: { reason in flow.captureFailed(reason) }
             )
+            Button("Use a Safari session instead") { importPresented = true }
+                .buttonStyle(.plain)
+                .foregroundStyle(.tint)
+                .font(.footnote.weight(.semibold))
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 12)
+                .background(.bar)
         }
         .animation(.easeInOut(duration: 0.2), value: flow.prompt)
         .navigationTitle("Sign in to YouTube Music")
@@ -98,6 +106,89 @@ struct YtMusicLoginView: View {
                         flow.session.take?()
                     }
                     .accessibilityHint("Saves the profile shown by the page to this device")
+                }
+            }
+        }
+        .sheet(isPresented: $importPresented) {
+            SessionImportView(onCaptured: onCaptured)
+        }
+    }
+}
+
+/// Explicit fallback when Google refuses the embedded view. The transfer is
+/// manual until a Safari extension can be verified on a real device; unlike a
+/// fake browser user agent, this path does not claim WebKit passkey support.
+private struct SessionImportView: View {
+    var onCaptured: (SignInCapture, @escaping (Bool) -> Void) -> Void
+    @Environment(\.dismiss) private var dismiss
+    @State private var cookieHeader = ""
+    @State private var checking = false
+    @State private var error: String?
+
+    private var normalizedHeader: String {
+        let trimmed = cookieHeader.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.lowercased().hasPrefix("cookie:") {
+            return String(trimmed.dropFirst(7)).trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        return trimmed
+    }
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                Section {
+                    Link("Open YouTube Music in Safari", destination: URL(string: "https://music.youtube.com/")!)
+                    Text("Sign in there with your passkey or password. To transfer the session, copy the Cookie request header for music.youtube.com from your browser's developer tools and paste it below.")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                }
+                Section("Session cookie") {
+                    SecureField("Paste Cookie header", text: $cookieHeader)
+                        .textContentType(.password)
+                    Text("This header grants account access. Keep it private; BitChord stores a verified session in Keychain.")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                }
+                if let error {
+                    Text(error).foregroundStyle(.red)
+                }
+                Section {
+                    Button {
+                        let header = normalizedHeader
+                        guard !header.contains("\n"), !header.contains("\r"),
+                              AuthBridge.shared.hasApiSid(cookieHeader: header)
+                        else {
+                            error = "Paste the Cookie header from a signed-in YouTube Music request."
+                            return
+                        }
+                        checking = true
+                        error = nil
+                        onCaptured(SignInCapture(
+                            cookie: header,
+                            pageId: nil,
+                            dataSyncId: nil,
+                            authUser: nil,
+                            visitorData: nil,
+                            clientVersion: nil,
+                            loggedIn: true
+                        )) { accepted in
+                            Task { @MainActor in
+                                checking = false
+                                if accepted { dismiss() }
+                                else { error = "The session could not be verified. Keep the browser open and try a fresh header." }
+                            }
+                        }
+                    } label: {
+                        if checking { ProgressView() }
+                        else { Text("Import and Verify") }
+                    }
+                    .disabled(checking || normalizedHeader.isEmpty)
+                }
+            }
+            .navigationTitle("Import Safari Session")
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Cancel") { dismiss() }
                 }
             }
         }
@@ -186,6 +277,10 @@ private struct LoginWebView: NSViewRepresentable {
     }
 
     func updateNSView(_ nsView: WKWebView, context: Context) {}
+
+    static func dismantleNSView(_ nsView: WKWebView, coordinator: LoginWebCoordinator) {
+        coordinator.stopObserving()
+    }
 }
 #else
 private struct LoginWebView: UIViewRepresentable {
@@ -206,6 +301,10 @@ private struct LoginWebView: UIViewRepresentable {
     }
 
     func updateUIView(_ uiView: WKWebView, context: Context) {}
+
+    static func dismantleUIView(_ uiView: WKWebView, coordinator: LoginWebCoordinator) {
+        coordinator.stopObserving()
+    }
 }
 #endif
 
@@ -223,15 +322,7 @@ final class LoginWebCoordinator: NSObject, WKNavigationDelegate, WKUIDelegate, W
     private let flow: LoginFlow
     private let onCaptured: (SignInCapture, @escaping (Bool) -> Void) -> Void
     private let onUnavailable: (String) -> Void
-    /// `nonisolated` so `deinit` can reach it.
-    ///
-    /// `deinit` runs on whichever thread released the coordinator, so it cannot
-    /// touch main-actor state. Unregistering from the cookie store is the one
-    /// thing it has to do, and reaching it through
-    /// `MainActor.assumeIsolated` would *trap* rather than merely leave an
-    /// observer registered — a crash on the way out, over a leak that ends with
-    /// the store itself.
-    nonisolated private let store = WKWebsiteDataStore.nonPersistent()
+    private let store: WKWebsiteDataStore
     private var captured = false
     /// Weak, because the coordinator is the navigation delegate the web view
     /// retains, and a strong reference back would be a cycle.
@@ -242,14 +333,17 @@ final class LoginWebCoordinator: NSObject, WKNavigationDelegate, WKUIDelegate, W
         onCaptured: @escaping (SignInCapture, @escaping (Bool) -> Void) -> Void,
         onUnavailable: @escaping (String) -> Void
     ) {
+        self.store = WKWebsiteDataStore.nonPersistent()
         self.flow = flow
         self.onCaptured = onCaptured
         self.onUnavailable = onUnavailable
     }
 
-    deinit {
-        // Safe without an actor hop: see `store`.
+    func stopObserving() {
         store.httpCookieStore.remove(self)
+        webView?.navigationDelegate = nil
+        webView?.uiDelegate = nil
+        webView = nil
     }
 
     func cookiesDidChange(in cookieStore: WKHTTPCookieStore) {
@@ -412,47 +506,50 @@ final class LoginWebCoordinator: NSObject, WKNavigationDelegate, WKUIDelegate, W
                     self.finish(message: "Google has not issued a session yet.")
                     return
                 }
-                view.evaluateJavaScript(Self.ytcfgProbe) { raw, _ in
-                    Task { @MainActor in
-                        guard let fields = SignInCapture.parse(jsResult: raw),
-                              fields.loggedIn
-                        else {
-                            // Upstream logs this and leaves the screen open. So does
-                            // this: the listener can try again once the page has
-                            // settled, including after switching channels in the
-                            // avatar menu.
-                            self.finish(message: "No signed-in profile is available on this page yet.")
-                            return
-                        }
-                        // A delegated identity is the most specific answer the live
-                        // page can give. Otherwise normalise its DATASYNC_ID.
-                        let dataSyncId = fields.pageId
-                            ?? SignInCapture.normalizeDataSyncId(fields.dataSyncId)
-                        self.captured = true
-                        self.flow.captureSucceeded()
-                        self.onCaptured(
-                            SignInCapture(
-                                cookie: header,
-                                pageId: fields.pageId,
-                                dataSyncId: dataSyncId,
-                                authUser: fields.authUser,
-                                visitorData: fields.visitorData,
-                                clientVersion: fields.clientVersion,
-                                loggedIn: true
-                            )
-                        ) { [weak self] accepted in
-                            Task { @MainActor in
-                                guard let self else { return }
-                                if accepted {
-                                    self.flow.captureSucceeded()
-                                } else {
-                                    // Validation refused it after the fact. The screen
-                                    // stays open so the listener can try again; the
-                                    // cookie stays stored so the next attempt has
-                                    // something to be judged against.
-                                    self.captured = false
-                                    self.finish(message: "No signed-in profile is available on this page yet.")
-                                }
+                Task { @MainActor in
+                    let raw = try? await view.evaluateJavaScript(
+                        Self.ytcfgProbe,
+                        in: nil,
+                        contentWorld: .page
+                    )
+                    guard let fields = SignInCapture.parse(jsResult: raw),
+                          fields.loggedIn
+                    else {
+                        // Upstream logs this and leaves the screen open. So does
+                        // this: the listener can try again once the page has
+                        // settled, including after switching channels in the
+                        // avatar menu.
+                        self.finish(message: "No signed-in profile is available on this page yet.")
+                        return
+                    }
+                    // A delegated identity is the most specific answer the live
+                    // page can give. Otherwise normalise its DATASYNC_ID.
+                    let dataSyncId = fields.pageId
+                        ?? SignInCapture.normalizeDataSyncId(fields.dataSyncId)
+                    self.captured = true
+                    self.flow.captureSucceeded()
+                    let coordinator = self
+                    self.onCaptured(
+                        SignInCapture(
+                            cookie: header,
+                            pageId: fields.pageId,
+                            dataSyncId: dataSyncId,
+                            authUser: fields.authUser,
+                            visitorData: fields.visitorData,
+                            clientVersion: fields.clientVersion,
+                            loggedIn: true
+                        )
+                    ) { [weak coordinator] accepted in
+                        Task { @MainActor in
+                            guard let coordinator else { return }
+                            if accepted {
+                                coordinator.flow.captureSucceeded()
+                            } else {
+                                // Validation refused the candidate. Keep the
+                                // screen open and preserve the prior saved
+                                // session so the listener can try again.
+                                coordinator.captured = false
+                                coordinator.finish(message: "No signed-in profile is available on this page yet.")
                             }
                         }
                     }

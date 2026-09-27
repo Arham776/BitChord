@@ -70,6 +70,32 @@ struct WebDavLibraryView: View {
             Section {
                 header
             }
+            if !conflicts.isEmpty {
+                Section {
+                    Button {
+                        activeConflict = conflicts.first
+                    } label: {
+                        HStack {
+                            Image(systemName: "exclamationmark.triangle")
+                                .foregroundStyle(.orange)
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(conflictTitle)
+                                    .foregroundStyle(.primary)
+                                Text("Same song in Downloads and on this share. Choose which copy wins.")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+                            Spacer()
+                            Image(systemName: "chevron.right")
+                                .font(.caption)
+                                .foregroundStyle(.tertiary)
+                        }
+                    }
+                    .buttonStyle(.plain)
+                } header: {
+                    Text("Sync Conflicts")
+                }
+            }
             ForEach(store.albums) { album in
                 Section {
                     ForEach(Array(album.songs.enumerated()), id: \.element.videoId) { _, song in
@@ -90,6 +116,30 @@ struct WebDavLibraryView: View {
         .listStyle(.inset)
         #endif
         .navigationTitle("WebDAV")
+        .sheet(item: $activeConflict) { conflict in
+            WebDavConflictAlert(
+                conflict: conflict,
+                rest: conflicts.filter { $0.id != conflict.id },
+                onDone: { next in activeConflict = next }
+            )
+        }
+    }
+    @State private var activeConflict: WebDavConflict?
+
+    /// Every local download that names the same song as a remote track.
+    ///
+    /// Both sides are read live — the remote listing from `WebDavStore`, the
+    /// local files from `DownloadStore` — so a conflict that was resolved by
+    /// deleting a copy disappears without any bookkeeping here.
+    private var conflicts: [WebDavConflict] {
+        WebDavConflictDetector.conflicts(
+            remote: store.albums.flatMap(\.songs),
+            local: DownloadStore.shared.items
+        )
+    }
+
+    private var conflictTitle: String {
+        conflicts.count == 1 ? "1 track in two places" : "\(conflicts.count) tracks in two places"
     }
 
     /// Which share this is, and how much of it there is.
@@ -165,5 +215,186 @@ private struct AlbumHeader: View {
         .textCase(nil)
         .accessibilityElement(children: .combine)
         .accessibilityLabel("\(album.name ?? "Unknown album"), \(album.songs.count) tracks")
+    }
+}
+
+// MARK: - Sync conflicts
+
+/// One song living in two libraries: a finished download on this device and a
+/// track on the configured WebDAV share.
+///
+/// Upstream meets this as a name clash mid-upload (`WebDavConflictAlert`) with
+/// three outcomes. There is no upload path on this platform, so the clash is
+/// met where the two copies are both visible — this library — and the data is
+/// the real thing on both sides: the remote album the share filed the track
+/// under, and the local file's size and modification date read off the disk.
+struct WebDavConflict: Identifiable, Equatable {
+    /// Remote track id + local path: the two provenances that make it a clash.
+    let id: String
+    let title: String
+    let artist: String
+    let remoteAlbum: String?
+    let localPath: String
+    let localSize: Int64?
+    let localModified: Date?
+}
+
+/// The clash detector: same song, two libraries.
+///
+/// Matched on normalized title plus artist — case, diacritics and punctuation
+/// folded away, because "Café" on the share and "Cafe (Remastered)"... no:
+/// only true normalizations match, never guesses. A featured-artist credit in
+/// one library and not the other is still the same song when the title agrees
+/// and both artists name the same lead, which is why the artist half matches on
+/// containment rather than equality.
+enum WebDavConflictDetector {
+    static func conflicts(remote: [Song], local: [DownloadedTrack]) -> [WebDavConflict] {
+        var out: [WebDavConflict] = []
+        for item in local {
+            let localTitle = normalize(item.title)
+            guard !localTitle.isEmpty else { continue }
+            let localArtist = normalize(item.artist)
+            guard let match = remote.first(where: { song in
+                normalize(song.title) == localTitle && artistsAgree(localArtist, normalize(song.artist))
+            }) else { continue }
+            let attributes = try? FileManager.default.attributesOfItem(atPath: item.path)
+            let size = (attributes?[.size] as? NSNumber)?.int64Value
+            let modified = attributes?[.modificationDate] as? Date
+            out.append(WebDavConflict(
+                id: "\(match.videoId)|\(item.path)",
+                title: item.title,
+                artist: item.artist,
+                remoteAlbum: match.albumName,
+                localPath: item.path,
+                localSize: size,
+                localModified: modified
+            ))
+        }
+        return out.sorted { $0.title.localizedStandardCompare($1.title) == .orderedAscending }
+    }
+
+    static func normalize(_ raw: String) -> String {
+        raw.folding(options: [.diacriticInsensitive, .caseInsensitive], locale: .current)
+            .components(separatedBy: CharacterSet.alphanumerics.inverted)
+            .filter { !$0.isEmpty }
+            .joined(separator: " ")
+    }
+
+    private static func artistsAgree(_ local: String, _ remote: String) -> Bool {
+        if local.isEmpty || remote.isEmpty { return true }
+        if local == remote { return true }
+        return local.contains(remote) || remote.contains(local)
+    }
+}
+
+/// Upstream `WebDavConflictAlert`, in a native sheet.
+///
+/// Keep Both is the emphasised, non-destructive answer — the copies live in
+/// different libraries and coexisting is a state that needs no work. Keep
+/// Remote deletes the local file for real and refreshes Downloads; Skip leaves
+/// this one undecided and moves on. With several clashes queued, Apply to All
+/// carries the same answer through the rest.
+struct WebDavConflictAlert: View {
+    let conflict: WebDavConflict
+    let rest: [WebDavConflict]
+    /// The next conflict to show, or nil to close.
+    let onDone: (WebDavConflict?) -> Void
+
+    @Environment(ToastCenter.self) private var toast
+    @State private var applyToAll = false
+
+    var body: some View {
+        NavigationStack {
+            VStack(alignment: .leading, spacing: 12) {
+                Text("“\(conflict.title)” is in two places")
+                    .font(.headline)
+                Text("This download and a track on your WebDAV share name the same song.")
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+                Group {
+                    HStack {
+                        Text("On this device").foregroundStyle(.secondary)
+                        Spacer()
+                        Text(localDetail).monospacedDigit()
+                    }
+                    HStack {
+                        Text("On the share").foregroundStyle(.secondary)
+                        Spacer()
+                        Text(remoteDetail)
+                    }
+                }
+                .font(.subheadline)
+                if !rest.isEmpty {
+                    Toggle("Apply to all \(rest.count + 1) conflicts", isOn: $applyToAll)
+                        .font(.subheadline)
+                }
+                Spacer(minLength: 8)
+                Button("Keep Both") {
+                    toast.show("Kept both copies of “\(conflict.title)”")
+                    advance(deletingLocal: false, applyEverywhere: true)
+                }
+                .buttonStyle(.borderedProminent)
+                .frame(maxWidth: .infinity)
+                Button("Keep Remote — Delete Local Copy", role: .destructive) {
+                    advance(deletingLocal: true, applyEverywhere: applyToAll)
+                }
+                .buttonStyle(.bordered)
+                .frame(maxWidth: .infinity)
+                Button("Skip", role: .cancel) {
+                    advance(deletingLocal: false, applyEverywhere: applyToAll)
+                }
+                .frame(maxWidth: .infinity)
+            }
+            .padding(20)
+            .navigationTitle("Sync Conflict")
+            #if os(iOS)
+            .navigationBarTitleDisplayMode(.inline)
+            #endif
+        }
+        #if os(macOS)
+        .frame(minWidth: 380, minHeight: 400)
+        #endif
+    }
+
+    private var localDetail: String {
+        var parts: [String] = []
+        if let size = conflict.localSize {
+            parts.append(ByteCountFormatter.string(fromByteCount: size, countStyle: .file))
+        }
+        if let modified = conflict.localModified {
+            parts.append(modified.formatted(date: .abbreviated, time: .omitted))
+        }
+        return parts.isEmpty ? "Downloaded file" : parts.joined(separator: " · ")
+    }
+
+    private var remoteDetail: String {
+        conflict.remoteAlbum ?? "On the share"
+    }
+
+    /// Resolve this conflict and, when asked, the rest behind it.
+    ///
+    /// Keeping both is a no-op whatever the toggle says — coexistence needs no
+    /// work — so Apply to All only carries deletions and skips. Deletion is the
+    /// real file removal plus a Downloads refresh, which is also what makes the
+    /// resolved rows disappear from the list behind this sheet.
+    private func advance(deletingLocal: Bool, applyEverywhere: Bool) {
+        let targets = applyEverywhere && deletingLocal ? [conflict] + rest : [conflict]
+        if deletingLocal {
+            var removed = 0
+            for target in targets {
+                if (try? FileManager.default.removeItem(atPath: target.localPath)) != nil {
+                    removed += 1
+                }
+            }
+            DownloadStore.shared.refresh()
+            toast.show(removed == 1
+                ? "Deleted the local copy of “\(conflict.title)”"
+                : "Deleted \(removed) local copies")
+        }
+        if applyEverywhere {
+            onDone(nil)
+        } else {
+            onDone(rest.first)
+        }
     }
 }

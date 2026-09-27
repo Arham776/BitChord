@@ -13,6 +13,11 @@ enum QualityUpgrade {
     static let minGainKbps = 96
     static let driftSec = 2
     static let minRemaining: TimeInterval = 20
+    /// Upstream `swapCurrentToVersion`'s `swapCrossfadeMs`: the equal-power
+    /// crossfade the engine runs between the old and the new source of the same
+    /// recording. Long enough to hide a decoder swap, short enough that a
+    /// same-timeline blend never reads as an edit.
+    static let swapCrossfadeSeconds: Double = 0.55
 
     struct Format: Sendable, Equatable {
         var codec: String?
@@ -189,23 +194,20 @@ enum QualityUpgrade {
         playingDurationSec: Int?,
         search: () async -> Candidate?
     ) async -> Candidate? {
-        store.lock.lock()
-        guard let waiting = store.pending[mediaId] else {
-            store.lock.unlock()
-            return nil
+        let snapshot = store.lock.withLock { () -> (Task<Candidate?, Never>?, Format?)? in
+            guard let waiting = store.pending[mediaId] else { return nil }
+            return (waiting.inFlight, waiting.playing)
         }
-        let inFlight = waiting.inFlight
-        let playing = waiting.playing
-        store.lock.unlock()
+        guard let (inFlight, playing) = snapshot else { return nil }
 
         var found: Candidate?
         var answered = false
         defer {
             if answered {
-                store.lock.lock()
-                store.pending.removeValue(forKey: mediaId)
-                store.asked.insert(mediaId)
-                store.lock.unlock()
+                store.lock.withLock {
+                    store.pending.removeValue(forKey: mediaId)
+                    store.asked.insert(mediaId)
+                }
             }
             if found == nil {
                 onRaceEnd(mediaId)

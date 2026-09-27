@@ -11,6 +11,7 @@ struct DetailPageModel: Decodable {
     let description: String?
     let subscriberCountText: String?
     let monthlyListenerCount: String?
+    let subscription: ArtistSubscriptionPayload?
     var continuation: String?
     var suggestedSongs: [SongPayload]
     let libraryPlaylistId: String?
@@ -19,7 +20,7 @@ struct DetailPageModel: Decodable {
     let type: String?
 
     enum CodingKeys: String, CodingKey {
-        case browseId, title, subtitle, thumbnailUrl, songs, sections, description, subscriberCountText, monthlyListenerCount, continuation, type, suggestedSongs, libraryPlaylistId, librarySaved, playlistOwned
+        case browseId, title, subtitle, thumbnailUrl, songs, sections, description, subscriberCountText, monthlyListenerCount, subscription, continuation, type, suggestedSongs, libraryPlaylistId, librarySaved, playlistOwned
     }
 
     init(from decoder: Decoder) throws {
@@ -33,6 +34,7 @@ struct DetailPageModel: Decodable {
         description = try c.decodeIfPresent(String.self, forKey: .description)
         subscriberCountText = try c.decodeIfPresent(String.self, forKey: .subscriberCountText)
         monthlyListenerCount = try c.decodeIfPresent(String.self, forKey: .monthlyListenerCount)
+        subscription = try c.decodeIfPresent(ArtistSubscriptionPayload.self, forKey: .subscription)
         continuation = try c.decodeIfPresent(String.self, forKey: .continuation)
         type = try c.decodeIfPresent(String.self, forKey: .type)
         suggestedSongs = try c.decodeIfPresent([SongPayload].self, forKey: .suggestedSongs) ?? []
@@ -79,6 +81,11 @@ struct DetailPageModel: Decodable {
             )
         }
     }
+}
+
+struct ArtistSubscriptionPayload: Decodable {
+    let channelId: String
+    let subscribed: Bool
 }
 
 final class InnertubeDetail: Sendable {

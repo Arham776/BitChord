@@ -27,27 +27,46 @@ enum Keychain {
     /// down on launch.
     static func get(_ account: String) -> String? {
         var result: AnyObject?
-        let status = SecItemCopyMatching(baseQuery(account) as CFDictionary, &result)
+        var query = baseQuery(account)
+        query[kSecReturnData as String] = true
+        query[kSecMatchLimit as String] = kSecMatchLimitOne
+        let status = SecItemCopyMatching(query as CFDictionary, &result)
         guard status == errSecSuccess, let data = result as? Data else { return nil }
         return String(data: data, encoding: .utf8)
     }
 
-    /// Store a value, or remove the item when [value] is nil or empty.
-    static func put(_ account: String, _ value: String?) {
-        // Delete first: adding a duplicate account fails rather than replacing,
-        // so a rotated credential would otherwise leave the old one in place.
-        SecItemDelete(baseQuery(account) as CFDictionary)
-        guard let value, let data = value.data(using: .utf8), !value.isEmpty else { return }
-
+    /// Replace an existing value without a delete/add window that can lose the
+    /// previous session if the second operation fails.
+    @discardableResult
+    static func put(_ account: String, _ value: String?) -> Bool {
+        guard let value, !value.isEmpty else { return clear(account) }
+        let data = Data(value.utf8)
+        let attributes: [String: Any] = [
+            kSecValueData as String: data,
+            kSecAttrAccessible as String: kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly,
+        ]
+        let update = SecItemUpdate(baseQuery(account) as CFDictionary, attributes as CFDictionary)
+        if update == errSecSuccess { return true }
+        guard update == errSecItemNotFound else {
+            NSLog("[BitChord] Keychain update failed for %@: %d", account, update)
+            return false
+        }
         var item = baseQuery(account)
         item[kSecValueData as String] = data
         item[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
         item[kSecAttrSynchronizable as String] = false
-        SecItemAdd(item as CFDictionary, nil)
+        let added = SecItemAdd(item as CFDictionary, nil)
+        if added == errSecSuccess { return true }
+        NSLog("[BitChord] Keychain add failed for %@: %d", account, added)
+        return false
     }
 
-    static func clear(_ account: String) {
-        SecItemDelete(baseQuery(account) as CFDictionary)
+    @discardableResult
+    static func clear(_ account: String) -> Bool {
+        let status = SecItemDelete(baseQuery(account) as CFDictionary)
+        if status == errSecSuccess || status == errSecItemNotFound { return true }
+        NSLog("[BitChord] Keychain delete failed for %@: %d", account, status)
+        return false
     }
 
     /// Whether an item exists but cannot be read yet — a device that has not been
@@ -58,9 +77,10 @@ enum Keychain {
     /// good session and browses as a guest until the next launch.
     static func isLocked(_ account: String) -> Bool {
         var query = baseQuery(account)
-        query[kSecReturnData as String] = false
+        query[kSecReturnData as String] = true
         query[kSecMatchLimit as String] = kSecMatchLimitOne
-        return SecItemCopyMatching(query as CFDictionary, nil) == errSecInteractionNotAllowed
+        var result: AnyObject?
+        return SecItemCopyMatching(query as CFDictionary, &result) == errSecInteractionNotAllowed
     }
 
     private static func baseQuery(_ account: String) -> [String: Any] {

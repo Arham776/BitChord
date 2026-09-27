@@ -1,5 +1,11 @@
 import SwiftUI
 import BitChordShared
+import AVKit
+#if os(iOS)
+import UIKit
+#else
+import AppKit
+#endif
 
 /// Upstream `AudioPipelineDialog`: the live signal path, decoder to output.
 ///
@@ -57,6 +63,7 @@ struct AudioPipelineSheet: View {
                     stage(3, "slider.horizontal.3", "DSP") {
                         row("PCM Format", pcmFormat)
                         row("Sample Rate", deviceRate)
+                        row("Loudness", loudness)
                         row("EQ Preset", eqPreset)
                         row("Spatial Audio", spatial ? "On" : "Off")
                         row("Output API", "CoreAudio")
@@ -70,6 +77,16 @@ struct AudioPipelineSheet: View {
                         row("Device Name", deviceName)
                         row("Sample Rate", deviceRate)
                         row("Channels", deviceChannels)
+                    }
+                    rule
+                    TimelineView(.periodic(from: .now, by: 1)) { _ in
+                        stage(5, "waveform.path.ecg", "Playback Diagnostics") {
+                            row("Buffered", "\(controller.outputHealth.bufferedFrames) frames")
+                            row("Silent callbacks", "\(controller.outputHealth.callbackUnderruns)")
+                            row("Output rebuilds", "\(controller.outputHealth.outputRebuilds)")
+                            row("Device xruns", "\(controller.outputHealth.outputXruns)")
+                            row("Output peak", String(format: "%.4f", controller.outputHealth.outputPeak))
+                        }
                     }
                     note("Values are read from the engine as it runs. “—” is a figure the system does not report, not one this app chose to hide.")
                 }
@@ -207,10 +224,27 @@ struct AudioPipelineSheet: View {
         return src == device.sampleRate ? "Not applicable" : "Band-limited"
     }
 
-    /// The engine carries interleaved f32 into the device, so the PCM format is
-    /// Float32 at the output rate whatever the source encoding was.
+    /// The word length the unit was actually opened as — the setting's answer,
+    /// not its request. Upstream's panel names the negotiated encoding for the
+    /// same reason: PCM_16 quantizes at the callback, FLOAT_32 passes through.
     private var pcmFormat: String {
-        device.started ? "Float32" : "—"
+        guard device.started else { return "—" }
+        switch device.sampleFormat {
+        case "FLOAT_32": return "Float32"
+        default: return "PCM 16"
+        }
+    }
+
+    /// Applied loudness correction, read off the engine rather than the
+    /// switch: "Off" when the listener switched it off, "No figure" when a
+    /// track carries none (local files, substitutes), "+x.x dB" otherwise.
+    /// Upstream's panel makes the same three-way distinction.
+    private var loudness: String {
+        let enabled = PlatformSettings.shared.getBoolean(key: "loudness_normalization", default: true)
+        guard enabled else { return "Off" }
+        guard let gain = nerd?.loudnessGainDb else { return "No figure" }
+        if gain == 0 { return "Unity (0 dB)" }
+        return String(format: "%+.1f dB", gain)
     }
 
     private var equalizerEnabled: Bool {
@@ -237,6 +271,8 @@ struct AudioPipelineSheet: View {
         let src = nerd?.sampleRate ?? 0
         let resampling = src > 0 && device.sampleRate > 0 && src != device.sampleRate
         if equalizerEnabled || spatial { return "No — DSP is active" }
+        if let gain = nerd?.loudnessGainDb, gain != 0 { return "No — loudness correction active" }
+        if device.sampleFormat == "PCM_16" { return "No — 16-bit quantization at the output" }
         if resampling { return "No — resampling \(src) → \(device.sampleRate) Hz" }
         return "Yes — decoded straight to the device"
     }
@@ -279,14 +315,14 @@ struct AudioOutputRow: View {
         .buttonStyle(.plain)
     }
 
-    /// "Float32 · 48 kHz", or the device name once the engine is open. Whichever
-    /// is actually known: upstream shows the encoding and the rate and falls back
-    /// to the encoding alone, and there is no reason to show a rate the device
-    /// has not reported.
+    /// "PCM 16 · 48 kHz" or "Float32 · 48 kHz", or the device name once the
+    /// engine is open. Whichever is actually known: upstream shows the
+    /// encoding and the rate and falls back to the encoding alone, and there
+    /// is no reason to show a rate the device has not reported.
     private var summary: String {
         let device = controller.outputDevice
         guard device.started else { return "Nothing open yet" }
-        var parts: [String] = ["Float32"]
+        var parts: [String] = [device.sampleFormat == "FLOAT_32" ? "Float32" : "PCM 16"]
         if device.sampleRate > 0 {
             let khz = Double(device.sampleRate) / 1000
             parts.append(String(format: khz == khz.rounded() ? "%.0f kHz" : "%.1f kHz", khz))
@@ -294,3 +330,148 @@ struct AudioOutputRow: View {
         return parts.joined(separator: " · ")
     }
 }
+
+/// Upstream `AudioOutputSheet`: where the music is coming out.
+///
+/// iOS sandboxes route selection — no app can enumerate or switch outputs
+/// itself — so this is the system route picker (`AVRoutePickerView`, the
+/// AirPlay control) plus the live pipeline readout, not a custom device list.
+/// A custom list would be a second switcher that routes nothing; the system
+/// control is the one that actually takes effect.
+struct OutputDeviceSheet: View {
+    @Environment(PlaybackController.self) private var controller
+    @Environment(\.dismiss) private var dismiss
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                Section {
+                    row("Device", deviceName)
+                    row("Sample Rate", deviceRate)
+                    row("Channels", deviceChannels)
+                    row("Pipeline", pipelineSummary)
+                } header: {
+                    Text("Current Route")
+                } footer: {
+                    Text("Read from the engine as it runs. “—” is a figure the system does not report.")
+                }
+                Section {
+                    SystemRoutePickerRow()
+                    #if os(iOS)
+                    SystemVolumeRouteRow()
+                    #endif
+                } header: {
+                    Text("Choose Output")
+                } footer: {
+                    Text("The system picker routes this app's audio — AirPlay, Bluetooth and the device speaker.")
+                }
+                TimelineView(.periodic(from: .now, by: 1)) { _ in
+                    Section {
+                        row("Buffered", "\(controller.outputHealth.bufferedFrames) frames")
+                        row("Silent callbacks", "\(controller.outputHealth.callbackUnderruns)")
+                        row("Output rebuilds", "\(controller.outputHealth.outputRebuilds)")
+                        row("Device xruns", "\(controller.outputHealth.outputXruns)")
+                        row("Output peak", String(format: "%.4f", controller.outputHealth.outputPeak))
+                    } header: {
+                        Text("Playback Diagnostics")
+                    } footer: {
+                        Text("Compare counter changes while a track plays. The output callback also runs with an empty queue, so idle silent callbacks are expected.")
+                    }
+                }
+            }
+            .formStyle(.grouped)
+            .navigationTitle("Audio Output")
+            #if os(iOS)
+            .navigationBarTitleDisplayMode(.inline)
+            #endif
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Close") { dismiss() }
+                }
+            }
+        }
+        #if os(macOS)
+        .frame(minWidth: 420, minHeight: 380)
+        #endif
+    }
+
+    private func row(_ label: String, _ value: String) -> some View {
+        HStack {
+            Text(label).foregroundStyle(.secondary)
+            Spacer(minLength: 12)
+            Text(value).monospacedDigit().multilineTextAlignment(.trailing)
+        }
+    }
+
+    private var device: OutputDeviceRec { controller.outputDevice }
+
+    private var deviceName: String {
+        device.started && !device.name.isEmpty ? device.name : "Not open yet"
+    }
+    private var deviceRate: String {
+        device.started && device.sampleRate > 0 ? "\(device.sampleRate) Hz" : "—"
+    }
+    private var deviceChannels: String {
+        device.started && device.channels > 0 ? "\(device.channels)" : "—"
+    }
+    private var pipelineSummary: String {
+        guard device.started else { return "—" }
+        var parts = [device.sampleFormat == "FLOAT_32" ? "Float32" : "PCM 16"]
+        if device.sampleRate > 0 { parts.append("\(device.sampleRate) Hz") }
+        return parts.joined(separator: " · ")
+    }
+}
+
+/// The system AirPlay route picker, hosted as a row.
+///
+/// `AVRoutePickerView` is the only control iOS offers that actually changes the
+/// route — a custom list of devices would display without switching anything,
+/// because route selection is a system decision apps can only request through
+/// this control.
+private struct SystemRoutePickerRow: View {
+    var body: some View {
+        HStack {
+            Text("AirPlay & Bluetooth")
+            Spacer(minLength: 12)
+            SystemRoutePickerView()
+                .frame(width: 44, height: 44)
+        }
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("Choose audio output")
+    }
+}
+
+#if os(iOS)
+private struct SystemRoutePickerView: UIViewRepresentable {
+    func makeUIView(context: Context) -> AVRoutePickerView {
+        let view = AVRoutePickerView()
+        view.activeTintColor = .systemBlue
+        return view
+    }
+
+    func updateUIView(_ uiView: AVRoutePickerView, context: Context) {}
+}
+
+/// A second entry point to the system output picker, for the output control
+/// presented alongside the pipeline settings.
+private struct SystemVolumeRouteRow: View {
+    var body: some View {
+        HStack {
+            Text("Output Switcher")
+            Spacer(minLength: 12)
+            SystemRoutePickerView()
+                .frame(width: 44, height: 44)
+        }
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("Open system output switcher")
+    }
+}
+#else
+private struct SystemRoutePickerView: NSViewRepresentable {
+    func makeNSView(context: Context) -> AVRoutePickerView {
+        AVRoutePickerView()
+    }
+
+    func updateNSView(_ nsView: AVRoutePickerView, context: Context) {}
+}
+#endif

@@ -16,6 +16,9 @@ final class AuthController {
     var sessionEpoch = 0
 
     init() {
+        // AccountStore reads its encrypted blob during restore. Install the
+        // Keychain bridge before the first view (and its feed task) exists.
+        SecretStoreWiring.install()
         // Apply the Keychain cookie before the first Home `.task` so the
         // signed-in browse is not raced by a guest fetch.
         restore()
@@ -31,7 +34,10 @@ final class AuthController {
 
     func restore() {
         sessionUnavailableReason = nil
-        guard let cookie = AuthStore.cookie else {
+        AccountStore.shared.restore()
+        // Existing single-account installs only have the legacy cookie. Once a
+        // validated account is recorded, the account store becomes authoritative.
+        guard let cookie = AccountStore.shared.activeAccount()?.cookie ?? AuthStore.cookie else {
             if AuthStore.isLocked {
                 sessionUnavailableReason =
                     "Your session is saved but this device has not been unlocked yet."
@@ -84,13 +90,8 @@ final class AuthController {
 
     /// Installs a freshly captured session.
     ///
-    /// The cookie is written to the Keychain **first**, and the refusal check
-    /// comes after. The other way round, a jar that was refused was never stored —
-    /// so a refusal cost the listener the sign-in they had just completed, and the
-    /// next launch was signed out. Writing first means a refusal leaves a stored
-    /// cookie that the next attempt can still be judged against, and since
-    /// [restore] no longer destroys what it cannot apply, the failure is recoverable
-    /// rather than terminal.
+    /// Validate the candidate against the page's chosen identity before writing
+    /// it. A rejected jar must never replace a session that already worked.
     ///
     /// The page's own identity is adopted before anything validates it — port of
     /// upstream `onWebSession`. The shell fetch can only ever report the default
@@ -99,9 +100,9 @@ final class AuthController {
     /// The screen stays open until `onComplete` fires, so a half-finished channel
     /// chooser can never become a durable broken account.
     func accept(_ session: SignInCapture, onComplete: ((Bool) -> Void)? = nil) {
-        let previousCookie = AuthStore.cookie
-        AuthStore.cookie = session.cookie
-        guard AuthBridge.shared.hasApiSid(cookieHeader: session.cookie),
+        let previousCookie = AccountStore.shared.activeAccount()?.cookie ?? AuthStore.cookie
+        guard session.loggedIn,
+              AuthBridge.shared.hasApiSid(cookieHeader: session.cookie),
               AuthBridge.shared.applyCookie(cookieHeader: session.cookie)
         else {
             // Visible rather than silent: the listener confirmed and the app is
@@ -120,45 +121,39 @@ final class AuthController {
             clientVersion: session.clientVersion,
             loggedIn: true
         )
-        AuthBridge.shared.ensureSession(callback: SessionDoneAdapter { _, _ in
+        AuthBridge.shared.ensureSession(callback: SessionDoneAdapter { ok, _ in
+            guard ok else {
+                Task { @MainActor in
+                    self.restorePreviousSession(cookie: previousCookie)
+                    self.sessionUnavailableReason =
+                        "Google gave a session this app could not use. Try signing in again."
+                    onComplete?(false)
+                }
+                return
+            }
             AccountBridge.shared.account(callback: AccountCallbackAdapter { json, _ in
                 Task { @MainActor in
                     guard let json,
                           let info = try? JSONDecoder().decode(AccountInfo.self, from: Data(json.utf8))
                     else {
-                        // Back to how requests behaved before the attempt, so a
-                        // rejected candidate never leaves the app signing as an
-                        // identity it refused to declare. The new cookie stays
-                        // stored, so the next attempt has something to be judged
-                        // against rather than nothing.
-                        if let previousCookie, !previousCookie.isEmpty {
-                            _ = AuthBridge.shared.applyCookie(cookieHeader: previousCookie)
-                        } else {
-                            _ = AuthBridge.shared.applyCookie(cookieHeader: nil)
-                        }
-                        AuthBridge.shared.clearChannelOverride()
+                        self.restorePreviousSession(cookie: previousCookie)
                         self.sessionUnavailableReason =
                             "Google gave a session this app could not use. Try signing in again."
                         onComplete?(false)
                         return
                     }
-                    self.sessionUnavailableReason = nil
-                    self.signedIn = true
-                    self.sessionEpoch += 1
-                    self.accountName = info.name
-                    self.accountEmail = info.email
-                    self.accountPhotoUrl = info.photoUrl
-                    self.publishAccount()
                     // The account's own channels are the page's choice, not the
                     // shell's default: the ids come from the confirmed page and
                     // only the display name comes from the server.
-                    let id = AccountSessionsKt.sessionIdOf(
+                    let id = self.accounts.first(where: {
+                        !info.email.isEmpty && $0.email.caseInsensitiveCompare(info.email) == .orderedSame
+                    })?.id ?? AccountSessionsKt.sessionIdOf(
                         cookie: session.cookie, dataSyncId: session.dataSyncId
                     )
                     let profileId = AccountSessionsKt.profileIdOf(
                         pageId: session.pageId, dataSyncId: session.dataSyncId, name: info.name
                     )
-                    self.record(account: AccountSummary(
+                    guard self.record(account: AccountSummary(
                         id: id,
                         name: info.name,
                         email: info.email,
@@ -170,7 +165,23 @@ final class AuthController {
                             dataSyncId: session.dataSyncId,
                             authUser: session.authUser
                         )]
-                    ))
+                    )) else {
+                        self.restorePreviousSession(cookie: previousCookie)
+                        self.sessionUnavailableReason =
+                            "Your account was verified, but its session could not be saved. Try again."
+                        onComplete?(false)
+                        return
+                    }
+                    // The legacy single-cookie key is a migration mirror. The
+                    // validated account store is the source of truth on launch.
+                    _ = AuthStore.save(session.cookie)
+                    self.sessionUnavailableReason = nil
+                    self.signedIn = true
+                    self.sessionEpoch += 1
+                    self.accountName = info.name
+                    self.accountEmail = info.email
+                    self.accountPhotoUrl = info.photoUrl
+                    self.publishAccount()
                     Task { await self.refreshAccount() }
                     onComplete?(true)
                 }
@@ -178,13 +189,41 @@ final class AuthController {
         })
     }
 
+    private func restorePreviousSession(cookie: String?) {
+        if AccountStore.shared.activeAccount() != nil {
+            AccountStore.shared.restore()
+        } else {
+            _ = AuthBridge.shared.applyCookie(cookieHeader: cookie)
+            AuthBridge.shared.clearChannelOverride()
+        }
+    }
+
     func signOut() {
         // Upstream's sign-out removes the *account*, not just the session: the
         // credential is what the account is, so forgetting one is the same act.
         // Leaving a stored account behind after "sign out" would let a later
         // sign-in silently resume the old identity.
-        AccountStore.shared.forget(accountId: AccountStore.shared.activeAccount()?.accountId ?? "")
-        AuthStore.clear()
+        guard AuthStore.clear() else {
+            sessionUnavailableReason = "The session could not be removed from Keychain. Try again after unlocking this device."
+            return
+        }
+        guard AccountStore.shared.forget(accountId: AccountStore.shared.activeAccount()?.accountId ?? "") else {
+            sessionUnavailableReason = "The account could not be removed from Keychain. Try again after unlocking this device."
+            return
+        }
+        if let remaining = AccountStore.shared.activeAccount() {
+            AccountStore.shared.restore()
+            _ = AuthStore.save(remaining.cookie)
+            signedIn = true
+            sessionEpoch += 1
+            refreshAccounts()
+            accountName = listeningAs?.displayName
+            accountEmail = listeningAs?.email
+            accountPhotoUrl = listeningAs?.activeProfile?.avatar
+            publishAccount()
+            Task { await refreshAccount() }
+            return
+        }
         _ = AuthBridge.shared.applyCookie(cookieHeader: nil)
         signedIn = false
         accountName = nil
@@ -192,6 +231,7 @@ final class AuthController {
         accountPhotoUrl = nil
         sessionUnavailableReason = nil
         sessionEpoch += 1
+        refreshAccounts()
         publishAccount()
     }
 
@@ -210,7 +250,8 @@ final class AuthController {
     private(set) var listeningAs: AccountSummary?
 
     /// Records a signed-in account and selects it.
-    func record(account: AccountSummary) {
+    @discardableResult
+    func record(account: AccountSummary) -> Bool {
         // Built as the shared module's own records rather than passing the Swift
         // value types across: the store persists exactly what it is handed, and
         // a second shape would be a second thing that could disagree about a field.
@@ -226,7 +267,7 @@ final class AuthController {
                 isBrandAccount: false
             )
         }
-        AccountStore.shared.record(
+        let saved = AccountStore.shared.record(
             accountId: account.id,
             cookie: account.cookie,
             name: account.name,
@@ -234,6 +275,7 @@ final class AuthController {
             profiles: profiles
         )
         refreshAccounts()
+        return saved
     }
 
     /// Selects an identity, for the list UI and for the avatar's swipe.
@@ -242,8 +284,18 @@ final class AuthController {
     /// the "listening as" label and the request headers cannot be updated by two
     /// different paths and left disagreeing.
     func select(accountId: String?, profileId: String?) {
+        let previous = AccountStore.shared.activeSelection()
         AccountStore.shared.select(accountId: accountId, profileId: profileId)
         refreshAccounts()
+        if previous?.account.accountId != AccountStore.shared.activeSelection()?.account.accountId
+            || previous?.profile.profileId != AccountStore.shared.activeSelection()?.profile.profileId {
+            sessionEpoch += 1
+            accountName = listeningAs?.displayName
+            accountEmail = listeningAs?.email
+            accountPhotoUrl = listeningAs?.activeProfile?.avatar
+            publishAccount()
+            Task { await refreshAccount() }
+        }
     }
 
     /// Moves to the next or previous identity. False at either end, so a swipe
@@ -251,7 +303,15 @@ final class AuthController {
     @discardableResult
     func stepProfile(forward: Bool) -> Bool {
         let moved = AccountStore.shared.step(forward: forward)
-        if moved { refreshAccounts() }
+        if moved {
+            refreshAccounts()
+            sessionEpoch += 1
+            accountName = listeningAs?.displayName
+            accountEmail = listeningAs?.email
+            accountPhotoUrl = listeningAs?.activeProfile?.avatar
+            publishAccount()
+            Task { await refreshAccount() }
+        }
         return moved
     }
 
@@ -266,16 +326,18 @@ final class AuthController {
     }
 
     private func refreshAccount() async {
+        let epoch = sessionEpoch
         await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
             AuthBridge.shared.ensureSession(callback: SessionDoneAdapter { _, _ in
                 AccountBridge.shared.account(callback: AccountCallbackAdapter { json, _ in
                     Task { @MainActor in
-                        if let json, let info = try? JSONDecoder().decode(AccountInfo.self, from: Data(json.utf8)) {
+                        if self.signedIn, self.sessionEpoch == epoch,
+                           let json, let info = try? JSONDecoder().decode(AccountInfo.self, from: Data(json.utf8)) {
                             self.accountName = info.name
                             self.accountEmail = info.email
                             self.accountPhotoUrl = info.photoUrl
+                            self.publishAccount()
                         }
-                        self.publishAccount()
                         cont.resume()
                     }
                 })

@@ -21,6 +21,16 @@ enum LibraryActions {
         }
     }
 
+    static func setSubscribed(channelId: String, subscribed: Bool) async -> String? {
+        await withCheckedContinuation { cont in
+            LibraryActionsBridge.shared.setSubscribed(
+                channelId: channelId,
+                subscribed: subscribed,
+                callback: DoneCB { ok, msg in cont.resume(returning: ok ? nil : msg) }
+            )
+        }
+    }
+
     static func createPlaylist(title: String, privacy: String, videoId: String?) async -> String? {
         await withCheckedContinuation { cont in
             LibraryActionsBridge.shared.createPlaylist(title: title, privacy: privacy, videoId: videoId, callback: JsonCB { json, _ in

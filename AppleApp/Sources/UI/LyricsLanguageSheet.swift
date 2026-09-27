@@ -199,3 +199,117 @@ struct LyricsTranslationNote: View {
         Locale.current.localizedString(forIdentifier: code) ?? code
     }
 }
+
+/// Upstream `LyricsSourcesDialog`: which lyric databases the player may ask.
+///
+/// Presented from the Now Playing more menu, so the choice lives where lyrics
+/// are used rather than only in Settings. Backed by the same
+/// `lyrics_sources` / `lyrics_source_order` / `prioritize_syllable_sync` keys
+/// the Settings screen writes through `AppSettings` — one store, two doors —
+/// and deliberately minimal here (toggles in priority order + the word-synced
+/// preference + reset), because reordering UI already has a home in Settings.
+///
+/// The order shown is the order they are tried. The last enabled source cannot
+/// be switched off: an empty set is indistinguishable from lyrics being off,
+/// and there is already a switch for that.
+struct LyricsSourcesSheet: View {
+    @Environment(\.dismiss) private var dismiss
+    @State private var selection = LyricsSourceNames.normalizeList(
+        PlatformSettings.shared.getString(key: "lyrics_sources", default: LyricsSourceNames.defaultEnabled)
+    )
+    @State private var order = LyricsSourceNames.normalizeList(
+        PlatformSettings.shared.getString(key: "lyrics_source_order", default: LyricsSourceNames.defaultEnabled)
+    )
+    @State private var syllableSync = PlatformSettings.shared.getBoolean(key: "prioritize_syllable_sync", default: false)
+    @State private var paxSenixKey = PlatformSettings.shared.getSecret(key: "paxsenix_api_key") ?? ""
+
+    var body: some View {
+        NavigationStack {
+            List {
+                Section {
+                    ForEach(orderedIds, id: \.self) { id in
+                        if let source = LyricsSourceOption.all.first(where: { $0.name == id }) {
+                            Toggle(isOn: enabledBinding(source.name)) {
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text(source.label)
+                                    Text(source.detail)
+                                        .font(.subheadline)
+                                        .foregroundStyle(.secondary)
+                                }
+                            }
+                        }
+                    }
+                } footer: {
+                    Text("Tried top to bottom. Reorder in Settings → Lyrics → Lyrics Sources.")
+                }
+                if usesAuthenticatedRoutes {
+                    Section {
+                        SecureField("API key", text: $paxSenixKey)
+                            #if os(iOS)
+                            .textContentType(.password)
+                            #endif
+                    } header: {
+                        Text("PaxSeniX Key")
+                    } footer: {
+                        Text("Needed for the PaxSeniX sources. Stored in the Keychain, not in preferences.")
+                    }
+                }
+                Section {
+                    Toggle("Prefer Word-Synced Lyrics", isOn: $syllableSync)
+                    Button("Reset to Default") {
+                        AppSettings.shared.resetLyricsSourceSettings()
+                        order = LyricsSourceNames.defaultEnabled
+                        selection = LyricsSourceNames.defaultEnabled
+                        syllableSync = false
+                    }
+                } footer: {
+                    Text("When on, a merely line-synced answer waits for a word-synced one further down the list.")
+                }
+            }
+            .navigationTitle("Lyrics Sources")
+            #if os(iOS)
+            .navigationBarTitleDisplayMode(.inline)
+            #endif
+            .toolbar {
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Done") { dismiss() }
+                }
+            }
+            .onChange(of: selection) { _, value in AppSettings.shared.setLyricsSources(value: value) }
+            .onChange(of: order) { _, value in AppSettings.shared.setLyricsSourceOrder(value: value) }
+            .onChange(of: syllableSync) { _, value in AppSettings.shared.setPrioritizeSyllableSync(value: value) }
+            .onChange(of: paxSenixKey) { _, value in AppSettings.shared.setPaxSenixApiKey(value: value) }
+        }
+        #if os(macOS)
+        .frame(minWidth: 440, minHeight: 480)
+        #endif
+    }
+
+    private var orderedIds: [String] {
+        let saved = order.split(separator: ",").map(String.init)
+        let known = LyricsSourceOption.all.map(\.name)
+        let fromSaved = saved.filter { known.contains($0) }
+        return fromSaved + known.filter { !fromSaved.contains($0) }
+    }
+
+    private var usesAuthenticatedRoutes: Bool {
+        let enabled = Set(selection.split(separator: ",").map(String.init))
+        return enabled.contains("PAXSENIX_SPOTIFY") || enabled.contains("PAXSENIX_MUSIXMATCH")
+    }
+
+    private func enabledBinding(_ id: String) -> Binding<Bool> {
+        Binding(
+            get: { Set(selection.split(separator: ",").map(String.init)).contains(id) },
+            set: { on in
+                let ids = orderedIds
+                var enabled = Set(selection.split(separator: ",").map(String.init))
+                if on {
+                    enabled.insert(id)
+                } else if enabled.count > 1 {
+                    enabled.remove(id)
+                }
+                selection = ids.filter { enabled.contains($0) }.joined(separator: ",")
+            }
+        )
+    }
+}

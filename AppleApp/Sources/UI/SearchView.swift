@@ -1,5 +1,99 @@
 import SwiftUI
+#if os(macOS)
+import AppKit
+#else
+import UIKit
+#endif
 import BitChordShared
+
+/// One recent search, stored as an entity rather than a raw query string:
+/// the exact identity (id, artwork, type) of what was tapped, so recents
+/// render with real cover art and tapping one navigates straight to it
+/// instead of re-running a text search. Port of upstream `SearchHistoryEntity`.
+struct RecentSearchEntity: Codable, Identifiable, Hashable {
+    /// videoId for tracks, browseId for collections, `q:<query>` for raw text.
+    var id: String
+    var title: String
+    var subtitle: String
+    var artworkUrl: String?
+    /// TRACK, ALBUM, ARTIST, PLAYLIST or QUERY.
+    var entityType: String
+    var timestamp: Int64
+
+    init(id: String, title: String, subtitle: String = "", artworkUrl: String? = nil, entityType: String = "QUERY") {
+        self.id = id
+        self.title = title
+        self.subtitle = subtitle
+        self.artworkUrl = artworkUrl
+        self.entityType = entityType
+        self.timestamp = Int64(Date().timeIntervalSince1970 * 1000)
+    }
+
+    var typeLabel: String {
+        switch entityType.uppercased() {
+        case "TRACK": return "Song"
+        case "ALBUM": return "Album"
+        case "ARTIST": return "Artist"
+        case "PLAYLIST": return "Playlist"
+        default: return subtitle.isEmpty ? "Search" : subtitle
+        }
+    }
+}
+
+/// Device-only recent searches, kept under the existing `search_history` key.
+/// Reads the legacy `[String]` list and migrates each query to a QUERY entity
+/// on first write, so an update never drops what was searched before.
+enum RecentSearchStore {
+    private static let key = "search_history"
+    private static let maxEntries = 20
+
+    static func load() -> [RecentSearchEntity] {
+        let raw = PlatformSettings.shared.getString(key: key, default: "[]")
+        guard let data = raw.data(using: .utf8) else { return [] }
+        if let entities = try? JSONDecoder().decode([RecentSearchEntity].self, from: data) {
+            // A legacy `["query"]` list fails this decode and falls through;
+            // `[]` decodes either way and is empty either way.
+            return entities
+        }
+        let legacy = (try? JSONDecoder().decode([String].self, from: data)) ?? []
+        return legacy.map { RecentSearchEntity(id: "q:\($0.lowercased())", title: $0) }
+    }
+
+    static func record(_ entity: RecentSearchEntity) {
+        var list = load().filter { !$0.id.equalsIgnoringCase(entity.id) }
+        var fresh = entity
+        fresh.timestamp = Int64(Date().timeIntervalSince1970 * 1000)
+        list.insert(fresh, at: 0)
+        save(Array(list.prefix(maxEntries)))
+    }
+
+    /// The raw submitted query, for when no result has been tapped yet.
+    /// A later tap on a real hit records the rich entity alongside it, which
+    /// is what carries the artwork — same as upstream's `recordSearch`.
+    static func recordQuery(_ query: String) {
+        let term = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !term.isEmpty else { return }
+        record(RecentSearchEntity(id: "q:\(term.lowercased())", title: term))
+    }
+
+    static func remove(id: String) {
+        save(load().filter { !$0.id.equalsIgnoringCase(id) })
+    }
+
+    static func clear() { save([]) }
+
+    private static func save(_ list: [RecentSearchEntity]) {
+        guard let data = try? JSONEncoder().encode(list),
+              let json = String(data: data, encoding: .utf8) else { return }
+        PlatformSettings.shared.putString(key: key, value: json)
+    }
+}
+
+private extension String {
+    func equalsIgnoringCase(_ other: String) -> Bool {
+        compare(other, options: .caseInsensitive) == .orderedSame
+    }
+}
 
 struct SearchView: View {
     @Environment(PlaybackController.self) private var controller
@@ -14,9 +108,7 @@ struct SearchView: View {
     @State private var suggestions: [String] = []
     @State private var searchError: String?
     @State private var attempted = false
-    /// The platform search field's own focus, addressed through
-    /// `searchFocused(_:)`. The modifier exists from iOS 18 / macOS 15, which is
-    /// the project's floor.
+    /// Focus for the fixed in-page field, including tab reselect and deep links.
     @FocusState private var searchFieldFocused: Bool
     @State private var suggestTask: Task<Void, Never>?
     /// The in-flight search, so leaving the screen or starting a new one can
@@ -60,22 +152,19 @@ struct SearchView: View {
 
     var body: some View {
         NavigationStack {
-            resultsColumn
+            searchPageContent
                 .navigationTitle("Search")
                 .toolbarTitleDisplayMode(.inline)
-                // The platform's own search field, on both platforms.
-                //
-                // iOS used to get a hand-rolled `TextField` in a `Capsule` with a
-                // 13-point glyph in it, and that is what the port was missing: no
-                // Cancel, no native clear button, no "Search" return key, and
-                // nothing for VoiceOver to label. All of those come with the real
-                // control, and hand-rolling them again is exactly the kind of local
-                // hack this port is supposed to be removing. `always` rather than
-                // `automatic` because upstream's field is always on screen — a
-                // search that appears only after a pull is a different screen.
-                .searchable(text: $query, placement: searchPlacement, prompt: "Search")
+                .toolbar {
+                    #if os(iOS)
+                    ToolbarItem(placement: .topBarTrailing) { TopBarAccountButton() }
+                    #endif
+                }
+                #if os(macOS)
+                .searchable(text: $query, placement: .toolbar, prompt: "Search")
                 .searchFocused($searchFieldFocused)
                 .onSubmit(of: .search) { Task { await performSearch() } }
+                #endif
                 // Upstream's `searchFocusTrigger`: re-tapping the tab that is
                 // already selected focuses the field instead of doing nothing.
                 // Bound to the counter rather than a flag so a second tap while
@@ -89,12 +178,8 @@ struct SearchView: View {
                 }
                 .onChange(of: query) { _, value in
                     scheduleSuggestions(value)
-                    // The field's own Cancel empties the text without telling the
-                    // results anything, so the screen would keep showing the last
-                    // search's hits under an empty field. Upstream reaches the
-                    // recent-searches view the same way — one tap on the clear
-                    // button — and here that tap is Cancel, so this is the
-                    // equivalent of the clear button's own reset.
+                    // Clearing or cancelling must not leave old hits visible
+                    // below an empty field.
                     if value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                         resetToHistory()
                     }
@@ -114,19 +199,88 @@ struct SearchView: View {
         }
     }
 
-    /// Where the platform puts the field.
-    ///
-    /// iOS's navigation-bar drawer, shown always rather than on pull, because
-    /// upstream's field is always on screen and a search that appears only after
-    /// a pull is a different screen. On macOS the field belongs in the window
-    /// toolbar. Stated on both rather than left to a default, so the two are not
-    /// left to a compiler that may choose differently on either.
-    private var searchPlacement: SearchFieldPlacement {
+    @ViewBuilder
+    private var searchPageContent: some View {
         #if os(iOS)
-        .navigationBarDrawer(displayMode: .always)
+        VStack(spacing: 0) {
+            searchField
+                .padding(.horizontal, 16)
+                .padding(.top, 4)
+                .padding(.bottom, 8)
+            resultsColumn
+        }
         #else
-        .toolbar
+        resultsColumn
         #endif
+    }
+
+    /// Upstream's fixed 46dp SearchField below the top bar. Submit is available
+    /// from the leading magnifier and keyboard Search key; clear preserves focus,
+    /// while Cancel clears the query and returns to the recent-search view.
+    private var searchField: some View {
+        HStack(spacing: 4) {
+            Button {
+                Task {
+                    await performSearch()
+                    searchFieldFocused = false
+                }
+            } label: {
+                Image(systemName: "magnifyingglass")
+                    .font(.system(size: 17, weight: .regular))
+                    .foregroundStyle(.secondary)
+                    .frame(width: 32, height: 32)
+                    .contentShape(Circle())
+            }
+            .buttonStyle(.plain)
+            .disabled(term.isEmpty)
+            .accessibilityLabel("Search")
+
+            TextField("Search", text: $query)
+                .font(.body)
+                .textFieldStyle(.plain)
+                #if os(iOS)
+                .textInputAutocapitalization(.never)
+                .autocorrectionDisabled()
+                .submitLabel(.search)
+                #endif
+                .focused($searchFieldFocused)
+                .onSubmit {
+                    Task {
+                        await performSearch()
+                        searchFieldFocused = false
+                    }
+                }
+
+            if !query.isEmpty {
+                Button {
+                    query = ""
+                    searchFieldFocused = true
+                } label: {
+                    Image(systemName: "xmark")
+                        .font(.system(size: 12, weight: .semibold))
+                        .foregroundStyle(.secondary)
+                        .frame(width: 28, height: 28)
+                        .contentShape(Circle())
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("Clear search")
+            }
+
+            if searchFieldFocused {
+                Button("Cancel") {
+                    query = ""
+                    resetToHistory()
+                    searchFieldFocused = false
+                }
+                .font(.body)
+                .buttonStyle(.plain)
+                .padding(.leading, 4)
+            }
+        }
+        .padding(.leading, 8)
+        .padding(.trailing, 12)
+        .frame(height: 46)
+        .background(.quaternary.opacity(0.65), in: RoundedRectangle(cornerRadius: 11, style: .continuous))
     }
 
     /// Back to the idle screen: no results, no error, no skeletons, and the
@@ -182,9 +336,8 @@ struct SearchView: View {
             // "pick a filter that finds nothing" would take away the control
             // needed to leave it.
             if showsFilters {
-                scopePicker
-                    .padding(.horizontal, 24)
-                    .padding(.bottom, 10)
+                filterChips
+                    .padding(.bottom, 6)
             }
 
             if searching {
@@ -217,37 +370,25 @@ struct SearchView: View {
                             .listRowSeparator(.hidden)
                         }
                     }
-                    ForEach(Array(listHits.enumerated()), id: \.element.id) { _, hit in
-                        Group {
-                            if hit.isBrowse, let browseId = hit.browseId {
-                                NavigationLink(destination: DetailView(browseId: browseId, initialTitle: hit.title)) {
-                                    browseRow(hit)
+                    ForEach(sections) { sec in
+                        if let title = sec.title {
+                            Section {
+                                ForEach(sec.hits) { hit in
+                                    searchHitRow(hit)
                                 }
-                                .buttonStyle(.plain)
-                                .contextMenu {
-                                    BrowseActionButtons(card: ShelfCard(
-                                        title: hit.title, subtitle: hit.subtitle,
-                                        thumbnailUrl: hit.thumbnailUrl, browseId: browseId
-                                    ))
-                                }
-                            } else {
-                                SongRow(
-                                    entry: hit.asEntry(),
-                                    play: {
-                                        let tracks = listHits.filter(\.isTrack).map { $0.asEntry() }
-                                        let at = tracks.firstIndex(where: { $0.id == hit.videoId }) ?? 0
-                                        if scope == .songs {
-                                            controller.playRadio(hit.asEntry())
-                                        } else {
-                                            controller.play(tracks, at: at)
-                                        }
-                                    },
-                                    playNext: { controller.playNext(hit.asEntry()) },
-                                    addToQueue: { controller.addToQueue(hit.asEntry()) }
-                                )
+                            } header: {
+                                Text(title)
+                                    .font(.title3.weight(.bold))
+                                    .foregroundStyle(.primary)
+                                    .textCase(nil)
+                                    .padding(.top, 10)
+                                    .padding(.bottom, 4)
+                            }
+                        } else {
+                            ForEach(sec.hits) { hit in
+                                searchHitRow(hit)
                             }
                         }
-                        .listRowInsets(EdgeInsets(top: 2, leading: 28, bottom: 2, trailing: 28))
                     }
                 }
                 .listStyle(.plain)
@@ -262,6 +403,78 @@ struct SearchView: View {
                 history
             }
         }
+    }
+
+    private struct SearchSectionModel: Identifiable {
+        var id: String { title ?? "all" }
+        let title: String?
+        let hits: [SearchHitDTO]
+    }
+
+    /// Upstream's `searchSections`: when filtering by All, group into Songs, Artists,
+    /// Albums, Playlists, and More sections so mixed results are readable at a glance.
+    private var sections: [SearchSectionModel] {
+        if scope != .all {
+            return [SearchSectionModel(title: nil, hits: listHits)]
+        }
+        let songs = listHits.filter(\.isTrack)
+        let artists = listHits.filter { $0.isBrowse && ($0.browseType?.uppercased() == "ARTIST") }
+        let albums = listHits.filter { $0.isBrowse && ($0.browseType?.uppercased() == "ALBUM") }
+        let playlists = listHits.filter { $0.isBrowse && ($0.browseType?.uppercased() == "PLAYLIST") }
+        let more = listHits.filter { $0.isBrowse && !["ARTIST", "ALBUM", "PLAYLIST"].contains($0.browseType?.uppercased() ?? "") }
+
+        var list: [SearchSectionModel] = []
+        if !songs.isEmpty { list.append(SearchSectionModel(title: "Songs", hits: songs)) }
+        if !artists.isEmpty { list.append(SearchSectionModel(title: "Artists", hits: artists)) }
+        if !albums.isEmpty { list.append(SearchSectionModel(title: "Albums", hits: albums)) }
+        if !playlists.isEmpty { list.append(SearchSectionModel(title: "Playlists", hits: playlists)) }
+        if !more.isEmpty { list.append(SearchSectionModel(title: "More", hits: more)) }
+        return list
+    }
+
+    @ViewBuilder
+    private func searchHitRow(_ hit: SearchHitDTO) -> some View {
+        Group {
+            if hit.isBrowse, let browseId = hit.browseId {
+                NavigationLink(destination: DetailView(browseId: browseId, initialTitle: hit.title)) {
+                    browseRow(hit)
+                }
+                .buttonStyle(.plain)
+                .simultaneousGesture(TapGesture().onEnded {
+                    // Tapping a result records the rich entity —
+                    // real artwork and type — for the recents list.
+                    RecentSearchStore.record(RecentSearchEntity(
+                        id: browseId, title: hit.title,
+                        subtitle: hit.subtitle ?? "",
+                        artworkUrl: hit.thumbnailUrl,
+                        entityType: browseEntityType(hit)
+                    ))
+                })
+                .contextMenu {
+                    BrowseActionButtons(card: ShelfCard(
+                        title: hit.title, subtitle: hit.subtitle,
+                        thumbnailUrl: hit.thumbnailUrl, browseId: browseId
+                    ))
+                }
+            } else {
+                SongRow(
+                    entry: hit.asEntry(),
+                    play: {
+                        recordTrackEntity(hit)
+                        let tracks = listHits.filter(\.isTrack).map { $0.asEntry() }
+                        let at = tracks.firstIndex(where: { $0.id == hit.videoId }) ?? 0
+                        if scope == .songs {
+                            controller.playRadio(hit.asEntry())
+                        } else {
+                            controller.play(tracks, at: at)
+                        }
+                    },
+                    playNext: { controller.playNext(hit.asEntry()) },
+                    addToQueue: { controller.addToQueue(hit.asEntry()) }
+                )
+            }
+        }
+        .listRowInsets(EdgeInsets(top: 2, leading: 24, bottom: 2, trailing: 24))
     }
 
     /// The trimmed query, in one place. Everywhere below asks the same question
@@ -293,10 +506,7 @@ struct SearchView: View {
             if !suggestions.isEmpty {
                 Section("Suggestions") {
                     ForEach(suggestions, id: \.self) { term in
-                        Button(term) {
-                            query = term
-                            Task { await performSearch() }
-                        }
+                        suggestionRow(term)
                     }
                 }
             }
@@ -304,15 +514,12 @@ struct SearchView: View {
             // suggestions, so a query too short to produce any — or one the
             // service has nothing for — leaves something to tap rather than an
             // empty "Suggestions" header and no way onward.
-            let recent = Self.recentSearches()
+            let recent = RecentSearchStore.load()
             if !suggestions.isEmpty || !recent.isEmpty {
                 if !suggestions.isEmpty { Divider() }
                 Section("Recent") {
-                    ForEach(recent, id: \.self) { term in
-                        Button(term) {
-                            query = term
-                            Task { await performSearch() }
-                        }
+                    ForEach(recent) { entity in
+                        suggestionRow(entity.title)
                     }
                 }
             }
@@ -320,34 +527,109 @@ struct SearchView: View {
         .listStyle(.plain)
     }
 
+    /// One typeahead row: tapping the text searches it, tapping the arrow
+    /// fills the field and carries on typing — the pair YouTube, Google and
+    /// every mobile keyboard's suggestion strip use.
+    private func suggestionRow(_ term: String) -> some View {
+        HStack(spacing: 0) {
+            Button {
+                query = term
+                Task { await performSearch() }
+            } label: {
+                HStack(spacing: 12) {
+                    Image(systemName: "magnifyingglass")
+                        .foregroundStyle(.secondary)
+                    Text(term)
+                        .foregroundStyle(.primary)
+                        .lineLimit(1)
+                    Spacer(minLength: 0)
+                }
+                .contentShape(.rect)
+            }
+            .buttonStyle(.plain)
+            Button {
+                // Fill without searching: the completions update for the
+                // longer text and the results stay for what was searched.
+                query = term
+            } label: {
+                Image(systemName: "arrow.up.left")
+                    .foregroundStyle(.secondary)
+                    .frame(width: 40, height: 32)
+                    .contentShape(.rect)
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("Fill search with \(term)")
+        }
+    }
+
     private func browseRow(_ hit: SearchHitDTO) -> some View {
-        HStack(spacing: 12) {
-            ArtworkView(url: hit.thumbnailUrl, data: nil, side: 44)
-                .clipShape(.rect(cornerRadius: 6, style: .continuous))
-            VStack(alignment: .leading, spacing: 2) {
-                Text(hit.title).lineLimit(1)
+        let isArtist = hit.browseType?.uppercased() == "ARTIST"
+        return HStack(spacing: 14) {
+            if isArtist {
+                ArtworkView(url: hit.thumbnailUrl, data: nil, side: 48)
+                    .clipShape(Circle())
+            } else {
+                ArtworkView(url: hit.thumbnailUrl, data: nil, side: 48)
+                    .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+            }
+            VStack(alignment: .leading, spacing: 3) {
+                Text(hit.title)
+                    .font(.body.weight(.medium))
+                    .lineLimit(1)
                 Text(hit.subtitle ?? hit.browseType ?? "")
-                    .font(.callout)
+                    .font(.subheadline)
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
             }
             Spacer()
         }
-        .padding(.vertical, 6)
+        .padding(.vertical, 4)
     }
 
-    private var scopePicker: some View {
-        Picker("Kind", selection: $scope) {
-            ForEach(Scope.allCases) { Text($0.label).tag($0) }
+    #if os(iOS)
+    private var pillSelectedTextColor: Color { Color(uiColor: .systemBackground) }
+    #else
+    private var pillSelectedTextColor: Color { Color(nsColor: .windowBackgroundColor) }
+    #endif
+
+    /// Upstream's `SearchFilterTabs`: horizontal scrolling filter pills (All, Songs,
+    /// Videos, Albums, Artists, Playlists) with tactile feedback and inverted contrast.
+    private var filterChips: some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 8) {
+                ForEach(Scope.allCases) { entry in
+                    let selected = entry == scope
+                    Button {
+                        if !selected {
+                            #if os(iOS)
+                            let generator = UISelectionFeedbackGenerator()
+                            generator.prepare()
+                            generator.selectionChanged()
+                            #endif
+                            scope = entry
+                        }
+                    } label: {
+                        Text(entry.label)
+                            .font(.subheadline.weight(selected ? .semibold : .regular))
+                            .padding(.horizontal, 14)
+                            .padding(.vertical, 7)
+                            .background(
+                                selected ? Color.primary : Color.secondary.opacity(0.12),
+                                in: RoundedRectangle(cornerRadius: 12, style: .continuous)
+                            )
+                            .foregroundStyle(selected ? pillSelectedTextColor : Color.primary)
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+            .padding(.horizontal, 16)
+            .padding(.vertical, 4)
         }
-        .pickerStyle(.segmented)
-        .labelsHidden()
-        .frame(maxWidth: 360)
     }
 
     private var history: some View {
         Group {
-            let recent = Self.recentSearches()
+            let recent = RecentSearchStore.load()
             if recent.isEmpty {
                 EmptyStateView(
                     icon: Image(.bchSearch),
@@ -356,46 +638,92 @@ struct SearchView: View {
                     buttonTitle: nil, action: nil
                 )
             } else {
-                VStack(alignment: .leading, spacing: 10) {
-                    HStack {
-                        Text("Recent searches").font(.headline)
-                        Spacer()
-                        Button("Clear") { SearchHistory.shared.clear() }
-                            .font(.caption)
-                    }
-                    .padding(.horizontal, 28)
-                    ScrollView(.horizontal, showsIndicators: false) {
-                        LazyHStack(spacing: 8) {
-                            ForEach(recent, id: \.self) { term in
-                                Button {
-                                    query = term
-                                    Task { await performSearch() }
-                                } label: {
-                                    Text(term)
-                                        .font(.callout)
-                                        .padding(.horizontal, 12)
-                                        .padding(.vertical, 6)
-                                        .background(.quaternary, in: Capsule())
-                                }
-                                .buttonStyle(.plain)
-                                .contextMenu {
-                                    Button("Remove") { SearchHistory.shared.remove(query: term) }
-                                }
-                            }
+                List {
+                    Section {
+                        ForEach(recent) { entity in
+                            recentEntityRow(entity)
+                                .listRowInsets(EdgeInsets(top: 2, leading: 24, bottom: 2, trailing: 12))
                         }
-                        .padding(.horizontal, 28)
+                    } header: {
+                        HStack {
+                            Text("Recent searches")
+                            Spacer()
+                            Button("Clear") { RecentSearchStore.clear() }
+                                .font(.caption)
+                                .textCase(nil)
+                        }
                     }
-                    .fixedSize(horizontal: false, vertical: true)
-                    Spacer(minLength: 0)
                 }
-                .padding(.top, 16)
+                .listStyle(.plain)
+                .id(requestToken)
             }
         }
     }
 
-    static func recentSearches() -> [String] {
-        let raw = PlatformSettings.shared.getString(key: "search_history", default: "[]")
-        return (try? JSONDecoder().decode([String].self, from: Data(raw.utf8))) ?? []
+    /// Upstream's Spotify-style entity row: square thumbnail, bold title,
+    /// subtitle with the type, and a removal button. Tapping navigates to the
+    /// entity or plays it directly instead of re-running a text search.
+    private func recentEntityRow(_ entity: RecentSearchEntity) -> some View {
+        let isArtist = entity.entityType.uppercased() == "ARTIST"
+        return HStack(spacing: 12) {
+            Button { openHistoryEntity(entity) } label: {
+                HStack(spacing: 14) {
+                    if isArtist {
+                        ArtworkView(url: entity.artworkUrl, data: nil, side: 48)
+                            .clipShape(Circle())
+                    } else {
+                        ArtworkView(url: entity.artworkUrl, data: nil, side: 48)
+                            .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+                    }
+                    VStack(alignment: .leading, spacing: 3) {
+                        Text(entity.title)
+                            .font(.body.weight(.medium))
+                            .lineLimit(1)
+                        Text(entity.subtitle.isEmpty ? entity.typeLabel : "\(entity.subtitle) · \(entity.typeLabel)")
+                            .font(.subheadline)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                    }
+                    Spacer(minLength: 0)
+                }
+                .contentShape(.rect)
+            }
+            .buttonStyle(.plain)
+            Button {
+                RecentSearchStore.remove(id: entity.id)
+            } label: {
+                Image(systemName: "xmark")
+                    .font(.system(size: 13, weight: .medium))
+                    .foregroundStyle(.secondary)
+                    .frame(width: 32, height: 32)
+                    .contentShape(.rect)
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("Remove \(entity.title) from recent searches")
+        }
+        .padding(.vertical, 4)
+    }
+
+    /// Tapping a history entity navigates or plays without re-logging it —
+    /// it is already the most recent record of itself.
+    private func openHistoryEntity(_ entity: RecentSearchEntity) {
+        switch entity.entityType.uppercased() {
+        case "TRACK":
+            if entity.id.hasPrefix("q:") {
+                query = entity.title
+                Task { await performSearch() }
+            } else {
+                controller.playRadio(QueueEntry.youtube(
+                    videoId: entity.id, title: entity.title,
+                    artist: entity.subtitle, thumbnailUrl: entity.artworkUrl
+                ))
+            }
+        case "ALBUM", "ARTIST", "PLAYLIST":
+            appModel.pendingDetail = .detail(browseId: entity.id, title: entity.title)
+        default:
+            query = entity.title
+            Task { await performSearch() }
+        }
     }
 
     private func scheduleSuggestions(_ value: String) {
@@ -426,6 +754,29 @@ struct SearchView: View {
         return hits.filter { !$0.isTopResult }
     }
 
+    /// Records a tapped track with its real artwork and artist, so recents
+    /// show the song rather than the words that found it.
+    private func recordTrackEntity(_ hit: SearchHitDTO) {
+        guard let videoId = hit.videoId else { return }
+        RecentSearchStore.record(RecentSearchEntity(
+            id: videoId, title: hit.title,
+            subtitle: hit.subtitle ?? "",
+            artworkUrl: hit.thumbnailUrl,
+            entityType: "TRACK"
+        ))
+    }
+
+    /// Maps a browse hit's type to the entity type the recents list files it
+    /// under — album, artist, playlist, or a track carrying a browse id.
+    private func browseEntityType(_ hit: SearchHitDTO) -> String {
+        switch (hit.browseType ?? "").uppercased() {
+        case "ALBUM": return "ALBUM"
+        case "ARTIST": return "ARTIST"
+        case "PLAYLIST": return "PLAYLIST"
+        default: return "TRACK"
+        }
+    }
+
     private func performSearch() async {
         let term = query.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !term.isEmpty else { return }
@@ -441,7 +792,7 @@ struct SearchView: View {
         // A new list identity per request, so the results open at the top rather
         // than at the previous set's offset.
         requestToken &+= 1
-        SearchHistory.shared.record(query: term)
+        RecentSearchStore.recordQuery(term)
         searchedTerm = term
         let wanted = scope
         let task = Task { @MainActor in

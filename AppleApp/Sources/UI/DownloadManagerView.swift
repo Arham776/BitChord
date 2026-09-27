@@ -1,7 +1,15 @@
 import SwiftUI
 
+/// Upstream `DownloadManagerSheet`: every track asked for, what became of it,
+/// and a way out of the ones still going.
+///
+/// Per-job Cancel/Retry and Cancel All / Clear all act on the real
+/// `DownloadStore`. The destructive ones — deleting a finished file, clearing
+/// the on-device library — go through `ConfirmationDialog` first, because a
+/// tap that destroys a file is not a tap that should land by accident.
 struct DownloadManagerView: View {
     private var store: DownloadStore { DownloadStore.shared }
+    @Environment(ToastCenter.self) private var toast
 
     var body: some View {
         NavigationStack {
@@ -26,9 +34,23 @@ struct DownloadManagerView: View {
                                 Spacer()
                                 switch job.status {
                                 case .queued, .running:
-                                    Button("Cancel") { store.cancel(job.id) }
+                                    Button("Cancel") {
+                                        store.cancel(job.id)
+                                        toast.show("Download cancelled", kind: .info)
+                                    }
                                 case .failed:
-                                    Button("Retry") { store.retry(job.id) }
+                                    Button("Retry") {
+                                        switch store.retry(job.id) {
+                                        case .started:
+                                            toast.show("Downloading \(job.title)")
+                                        case .blockedByWifiOnly:
+                                            toast.show("Downloads are limited to Wi-Fi. Turn that off in Settings to use mobile data.", kind: .failure)
+                                        case .alreadyExists:
+                                            toast.show("\(job.title) is already downloading or downloaded", kind: .info)
+                                        case .ignoredLocalTrack:
+                                            break
+                                        }
+                                    }
                                 case .done:
                                     EmptyView()
                                 }
@@ -39,9 +61,28 @@ struct DownloadManagerView: View {
                 if !store.items.isEmpty {
                     Section("On this device") {
                         ForEach(store.items) { item in
-                            VStack(alignment: .leading) {
-                                Text(item.title)
-                                Text(item.artist).font(.caption).foregroundStyle(.secondary)
+                            HStack {
+                                VStack(alignment: .leading) {
+                                    Text(item.title)
+                                    Text(item.artist).font(.caption).foregroundStyle(.secondary)
+                                }
+                                Spacer()
+                                Button(role: .destructive) {
+                                    let item = item
+                                    toast.requestConfirmation(ConfirmationRequest(
+                                        title: "Delete this download?",
+                                        message: "“\(item.title)” will be removed from this device. The stream stays in your library.",
+                                        confirm: "Delete Download"
+                                    ) {
+                                        try? FileManager.default.removeItem(atPath: item.path)
+                                        store.refresh()
+                                    })
+                                } label: {
+                                    Image(systemName: "trash")
+                                        .foregroundStyle(.secondary)
+                                }
+                                .buttonStyle(.plain)
+                                .accessibilityLabel("Delete \(item.title)")
                             }
                         }
                     }
@@ -52,9 +93,8 @@ struct DownloadManagerView: View {
                 ToolbarItem(placement: .primaryAction) {
                     if store.activeCount > 0 {
                         Button("Cancel All") {
-                            for job in store.jobs where job.status == .queued || job.status == .running {
-                                store.cancel(job.id)
-                            }
+                            store.cancelAll()
+                            toast.show("Downloads cancelled", kind: .info)
                         }
                     } else if store.jobs.contains(where: { $0.status == .done || $0.status == .failed }) || !store.items.isEmpty {
                         Menu("Clear") {
@@ -65,7 +105,14 @@ struct DownloadManagerView: View {
                             }
                             if !store.items.isEmpty {
                                 Button("Clear downloads on this device", role: .destructive) {
-                                    store.clearDownloads()
+                                    let count = store.items.count
+                                    toast.requestConfirmation(ConfirmationRequest(
+                                        title: "Clear all downloads?",
+                                        message: "\(count) downloaded \(count == 1 ? "file" : "files") will be removed from this device. Streams stay in your library.",
+                                        confirm: "Clear All Downloads"
+                                    ) {
+                                        store.clearDownloads()
+                                    })
                                 }
                             }
                         }

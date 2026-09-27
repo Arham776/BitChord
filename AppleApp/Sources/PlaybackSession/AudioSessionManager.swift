@@ -53,7 +53,7 @@ enum AudioSessionManager {
         let session = AVAudioSession.sharedInstance()
         do {
             try session.setCategory(.playback, mode: .default, options: [])
-            try await session.setActive(true)
+            try session.setActive(true)
         } catch {
             // Worth surfacing: a session that will not activate is a session with
             // no background audio at all. Nothing actionable beyond the log.
@@ -64,7 +64,24 @@ enum AudioSessionManager {
         // that is the number the audio unit has to agree with. A route with no
         // outputs means nothing is plugged in — reported as "no format" so the
         // engine asks the device instead of guessing.
-        let channels = session.currentRoute.outputs.first?.channels?.count ?? 0
+        //
+        // Note: on iOS built-in speakers and standard headphones, `portDescription.channels`
+        // is nil (it is only non-nil for multi-channel USB devices). Use
+        // `session.outputNumberOfChannels` first, falling back to 2 channels.
+        // One line that separates "the mix was silent" from "the mix never
+        // reached the speaker". `outputVolume` here is the *system* volume for
+        // this session: a zero here silences a perfectly healthy engine.
+        let output = session.currentRoute.outputs.first
+        NSLog("[BitChord] audio session category=%@ volume=%.2f route=%@ rate=%.0f ch=%d",
+              session.category.rawValue,
+              session.outputVolume,
+              output.map { "\($0.portType.rawValue)/\($0.portName)" } ?? "none",
+              session.sampleRate,
+              session.outputNumberOfChannels)
+
+        let hardwareChannels = session.outputNumberOfChannels
+        let routeChannels = session.currentRoute.outputs.first?.channels?.count ?? 0
+        let channels = hardwareChannels > 0 ? hardwareChannels : (routeChannels > 0 ? routeChannels : (session.currentRoute.outputs.isEmpty ? 0 : 2))
         guard channels > 0, session.sampleRate > 0 else { return nil }
         return Format(rate: session.sampleRate, channels: UInt32(channels))
 #else

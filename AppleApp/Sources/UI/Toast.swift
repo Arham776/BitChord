@@ -39,6 +39,18 @@ final class ToastCenter {
 
     private(set) var current: Notice?
 
+    /// A track-log viewer request, served by `ToastHost`'s sheet.
+    ///
+    /// Song menus are ephemeral — a `Menu` or context menu tears its content
+    /// down the moment an item is tapped — so a `.sheet` hung off a menu item
+    /// is torn down with it and never appears. This rides the one presenter
+    /// that is always in the hierarchy instead.
+    private(set) var trackLogEntry: QueueEntry?
+    /// A destructive-action confirmation, served by `ToastHost`'s sheet.
+    /// Same reason as `trackLogEntry`: confirmations raised from menus need a
+    /// presenter that outlives the menu.
+    private(set) var confirmation: ConfirmationRequest?
+
     @ObservationIgnored private var dismissTask: Task<Void, Never>?
 
     /// How long a notice stays. Long enough to read, short enough that a burst of
@@ -46,9 +58,22 @@ final class ToastCenter {
     private let dwell: Duration = .seconds(3)
 
     func show(_ message: String, kind: Notice.Kind = .success, action: Action? = nil) {
+        show(message, kind: kind, action: action, dwell: dwell)
+    }
+
+    /// Upstream `QueueActionNotice`: the transient "Playing next …" / "Added to
+    /// queue" confirmation shown just above the playback pill.
+    ///
+    /// Shorter dwell than a general toast (2s vs 3s) because queue actions are
+    /// high-frequency and back-to-back notices must not stack up. Same bottom
+    /// placement as `ToastHost`, which sits above the pill at the root.
+    func queueNotice(_ message: String) {
+        show(message, kind: .info, dwell: .seconds(2))
+    }
+
+    private func show(_ message: String, kind: Notice.Kind, action: Action? = nil, dwell: Duration) {
         dismissTask?.cancel()
         current = Notice(message: message, kind: kind, action: action)
-        let dwell = self.dwell
         dismissTask = Task { [weak self] in
             try? await Task.sleep(for: dwell)
             guard !Task.isCancelled else { return }
@@ -60,9 +85,52 @@ final class ToastCenter {
         dismissTask?.cancel()
         current = nil
     }
+
+    /// Open the per-track playback log viewer for this entry.
+    func showTrackLog(_ entry: QueueEntry) {
+        trackLogEntry = entry
+    }
+
+    func dismissTrackLog() {
+        trackLogEntry = nil
+    }
+
+    /// Ask for confirmation before a destructive action. The dialog's Confirm
+    /// runs `request.onConfirm`, then clears — so a stale confirm can never
+    /// fire twice.
+    func requestConfirmation(_ request: ConfirmationRequest) {
+        confirmation = request
+    }
+
+    func resolveConfirmation() {
+        confirmation?.onConfirm()
+        confirmation = nil
+    }
+
+    func dismissConfirmation() {
+        confirmation = nil
+    }
+}
+
+/// What `ToastCenter.requestConfirmation` presents.
+///
+/// A struct with an identity so `ToastHost` can show it with `.sheet(item:)`.
+/// The handler is intentionally opaque to the host: the host confirms or
+/// cancels, and the caller owns what confirming means.
+struct ConfirmationRequest: Identifiable {
+    let id = UUID()
+    let title: String
+    let message: String
+    let confirm: String
+    let onConfirm: () -> Void
 }
 
 /// The host view. Place once, at the top of the root view's hierarchy.
+///
+/// Also the presenter for the track-log viewer and destructive-action
+/// confirmations (see `ToastCenter.trackLogEntry` / `confirmation`): both are
+/// routinely raised from song menus, whose content is torn down on tap, so
+/// hanging their sheets here is what lets them appear at all.
 struct ToastHost: View {
     @Environment(ToastCenter.self) private var center
 
@@ -80,6 +148,32 @@ struct ToastHost: View {
         // A toast is decorative confirmation; the action it announces has already
         // happened, and re-announcing it would double up with whatever caused it.
         .allowsHitTesting(center.current != nil)
+        .sheet(item: trackLogBinding) { entry in
+            TrackLogSheet(entry: entry)
+        }
+        .sheet(item: confirmationBinding) { request in
+            ConfirmationDialog(
+                title: request.title,
+                message: request.message,
+                confirm: request.confirm
+            ) {
+                center.resolveConfirmation()
+            }
+        }
+    }
+
+    private var trackLogBinding: Binding<QueueEntry?> {
+        Binding(
+            get: { center.trackLogEntry },
+            set: { if $0 == nil { center.dismissTrackLog() } }
+        )
+    }
+
+    private var confirmationBinding: Binding<ConfirmationRequest?> {
+        Binding(
+            get: { center.confirmation },
+            set: { if $0 == nil { center.dismissConfirmation() } }
+        )
     }
 }
 

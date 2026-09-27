@@ -19,6 +19,7 @@ import SwiftUI
 /// listener to their oldest.
 struct AccountProfileSheet: View {
     @Environment(AuthController.self) private var auth
+    @Environment(AppModel.self) private var appModel
     @Environment(\.dismiss) private var dismiss
     /// The account this sheet is showing, or nil for "whichever is selected".
     /// Set by the header avatar so a tap on a *non*-selected account's avatar
@@ -30,7 +31,7 @@ struct AccountProfileSheet: View {
     }
 
     private var accounts: [AccountSummary] {
-        guard let scopedAccountId else { return auth.accounts }
+        guard scopedAccountId != nil else { return auth.accounts }
         // A scoped sheet still shows every account — the point is to be able to
         // change which one — but starts on the one that was tapped.
         return auth.accounts
@@ -74,6 +75,12 @@ struct AccountProfileSheet: View {
                 ToolbarItem(placement: .cancellationAction) {
                     Button("Done") { dismiss() }
                 }
+                ToolbarItem(placement: .primaryAction) {
+                    Button("Settings") {
+                        dismiss()
+                        Task { @MainActor in appModel.settingsPresented = true }
+                    }
+                }
             }
         }
         #if os(iOS)
@@ -112,6 +119,57 @@ struct AccountProfileSheet: View {
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
+    }
+}
+
+/// The upstream account control in a screen's visible top bar. It is hosted
+/// by each tab's NavigationStack, because a toolbar on the parent TabView is
+/// not reliably shown with nested navigation stacks on iPhone.
+struct TopBarAccountButton: View {
+    @Environment(AuthController.self) private var auth
+    @Environment(AppModel.self) private var appModel
+    @State private var showingProfiles = false
+
+    var body: some View {
+        Button {
+            if auth.signedIn && !auth.accounts.isEmpty {
+                showingProfiles = true
+            } else {
+                appModel.settingsPresented = true
+            }
+        } label: {
+            Group {
+                if auth.signedIn {
+                    Avatar(
+                        url: auth.accountPhotoUrl,
+                        name: auth.accountName ?? "Account",
+                        side: 32
+                    )
+                } else {
+                    Image(systemName: "person.fill")
+                        .font(.system(size: 17, weight: .medium))
+                        .foregroundStyle(.secondary)
+                        .frame(width: 32, height: 32)
+                        .background(.quaternary, in: Circle())
+                }
+            }
+            .overlay(Circle().strokeBorder(.primary.opacity(0.12), lineWidth: 1))
+            .frame(width: 44, height: 44)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel(auth.signedIn ? "Account and Settings" : "Sign in and Settings")
+        .gesture(
+            DragGesture(minimumDistance: 28).onEnded { value in
+                guard auth.signedIn,
+                      abs(value.translation.height) > abs(value.translation.width)
+                else { return }
+                auth.stepProfile(forward: value.translation.height > 0)
+            }
+        )
+        .sheet(isPresented: $showingProfiles) {
+            AccountProfileSheet(scopedAccountId: auth.listeningAs?.id)
+        }
     }
 }
 

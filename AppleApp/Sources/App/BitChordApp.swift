@@ -1,4 +1,5 @@
 import SwiftUI
+import Observation
 import BitChordShared
 
 @main
@@ -41,24 +42,44 @@ struct BitChordApp: App {
                     // so a press is not undone by the next frame still describing the
                     // old transport. Wired here, once, because the controller outlives
                     // every view and the party binding is replaced on each launch.
-                    controller.onLocalIntent = { [weak partySync] in
-                        partySync?.onLocalIntent()
+                    let localPartySync = partySync
+                    controller.onLocalIntent = { [weak localPartySync] in
+                        localPartySync?.onLocalIntent()
                     }
-                    installAutomixModels()
+                    // What is on disk decides what the analyzer gets. Refreshed first
+                    // so a resumed or already-downloaded graph is visible, and loaded
+                    // in the background: 123 MB of ONNX is seconds of work and the
+                    // engine should not wait behind it. Whatever is missing stays
+                    // missing, and Automix keeps its tempo fallback — the whole reason
+                    // the models are optional.
+                    AutomixModelStore.shared.refresh()
+                    AutomixModelStore.shared.onChanged = {
+                        Task { await reloadAutomixModels() }
+                    }
+                    Task { await reloadAutomixModels() }
                     controller.startEngineIfNeeded()
+                    // After the shell is up and the first frame has been drawn: an
+                    // offer as the window appears reads as chrome, and one that
+                    // arrives a moment later reads as a question.
+                    Task {
+                        try? await Task.sleep(for: .seconds(1))
+                        appModel.offerAutomixModelsIfNeeded()
+                    }
                     LocalLibrary.shared.restore()
                     DownloadStore.shared.refresh()
                     Task { await StreamFileCache.shared.trim() }
                     let token = PlatformSettings.shared.getSecret(key: "discord_token") ?? ""
                     if !token.isEmpty { DiscordGateway.shared.connect(token: token) }
                 }
-                .onChange(of: scenePhase) { _, phase in
+                .onChange(of: scenePhase) { oldPhase, phase in
                     appModel.scenePhase = phase
                     if phase == .background {
                         controller.persistSession()
                         if PlatformSettings.shared.getBoolean(key: "stop_when_backgrounded", default: false) {
                             controller.pauseForBackground()
                         }
+                    } else if oldPhase == .background, phase == .active {
+                        controller.reactivateAudioSessionAfterForeground()
                     }
                 }
                 .onOpenURL { url in
@@ -69,6 +90,11 @@ struct BitChordApp: App {
                     // scene it runs before the view hierarchy exists, which is what
                     // a cold launch from a link actually needs.
                     if url.absoluteString.contains("open-player") {
+                        let requestedScreen = URLComponents(url: url, resolvingAgainstBaseURL: false)?
+                            .queryItems?.first(where: { $0.name == "screen" })?.value
+                        if requestedScreen?.caseInsensitiveCompare("lyrics") == .orderedSame {
+                            PlatformSettings.shared.putString(key: "last_player_screen", value: "LYRICS")
+                        }
                         appModel.nowPlayingPresented = true
                     }
                     // An invite is not joined on the spot: it is carried to the
@@ -104,14 +130,24 @@ struct BitChordApp: App {
     }
 }
 
-private func installAutomixModels() {
-    let beat = Bundle.main.url(forResource: "beat_this", withExtension: "onnx", subdirectory: "Models")
-        ?? Bundle.main.url(forResource: "beat_this", withExtension: "onnx")
-    let vocal = Bundle.main.url(forResource: "vocals_umxhq", withExtension: "onnx", subdirectory: "Models")
-        ?? Bundle.main.url(forResource: "vocals_umxhq", withExtension: "onnx")
-    _ = configureAnalyzer(
-        beatModelPath: beat?.path ?? "",
-        vocalModelPath: vocal?.path ?? ""
+/// Hand the analyzer whatever Automix graphs this device has.
+///
+/// The paths are resolved on the main actor — the store's state and the bundle
+/// live there — and the load itself runs detached. `configureAnalyzer` accepts
+/// empty paths and treats them as "unload", which is what a model that was removed,
+/// or never downloaded, must mean: Automix falls back to the tempo planner and
+/// stops avoiding vocal clashes rather than refusing to transition at all.
+///
+/// Called once at launch and again after every install or removal, so a model that
+/// arrives mid-session is in use without a relaunch.
+@MainActor
+private func reloadAutomixModels() async {
+    let paths = AutomixModelStore.shared.analyzerPaths
+    let ready = await Task.detached(priority: .userInitiated) {
+        configureAnalyzer(beatModelPath: paths.beat, vocalModelPath: paths.vocal)
+    }.value
+    DebugLog.shared.d(
+        message: "automix models: beat=\(paths.beat) vocal=\(paths.vocal) loaded=\(ready)"
     )
 }
 
@@ -121,6 +157,8 @@ private func installAutomixModels() {
 final class AppModel {
     var scenePhase: ScenePhase = .active
     var nowPlayingPresented = false
+    /// Presented by the account control in each iPhone tab's own toolbar.
+    var settingsPresented = false
     /// Cross-tab navigation request — RootView observes and consumes it.
     var requestedTab: Tab?
     /// Bumped when the already-selected Search tab is tapped again, so the field
@@ -135,6 +173,9 @@ final class AppModel {
     var playlistPicker: PlaylistPickerRequest?
     var downloadManagerPresented = false
     var replayPresented = false
+    /// The first-run Automix models offer. Set by ``offerAutomixModelsIfNeeded()``
+    /// and consumed by `RootView`.
+    var automixModelsPresented = false
     /// Listen Together, presented over whatever the listener was doing.
     ///
     /// Its own flag rather than a settings row, because a party invite is a request
@@ -168,6 +209,51 @@ final class AppModel {
         case "dark": return .dark
         default: return nil
         }
+    }
+
+    /// Whether the first-run offer has already been made this launch.
+    ///
+    /// Session-scoped rather than persisted: the persisted flag is the listener's
+    /// "no", and it means "stop bringing this up on your own", not "never mention
+    /// it again". Turning Automix on is a fresh question, and answering it with
+    /// silence would leave the feature quietly half-working.
+    @ObservationIgnored private var automixModelsAskedThisLaunch = false
+
+    /// Offer the models, when there is something to offer and nobody has said no.
+    ///
+    /// The beat model is the line: with it installed the offer has nothing to add,
+    /// and without it Automix is running on the tempo fallback whether or not the
+    /// listener knows.
+    @MainActor
+    func offerAutomixModelsIfNeeded() {
+        guard !AutomixModelStore.shared.beatInstalled else { return }
+        guard !automixModelsPresented else { return }
+        guard !automixModelsAskedThisLaunch else { return }
+        // The session flag is spent only when the offer is actually shown. A launch
+        // that honours a previous "not now" has not asked the listener anything, so
+        // switching Automix on later in that session is still free to.
+        guard !PlatformSettings.shared.getBoolean(key: "automix_models_prompt_dismissed", default: false) else { return }
+        automixModelsAskedThisLaunch = true
+        automixModelsPresented = true
+    }
+
+    /// Whether switching Automix on may put the offer up again, once per launch.
+    ///
+    /// Separate from ``offerAutomixModelsIfNeeded()`` because the two present from
+    /// different places — the root sheet and the Settings window — and a decline is
+    /// about the launch offer, not about the deliberate act of turning the feature
+    /// on and being told nothing.
+    @MainActor
+    func mayAskForAutomixModels() -> Bool {
+        guard !AutomixModelStore.shared.beatInstalled else { return false }
+        guard !automixModelsAskedThisLaunch else { return false }
+        automixModelsAskedThisLaunch = true
+        return true
+    }
+
+    /// Remember a "not now", so the launch offer does not return on its own.
+    func declineAutomixModels() {
+        PlatformSettings.shared.putBoolean(key: "automix_models_prompt_dismissed", value: true)
     }
 
     /// Canonical tabs (UI spec §2). macOS Library sub-destinations live as

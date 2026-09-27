@@ -360,6 +360,7 @@ struct SongRow: View {
 
     @Environment(PlaybackController.self) private var controller
     @Environment(AuthController.self) private var auth
+    @Environment(ToastCenter.self) private var toast
     @Environment(\.dynamicTypeSize) private var dynamicTypeSize
     @State private var hovering = false
 
@@ -454,7 +455,18 @@ struct SongRow: View {
                 .tint(.pink)
             }
             if !entry.isLocal {
-                Button { DownloadStore.shared.download(entry) } label: {
+                Button {
+                    switch DownloadStore.shared.download(entry) {
+                    case .started:
+                        toast.show("Downloading \(entry.title)")
+                    case .blockedByWifiOnly:
+                        toast.show("Downloads are limited to Wi-Fi. Turn that off in Settings to use mobile data.", kind: .failure)
+                    case .alreadyExists:
+                        toast.show("\(entry.title) is already downloading or downloaded", kind: .info)
+                    case .ignoredLocalTrack:
+                        break
+                    }
+                } label: {
                     Label("Download", systemImage: "arrow.down.circle")
                 }
                 .tint(.indigo)
@@ -515,6 +527,7 @@ struct ThinSlider: View {
     var mixing: Bool = false
     var transitionWindow: ClosedRange<Double>? = nil
     var onEditingChanged: (Double) -> Void
+    var onDraggingChanged: (Bool) -> Void = { _ in }
 
     @State private var dragging = false
     @State private var dragValue: Double?
@@ -554,6 +567,7 @@ struct ThinSlider: View {
             .gesture(
                 DragGesture(minimumDistance: 0)
                     .onChanged { g in
+                        if !dragging { onDraggingChanged(true) }
                         dragging = true
                         let f = min(max(g.location.x / geo.size.width, 0), 1)
                         dragValue = f * maximum
@@ -562,6 +576,7 @@ struct ThinSlider: View {
                         if let v = dragValue { onEditingChanged(v) }
                         dragging = false
                         dragValue = nil
+                        onDraggingChanged(false)
                     }
             )
             .animation(Motion.once(reduceMotion, duration: 0.28, curve: .spring(response: 0.28, dampingFraction: 0.72)), value: dragging)

@@ -17,9 +17,16 @@ final class DownloadStore {
     static let shared = DownloadStore()
     private(set) var items: [DownloadedTrack] = []
     var onChange: (() -> Void)?
+    enum RequestResult: Equatable {
+        case started
+        case blockedByWifiOnly
+        case alreadyExists
+        case ignoredLocalTrack
+    }
     struct Job: Identifiable {
         enum Status { case queued, running, done, failed }
         let id: String
+        let runID: String
         var title: String
         var status: Status
         var message: String?
@@ -61,19 +68,22 @@ final class DownloadStore {
         onChange?()
     }
 
-    func download(_ entry: QueueEntry) {
-        guard !entry.isLocal else { return }
+    @discardableResult
+    func download(_ entry: QueueEntry) -> RequestResult {
+        guard !entry.isLocal else { return .ignoredLocalTrack }
         if NetworkQuality.shared.metered,
            PlatformSettings.shared.getBoolean(key: "wifi_only_downloads", default: true) {
-            return
+            return .blockedByWifiOnly
         }
         let videoId = entry.source.hasPrefix("yt:") ? String(entry.source.dropFirst(3)) : entry.id
         if jobs.contains(where: { $0.id == videoId && ($0.status == .queued || $0.status == .running || $0.status == .done) }) {
-            return
+            return .alreadyExists
         }
-        jobs.append(Job(id: videoId, title: entry.title, status: .running, message: nil, entry: entry))
+        let runID = UUID().uuidString
+        jobs.append(Job(id: videoId, runID: runID, title: entry.title, status: .running, message: nil, entry: entry))
         DownloadBridge.shared.resolve(videoId: videoId, title: entry.title, artist: entry.artist, callback: ResolveAdapter { json, msg in
             Task { @MainActor in
+                guard self.isActive(videoId, runID: runID) else { return }
                 guard let json, let data = json.data(using: .utf8) else {
                     self.fail(videoId, msg ?? "resolve failed")
                     return
@@ -90,35 +100,74 @@ final class DownloadStore {
                     self.fail(videoId, "bad payload")
                     return
                 }
-                StreamDownloadBridge.shared.download(url: url, headers: headers, callback: DoneAdapter { path, err in
+                StreamDownloadBridge.shared.download(downloadId: runID, url: url, headers: headers, callback: DoneAdapter { path, err in
                     Task { @MainActor in
+                        guard self.isActive(videoId, runID: runID) else {
+                            if let path { self.discardTemporaryDownload(path) }
+                            return
+                        }
                         guard let path else {
                             self.fail(videoId, err ?? "download failed")
                             return
                         }
-                        self.finish(path: path, entry: entry)
-                        self.mark(videoId, .done)
+                        do {
+                            try self.finish(path: path, entry: entry)
+                            self.mark(videoId, .done)
+                        } catch {
+                            self.discardTemporaryDownload(path)
+                            self.fail(videoId, error.localizedDescription)
+                        }
                     }
                 })
             }
         })
+        return .started
     }
 
-    func downloadCollection(browseId: String) async {
-        guard let page = try? await InnertubeDetail.shared.browse(browseId: browseId) else { return }
-        for song in page.songs {
-            download(song.asEntry(fallbackArt: page.thumbnailUrl))
+    @discardableResult
+    func downloadCollection(browseId: String) async -> RequestResult {
+        if NetworkQuality.shared.metered,
+           PlatformSettings.shared.getBoolean(key: "wifi_only_downloads", default: true) {
+            return .blockedByWifiOnly
         }
+        guard let page = try? await InnertubeDetail.shared.browse(browseId: browseId) else { return .ignoredLocalTrack }
+        var started = false
+        for song in page.songs {
+            if download(song.asEntry(fallbackArt: page.thumbnailUrl)) == .started { started = true }
+        }
+        return started ? .started : .alreadyExists
     }
 
-    func retry(_ id: String) {
-        guard let job = jobs.first(where: { $0.id == id }) else { return }
+    @discardableResult
+    func retry(_ id: String) -> RequestResult {
+        guard let job = jobs.first(where: { $0.id == id }) else { return .alreadyExists }
         jobs.removeAll { $0.id == id }
-        download(job.entry)
+        return download(job.entry)
     }
 
     func cancel(_ id: String) {
+        if let job = jobs.first(where: { $0.id == id }),
+           job.status == .queued || job.status == .running {
+            StreamDownloadBridge.shared.cancel(downloadId: job.runID)
+        }
         jobs.removeAll { $0.id == id }
+    }
+
+    func cancelAll() {
+        let ids = jobs.filter { $0.status == .queued || $0.status == .running }.map(\.id)
+        ids.forEach(cancel)
+    }
+
+    private func isActive(_ id: String, runID: String) -> Bool {
+        jobs.contains {
+            $0.id == id && $0.runID == runID && ($0.status == .queued || $0.status == .running)
+        }
+    }
+
+    private func discardTemporaryDownload(_ path: String) {
+        for temporaryPath in [path, "\(path).len", "\(path).grow", "\(path).complete"] {
+            try? FileManager.default.removeItem(atPath: temporaryPath)
+        }
     }
 
     private func fail(_ id: String, _ message: String) {
@@ -134,12 +183,14 @@ final class DownloadStore {
         }
     }
 
-    private func finish(path: String, entry: QueueEntry) {
+    private func finish(path: String, entry: QueueEntry) throws {
         let ext = URL(fileURLWithPath: path).pathExtension.isEmpty ? "m4a" : URL(fileURLWithPath: path).pathExtension
         let safe = entry.title.replacingOccurrences(of: "/", with: "-")
         let dest = folder.appendingPathComponent("\(safe).\(ext)")
-        try? FileManager.default.removeItem(at: dest)
-        try? FileManager.default.moveItem(atPath: path, toPath: dest.path)
+        guard !FileManager.default.fileExists(atPath: dest.path) else {
+            throw CocoaError(.fileWriteFileExists)
+        }
+        try FileManager.default.moveItem(atPath: path, toPath: dest.path)
         _ = writeTrackTags(
             path: dest.path,
             title: entry.title,

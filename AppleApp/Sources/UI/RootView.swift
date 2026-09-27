@@ -15,7 +15,6 @@ struct RootView: View {
     @Environment(\.openSettings) private var openSettings
     #endif
     @State private var homeFeed = FeedLoader(.home)
-    @State private var exploreFeed = FeedLoader(.explore)
     #if os(iOS)
     @Namespace private var nowPlayingZoom
     #endif
@@ -80,6 +79,15 @@ struct RootView: View {
             PartyMembersSheet()
                 .environment(PartyStore.shared)
         }
+        // The first-run model offer. Its own sheet at the root, because it is the
+        // one question the app asks before it has been used at all and it must not
+        // be attached to a screen the listener might never open.
+        .sheet(isPresented: Binding(
+            get: { appModel.automixModelsPresented },
+            set: { appModel.automixModelsPresented = $0 }
+        )) {
+            AutomixModelsSheet(onDecline: { appModel.declineAutomixModels() })
+        }
         .sheet(item: Binding(
             get: { appModel.pendingDetail },
             set: { appModel.pendingDetail = $0 }
@@ -115,32 +123,18 @@ struct RootView: View {
             _ = old
         }
         #if os(iOS)
-        .sheet(isPresented: $settingsPresented) {
+        .sheet(isPresented: Binding(
+            get: { appModel.settingsPresented },
+            set: { appModel.settingsPresented = $0 }
+        )) {
             SettingsView()
                 .environment(controller)
                 .environment(appModel)
                 .environment(auth)
                 .id(settingsSession)
         }
-        .onChange(of: settingsPresented) { _, presented in
+        .onChange(of: appModel.settingsPresented) { _, presented in
             if !presented { settingsSession += 1 }
-        }
-        .toolbar {
-            ToolbarItem {
-                Button {
-                    appModel.downloadManagerPresented = true
-                } label: {
-                    Image(systemName: DownloadStore.shared.activeCount > 0 ? "arrow.down.circle.fill" : "arrow.down.circle")
-                }
-                .help("Downloads")
-            }
-            ToolbarItem {
-                Button {
-                    settingsPresented = true
-                } label: {
-                    Image(systemName: "gearshape")
-                }
-            }
         }
         #endif
         #if os(macOS)
@@ -206,7 +200,7 @@ struct RootView: View {
                 sidebarLabel("Home", image: .bchHome)
             }
             Tab(value: AppModel.Tab.explore) {
-                ExploreView(feed: exploreFeed).modifier(MacPlaybackChrome())
+                ExploreView().modifier(MacPlaybackChrome())
             } label: {
                 sidebarLabel("Explore", image: .bchExplore)
             }
@@ -269,7 +263,7 @@ struct RootView: View {
                 HomeView(feed: homeFeed)
             }
             Tab("Explore", image: "bch-explore", value: AppModel.Tab.explore) {
-                ExploreView(feed: exploreFeed)
+                ExploreView()
             }
             Tab("Library", image: "bch-library", value: AppModel.Tab.library) {
                 LibraryView()
@@ -307,7 +301,6 @@ struct RootView: View {
     }
 
     #if os(iOS)
-    @State private var settingsPresented = false
     @State private var settingsSession = 0
     #endif
 
@@ -379,8 +372,10 @@ struct PlaybackPillMount: ViewModifier {
     private func fallbackMount(_ content: Content) -> some View {
         content.safeAreaInset(edge: .bottom) {
             PlaybackPill()
-                .padding(.horizontal, 16)
-                .padding(.bottom, 10)
+                // Upstream's MiniPlayer and FloatingBottomBar share PAGE_GUTTER
+                // (10dp), and the mini-player sits 8dp above the tab capsule.
+                .padding(.horizontal, 10)
+                .padding(.bottom, 8)
         }
     }
 }

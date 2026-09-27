@@ -19,8 +19,8 @@ struct SettingsView: View {
     @State private var spatial = PlatformSettings.shared.getBoolean(key: "spatial_audio", default: false)
     @State private var automix = PlatformSettings.shared.getBoolean(key: "smart_fade_enabled", default: false)
     @State private var skipSilence = PlatformSettings.shared.getBoolean(key: "skip_silence", default: false)
-    @State private var wifiQuality = PlatformSettings.shared.getString(key: "audio_quality_wifi", default: "HIGH")
-    @State private var cellQuality = PlatformSettings.shared.getString(key: "audio_quality_cellular", default: "HIGH")
+    @State private var wifiQuality = PlatformSettings.shared.getString(key: "audio_quality_wifi", default: "LOSSLESS")
+    @State private var cellQuality = PlatformSettings.shared.getString(key: "audio_quality_cellular", default: "LOSSLESS")
     @State private var downloadQuality = PlatformSettings.shared.getString(key: "download_quality", default: "LOSSLESS")
     @State private var wifiOnlyDownloads = PlatformSettings.shared.getBoolean(key: "wifi_only_downloads", default: true)
     @State private var nerdStats = PlatformSettings.shared.getBoolean(key: "show_nerd_stats", default: false)
@@ -37,6 +37,22 @@ struct SettingsView: View {
     @State private var swipeNext = PlatformSettings.shared.getBoolean(key: "swipe_to_play_next", default: false)
     @State private var dontRepeat = PlatformSettings.shared.getBoolean(key: "dont_repeat_suggestions", default: false)
     @State private var hideVolume = PlatformSettings.shared.getBoolean(key: "hide_volume_bar", default: false)
+    @State private var hideSongStatus = PlatformSettings.shared.getBoolean(key: "hide_song_status", default: false)
+    @State private var outputPcm = PlaybackController.migrateOutputPcmMode()
+    @State private var preferUsbDac = PlatformSettings.shared.getBoolean(key: "prefer_usb_dac", default: false)
+    @State private var loudness = PlatformSettings.shared.getBoolean(key: "loudness_normalization", default: true)
+    @State private var automixPerf = PlatformSettings.shared.getString(key: "automix_performance", default: "BALANCED")
+    @State private var highPerf = PlatformSettings.shared.getBoolean(key: "high_performance_mode", default: false)
+    @State private var refreshRate: Int = Int(PlatformSettings.shared.getInt(key: "performance_refresh_rate", default: 60))
+    @State private var showPerfWarning = false
+    @State private var localFolderName: String? = SettingsView.storedLocalFolderName()
+    @State private var pickingFolder = false
+    @State private var filterNonMusic = PlatformSettings.shared.getBoolean(key: "filter_non_music_audio", default: true)
+    @State private var exportDownloads = PlatformSettings.shared.getBoolean(key: "export_downloads", default: false)
+    @State private var smartAlign = PlatformSettings.shared.getBoolean(key: "smart_version_alignment", default: true)
+    @State private var legacyMesh = PlatformSettings.shared.getBoolean(key: "legacy_mesh_gradient", default: false)
+    @State private var preferMusicOnly = PlatformSettings.shared.getBoolean(key: "prefer_music_only", default: false)
+    @State private var confirmImport = false
     @State private var theme = PlatformSettings.shared.getString(key: "theme_mode", default: "dark")
     @State private var lyricsSources = LyricsSourceNames.normalizeList(
         PlatformSettings.shared.getString(key: "lyrics_sources", default: LyricsSourceNames.defaultEnabled)
@@ -57,6 +73,9 @@ struct SettingsView: View {
     @State private var cacheLimitMB = SettingsView.cacheLimitMegabytes()
     @State private var loginPresented = false
     @State private var discordPresented = false
+    /// The Automix models offer, raised when Automix is switched on without the
+    /// beat model that makes it worth having.
+    @State private var offerModelsSheet = false
     @State private var songCacheNote: String?
     @State private var imageCacheNote: String?
     /// The settings search box. Empty means "no filter", not "nothing" — clearing
@@ -83,22 +102,44 @@ struct SettingsView: View {
         .frame(minWidth: 560, idealWidth: 620, minHeight: 720)
         #endif
         .preferredColorScheme(appModel.preferredScheme)
+        .onAppear {
+            // The tuner holds a display link while high performance is on, so it
+            // has to be (re)applied every time this screen appears — and a value
+            // written by another build that is not a rate offered here snaps to
+            // 60 rather than requesting a mode the picker cannot name.
+            if !PerformanceTuner.supportedRates.contains(refreshRate) { refreshRate = 60 }
+            PerformanceTuner.shared.apply(highPerformance: highPerf, refreshRateHz: refreshRate)
+            localFolderName = SettingsView.storedLocalFolderName()
+        }
         .sheet(isPresented: $loginPresented) { loginSheet }
         .sheet(isPresented: $discordPresented) { DiscordLoginView() }
+        // The offer again, from inside Settings, when Automix is switched on with
+        // no beat model to time it. Presented here rather than through the root
+        // binding because on macOS this screen is its own window and has no root
+        // view above it.
+        .sheet(isPresented: $offerModelsSheet) { AutomixModelsSheet() }
         .modifier(SettingsPlaybackPersist(
             controller: controller,
             crossfade: $crossfade,
             spatial: $spatial,
             automix: $automix,
+            automixPerf: $automixPerf,
             skipSilence: $skipSilence,
-            playbackSpeed: $playbackSpeed
+            playbackSpeed: $playbackSpeed,
+            onAutomixEnabled: {
+                if appModel.mayAskForAutomixModels() { offerModelsSheet = true }
+            }
         ))
         .modifier(SettingsQualityPersist(
+            controller: controller,
             wifiQuality: $wifiQuality,
             cellQuality: $cellQuality,
             downloadQuality: $downloadQuality,
             wifiOnlyDownloads: $wifiOnlyDownloads,
-            cacheLimitMB: $cacheLimitMB
+            cacheLimitMB: $cacheLimitMB,
+            outputPcm: $outputPcm,
+            preferUsbDac: $preferUsbDac,
+            loudness: $loudness
         ))
         .modifier(SettingsExperiencePersist(
             controller: controller,
@@ -114,7 +155,20 @@ struct SettingsView: View {
             swipeNext: $swipeNext,
             dontRepeat: $dontRepeat,
             hideVolume: $hideVolume,
+            legacyMesh: $legacyMesh,
+            preferMusicOnly: $preferMusicOnly,
             theme: $theme
+        ))
+        .modifier(SettingsAdvancedPersist(
+            controller: controller,
+            smartAlign: $smartAlign,
+            hideSongStatus: $hideSongStatus,
+            exportDownloads: $exportDownloads,
+            filterNonMusic: $filterNonMusic,
+            highPerf: $highPerf,
+            refreshRate: $refreshRate,
+            reduceAnimation: $reduceAnimation,
+            reduceBlur: $reduceBlur
         ))
         .modifier(SettingsExtrasPersist(
             lyricsSources: $lyricsSources,
@@ -154,7 +208,7 @@ struct SettingsView: View {
     /// describes cannot drift from it, and one kept in a table elsewhere does.
     enum SettingsSection: String, CaseIterable, Identifiable {
         case account, audioQuality, downloads, playback
-        case appearance, storage, yourData, miscellaneous, about
+        case appearance, performance, localMusic, storage, yourData, miscellaneous, advanced, about
 
         var id: String { rawValue }
 
@@ -165,9 +219,12 @@ struct SettingsView: View {
             case .downloads: return "Downloads"
             case .playback: return "Playback"
             case .appearance: return "Appearance"
+            case .performance: return "Performance"
+            case .localMusic: return "Local Music"
             case .storage: return "Storage"
             case .yourData: return "Your Data"
             case .miscellaneous: return "Miscellaneous"
+            case .advanced: return "Advanced Options"
             case .about: return "About"
             }
         }
@@ -182,24 +239,40 @@ struct SettingsView: View {
             case .account:
                 return ["sign in", "login", "google", "discord", "rich presence",
                         "scrobbling", "last.fm", "lastfm", "listenbrainz", "spotify",
-                        "canvas", "paxsenix", "api key", "account", "profile"]
+                        "canvas", "paxsenix", "api key", "account", "profile",
+                        "primary artist", "album artist", "track artist", "scrobble artist"]
             case .audioQuality:
                 return ["quality", "lossless", "flac", "bitrate", "bitrate cap",
                         "wifi", "wi-fi", "cellular", "mobile data", "metered",
-                        "transcode", "streaming quality"]
+                        "transcode", "streaming quality", "pcm", "bit depth",
+                        "output precision", "float", "usb", "dac", "headphone",
+                        "loudness", "normalize", "normalization", "replaygain", "lufs"]
             case .downloads:
                 return ["download", "downloaded", "offline", "wifi only",
-                        "over cellular", "save", "storage location", "cache"]
+                        "over cellular", "save", "storage location", "cache",
+                        "export", "compatible", "music folder", "visible"]
             case .playback:
                 return ["crossfade", "gapless", "automix", "autoplay", "skip silence",
                         "playback speed", "speed", "spatial audio", "fade", "sounds",
                         "equalizer", "eq", "volume", "sleep timer", "queue", "repeat",
-                        "shuffle", "scrobble"]
+                        "shuffle", "scrobble", "automix performance", "cpu", "threads",
+                        "automix models", "models", "model", "onnx", "beat", "downbeat",
+                        "vocal", "download models",
+                        "battery", "prefer music only", "music video"]
             case .appearance:
                 return ["theme", "dark mode", "light mode", "appearance", "colour",
                         "color", "accent", "transparency", "reduce motion",
                         "reduce transparency", "animation", "full bleed", "artwork",
-                        "dynamic blur", "contrast"]
+                        "dynamic blur", "contrast", "mesh", "gradient", "legacy",
+                        "backdrop", "single wash"]
+            case .performance:
+                return ["performance", "high performance", "refresh rate",
+                        "frame rate", "hz", "smooth", "battery", "proMotion",
+                        "display", "animation"]
+            case .localMusic:
+                return ["local music", "local library", "folder", "scan", "files",
+                        "offline", "filter", "podcast", "recording", "ringtone",
+                        "voice", "non-music", "all audio folders"]
             case .storage:
                 return ["storage", "cache", "clear cache", "local library",
                         "local music", "library", "folder", "scan", "space", "disk",
@@ -213,7 +286,11 @@ struct SettingsView: View {
                         "swipe", "suggestions", "volume bar", "lyrics source",
                         "spotify canvas", "jiosaavn", "background", "stop when backgrounded",
                         "listen together", "party", "jam", "party code", "invite",
-                        "party server", "in sync", "synchronise", "synchronize"]
+                        "party server", "in sync", "synchronise", "synchronize",
+                        "hide song status", "playing from", "played by", "caption"]
+            case .advanced:
+                return ["advanced", "version", "alignment", "waveform", "sync",
+                        "audio", "video", "intro", "skit", "debug", "bitrate", "codec"]
             case .about:
                 return ["about", "version", "credits", "licence", "license",
                         "acknowledgements", "privacy policy", "github"]
@@ -260,9 +337,12 @@ struct SettingsView: View {
         case .downloads: downloadsSection
         case .playback: playbackSection
         case .appearance: appearanceSection
+        case .performance: performanceSection
+        case .localMusic: localMusicSection
         case .storage: storageSection
         case .yourData: yourDataSection
         case .miscellaneous: miscellaneousSection
+        case .advanced: advancedSection
         case .about: aboutSection
         }
     }
@@ -274,9 +354,12 @@ struct SettingsView: View {
             if shows(.downloads) { downloadsSection }
             if shows(.playback) { playbackSection }
             if shows(.appearance) { appearanceSection }
+            if shows(.performance) { performanceSection }
+            if shows(.localMusic) { localMusicSection }
             if shows(.storage) { storageSection }
             if shows(.yourData) { yourDataSection }
             if shows(.miscellaneous) { miscellaneousSection }
+            if shows(.advanced) { advancedSection }
             if shows(.about) { aboutSection }
             if search.isEmpty {
                 // Nothing.
@@ -377,8 +460,55 @@ struct SettingsView: View {
                 selection: $cellQuality,
                 options: AudioQualityOption.stream
             )
+            VStack(alignment: .leading, spacing: 10) {
+                SettingsLine(
+                    glyph: .precision,
+                    title: "Output Precision",
+                    subtitle: outputPrecisionSubtitle
+                ) {
+                    EmptyView()
+                }
+                Picker("Output Precision", selection: $outputPcm) {
+                    Text("PCM 16").tag("PCM_16")
+                    Text("Float 32").tag("FLOAT_32")
+                }
+                .pickerStyle(.segmented)
+                .labelsHidden()
+                .padding(.leading, 41)
+            }
+            .padding(.vertical, 4)
+            SettingsSubToggle(title: "Prefer USB DAC", isOn: $preferUsbDac)
+            SettingsToggleLine(
+                glyph: .loudness,
+                title: "Loudness Normalization",
+                subtitle: "Levels every track to the same loudness across sources",
+                isOn: $loudness
+            )
         } header: {
             Text("Audio Quality")
+        } footer: {
+            Text("Precision is the word length at the output boundary. PCM 16 quantizes once at the unit; Float 32 passes the mix through untouched. The Audio Pipeline readout shows what is actually in effect.")
+        }
+    }
+
+    /// What the output is doing right now, read off the engine rather than the
+    /// setting — the setting is the request, and this is the answer.
+    private var outputPrecisionSubtitle: String {
+        let device = controller.outputDevice
+        guard device.started else { return "Requested \(Self.pcmLabel(outputPcm))" }
+        var parts = [Self.pcmLabel(outputPcm)]
+        if !device.name.isEmpty { parts.append(device.name) }
+        if device.sampleRate > 0 {
+            let khz = Double(device.sampleRate) / 1000
+            parts.append(String(format: khz == khz.rounded() ? "%.0f kHz" : "%.1f kHz", khz))
+        }
+        return parts.joined(separator: " · ")
+    }
+
+    private static func pcmLabel(_ mode: String) -> String {
+        switch mode {
+        case "FLOAT_32": return "Float 32"
+        default: return "PCM 16"
         }
     }
 
@@ -398,8 +528,18 @@ struct SettingsView: View {
                 isOn: $wifiOnlyDownloads,
                 badge: (wifiOnlyDownloads && metered) ? "Blocking" : nil
             )
+            SettingsToggleLine(
+                glyph: .sharedFolder,
+                title: "Export Compatible Downloads",
+                subtitle: exportDownloads
+                    ? "Music/BitChord — visible to other music apps"
+                    : "Keeps downloads where other music apps can see them",
+                isOn: $exportDownloads
+            )
         } header: {
             Text("Downloads")
+        } footer: {
+            Text("Exported downloads live in the shared Music folder. Private ones stay inside BitChord's own storage.")
         }
     }
 
@@ -407,28 +547,62 @@ struct SettingsView: View {
 
     private var playbackSection: some View {
         Section {
-            SettingsSliderRow(
-                glyph: .crossfade,
-                title: "Crossfade",
-                subtitle: automix
-                    ? "Fallback blend length when Automix uses a plain transition"
-                    : "Blends one track into the next",
-                valueText: crossfade == 0 ? "Off" : "\(crossfade)s",
-                value: Binding(
-                    get: { Double(crossfade) },
-                    set: { crossfade = Int($0.rounded()) }
-                ),
-                range: 0...12,
-                step: 1
-            )
+            // Automix decides its own length from each pair of tracks, so it
+            // replaces the manual slider rather than needing it set to anything
+            // first — upstream's rule, which is why the slider goes away
+            // entirely instead of greying out.
+            if automix {
+                Text("Automix times every transition itself; the crossfade slider returns when Automix is off.")
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+                    .padding(.vertical, 4)
+            } else {
+                SettingsSliderRow(
+                    glyph: .crossfade,
+                    title: "Crossfade",
+                    subtitle: "Blends one track into the next",
+                    valueText: crossfade == 0 ? "Off" : "\(crossfade)s",
+                    value: Binding(
+                        get: { Double(crossfade) },
+                        set: { crossfade = Int($0.rounded()) }
+                    ),
+                    range: 0...12,
+                    step: 1
+                )
+            }
             SettingsToggleLine(
                 glyph: .automix,
                 title: "Automix [Beta]",
                 subtitle: automix
-                    ? "Blends every transition, timed automatically from each track. Turn off if facing overheating or lag."
+                    ? (AutomixModelStore.shared.beatInstalled
+                        ? "Blends every transition, timed automatically from each track. Turn off if facing overheating or lag."
+                        : "Blends every transition automatically. The beat model is not installed, so timing comes from tempo analysis — install it below for transitions that land on the beat.")
                     : "Times and blends transitions automatically, no slider needed.",
                 isOn: $automix
             )
+            NavigationLink {
+                AutomixPerformancePage(selection: $automixPerf)
+            } label: {
+                SettingsLine(
+                    glyph: .cpu,
+                    title: "Automix Performance",
+                    subtitle: "Background analysis budget — \(Self.automixPerfLabel(automixPerf)), \(controller.automixInferenceThreads) thread\(controller.automixInferenceThreads == 1 ? "" : "s")"
+                ) {
+                    Text(Self.automixPerfLabel(automixPerf))
+                        .foregroundStyle(.secondary)
+                }
+            }
+            NavigationLink {
+                AutomixModelsPage()
+            } label: {
+                SettingsLine(
+                    glyph: .models,
+                    title: "Automix Models",
+                    subtitle: Self.automixModelsSubtitle
+                ) {
+                    EmptyView()
+                }
+            }
             SettingsToggleLine(
                 glyph: .skipSilence,
                 title: "Skip Silence",
@@ -476,10 +650,45 @@ struct SettingsView: View {
                     set: { convertVideo = !$0 }
                 )
             )
+            SettingsToggleLine(
+                glyph: .musicOnly,
+                title: "Prefer Music Only",
+                subtitle: "Starts a music-video result on its catalogue audio release instead of the video's own upload",
+                isOn: $preferMusicOnly
+            )
         } header: {
             Text("Playback")
         } footer: {
             Text("Gapless stays on at 0s. Automix picks timing per track; crossfade sets the manual blend length.")
+        }
+    }
+
+    private static func automixPerfLabel(_ mode: String) -> String {
+        switch mode {
+        case "EFFICIENT": return "Efficient"
+        case "PERFORMANCE": return "Performance"
+        default: return "Balanced"
+        }
+    }
+
+    /// What the Automix Models row says without opening it.
+    ///
+    /// State rather than instruction: "Not installed" is the fact, and the row's
+    /// destination is where the action is — a subtitle that also shouts "tap here"
+    /// is a settings row pretending to be a button.
+    private static var automixModelsSubtitle: String {
+        let store = AutomixModelStore.shared
+        let beat = store.status(of: .beat).isInstalled
+        let vocals = store.status(of: .vocals).isInstalled
+        switch (beat, vocals) {
+        case (true, true):
+            return "Beat, downbeat and vocal models installed — \(AutomixModelStore.bytes(store.totalBytesOnDisk)) on disk"
+        case (true, false):
+            return "Beat model installed; vocal detection can be added for vocal-clash avoidance"
+        case (false, true):
+            return "Vocal model installed; the beat model is what times transitions"
+        case (false, false):
+            return "Not installed — Automix falls back to tempo analysis"
         }
     }
 
@@ -518,6 +727,12 @@ struct SettingsView: View {
                 isOn: $fullBleed
             )
             SettingsToggleLine(
+                glyph: .mesh,
+                title: "Legacy Mesh Gradient",
+                subtitle: "The single-wash backdrop instead of colours sampled from the artwork",
+                isOn: $legacyMesh
+            )
+            SettingsToggleLine(
                 glyph: .canvas,
                 title: "Animated Cover Art",
                 subtitle: "Plays the looping video some releases ship instead of a still sleeve",
@@ -554,6 +769,138 @@ struct SettingsView: View {
         } header: {
             Text("Appearance")
         }
+    }
+
+    // MARK: - Performance
+
+    private var performanceSection: some View {
+        Section {
+            Toggle(isOn: Binding(
+                get: { highPerf },
+                set: { enabled in
+                    // Turning it on is the consequential direction — a sustained
+                    // high refresh rate costs real battery — so that way goes
+                    // through the warning first. Turning it off just stops.
+                    if enabled { showPerfWarning = true } else { highPerf = false }
+                }
+            )) {
+                SettingsLine(
+                    glyph: .performance,
+                    title: "High Performance Mode",
+                    subtitle: highPerf
+                        ? "Holding \(refreshRate) Hz"
+                        : "Requests a sustained high refresh rate"
+                ) {
+                    EmptyView()
+                }
+            }
+            .padding(.vertical, 2)
+            if highPerf {
+                VStack(alignment: .leading, spacing: 10) {
+                    SettingsLine(glyph: .refreshRate, title: "Refresh Rate") { EmptyView() }
+                    Picker("Refresh Rate", selection: $refreshRate) {
+                        ForEach(PerformanceTuner.supportedRates, id: \.self) { rate in
+                            Text("\(rate) Hz").tag(rate)
+                        }
+                    }
+                    .pickerStyle(.segmented)
+                    .labelsHidden()
+                    .padding(.leading, 41)
+                }
+                .padding(.vertical, 4)
+            }
+        } header: {
+            Text("Performance")
+        } footer: {
+            Text("High Performance Mode holds the display at the chosen refresh rate instead of letting the system vary it. Expect noticeably shorter battery life while it is on.")
+        }
+        .alert("Higher refresh rate?", isPresented: $showPerfWarning) {
+            Button("Cancel", role: .cancel) {}
+            Button("Turn On") { highPerf = true }
+        } message: {
+            Text("Holding a high refresh rate keeps the display working harder the whole time BitChord is open, and the battery drains faster for it. Turn it on anyway?")
+        }
+    }
+
+    // MARK: - Local music
+
+    private var localMusicSection: some View {
+        Section {
+            Button {
+                pickLocalFolder()
+            } label: {
+                SettingsLine(
+                    glyph: .folder,
+                    title: "Folder",
+                    subtitle: localFolderName ?? "No folder chosen"
+                ) {
+                    Image(systemName: "chevron.right")
+                        .font(.system(size: 12, weight: .semibold))
+                        .foregroundStyle(.tertiary)
+                }
+            }
+            .buttonStyle(.plain)
+            if localFolderName != nil {
+                Button {
+                    AppSettings.shared.setLocalLibraryPath(value: "")
+                    localFolderName = nil
+                } label: {
+                    SettingsLine(
+                        glyph: .localMusic,
+                        title: "Use All Audio Folders",
+                        subtitle: "Forgets the chosen folder"
+                    ) {
+                        EmptyView()
+                    }
+                }
+                .buttonStyle(.plain)
+            }
+            SettingsToggleLine(
+                glyph: .filter,
+                title: "Filter Non-Music Audio",
+                subtitle: "Hides clips under 30 seconds, ringtones, podcasts and recorder output",
+                isOn: $filterNonMusic
+            )
+        } header: {
+            Text("Local Music")
+        } footer: {
+            Text("BitChord watches the folder you choose for music files. Filtering keeps everything that is not a song out of the list.")
+        }
+        .fileImporter(isPresented: $pickingFolder, allowedContentTypes: [.folder]) { result in
+            if case .success(let url) = result {
+                LocalLibrary.shared.scanPicked(url)
+                localFolderName = SettingsView.storedLocalFolderName()
+                    ?? url.lastPathComponent
+            }
+        }
+    }
+
+    private func pickLocalFolder() {
+        #if os(macOS)
+        LocalLibrary.shared.chooseFolder()
+        localFolderName = SettingsView.storedLocalFolderName()
+        #else
+        pickingFolder = true
+        #endif
+    }
+
+    /// The chosen library folder's display name, from the persisted bookmark.
+    ///
+    /// Read from the bookmark rather than held in state: the library owns the
+    /// bookmark and this screen only reports it, so resolving it fresh is what
+    /// keeps the row honest after a pick made from the Library tab.
+    static func storedLocalFolderName() -> String? {
+        let stored = PlatformSettings.shared.getString(key: "local_library_path", default: "")
+        guard !stored.isEmpty, let data = Data(base64Encoded: stored) else { return nil }
+        var stale = false
+        guard let url = try? URL(
+            resolvingBookmarkData: data,
+            options: [],
+            relativeTo: nil,
+            bookmarkDataIsStale: &stale
+        ) else { return nil }
+        let name = url.lastPathComponent
+        return name.isEmpty ? nil : name
     }
 
     // MARK: - Storage
@@ -644,7 +991,7 @@ struct SettingsView: View {
             }
             .buttonStyle(.plain)
             Button {
-                importPresented = true
+                confirmImport = true
             } label: {
                 SettingsLine(
                     glyph: .importData,
@@ -657,6 +1004,15 @@ struct SettingsView: View {
             .buttonStyle(.plain)
         } header: {
             Text("Your Data")
+        }
+        // Asked before the picker opens rather than after a file is chosen: the
+        // thing being confirmed is that this device's own data is about to be
+        // replaced, and that is true whichever file gets picked.
+        .alert("Replace this device's data?", isPresented: $confirmImport) {
+            Button("Cancel", role: .cancel) {}
+            Button("Choose File") { importPresented = true }
+        } message: {
+            Text("Importing a backup replaces the settings and listening history on this device. This cannot be undone.")
         }
     }
 
@@ -683,6 +1039,12 @@ struct SettingsView: View {
                 title: "Hide Volume Bar",
                 subtitle: "Removes the volume slider from the main player",
                 isOn: $hideVolume
+            )
+            SettingsToggleLine(
+                glyph: .songStatus,
+                title: "Hide Song Status",
+                subtitle: "Hides the “Playing from” caption on the main player",
+                isOn: $hideSongStatus
             )
             SettingsToggleLine(
                 glyph: .sources,
@@ -740,6 +1102,23 @@ struct SettingsView: View {
             Text("Miscellaneous")
         } footer: {
             Text("When enabled, closing the app from the recent apps screen will also stop music playback.")
+        }
+    }
+
+    // MARK: - Advanced options
+
+    private var advancedSection: some View {
+        Section {
+            SettingsToggleLine(
+                glyph: .align,
+                title: "Smart Version Alignment",
+                subtitle: "Keeps your place when switching between versions of a track",
+                isOn: $smartAlign
+            )
+        } header: {
+            Text("Advanced Options")
+        } footer: {
+            Text("A version switch resumes where you left off. With this off it restarts from the top, since no alignment is attempted.")
         }
     }
 
@@ -909,6 +1288,7 @@ private struct AccountIntegrationsView: View {
     @State private var scrobbleMin = Double(PlatformSettings.shared.getInt(key: "scrobble_min_duration", default: 30))
     @State private var scrobblePercent = Double(PlatformSettings.shared.getFloat(key: "scrobble_delay_percent", default: 0.5))
     @State private var scrobbleMax = Double(PlatformSettings.shared.getInt(key: "scrobble_delay_seconds", default: 180))
+    @State private var scrobblePrimary = PlatformSettings.shared.getString(key: "scrobble_primary_artist", default: "track")
 
     var body: some View {
         Form {
@@ -1093,6 +1473,20 @@ private struct AccountIntegrationsView: View {
                     range: 30...480,
                     step: 10
                 )
+                Picker(selection: $scrobblePrimary) {
+                    Text("Track artist").tag("track")
+                    Text("Album artist").tag("album")
+                } label: {
+                    SettingsLine(
+                        glyph: .lastFm,
+                        title: "Primary Artist",
+                        subtitle: scrobblePrimary == "album"
+                            ? "Scrobbles the lead name alone (“A, B & C” as “A”)"
+                            : "Scrobbles the full credit as the catalogue gave it"
+                    ) {
+                        EmptyView()
+                    }
+                }
             } header: {
                 Text("Scrobbling")
             } footer: {
@@ -1140,6 +1534,7 @@ private struct AccountIntegrationsView: View {
             lastFmSecret: $lastFmSecret,
             listenToken: $listenToken,
             listenEnabled: $listenEnabled,
+            scrobblePrimary: $scrobblePrimary,
             controller: controller
         ))
         .modifier(AccountDiscordPersist(
@@ -1354,6 +1749,43 @@ private struct QualityPickerPage: View {
     }
 }
 
+private struct AutomixPerformancePage: View {
+    @Binding var selection: String
+
+    private let modes = [
+        ("EFFICIENT", "Efficient", "1 analysis thread · kindest to battery"),
+        ("BALANCED", "Balanced", "2 threads · the default"),
+        ("PERFORMANCE", "Performance", "4 threads · fastest transitions, warmest phone"),
+    ]
+
+    var body: some View {
+        List {
+            ForEach(modes, id: \.0) { mode in
+                Button {
+                    selection = mode.0
+                } label: {
+                    HStack {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(mode.1)
+                                .foregroundStyle(.primary)
+                            Text(mode.2)
+                                .font(.subheadline)
+                                .foregroundStyle(.secondary)
+                        }
+                        Spacer()
+                        if selection == mode.0 {
+                            Image(systemName: "checkmark")
+                                .fontWeight(.semibold)
+                                .foregroundStyle(Color.accentColor)
+                        }
+                    }
+                }
+            }
+        }
+        .navigationTitle("Automix Performance")
+    }
+}
+
 private struct SpotifyCanvasAuthView: View {
     @Binding var cookie: String
 
@@ -1484,6 +1916,9 @@ private struct SettingsGlyph: View {
         case discord, listenBrainz, lastFm
         case replay, genres, export, importData, listenTogether
         case update
+        case precision, loudness, sharedFolder, cpu, musicOnly, models
+        case performance, refreshRate, folder, localMusic, filter
+        case songStatus, align, mesh
     }
 
     var kind: Kind
@@ -1542,6 +1977,22 @@ private struct SettingsGlyph: View {
         // An arrow down into a tray, which is what "a newer build is here" looks like
         // and is not the gear everybody expects an update row to be.
         case .update: "arrow.down.app.fill"
+        case .precision: "waveform.path.ecg"
+        case .loudness: "speaker.wave.3.fill"
+        case .sharedFolder: "folder.fill.badge.plus"
+        case .cpu: "cpu.fill"
+        // A brain rather than a chip: this row is about what the analysis knows,
+        // not about the hardware that runs it — `cpu` already sits one row above.
+        case .models: "brain"
+        case .musicOnly: "music.note"
+        case .performance: "gauge.with.dots.needle.100percent"
+        case .refreshRate: "display"
+        case .folder: "folder.fill"
+        case .localMusic: "music.note.list"
+        case .filter: "line.3.horizontal.decrease.circle.fill"
+        case .songStatus: "eye.slash.fill"
+        case .align: "arrow.left.and.right"
+        case .mesh: "paintbrush.pointed.fill"
         }
     }
 
@@ -1583,6 +2034,22 @@ private struct SettingsGlyph: View {
         case .export, .importData: .gray
         case .listenTogether: .teal
         case .update: .indigo
+        case .precision: .purple
+        case .loudness: .teal
+        case .sharedFolder: Color(red: 0.20, green: 0.48, blue: 0.96)
+        case .cpu: .orange
+        // The Automix row's own red, one shade down: the same feature, a different
+        // part of it.
+        case .models: Color(red: 0.72, green: 0.25, blue: 0.52)
+        case .musicOnly: .purple
+        case .performance: .red
+        case .refreshRate: .blue
+        case .folder: .blue
+        case .localMusic: .pink
+        case .filter: .gray
+        case .songStatus: .gray
+        case .align: .teal
+        case .mesh: .indigo
         }
     }
 }
@@ -1594,8 +2061,9 @@ private struct AudioQualityOption: Identifiable {
 
     static let stream: [AudioQualityOption] = [
         .init(id: "LOW", title: "Low", detail: "64 kbps · uses the least data"),
-        .init(id: "MEDIUM", title: "Medium", detail: "128 kbps · a lighter stream"),
-        .init(id: "HIGH", title: "High", detail: "Best available for this connection"),
+        .init(id: "MEDIUM", title: "Medium", detail: "Best available · ~171 kbps Opus"),
+        .init(id: "HIGH", title: "High", detail: "JioSaavn up to 320 kbps · YouTube fallback"),
+        .init(id: "LOSSLESS", title: "Lossless", detail: "Your addons and JioSaavn · bit-exact where available"),
     ]
 
     static let download: [AudioQualityOption] = [
@@ -1656,8 +2124,13 @@ private struct SettingsPlaybackPersist: ViewModifier {
     @Binding var crossfade: Int
     @Binding var spatial: Bool
     @Binding var automix: Bool
+    @Binding var automixPerf: String
     @Binding var skipSilence: Bool
     @Binding var playbackSpeed: Double
+    /// Raised when Automix goes on. The models are what make Automix's timing real,
+    /// so switching it on with none installed is the one moment the question is
+    /// worth asking again.
+    var onAutomixEnabled: () -> Void = {}
 
     func body(content: Content) -> some View {
         content
@@ -1672,6 +2145,10 @@ private struct SettingsPlaybackPersist: ViewModifier {
             .onChange(of: automix) { _, value in
                 AppSettings.shared.setSmartFadeEnabled(value: value)
                 controller.setAutomixEnabled(value)
+                if value { onAutomixEnabled() }
+            }
+            .onChange(of: automixPerf) { _, value in
+                controller.setAutomixPerformanceMode(value)
             }
             .onChange(of: skipSilence) { _, value in
                 AppSettings.shared.setSkipSilence(value: value)
@@ -1685,11 +2162,15 @@ private struct SettingsPlaybackPersist: ViewModifier {
 }
 
 private struct SettingsQualityPersist: ViewModifier {
+    var controller: PlaybackController
     @Binding var wifiQuality: String
     @Binding var cellQuality: String
     @Binding var downloadQuality: String
     @Binding var wifiOnlyDownloads: Bool
     @Binding var cacheLimitMB: Int
+    @Binding var outputPcm: String
+    @Binding var preferUsbDac: Bool
+    @Binding var loudness: Bool
 
     func body(content: Content) -> some View {
         content
@@ -1697,6 +2178,9 @@ private struct SettingsQualityPersist: ViewModifier {
             .onChange(of: cellQuality) { _, value in AppSettings.shared.setAudioQualityCellular(value: value) }
             .onChange(of: downloadQuality) { _, value in AppSettings.shared.setDownloadQuality(value: value) }
             .onChange(of: wifiOnlyDownloads) { _, value in AppSettings.shared.setWifiOnlyDownloads(value: value) }
+            .onChange(of: outputPcm) { _, value in controller.updateOutputPcmMode(value) }
+            .onChange(of: preferUsbDac) { _, value in controller.updatePreferUsbDac(value) }
+            .onChange(of: loudness) { _, value in controller.updateLoudnessNormalization(value) }
             .onChange(of: cacheLimitMB) { _, value in
                 AppSettings.shared.setAudioCacheLimitBytes(value: Swift.Int64(value) * 1024 * 1024)
                 Task { await StreamFileCache.shared.trim() }
@@ -1718,16 +2202,26 @@ private struct SettingsExperiencePersist: ViewModifier {
     @Binding var swipeNext: Bool
     @Binding var dontRepeat: Bool
     @Binding var hideVolume: Bool
+    @Binding var legacyMesh: Bool
+    @Binding var preferMusicOnly: Bool
     @Binding var theme: String
 
     func body(content: Content) -> some View {
         content
             .onChange(of: nerdStats) { _, value in AppSettings.shared.setShowNerdStats(value: value) }
-            .onChange(of: canvas) { _, value in AppSettings.shared.setAnimatedCanvas(value: value) }
-            .onChange(of: canvasCellular) { _, value in AppSettings.shared.setCanvasOverCellular(value: value) }
+            .onChange(of: canvas) { _, value in
+                AppSettings.shared.setAnimatedCanvas(value: value)
+                controller.refreshCanvasLookup()
+            }
+            .onChange(of: canvasCellular) { _, value in
+                AppSettings.shared.setCanvasOverCellular(value: value)
+                controller.refreshCanvasLookup()
+            }
             .onChange(of: reduceBlur) { _, value in AppSettings.shared.setReduceDynamicBlur(value: value) }
             .onChange(of: reduceAnimation) { _, value in AppSettings.shared.setReduceAnimation(value: value) }
             .onChange(of: fullBleed) { _, value in AppSettings.shared.setFullBleedArtwork(value: value) }
+            .onChange(of: legacyMesh) { _, value in PlatformSettings.shared.putBoolean(key: "legacy_mesh_gradient", value: value) }
+            .onChange(of: preferMusicOnly) { _, value in controller.updatePreferMusicOnly(value) }
             .onChange(of: syncedLyrics) { _, value in AppSettings.shared.setSyncedLyrics(value: value) }
             .onChange(of: convertVideo) { _, value in AppSettings.shared.setConvertVideoToAudio(value: value) }
             .onChange(of: swipeNext) { _, value in AppSettings.shared.setSwipeToPlayNext(value: value) }
@@ -1770,6 +2264,49 @@ private struct SettingsExtrasPersist: ViewModifier {
     }
 }
 
+/// Persists the settings that live outside the classic groups: the Advanced
+/// Options section, the Local Music filter, the Downloads export switch, the
+/// song-status caption, and the Performance section.
+private struct SettingsAdvancedPersist: ViewModifier {
+    var controller: PlaybackController
+    @Binding var smartAlign: Bool
+    @Binding var hideSongStatus: Bool
+    @Binding var exportDownloads: Bool
+    @Binding var filterNonMusic: Bool
+    @Binding var highPerf: Bool
+    @Binding var refreshRate: Int
+    @Binding var reduceAnimation: Bool
+    @Binding var reduceBlur: Bool
+
+    func body(content: Content) -> some View {
+        content
+            .onChange(of: smartAlign) { _, value in controller.setSmartVersionAlignment(value) }
+            .onChange(of: hideSongStatus) { _, value in controller.updateHideSongStatus(value) }
+            // The read side is `DownloadStore.folder`: on, downloads land in the
+            // shared Music/BitChord folder where other music apps can see them;
+            // off, they stay in BitChord's own storage.
+            .onChange(of: exportDownloads) { _, value in PlatformSettings.shared.putBoolean(key: "export_downloads", value: value) }
+            // The read side is the local-library scan, which drops rows that
+            // fail `LocalMusicEligibility` while this is on.
+            .onChange(of: filterNonMusic) { _, value in PlatformSettings.shared.putBoolean(key: "filter_non_music_audio", value: value) }
+            .onChange(of: highPerf) { _, value in
+                PlatformSettings.shared.putBoolean(key: "high_performance_mode", value: value)
+                if value {
+                    // Upstream's rule: a sustained high refresh rate and frozen
+                    // gradients are opposites, so enabling this unfreezes both.
+                    // Each write flows through its own persist above.
+                    reduceAnimation = false
+                    reduceBlur = false
+                }
+                PerformanceTuner.shared.apply(highPerformance: value, refreshRateHz: refreshRate)
+            }
+            .onChange(of: refreshRate) { _, value in
+                PlatformSettings.shared.putInt(key: "performance_refresh_rate", value: Swift.Int32(value))
+                PerformanceTuner.shared.apply(highPerformance: highPerf, refreshRateHz: value)
+            }
+    }
+}
+
 private struct AccountScrobblePersist: ViewModifier {
     @Binding var lastFmEnabled: Bool
     @Binding var lastFmScrobble: Bool
@@ -1778,6 +2315,7 @@ private struct AccountScrobblePersist: ViewModifier {
     @Binding var lastFmSecret: String
     @Binding var listenToken: String
     @Binding var listenEnabled: Bool
+    @Binding var scrobblePrimary: String
     var controller: PlaybackController
 
     func body(content: Content) -> some View {
@@ -1791,6 +2329,7 @@ private struct AccountScrobblePersist: ViewModifier {
             .onChange(of: lastFmKey) { _, value in AppSettings.shared.setLastFmApiKey(value: value) }
             .onChange(of: lastFmSecret) { _, value in AppSettings.shared.setLastFmSecret(value: value) }
             .onChange(of: listenToken) { _, value in AppSettings.shared.setListenBrainzToken(value: value) }
+            .onChange(of: scrobblePrimary) { _, value in controller.updateScrobblePrimaryArtist(value) }
             .onChange(of: listenEnabled) { _, value in
                 if value && listenToken.isEmpty { return }
                 AppSettings.shared.setListenBrainzEnabled(value: value)
@@ -1880,6 +2419,103 @@ private struct AccountDiscordButtonsPersist: ViewModifier {
             .onChange(of: scrobbleMin) { _, value in AppSettings.shared.setScrobbleMinDuration(value: Swift.Int32(value)) }
             .onChange(of: scrobblePercent) { _, value in AppSettings.shared.setScrobbleDelayPercent(value: Float(value)) }
             .onChange(of: scrobbleMax) { _, value in AppSettings.shared.setScrobbleDelaySeconds(value: Swift.Int32(value)) }
+    }
+}
+
+/// Holds the display at a sustained high refresh rate while High Performance
+/// Mode is on, by keeping a display link alive that requests the chosen
+/// frame-rate range.
+///
+/// A retained link rather than a one-shot request: the range is a property of a
+/// live link, so with nothing holding one the system falls back to its own
+/// policy. Invalidated the moment the mode turns off, which is what hands the
+/// policy back. The system still clamps to what the panel can do — asking for
+/// 120 Hz on a 60 Hz screen is a request, not a mode switch.
+final class PerformanceTuner {
+    static let shared = PerformanceTuner()
+
+    /// The rates the picker offers. Fixed rather than queried off the panel:
+    /// the system clamps the request to what the hardware can do, so offering a
+    /// rate the screen cannot reach degrades to the screen's own maximum.
+    static let supportedRates = [60, 90, 120]
+
+    #if os(iOS)
+    private var link: CADisplayLink?
+    #endif
+
+    func apply(highPerformance: Bool, refreshRateHz: Int) {
+        #if os(iOS)
+        link?.invalidate()
+        link = nil
+        guard highPerformance else { return }
+        let clamped = min(max(refreshRateHz, 30), 240)
+        let link = CADisplayLink(target: self, selector: #selector(tick))
+        if #available(iOS 15.0, *) {
+            let max = Float(clamped)
+            link.preferredFrameRateRange = CAFrameRateRange(minimum: 30, maximum: max, preferred: max)
+        } else {
+            link.preferredFramesPerSecond = min(clamped, 60)
+        }
+        link.add(to: .main, forMode: .common)
+        self.link = link
+        #else
+        // macOS varies the refresh itself (ProMotion is the panel's own
+        // policy); there is no per-app hold to request, so the persisted key is
+        // the whole of the setting there.
+        _ = (highPerformance, refreshRateHz)
+        #endif
+    }
+
+    #if os(iOS)
+    @objc private func tick() {}
+    #endif
+}
+
+/// Whether a scanned file counts as music, ported 1:1 from upstream
+/// `LocalMediaRepository.isEligibleLocalMusic`.
+///
+/// Media scanners mark notification sounds and voice notes as music, so the
+/// scan needs a second gate of its own: at least 30 seconds long, a music
+/// container, and nowhere under an alarms / notifications / ringtones /
+/// podcasts / audiobooks / recordings path. Kept beside the toggle that
+/// controls it so the rule and its switch cannot drift apart; the scan calls
+/// this per file while `filter_non_music_audio` is on.
+enum LocalMusicEligibility {
+    static let minDurationSeconds = 30.0
+
+    static let musicExtensions: Set<String> = [
+        "mp3", "m4a", "flac", "ogg", "opus", "aac", "webm",
+    ]
+
+    static let nonMusicPathSegments = [
+        "/alarms/",
+        "/notifications/",
+        "/ringtones/",
+        "/podcasts/",
+        "/audiobooks/",
+        "/recordings/",
+        "/voice recorder/",
+        "/sound_recorder/",
+        "/call_rec/",
+        "/whatsapp voice notes/",
+    ]
+
+    static func isEligible(durationSeconds: Double, displayName: String, path: String?) -> Bool {
+        if durationSeconds < minDurationSeconds { return false }
+        let fileName: String = {
+            if let path, let last = path.split(separator: "/").last, !last.isEmpty {
+                return String(last)
+            }
+            return displayName
+        }()
+        guard let ext = fileName.split(separator: ".").last.map({ $0.lowercased() }),
+              musicExtensions.contains(ext)
+        else {
+            return false
+        }
+        guard let path else { return true }
+        let normalized = path.replacingOccurrences(of: "\\", with: "/").lowercased()
+        return !nonMusicPathSegments.contains { normalized.contains($0) }
     }
 }
 
