@@ -99,7 +99,12 @@ object LyricsBridge {
         }
         if (!AppSettings.syncedLyrics.value) return null to emptyList()
         val sources = AppSettings.lyricsSourcesSet()
-        if (sources.isEmpty() || durationMs <= 0L) return null to emptyList()
+        if (sources.isEmpty()) return null to emptyList()
+        // An unknown duration is not a reason to give up. Upstream defers and
+        // re-runs when the length arrives rather than answering "no lyrics" for
+        // the whole track — a length-dependent provider matching worse is a
+        // better trade than nothing at all, and the host re-fetches on
+        // `handleDuration` for exactly this case.
         val found = LyricsRepository.lyrics(
             videoId = videoId.orEmpty(),
             title = title,
@@ -110,6 +115,32 @@ object LyricsBridge {
             order = AppSettings.lyricsSourceOrderList(),
             prioritizeSyllableSync = AppSettings.prioritizeSyllableSync.value,
         )
+        if (found != null && found.lines.isNotEmpty()) {
+            return found.source to found.lines
+        }
+
+        // F13: Romanised second pass if title or artist contain non-Latin characters
+        // (Japanese, Korean, Chinese, Cyrillic, etc.) and no lyrics were found under native script.
+        if (title.any { isNonLatinLetter(it) } || artist.any { isNonLatinLetter(it) }) {
+            val romanizedTitle = LyricsTranslation.romanizeText(title) ?: title
+            val romanizedArtist = LyricsTranslation.romanizeText(artist) ?: artist
+            if (romanizedTitle != title || romanizedArtist != artist) {
+                com.music.bitchord.data.DebugLog.d("lyrics F13: retrying with romanised query '$romanizedTitle' - '$romanizedArtist'")
+                val secondPass = LyricsRepository.lyrics(
+                    videoId = "", // videoId was for native; empty forces provider text search
+                    title = romanizedTitle,
+                    artist = romanizedArtist,
+                    durationMs = durationMs,
+                    album = album,
+                    sources = sources,
+                    order = AppSettings.lyricsSourceOrderList(),
+                    prioritizeSyllableSync = AppSettings.prioritizeSyllableSync.value,
+                )
+                if (secondPass != null && secondPass.lines.isNotEmpty()) {
+                    return secondPass.source to secondPass.lines
+                }
+            }
+        }
         return found?.source to found?.lines.orEmpty()
     }
 

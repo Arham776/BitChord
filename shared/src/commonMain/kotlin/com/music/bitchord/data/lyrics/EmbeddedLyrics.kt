@@ -12,10 +12,36 @@ object EmbeddedLyrics {
 
     suspend fun forPath(path: String): List<LyricLineDto>? {
         if (path.isBlank()) return null
-        val raw = runCatching { readFileHead(path, MAX_TAG_BYTES)?.let(::fromBytes) }.getOrNull()
+        // The `<stem>.lrc` beside the file first, then the container's own tags.
+        //
+        // `LyricsTagBridge` writes that sidecar on every download and nothing
+        // ever read it back, so a downloaded track's lyrics were invisible
+        // offline and the app went to the network again for something already
+        // on disk. Upstream prefers its sidecar for the same reason: what the
+        // download found is richer than what a container search recovers.
+        val raw = sidecar(path)
+            ?: runCatching { readFileHead(path, MAX_TAG_BYTES)?.let(::fromBytes) }.getOrNull()
             ?: return null
         return LrcLib.parseLrc(raw).takeIf { lines -> lines.any { it.text.isNotBlank() } }
             ?.withBackgroundVocals()
+    }
+
+    /**
+     * The `<stem>.lrc` written beside a downloaded audio file.
+     *
+     * The other half of the pairing is [LyricsTagBridge.sidecarPath]; both
+     * spell the name the same way, and this is the only place that reads it.
+     * Bounded by [MAX_TAG_BYTES] for the same reason the container read is.
+     */
+    internal fun sidecar(audioPath: String): String? {
+        val slash = audioPath.lastIndexOf('/')
+        val name = if (slash >= 0) audioPath.substring(slash + 1) else audioPath
+        val dot = name.lastIndexOf('.')
+        val stem = if (dot > 0) name.substring(0, dot) else name
+        val dir = if (slash >= 0) audioPath.substring(0, slash + 1) else ""
+        return runCatching { readFileHead(dir + stem + ".lrc", MAX_TAG_BYTES)?.decodeToString() }
+            .getOrNull()
+            ?.takeIf { it.isNotBlank() }
     }
 
     internal fun fromBytes(head: ByteArray): String? {

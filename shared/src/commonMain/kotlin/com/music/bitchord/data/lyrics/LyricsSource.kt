@@ -11,22 +11,28 @@ enum class LyricsSource(
     val detail: String,
     val wordSynced: Boolean,
 ) {
-    LYRICS_PLUS(
-        label = "LyricsPlus",
-        detail = "Syllable by syllable, on community mirrors",
-        wordSynced = true,
-    ),
     /**
      * The one that hands out ISRCs.
      *
-     * Declared second because enabling it also enables the identify pass that
-     * makes every *other* source's match better — see [LyricsRepository]. It is
-     * the only source this app contacts outside the race, and only when it is
-     * switched on.
+     * Declared first, as upstream declares it, for two reasons. Enabling it
+     * also enables the identify pass that makes every *other* source's match
+     * better — see [LyricsRepository]. And order decides the race: the
+     * repository returns the first source whose answer it likes, so with this
+     * seventh (as the port had it) the aggregator's name-matched answer
+     * preempted the ISRC- and index-matched Apple answers. A name match is the
+     * loosest thing any of these sources does, so that is the wrong way round.
+     *
+     * It is the only source this app contacts outside the race, and only when
+     * it is switched on.
      */
     BINI_LYRICS(
         label = "BiniLyrics",
         detail = "Apple Music timings, and the recording's ISRC for everything else",
+        wordSynced = true,
+    ),
+    LYRICS_PLUS(
+        label = "LyricsPlus",
+        detail = "Syllable by syllable, on community mirrors",
         wordSynced = true,
     ),
     PAXSENIX(

@@ -262,6 +262,29 @@ object LyricsTranslation {
         )
     }
 
+    /**
+     * Transliterates a short single string (e.g. title or artist) to Latin script.
+     * Used by the F13 fallback pass when a native-script query yielded no lyrics.
+     */
+    suspend fun romanizeText(text: String, target: String = "en"): String? {
+        val trimmed = text.trim()
+        if (trimmed.isBlank() || !trimmed.any { isNonLatinLetter(it) }) return null
+        val body = postForm(ENDPOINT, mapOf(
+            "client" to "dict-chrome-ex",
+            "sl" to "auto",
+            "tl" to target,
+            "dt" to "rm",
+            "q" to trimmed,
+        )) ?: return null
+        return runCatching {
+            val root = json.parseToJsonElement(body).jsonArray
+            val romanizedBody = root[0].jsonArray.joinToString(separator = "") { segment ->
+                segment.jsonArray.getOrNull(3)?.jsonPrimitive?.contentOrNull.orEmpty()
+            }.trim()
+            if (romanizedBody.isBlank() || romanizedBody.equals(trimmed, ignoreCase = true)) null else romanizedBody
+        }.getOrNull()
+    }
+
     // ---- Slot extraction ---------------------------------------------------
 
     /**

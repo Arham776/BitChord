@@ -66,12 +66,25 @@ object PaxSenix {
         val query = listOfNotNull(title.cleaned(), artist.cleaned().takeIf { it.isNotBlank() })
             .joinToString(" ")
         val results = search(query) ?: return null
+        // The floor is the whole point and this path did not have it.
+        //
+        // Upstream routes its keyless search through `bestCandidate`, which
+        // refuses anything below `MINIMUM_MATCH_SCORE`. Without the floor a
+        // candidate that matches *neither* the title nor the artist scores zero
+        // and is still returned as long as its length lands within the
+        // tolerance — the wrong song's lyrics, correctly timed, which is the
+        // hardest kind of wrong to notice. It bites hardest where a name match
+        // was never going to succeed, which is exactly the unfamiliar and
+        // non-Latin catalogue.
         val best = results
             .filter { track ->
                 val trackSeconds = track.durationSeconds
                 seconds <= 0 || trackSeconds == null || abs(trackSeconds - seconds) <= DURATION_TOLERANCE_SECONDS
             }
-            .maxByOrNull { score(it, title, artist) }
+            .map { it to score(it, title, artist) }
+            .filter { it.second >= MINIMUM_MATCH_SCORE }
+            .maxByOrNull { it.second }
+            ?.first
             ?: return null
 
         return fetchLyrics(best.id)

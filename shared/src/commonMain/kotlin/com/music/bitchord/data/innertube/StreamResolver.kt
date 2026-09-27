@@ -800,6 +800,26 @@ object StreamResolver {
         val audioOnly = mime.startsWith("audio/")
         val muxedAac = mime.startsWith("video/mp4") && mime.contains("mp4a", ignoreCase = true)
         if (!audioOnly && !muxedAac) return null
+        // Opus is offered, and cannot be decoded.
+        //
+        // symphonia 0.6 ships no Opus codec, so an Opus-in-WebM rendition is not
+        // a lower-quality copy of the track — it is silence. `native-core/src/decode/mod.rs`
+        // says so outright ("Opus-in-WebM is the documented residual gap"), and the
+        // "retrying as AAC-LC" path there is a reconfiguration of *AAC*, so it cannot
+        // rescue a stream that is not AAC: the rejection became silence.
+        //
+        // Worse, it was ranked *first*. Ranking is by bitrate, and Opus at 146 kbps
+        // beats AAC at 128, so the resolver spent the client's turn on the one format
+        // the mixer is guaranteed to refuse — and a track that had a perfectly good
+        // AAC rendition alongside it played nothing at all. That is the whole of the
+        // "this song does not play" report, and the client in the log had in fact
+        // offered both.
+        //
+        // Dropped rather than ranked last: the caller treats an empty list as "this
+        // client offered nothing" and moves to the next client (`firstPlayable`
+        // returning null), which is how the AAC rendition gets found. A track with no
+        // playable format anywhere now says so instead of playing silence.
+        if (mime.contains("opus", ignoreCase = true)) return null
         val url = (get("url") as? JsonPrimitive)?.contentOrNull?.takeIf { it.isNotBlank() }
         val cipher = (get("signatureCipher") as? JsonPrimitive)?.contentOrNull
             ?: (get("cipher") as? JsonPrimitive)?.contentOrNull

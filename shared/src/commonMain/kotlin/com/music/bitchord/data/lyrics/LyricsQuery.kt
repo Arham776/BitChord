@@ -55,17 +55,49 @@ private const val MIN_QUERY = 1
 
 private val WHITESPACE = Regex("""\s+""")
 
+/**
+ * Brackets, in both widths.
+ *
+ * The ASCII pair alone is a Latin-only assumption. A Japanese or Chinese upload
+ * packages the same credits and the same upload labels in （）, 【】, 「」, 『』,
+ * 〈〉, 《》 or 〔〕, and none of those patterns matched: the brackets rode into the
+ * provider verbatim, which has never seen them, so the query missed every
+ * name-matched source — in exactly the catalogue that is hardest to hit.
+ */
+private const val OPEN_BRACKET = """[(\[（【「『〈《〔]"""
+private const val CLOSE_BRACKET = """[)\]）】」』〉》〕]"""
+
+/**
+ * The upload labels themselves, in the scripts whose uploads carry them.
+ *
+ * Every one describes the *upload* rather than the recording — 歌詞/歌词
+ * "lyrics", フル "full", 字幕 "subtitles", 高音質 "high quality" — so the note
+ * above still holds: nothing here names a different take, and stripping it
+ * cannot turn a search for one recording into a search for another.
+ */
+private const val UPLOAD_LABELS =
+    """(歌詞|歌词|フル|字幕|中日字幕|中文字幕|完整版|高音質|高音质|動画|PV|MV)"""
+
 private val CREDITS = listOf(
     // Bracketed credits: (feat. X), [ft. X], (with X).
-    Regex("""\s*[(\[]\s*(feat|ft|featuring|with)\b[^)\]]*[)\]]""", RegexOption.IGNORE_CASE),
+    Regex(
+        """\s*$OPEN_BRACKET\s*(feat|ft|featuring|with)\b[^)\]）】」』〉》〕]*$CLOSE_BRACKET""",
+        RegexOption.IGNORE_CASE,
+    ),
     // The same, unbracketed and running to the end of the title.
     Regex("""\s+(feat|ft|featuring)\.?\s+.*$""", RegexOption.IGNORE_CASE),
     // How the upload was labelled, not what was recorded.
     Regex(
-        """\s*[(\[]\s*(official\s*)?(music\s*)?""" +
+        """\s*$OPEN_BRACKET\s*(official\s*)?(music\s*)?""" +
             """(video|audio|visuali[sz]er|lyrics?\s*video|lyrics?|m/?v|hd|hq|4k|full\s*song)""" +
-            """\s*[)\]]""",
+            """\s*$CLOSE_BRACKET""",
         RegexOption.IGNORE_CASE,
     ),
-    Regex("""\s*[(\[]\s*official\s*[)\]]""", RegexOption.IGNORE_CASE),
+    Regex("""\s*$OPEN_BRACKET\s*official\s*$CLOSE_BRACKET""", RegexOption.IGNORE_CASE),
+    // The same labels again in their own scripts, bracketed...
+    Regex("""\s*$OPEN_BRACKET\s*$UPLOAD_LABELS\s*$CLOSE_BRACKET""", RegexOption.IGNORE_CASE),
+    // ...and simply appended, which is how they are most often written:
+    // "夜に駆ける 歌詞". Anchored to the end so a title that happens to contain
+    // one of these words is left alone.
+    Regex("""\s+$UPLOAD_LABELS\s*${'$'}""", RegexOption.IGNORE_CASE),
 )

@@ -51,15 +51,22 @@ object InnertubeParser {
         response: JsonObject,
         includeVideos: Boolean = false,
     ): List<SearchResult> {
-        val cards: List<SearchResult> = if (includeVideos) emptyList() else {
+        val topResults: List<SearchResult> = if (includeVideos) emptyList() else {
             collectRenderers(response, "musicCardShelfRenderer").mapNotNull { card ->
                 parseCardShelfSong(card)?.let { SearchResult.TopTrack(it) }
                     ?: parseCardShelfBrowse(card)?.let { SearchResult.Browse(it) }
             }
         }
+        val rows = collectRenderers(response, "musicResponsiveListItemRenderer")
+        val cardCredits: List<Pair<JsonObject, Credits>> = if (includeVideos) emptyList() else {
+            collectRenderers(response, "musicCardShelfRenderer").flatMap { card ->
+                val credit = cardShelfCredit(card) ?: return@flatMap emptyList()
+                collectRenderers(card, "musicResponsiveListItemRenderer").map { it to credit }
+            }
+        }
         val seen = HashSet<String>()
-        val claimed = buildList {
-            for (result in cards) {
+        return buildList {
+            topResults.forEach { result ->
                 when (result) {
                     is SearchResult.TopTrack ->
                         if (!result.song.isVideo && seen.add("v:${result.song.videoId}")) {
@@ -70,32 +77,25 @@ object InnertubeParser {
                     is SearchResult.Track -> Unit
                 }
             }
+            rows.forEach { renderer ->
+                val browse = parseBrowseItem(renderer)
+                if (browse != null) {
+                    if (seen.add("b:${browse.browseId}")) add(SearchResult.Browse(browse))
+                } else {
+                    val fallback = cardCredits.firstOrNull { it.first === renderer }?.second
+                    parseResponsiveListItem(renderer, fallback ?: Credits())?.let { song ->
+                        if (song.isVideo && !AppSettings.convertVideoToAudio.value) return@let
+                        if (song.isVideo == includeVideos && seen.add("v:${song.videoId}")) {
+                            add(SearchResult.Track(song))
+                        }
+                    }
+                }
+            }
         }
-        return claimed + parseSearch(response, seen)
     }
 
     fun parseSearch(response: JsonObject): List<SearchResult> =
-        parseSearch(response, HashSet())
-
-    private fun parseSearch(response: JsonObject, seen: HashSet<String>): List<SearchResult> {
-        val rows = collectRenderers(response, "musicResponsiveListItemRenderer")
-        return rows.mapNotNull { renderer ->
-            // Browse rows first: an album row also carries a "play album"
-            // videoId in its overlay, so a track-first test misreads every
-            // album as a single song.
-            parseBrowseItem(renderer)?.let { item ->
-                return@mapNotNull if (seen.add("b:${item.browseId}")) {
-                    SearchResult.Browse(item)
-                } else {
-                    null
-                }
-            }
-            parseResponsiveListItem(renderer)?.let { song ->
-                if (song.isVideo && !AppSettings.convertVideoToAudio.value) return@mapNotNull null
-                if (seen.add("v:${song.videoId}")) SearchResult.Track(song) else null
-            }
-        }
-    }
+        parseSearchPage(response)
 
     fun parseSearchSuggestions(response: JsonObject): List<String> =
         collectRenderers(response, "searchSuggestionRenderer")
@@ -173,10 +173,15 @@ object InnertubeParser {
             .o("musicResponsiveListItemFlexColumnRenderer").o("text").runs()
         if (title.isBlank()) return null
 
-        val subtitle = columns.getOrNull(1)
-            .o("musicResponsiveListItemFlexColumnRenderer").o("text").runs()
+        val subtitleRuns = columns.getOrNull(1)
+            .o("musicResponsiveListItemFlexColumnRenderer").o("text").a("runs").orEmpty()
+        val subtitle = subtitleRuns.joinToString("") { it.s("text").orEmpty() }
         val parts = subtitle.split(" • ").filter { it.isNotBlank() }
         val duration = parts.lastOrNull()?.takeIf { it.matches(DURATION) }
+            ?: renderer.a("fixedColumns").orEmpty().firstNotNullOfOrNull { column ->
+                column.o("musicResponsiveListItemFixedColumnRenderer")
+                    .o("text").runs().takeIf { it.matches(DURATION) }
+            }
         val rowType = parts.firstOrNull { it.lowercase() in TYPE_WORDS }?.lowercase()
         // A track row on an album lists its play count where a search row
         // lists the artist, so a segment that reads as a tally is no credit.
@@ -191,6 +196,7 @@ object InnertubeParser {
                 it.o("musicResponsiveListItemFlexColumnRenderer").o("text").a("runs").orEmpty()
             },
         )
+        val creditedArtists = artistNamesFromRuns(subtitleRuns)
 
         val thumbnails = renderer.o("thumbnail").o("musicThumbnailRenderer")
             .o("thumbnail").a("thumbnails")
@@ -202,7 +208,8 @@ object InnertubeParser {
             // credit; the "All" tab often lists only "Song • 4:30" otherwise,
             // and an album's own rows carry no credit at all — the release is
             // billed once, in the header the row hangs under.
-            artist = credits.artistName?.takeIf { it.isNotBlank() }
+            artist = creditedArtists
+                ?: credits.artistName?.takeIf { it.isNotBlank() }
                 ?: artist
                 ?: fallback.artistName
                 ?: "Unknown artist",
@@ -1006,18 +1013,44 @@ object InnertubeParser {
         )
     }
 
-    /** The artist names among a card's subtitle runs, in order. */
+    /**
+     * Every name in the artist segment, including names without a browse link.
+     * YouTube alternates name and separator runs inside a bullet-delimited
+     * segment, but only some names are guaranteed to carry an artist endpoint.
+     */
     private fun artistNamesFromRuns(runs: List<JsonElement>): String? {
-        val names = runs.mapNotNull { run ->
-            val endpoint = run.o("navigationEndpoint").o("browseEndpoint") ?: return@mapNotNull null
-            val pageType = endpoint.o("browseEndpointContextSupportedConfigs")
-                .o("browseEndpointContextMusicConfig").s("pageType").orEmpty()
-            if ("ARTIST" !in pageType) return@mapNotNull null
-            run.s("text")
+        val groups = mutableListOf<MutableList<JsonElement>>(mutableListOf())
+        runs.forEach { run ->
+            if (run.s("text")?.trim() == "•") {
+                groups += mutableListOf<JsonElement>()
+            } else {
+                groups.last() += run
+            }
         }
-        return names.filter { it.isNotBlank() }
-            .joinToString(", ")
-            .takeIf { it.isNotBlank() }
+        val artistGroup = groups.firstOrNull { group ->
+            group.any { run ->
+                val pageType = run.o("navigationEndpoint").o("browseEndpoint")
+                    .o("browseEndpointContextSupportedConfigs")
+                    .o("browseEndpointContextMusicConfig").s("pageType").orEmpty()
+                "ARTIST" in pageType
+            }
+        } ?: return null
+        return artistGroup.mapIndexedNotNull { index, run ->
+            if (index % 2 != 0) return@mapIndexedNotNull null
+            run.s("text")?.trim()?.takeIf { it.isNotBlank() }
+        }.distinct().joinToString(", ").ifBlank { null }
+    }
+
+    /**
+     * The credit out of a shelf card's subtitle, which reads "Song • Chelsea
+     * Wolfe" rather than just the artist. Same split as [parseResponsiveListItem]'s
+     * subtitle, so a "Song" or "Single" heading drops out the same way.
+     */
+    fun artistFromSubtitle(subtitle: String): String {
+        val parts = subtitle.split(" • ").map(String::trim).filter { it.isNotBlank() }
+        return parts.firstOrNull {
+            it.lowercase() !in TYPE_WORDS && !it.matches(TALLY) && !it.matches(DURATION)
+        } ?: subtitle
     }
 
     private fun browseTypeOf(pageType: String): BrowseType = when {

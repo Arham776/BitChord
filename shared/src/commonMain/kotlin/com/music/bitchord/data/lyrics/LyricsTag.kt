@@ -26,7 +26,10 @@ internal object LyricsTag {
             emptySet()
         }
         if (sources.isEmpty()) return null
-        if (durationMs <= 0L) return null
+        // An unknown duration is not a reason to refuse. Upstream logs it and
+        // carries on — "that must not make bulk downloads the one path that
+        // never saves lyrics" — and a length-dependent provider matching worse
+        // is a better trade than a downloaded track with no lyrics at all.
 
         val found = runCatching {
             withTimeoutOrNull(LOOKUP_MS) {

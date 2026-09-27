@@ -17,7 +17,7 @@ object CanvasBridge {
     private const val CACHE_SIZE = 64
     private class Entry(val artwork: CanvasArtworkDto?, val withAlbum: Boolean)
     // Access is protected by [lock], including across provider resolution.
-    private val cache = LinkedHashMap<String, Entry>(CACHE_SIZE, 0.75f, true)
+    private val cache = LinkedHashMap<String, Entry>()
 
     fun interface CanvasCallback {
         fun onResult(json: String?)
