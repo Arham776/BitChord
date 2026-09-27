@@ -73,14 +73,14 @@ struct BitChordApp: App {
                     let token = PlatformSettings.shared.getSecret(key: "discord_token") ?? ""
                     if !token.isEmpty { DiscordGateway.shared.connect(token: token) }
                 }
-                .onChange(of: scenePhase) { oldPhase, phase in
+                .onChange(of: scenePhase) { _, phase in
                     appModel.scenePhase = phase
                     if phase == .background {
                         controller.persistSession()
                         if PlatformSettings.shared.getBoolean(key: "stop_when_backgrounded", default: false) {
                             controller.pauseForBackground()
                         }
-                    } else if oldPhase == .background, phase == .active {
+                    } else if phase == .active {
                         controller.reactivateAudioSessionAfterForeground()
                     }
                 }
@@ -175,6 +175,16 @@ final class AppModel {
     var playlistPicker: PlaylistPickerRequest?
     var downloadManagerPresented = false
     var replayPresented = false
+    /// Which Replay story to open when the sheet arrives. Set alongside
+    /// `replayPresented` by library heroes — a tapped card opens Replay at
+    /// its chart, the empty-state banner at the intro — and consumed by
+    /// `ReplayView` on appear. Nil means the main Replay page.
+    var replayInitialPage: ReplayStoryPage?
+    /// Open Replay, optionally at one story page. Upstream's `onOpenReplay`.
+    func openReplay(at page: ReplayStoryPage? = nil) {
+        replayInitialPage = page
+        replayPresented = true
+    }
     /// The first-run Automix models offer. Set by ``offerAutomixModelsIfNeeded()``
     /// and consumed by `RootView`.
     var automixModelsPresented = false
@@ -264,6 +274,7 @@ final class AppModel {
         case home, explore, library, search
         case libraryYouTube, librarySongs, libraryAlbums
         case libraryArtists, libraryDownloads, libraryHistory, libraryWebDav
+        case libraryPlaylists, librarySubscriptions, libraryPodcasts, libraryOnDevice
     }
 }
 

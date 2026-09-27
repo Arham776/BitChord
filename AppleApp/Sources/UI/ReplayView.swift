@@ -174,7 +174,15 @@ struct ReplayView: View {
                     }
                 }
             }
-            .onAppear { reload() }
+            .onAppear {
+                reload()
+                // A library hero card asked for its chart: consumed one-shot
+                // so reopening Replay later starts at the main page again.
+                if let page = appModel.replayInitialPage {
+                    appModel.replayInitialPage = nil
+                    storyPage = page
+                }
+            }
             .onChange(of: period) { _, _ in reload() }
             .modifier(ReplayStoriesPresentation(
                 storyPage: $storyPage,
@@ -558,6 +566,48 @@ struct ReplayCreditCardView: View {
             .shadow(color: .black.opacity(0.35), radius: 12, y: 6)
         }
         .buttonStyle(.plain)
+    }
+}
+
+/// Library hero: upstream's replay slot on `LibraryScreen`. The personalised
+/// credit-card row when there is listening data — each card opens Replay at
+/// the chart it summarises — and the banner only before that (which opens
+/// the intro story, like upstream's empty-state banner). The holder names
+/// the account, like the cardholder line upstream.
+struct ReplayHeroSection: View {
+    var onOpen: (ReplayStoryPage) -> Void
+    @Environment(AuthController.self) private var auth
+    @State private var model = ReplayModel.load(period: .thisYear, holder: "You")
+
+    var body: some View {
+        Group {
+            if model.summary.isEmpty {
+                ReplayBanner { onOpen(.intro) }
+            } else {
+                ScrollView(.horizontal, showsIndicators: false) {
+                    LazyHStack(spacing: 12) {
+                        ForEach(model.cards) { card in
+                            ReplayCreditCardView(
+                                card: card,
+                                holder: model.holder,
+                                memberSince: model.memberSince
+                            ) {
+                                onOpen(card.page)
+                            }
+                            .frame(width: 300)
+                        }
+                    }
+                    .padding(.horizontal, 24)
+                    .padding(.vertical, 2)
+                }
+            }
+        }
+        .onAppear { reload() }
+    }
+
+    private func reload() {
+        let name = auth.accountName ?? ""
+        model = ReplayModel.load(period: .thisYear, holder: name.isEmpty ? "You" : name)
     }
 }
 

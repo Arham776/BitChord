@@ -1,10 +1,12 @@
 import SwiftUI
 import BitChordShared
+import UniformTypeIdentifiers
 import AVKit
 import CoreImage
 import CoreImage.CIFilterBuiltins
 #if os(iOS)
 import UIKit
+import AVFAudio
 #else
 import AppKit
 #endif
@@ -66,6 +68,18 @@ struct NowPlayingView: View {
         // hold on the next track could not be aimed at anything.
         .onReceive(NotificationCenter.default.publisher(for: .lyricsOffsetChanged)) { _ in
             lyricsOffsetMs = LyricsOffsetBridge.offsetMs()
+        }
+        .onChange(of: appModel.queueRevealRequested) { _, requested in
+            if requested {
+                withAnimation(.easeInOut(duration: 0.2)) { pane = .queue }
+                appModel.queueRevealRequested = false
+            }
+        }
+        .onChange(of: appModel.lyricsRevealRequested) { _, requested in
+            if requested {
+                withAnimation(.easeInOut(duration: 0.2)) { pane = .lyrics }
+                appModel.lyricsRevealRequested = false
+            }
         }
         .onChange(of: pane) { _, value in
             PlatformSettings.shared.putString(key: "last_player_screen", value: value.persistedValue)
@@ -131,6 +145,7 @@ struct NowPlayingView: View {
             Button("Close", systemImage: "xmark") {
                 appModel.nowPlayingPresented = false
             }
+            .keyboardShortcut(.cancelAction)
             .labelStyle(.iconOnly)
             .help("Close")
         }
@@ -239,6 +254,33 @@ struct NowPlayingView: View {
             .ignoresSafeArea(.container, edges: .top)
             .toolbar(.hidden, for: .navigationBar)
             .toolbarTitleDisplayMode(.inline)
+            .overlay(alignment: .top) {
+                if UIDevice.current.userInterfaceIdiom == .pad {
+                    HStack {
+                        Button {
+                            dismiss()
+                        } label: {
+                            Image(systemName: "chevron.down")
+                                .font(.system(size: 15, weight: .bold))
+                                .foregroundStyle(.white.opacity(0.85))
+                                .frame(width: 36, height: 36)
+                                .background(.ultraThinMaterial, in: Circle())
+                        }
+                        .buttonStyle(.plain)
+                        .accessibilityLabel("Dismiss")
+
+                        Spacer()
+
+                        AirPlayRouteButton()
+                            .frame(width: 22, height: 22)
+                            .frame(width: 36, height: 36)
+                            .background(.ultraThinMaterial, in: Circle())
+                            .accessibilityLabel("AirPlay")
+                    }
+                    .padding(.horizontal, 24)
+                    .padding(.top, 16)
+                }
+            }
         }
     }
     #endif
@@ -258,23 +300,25 @@ struct NowPlayingView: View {
         .animation(.easeInOut(duration: 0.22), value: lyricsControlsOpen)
     }
 
-    /// The landscape player: two columns of equal width.
-    ///
-    /// The left one is the same in every pane — the sleeve, and under it the row
-    /// that chooses which of the three the right column shows. The right one is
-    /// that one thing. Nothing is drawn twice and nothing moves between columns,
-    /// so opening the lyrics is only ever the right column's page being turned.
+    /// The landscape player: two columns.
+    /// On phones: compact two-column player.
+    /// On iPad & macOS: Apple Music standard two-column player with permanent transport on the left
+    /// and dedicated Lyrics / Up Next panel on the right.
     private func landscapePlayer(size: CGSize) -> some View {
-        // A phone on its side is short as well as wide, and the two are different
-        // problems: a short window needs less gutter and a smaller sleeve, or the
-        // row underneath gets pushed off the bottom.
         let compact = PlayerLayout.isCompactLandscape(width: size.width, height: size.height)
         let gutter = PlayerLayout.gutter(compact: compact)
-        return HStack(spacing: 0) {
-            VStack(spacing: compact ? 12 : 24) {
-                // Square, and taking whichever axis runs out first once the row
-                // below has had its height — measured, not estimated, so the row
-                // underneath can never be pushed off the bottom.
+        return Group {
+            if compact {
+                compactLandscapePlayer(size: size, gutter: gutter)
+            } else {
+                desktopLandscapePlayer(size: size, gutter: gutter)
+            }
+        }
+    }
+
+    private func compactLandscapePlayer(size: CGSize, gutter: CGFloat) -> some View {
+        HStack(spacing: 0) {
+            VStack(spacing: 12) {
                 GeometryReader { geo in
                     artworkStage(
                         side: max(80, min(geo.size.width, geo.size.height)),
@@ -289,12 +333,6 @@ struct NowPlayingView: View {
             Group {
                 switch pane {
                 case .main:
-                    // Credits, the lyric strip, the scrubber and the transport,
-                    // in that order — the same deck as the portrait player with
-                    // the artwork left out, because the left column already has it
-                    // and nothing is drawn twice. The lyric strip stays: it is the
-                    // one line of the words, and the pane it opens is the one this
-                    // column can swap to.
                     VStack(spacing: 14) {
                         creditsRow
                         currentLyricStrip
@@ -310,10 +348,177 @@ struct NowPlayingView: View {
             .frame(maxWidth: .infinity)
             .animation(.easeInOut(duration: 0.2), value: pane)
         }
-        // Held to a maximum width and centred: a very wide window should not
-        // stretch the columns into two narrow strips with a gulf between them.
         .frame(maxWidth: PlayerLayout.landscapeMaxWidth)
         .frame(maxWidth: .infinity)
+    }
+
+    private func desktopLandscapePlayer(size: CGSize, gutter: CGFloat) -> some View {
+        HStack(spacing: 36) {
+            // Left column: Large Album Artwork + Full Transport Deck
+            VStack(spacing: 16) {
+                Spacer(minLength: 0)
+
+                GeometryReader { geo in
+                    let side = min(geo.size.width, geo.size.height)
+                    artworkStage(side: max(180, side), collapsed: false)
+                        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .center)
+                }
+                .frame(maxHeight: min(size.height * 0.46, 380))
+
+                VStack(spacing: 12) {
+                    creditsRow
+
+                    if let status = songStatusLine {
+                        Text(status)
+                            .font(.caption2.weight(.medium))
+                            .foregroundStyle(.white.opacity(0.6))
+                            .lineLimit(1)
+                            .truncationMode(.tail)
+                            .shadow(color: .black.opacity(0.4), radius: 3, y: 1)
+                            .padding(.horizontal, 16)
+                    }
+
+                    positionControls
+                        .padding(.horizontal, 12)
+
+                    playerTransport
+
+                    #if os(iOS)
+                    if !controller.hideVolumeBar {
+                        deckVolumeRow
+                            .padding(.horizontal, 12)
+                    }
+                    outputPartyPill
+                    #endif
+                }
+                .frame(maxWidth: 420)
+
+                Spacer(minLength: 0)
+            }
+            .frame(maxWidth: 460)
+            .padding(.leading, gutter)
+
+            // Right column: Pane switcher header + Lyrics or Queue
+            VStack(spacing: 0) {
+                desktopPaneHeader
+                    .padding(.bottom, 8)
+
+                Group {
+                    if pane == .queue {
+                        UpNextPane(onOpenLyrics: { pane = .lyrics })
+                            .transition(.opacity)
+                    } else {
+                        desktopLyricsPane
+                            .transition(.opacity)
+                    }
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .padding(.trailing, gutter)
+        }
+        .frame(maxWidth: PlayerLayout.landscapeMaxWidth)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .animation(.easeInOut(duration: 0.2), value: pane)
+    }
+
+    private var desktopPaneHeader: some View {
+        HStack(spacing: 12) {
+            HStack(spacing: 4) {
+                Button {
+                    Haptics.play(.expand)
+                    pane = .lyrics
+                } label: {
+                    HStack(spacing: 6) {
+                        Image(.bchLyrics)
+                            .resizable().scaledToFit().frame(width: 14, height: 14)
+                        Text("Lyrics")
+                            .font(.subheadline.weight(pane != .queue ? .semibold : .regular))
+                    }
+                    .padding(.horizontal, 14)
+                    .padding(.vertical, 6)
+                    .background(pane != .queue ? Color.white.opacity(0.20) : Color.clear, in: Capsule())
+                    .foregroundStyle(pane != .queue ? .white : .white.opacity(0.6))
+                }
+                .buttonStyle(.plain)
+
+                Button {
+                    Haptics.play(.expand)
+                    pane = .queue
+                } label: {
+                    HStack(spacing: 6) {
+                        Image(.bchQueue)
+                            .resizable().scaledToFit().frame(width: 14, height: 14)
+                        Text("Up Next")
+                            .font(.subheadline.weight(pane == .queue ? .semibold : .regular))
+                    }
+                    .padding(.horizontal, 14)
+                    .padding(.vertical, 6)
+                    .background(pane == .queue ? Color.white.opacity(0.20) : Color.clear, in: Capsule())
+                    .foregroundStyle(pane == .queue ? .white : .white.opacity(0.6))
+                }
+                .buttonStyle(.plain)
+            }
+            .padding(3)
+            .background(.white.opacity(0.08), in: Capsule())
+
+            Spacer()
+
+            if pane == .queue {
+                queueModesPill
+            } else {
+                HStack(spacing: 8) {
+                    if let source = controller.lyricsSourceLabel, !source.isEmpty {
+                        Button {
+                            showLyricsSources = true
+                        } label: {
+                            Text(source)
+                                .font(.caption.weight(.medium))
+                                .foregroundStyle(.white.opacity(0.6))
+                                .padding(.horizontal, 8)
+                                .padding(.vertical, 4)
+                                .background(.white.opacity(0.08), in: Capsule())
+                        }
+                        .buttonStyle(.plain)
+                        .help("Change lyrics source")
+                    }
+
+                    Button {
+                        showLyricsOffset = true
+                    } label: {
+                        Image(systemName: "slider.horizontal.2.square")
+                            .font(.system(size: 15))
+                            .foregroundStyle(.white.opacity(0.7))
+                            .frame(width: 30, height: 30)
+                            .contentShape(.rect)
+                    }
+                    .buttonStyle(.plain)
+                    .help("Adjust lyrics timing")
+                }
+            }
+        }
+        .padding(.horizontal, 8)
+        .padding(.top, 14)
+    }
+
+    private var desktopLyricsPane: some View {
+        TimelineView(.animation) { timeline in
+            LyricsPane(
+                lines: controller.displayedLyrics,
+                loading: controller.lyricsLoading,
+                position: controller.livePosition(at: timeline.date),
+                hasTrack: controller.current != nil,
+                sourceLabel: controller.lyricsSourceLabel,
+                onSeek: { controller.seek(to: $0) },
+                translator: controller.lyricsTranslator,
+                trackId: controller.current?.id ?? "",
+                offsetMs: lyricsOffsetMs,
+                sourceVisible: true,
+                onChangeSource: { showLyricsSources = true },
+                onRevealControls: {},
+                onFocusLyrics: {}
+            )
+        }
     }
 
     /// Everything above the deck: the artwork, or whichever panel is open.
@@ -344,13 +549,17 @@ struct NowPlayingView: View {
             VStack(spacing: 0) {
                 if pane == .lyrics {
                     lyricsHeader
-                } else {
+                } else if pane == .main {
                     artworkStage(
-                        side: collapsed ? PlayerLayout.sleeveCollapsedSide : (hero ? geo.size.width : full),
-                        collapsed: collapsed,
+                        side: hero ? geo.size.width : full,
+                        collapsed: false,
                         hero: hero
                     )
                 }
+                // The queue pane draws no sleeve of its own: its first row is the
+                // playing track with its artwork, like and overflow, and a
+                // shrunken sleeve above that was a second artwork for the same
+                // song — the thing upstream's queue screen never had.
                 if collapsed {
                     if drawer {
                         PlayerDrawerView(onDismiss: {
@@ -493,7 +702,7 @@ struct NowPlayingView: View {
             )
             }
         case .queue:
-            UpNextPane()
+            UpNextPane(onOpenLyrics: { pane = .lyrics })
         }
     }
 
@@ -505,10 +714,14 @@ struct NowPlayingView: View {
     /// which is the same question the rest of this block answers.
     private var deck: some View {
         VStack(spacing: 14) {
-            if pane != .lyrics { creditsRow }
+            // Credits, status and strip live on the main player only. Upstream's
+            // queue screen goes Lyrics link straight to the scrubber — the song
+            // title and the sung line sitting over the queue is this codebase's
+            // invention, and it is what buried the list.
+            if pane == .main { creditsRow }
             // The playback-origin caption / nerd line, hidden behind
             // `hide_song_status` exactly as upstream hides it.
-            if pane != .lyrics, let status = songStatusLine {
+            if pane == .main, let status = songStatusLine {
                 Text(status)
                     .font(.caption2.weight(.medium))
                     .foregroundStyle(.white.opacity(0.6))
@@ -519,10 +732,9 @@ struct NowPlayingView: View {
                     .accessibilityLabel(status)
             }
             // Upstream's deck is "lyric strip, scrubber, transport, volume,
-            // toggles", and the strip is the first item: one line of the lyric
-            // being sung right now, or the line saying why there is not one. It
-            // stays on the player in every pane, so the words are there without
-            // opening the lyrics at all.
+            // toggles" — the strip sits directly above the seek line, in the
+            // main and queue panes alike. Only the lyrics pane hides it,
+            // because there the whole lyric is already on screen.
             if pane != .lyrics { currentLyricStrip }
             positionControls
                 .padding(.horizontal, 32)
@@ -855,12 +1067,20 @@ struct NowPlayingView: View {
     }
 
     private var outputCaption: String {
-        // Like upstream, identify the active output route here; do not surface
-        // CoreAudio's internal device name for the built-in iPhone speaker.
-        let routeName = controller.outputDevice.name.trimmingCharacters(in: .whitespacesAndNewlines)
+        // The live CoreAudio route, which is the only place the *current*
+        // output is named on iOS: cpal's default device does not follow a
+        // route change, so plugging in AirPods would have kept reporting the
+        // built-in speaker. Read it per render — the player re-renders on every
+        // position tick, so a route change lands without any observer.
+        #if os(iOS)
+        let port = AVAudioSession.sharedInstance().currentRoute.outputs.first?.portName ?? ""
+        let routeName = port.trimmingCharacters(in: .whitespacesAndNewlines)
+        #else
+        let routeName = controller.outputDevice.name
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        #endif
         let lowered = routeName.lowercased()
         if controller.outputDevice.started, !routeName.isEmpty,
-           !lowered.contains("iphone"), !lowered.contains("ipad"), !lowered.contains("built-in"),
            !lowered.contains("default output") {
             return routeName
         }
@@ -1256,40 +1476,23 @@ private extension View {
     }
 }
 
-/// Music's Up Next column: AutoPlay / AutoMix pills, then upcoming rows split
-/// into manual vs AutoPlay — a drag never crosses that boundary.
+/// Upstream's queue: title plus Clear, Now playing, the upcoming rows split
+/// into manual vs AutoPlay, an AutoPlay heading, and a Lyrics link.
+/// Mode toggles live only in the bottom pill — never as pills on top — and
+/// the deck drops its credits and lyric strip here, so the words never sit
+/// on top of the list.
 private struct UpNextPane: View {
     @Environment(PlaybackController.self) private var controller
+    @Environment(AuthController.self) private var auth
+    var onOpenLyrics: () -> Void = {}
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
-            HStack(spacing: 8) {
-                autoPill(
-                    title: "AutoPlay",
-                    on: controller.autoplayEnabled
-                ) {
-                    Haptics.play(controller.autoplayEnabled ? .toggleOff : .toggleOn)
-                    controller.toggleAutoplay()
-                }
-                autoPill(
-                    title: "AutoMix",
-                    on: controller.automixEnabled
-                ) {
-                    Haptics.play(controller.automixEnabled ? .toggleOff : .toggleOn)
-                    controller.toggleAutomix()
-                }
-                Spacer(minLength: 0)
-            }
-
+            queueHeader
             HStack(alignment: .firstTextBaseline) {
-                VStack(alignment: .leading, spacing: 2) {
-                    Text("Continue Playing")
-                        .font(.title3.weight(.bold))
-                        .foregroundStyle(.white)
-                    Text(subtitle)
-                        .font(.caption)
-                        .foregroundStyle(.white.opacity(0.6))
-                }
+                Text("Queue")
+                    .font(.title2.weight(.bold))
+                    .foregroundStyle(.white)
                 Spacer()
                 if !manualUpcoming.isEmpty || !autoplayUpcoming.isEmpty {
                     Button("Clear") { controller.clearUpcoming() }
@@ -1298,18 +1501,39 @@ private struct UpNextPane: View {
                         .foregroundStyle(Color.accentColor)
                 }
             }
+            .padding(.horizontal, 24)
+            .id("queueTop")
 
-            if manualUpcoming.isEmpty && autoplayUpcoming.isEmpty {
-                Text("Nothing else queued. Turn on AutoPlay to keep the music going.")
+            if controller.current == nil && manualUpcoming.isEmpty && autoplayUpcoming.isEmpty {
+                Text("Nothing playing.")
                     .font(.callout)
                     .foregroundStyle(.white.opacity(0.55))
                     .padding(.top, 8)
+                    .padding(.horizontal, 24)
                 Spacer()
             } else {
+                ScrollViewReader { proxy in
                 List {
+                    if controller.current != nil {
+                        Text("Now playing")
+                            .font(.headline.weight(.medium))
+                            .foregroundStyle(.white.opacity(0.75))
+                            .padding(.top, 12)
+                            .listRowBackground(Color.clear)
+                            .listRowSeparator(.hidden)
+                            .listRowInsets(EdgeInsets(top: 12, leading: 24, bottom: 6, trailing: 24))
+                        currentRow
+                    }
                     if !manualUpcoming.isEmpty {
-                        ForEach(manualUpcoming) { item in
-                            queueRow(item)
+                        Text("Up next")
+                            .font(.headline.weight(.medium))
+                            .foregroundStyle(.white.opacity(0.75))
+                            .padding(.top, 16)
+                            .listRowBackground(Color.clear)
+                            .listRowSeparator(.hidden)
+                            .listRowInsets(EdgeInsets(top: 16, leading: 24, bottom: 6, trailing: 24))
+                        ForEach(Array(manualUpcoming.enumerated()), id: \.element.id) { localIndex, item in
+                            queueRow(item, section: 0, index: localIndex, rows: manualUpcoming)
                         }
                         .onMove { source, dest in
                             move(source, dest, rows: manualUpcoming)
@@ -1319,79 +1543,95 @@ private struct UpNextPane: View {
                         }
                     }
                     if showAutoplayHeading {
-                        Section {
-                            if autoplayUpcoming.isEmpty {
-                                Text("Similar music will keep playing")
-                                    .font(.caption)
+                        HStack(spacing: 8) {
+                            Image(.bchInfinity)
+                                .resizable()
+                                .scaledToFit()
+                                .frame(width: 18, height: 18)
+                                .foregroundStyle(.white.opacity(0.75))
+                            VStack(alignment: .leading, spacing: 1) {
+                                Text("AutoPlay")
+                                    .font(.headline.weight(.medium))
+                                    .foregroundStyle(.white)
+                                Text(autoplayUpcoming.isEmpty
+                                     ? "Similar music will keep playing"
+                                     : "Similar music, selected to play next")
+                                    .font(.callout)
                                     .foregroundStyle(.white.opacity(0.55))
-                                    .listRowBackground(Color.clear)
-                                    .listRowSeparator(.hidden)
-                            } else {
-                                ForEach(autoplayUpcoming) { item in
-                                    queueRow(item)
-                                }
-                                .onMove { source, dest in
-                                    move(source, dest, rows: autoplayUpcoming)
-                                }
-                                .onDelete { offsets in
-                                    remove(offsets, rows: autoplayUpcoming)
-                                }
                             }
-                        } header: {
-                            HStack(spacing: 8) {
-                                Image(.bchInfinity)
-                                    .resizable()
-                                    .scaledToFit()
-                                    .frame(width: 14, height: 14)
-                                    .foregroundStyle(.white.opacity(0.75))
-                                VStack(alignment: .leading, spacing: 1) {
-                                    Text("AutoPlay")
-                                        .font(.subheadline.weight(.semibold))
-                                        .foregroundStyle(.white)
-                                    Text(autoplayUpcoming.isEmpty
-                                         ? "Similar music will keep playing"
-                                         : "Similar music, picked to follow on")
-                                        .font(.caption)
-                                        .foregroundStyle(.white.opacity(0.55))
-                                }
+                        }
+                        .padding(.vertical, 14)
+                        .listRowBackground(Color.clear)
+                        .listRowSeparator(.hidden)
+                        .listRowInsets(EdgeInsets(top: 14, leading: 24, bottom: 14, trailing: 24))
+                        if !autoplayUpcoming.isEmpty {
+                            ForEach(Array(autoplayUpcoming.enumerated()), id: \.element.id) { localIndex, item in
+                                queueRow(item, section: 1, index: localIndex, rows: autoplayUpcoming)
+                            }
+                            .onMove { source, dest in
+                                move(source, dest, rows: autoplayUpcoming)
+                            }
+                            .onDelete { offsets in
+                                remove(offsets, rows: autoplayUpcoming)
                             }
                         }
                     }
+                    Button {
+                        Haptics.play(.expand)
+                        onOpenLyrics()
+                    } label: {
+                        HStack(spacing: 6) {
+                            Image(systemName: "music.note")
+                                .font(.body.weight(.medium))
+                            Text("Lyrics")
+                                .font(.headline.weight(.medium))
+                            Image(systemName: "chevron.right")
+                                .font(.caption.weight(.semibold))
+                        }
+                        .foregroundStyle(.white)
+                        .padding(.vertical, 10)
+                        .contentShape(.rect)
+                    }
+                    .buttonStyle(.plain)
+                    .listRowBackground(Color.clear)
+                    .listRowSeparator(.hidden)
+                    .listRowInsets(EdgeInsets(top: 10, leading: 24, bottom: 10, trailing: 24))
                 }
                 .listStyle(.plain)
                 .scrollContentBackground(.hidden)
-                #if os(iOS)
-                // A real edit mode with an explicit control, rather than
-                // `.constant(.active)`. Forcing it active showed a red delete
-                // circle on every row permanently and suppressed the system
-                // Edit/Done toggle, so there was no way back out of it — and it
-                // fought the one gesture people already expect here, which is
-                // swipe-to-delete. Reordering is still available from the Reorder
-                // state; deletion is available at all times by swiping.
-                //
-                // iOS-only because `EditMode` is. On macOS the queue is reordered
-                // by click-to-move, which is the platform's own idiom.
-                .environment(\.editMode, $editMode)
-                .toolbar {
-                    if manualUpcoming.count > 1 {
-                        ToolbarItem(placement: .automatic) {
-                            Button(editMode == .active ? "Done" : "Reorder") {
-                                withAnimation {
-                                    editMode = editMode == .active ? .inactive : .active
-                                }
-                            }
-                        }
+                // Softens the list where it meets the header and the deck,
+                // like upstream's fading edges.
+                .mask(
+                    LinearGradient(
+                        stops: [
+                            .init(color: .clear, location: 0),
+                            .init(color: .black, location: 0.04),
+                            .init(color: .black, location: 0.96),
+                            .init(color: .clear, location: 1),
+                        ],
+                        startPoint: .top, endPoint: .bottom
+                    )
+                )
+                // Rows trade places across the section boundary on every track
+                // change; animate the placement, briskly, rather than jumping.
+                .animation(.easeOut(duration: 0.2), value: queueSignature)
+                .onChange(of: controller.playingIndex) { _, _ in
+                    // Back to the top on a track change — snapped the first
+                    // time, animated after.
+                    if hasScrolledOnce {
+                        withAnimation { proxy.scrollTo("queueTop", anchor: .top) }
+                    } else {
+                        proxy.scrollTo("queueTop", anchor: .top)
+                        hasScrolledOnce = true
                     }
                 }
-                #endif
+                }
             }
         }
         .padding(.top, 8)
     }
 
-    #if os(iOS)
-    @State private var editMode: EditMode = .inactive
-    #endif
+    @State private var hasScrolledOnce = false
 
     private var autoplayStart: Int { controller.autoplaySectionStart }
 
@@ -1416,46 +1656,143 @@ private struct UpNextPane: View {
         }
     }
 
-    private var subtitle: String {
-        let artist = controller.current?.artist ?? ""
-        if !autoplayUpcoming.isEmpty {
-            return artist.isEmpty ? "Similar artists" : "From \(artist) & Similar Artists"
+    /// The playing track heads the pane, like upstream's queue header:
+    /// artwork and title/artist in the same row as like and overflow.
+    private var queueHeader: some View {
+        HStack(spacing: 12) {
+            ArtworkView(entry: controller.current, side: 56)
+                .clipShape(.rect(cornerRadius: 8, style: .continuous))
+            VStack(alignment: .leading, spacing: 3) {
+                Text(controller.current?.title ?? "Nothing playing")
+                    .font(.title3.weight(.semibold))
+                    .foregroundStyle(.white)
+                    .lineLimit(1)
+                Text(controller.current?.artist ?? "")
+                    .font(.subheadline)
+                    .foregroundStyle(.white.opacity(0.65))
+                    .lineLimit(1)
+            }
+            Spacer(minLength: 0)
+            if auth.signedIn, controller.current?.videoId != nil {
+                GlassCircleButton(
+                    icon: controller.isLiked ? .bchHeartFilled : .bchHeart,
+                    label: controller.isLiked ? "Remove Like" : "Like"
+                ) { controller.toggleLike() }
+            }
+            Menu {
+                if let current = controller.current {
+                    SongActionButtons(entry: current, showSleepTimer: true, showDebugLog: true)
+                }
+            } label: {
+                Image(systemName: "ellipsis")
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundStyle(.white)
+                    .frame(width: 34, height: 34)
+                    .background(.white.opacity(0.14), in: Circle())
+            }
+            .buttonStyle(.plain)
+            .help("More")
         }
-        let n = manualUpcoming.count
-        if n == 0 { return "Nothing queued" }
-        return n == 1 ? "1 song" : "\(n) songs"
+        .padding(.horizontal, 24)
     }
 
-    private func queueRow(_ item: QueueRow) -> some View {
-        Button {
-            controller.playQueueItem(at: item.index)
-        } label: {
-            HStack(spacing: 12) {
-                ArtworkView(entry: item.entry, side: 40)
-                    .clipShape(.rect(cornerRadius: 6, style: .continuous))
-                VStack(alignment: .leading, spacing: 2) {
-                    Text(item.entry.title)
-                        .font(.body.weight(.medium))
-                        .foregroundStyle(.white)
-                        .lineLimit(1)
-                    Text(item.entry.artist)
-                        .font(.caption)
-                        .foregroundStyle(.white.opacity(0.65))
-                        .lineLimit(1)
+    /// What the row-motion animation tracks: every move changes it, nothing
+    /// else does.
+    private var queueSignature: String {
+        (manualUpcoming.map(\.id) + autoplayUpcoming.map(\.id)).joined(separator: "|")
+    }
+
+    private func queueRow(_ item: QueueRow, section: Int, index: Int, rows: [QueueRow]) -> some View {
+        HStack(spacing: 10) {
+            Image(systemName: "line.3.horizontal")
+                .font(.body.weight(.medium))
+                .foregroundStyle(.white.opacity(0.4))
+                .frame(width: 20, height: 44)
+                .contentShape(.rect)
+                .onDrag {
+                    NSItemProvider(object: "\(section):\(index)" as NSString)
                 }
-                Spacer(minLength: 0)
+            Button {
+                controller.playQueueItem(at: item.index)
+            } label: {
+                HStack(spacing: 12) {
+                    ArtworkView(entry: item.entry, side: 44)
+                        .clipShape(.rect(cornerRadius: 6, style: .continuous))
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(item.entry.title)
+                            .font(.body.weight(.medium))
+                            .foregroundStyle(.white)
+                            .lineLimit(1)
+                        Text(item.entry.artist)
+                            .font(.caption)
+                            .foregroundStyle(.white.opacity(0.65))
+                            .lineLimit(1)
+                    }
+                    Spacer(minLength: 0)
+                }
+                .contentShape(.rect)
             }
-            .contentShape(.rect)
+            .buttonStyle(.plain)
+            Button {
+                controller.removeFromQueue(at: item.index)
+            } label: {
+                Image(systemName: "xmark")
+                    .font(.body.weight(.medium))
+                    .foregroundStyle(.white.opacity(0.55))
+                    .frame(width: 32, height: 44)
+                    .contentShape(.rect)
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("Remove \(item.entry.title) from queue")
         }
-        .buttonStyle(.plain)
-        .listRowBackground(Color.white.opacity(0.04))
+        .listRowBackground(Color.clear)
         .listRowSeparator(.hidden)
+        .listRowInsets(EdgeInsets(top: 6, leading: 24, bottom: 6, trailing: 20))
+        .onDrop(of: [.text], delegate: QueueReorderDelegate(section: section, rows: rows, destIndex: index) { from, dest in
+            move(IndexSet(integer: from), dest, rows: rows)
+        })
         .contextMenu {
             Button("Play") { controller.playQueueItem(at: item.index) }
             Button("Remove from Queue", role: .destructive) {
                 controller.removeFromQueue(at: IndexSet(integer: item.index))
             }
         }
+    }
+
+    /// The playing track heads the list, like upstream: tap restarts it, and
+    /// there is deliberately no remove control — removing the current track
+    /// is a skip, `removeFromQueue` ignores it, and the transport owns that.
+    private var currentRow: some View {
+        Button {
+            let at = controller.playingIndex
+            if controller.queue.indices.contains(at) {
+                controller.playQueueItem(at: at)
+            }
+        } label: {
+            HStack(spacing: 12) {
+                ArtworkView(entry: controller.current, side: 40)
+                    .clipShape(.rect(cornerRadius: 6, style: .continuous))
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(controller.current?.title ?? "")
+                        .font(.body.weight(.medium))
+                        .foregroundStyle(.white)
+                        .lineLimit(1)
+                    Text(controller.current?.artist ?? "")
+                        .font(.caption)
+                        .foregroundStyle(.white.opacity(0.65))
+                        .lineLimit(1)
+                }
+                Spacer(minLength: 0)
+                Image(systemName: "waveform")
+                    .font(.body.weight(.medium))
+                    .foregroundStyle(.white)
+                    .accessibilityLabel("Now playing")
+            }
+            .contentShape(.rect)
+        }
+        .buttonStyle(.plain)
+        .listRowBackground(Color.clear)
+        .listRowSeparator(.hidden)
     }
 
     private func move(_ source: IndexSet, _ dest: Int, rows: [QueueRow]) {
@@ -1475,25 +1812,33 @@ private struct UpNextPane: View {
         let indices = IndexSet(offsets.compactMap { rows.indices.contains($0) ? rows[$0].index : nil })
         controller.removeFromQueue(at: indices)
     }
+}
 
-    private func autoPill(title: String, on: Bool, action: @escaping () -> Void) -> some View {
-        Button(action: action) {
-            HStack(spacing: 6) {
-                Image(.bchInfinity)
-                    .resizable()
-                    .scaledToFit()
-                    .frame(width: 14, height: 14)
-                Text(title)
-                    .font(.callout.weight(.semibold))
-            }
-            .foregroundStyle(.white)
-            .padding(.horizontal, 14)
-            .padding(.vertical, 8)
-            .background(.white.opacity(on ? 0.28 : 0.12), in: Capsule())
+/// Reorders within one queue section from the row's drag handle, like
+/// upstream: a drag never leaves its section, and neighbours trade slots
+/// live as the held row crosses them. The payload carries its section tag so
+/// a drop onto the other section's rows is ignored, not misfiled.
+private struct QueueReorderDelegate: DropDelegate {
+    let section: Int
+    let rows: [QueueRow]
+    let destIndex: Int
+    let onMove: (Int, Int) -> Void
+
+    func validateDrop(info: DropInfo) -> Bool { true }
+
+    func dropEntered(info: DropInfo) {
+        guard let provider = info.itemProviders(for: [.text]).first else { return }
+        provider.loadObject(ofClass: NSString.self) { object, _ in
+            guard let text = object as? String else { return }
+            let parts = text.split(separator: ":").map(String.init).compactMap(Int.init)
+            guard parts.count == 2, parts[0] == section else { return }
+            let from = parts[1]
+            guard rows.indices.contains(from), rows.indices.contains(destIndex), from != destIndex else { return }
+            Task { @MainActor in onMove(from, destIndex) }
         }
-        .buttonStyle(.plain)
-        .help(on ? "\(title) on" : "\(title) off")
     }
+
+    func performDrop(info: DropInfo) -> Bool { true }
 }
 
 private struct QueueRow: Identifiable {
@@ -2348,7 +2693,7 @@ private struct ToolbarVolumeSlider: View {
 }
 
 #if os(iOS)
-private struct AirPlayRouteButton: UIViewRepresentable {
+struct AirPlayRouteButton: UIViewRepresentable {
     func makeUIView(context: Context) -> AVRoutePickerView {
         let view = AVRoutePickerView()
         view.prioritizesVideoDevices = false
@@ -2357,7 +2702,7 @@ private struct AirPlayRouteButton: UIViewRepresentable {
     func updateUIView(_ uiView: AVRoutePickerView, context: Context) {}
 }
 #else
-private struct AirPlayRouteButton: NSViewRepresentable {
+struct AirPlayRouteButton: NSViewRepresentable {
     func makeNSView(context: Context) -> SquareRoutePicker {
         SquareRoutePicker()
     }
@@ -2366,7 +2711,7 @@ private struct AirPlayRouteButton: NSViewRepresentable {
 
 /// AVRoutePickerView's intrinsic size is not square, so toolbar glass becomes
 /// a squircle. Pin it to a 22pt box so the item can be a circle.
-private final class SquareRoutePicker: NSView {
+final class SquareRoutePicker: NSView {
     private let picker = AVRoutePickerView()
 
     override init(frame frameRect: NSRect) {

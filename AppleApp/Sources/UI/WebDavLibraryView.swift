@@ -24,6 +24,9 @@ struct WebDavLibraryView: View {
             #if os(iOS)
             .navigationBarTitleDisplayMode(.large)
             .toolbar {
+                ToolbarItem(placement: .topBarLeading) {
+                    TopBarLeadingMark()
+                }
                 ToolbarItem(placement: .topBarTrailing) {
                     TopBarAccountButton()
                 }

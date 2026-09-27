@@ -196,6 +196,26 @@ final class InnertubeFeed: Sendable {
         }
     }
 
+    /// Songs explicitly added to the library (`FEmusic_liked_videos`) —
+    /// distinct from Liked Music, which is a rating. Same `[YouTubeSong]`
+    /// contract as `history()`.
+    func librarySongs() async throws -> [YouTubeSong] {
+        try await withCheckedThrowingContinuation { continuation in
+            LibraryBridge.shared.librarySongs(callback: LibraryFeedAdapter { json, message in
+                if let json {
+                    do {
+                        let songs = try JSONDecoder().decode([YouTubeSong].self, from: Data(json.utf8))
+                        continuation.resume(returning: songs)
+                    } catch {
+                        continuation.resume(throwing: error)
+                    }
+                } else {
+                    continuation.resume(throwing: FeedError(message: message ?? "library songs failed"))
+                }
+            })
+        }
+    }
+
     private func fetch(_ call: @escaping (HomeBridgeFeedCallback) -> Void) async throws -> FeedResult {
         try await withCheckedThrowingContinuation { continuation in
             call(FeedCallbackAdapter { json, message in

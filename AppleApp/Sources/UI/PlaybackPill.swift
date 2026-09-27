@@ -22,8 +22,15 @@ struct PlaybackPill: View {
 
     // ---- iOS: mini-player above the tab bar --------------------------------
     #if os(iOS)
+    @Environment(\.horizontalSizeClass) private var horizontalSizeClass
+    private var isRegularWidth: Bool { horizontalSizeClass == .regular }
+
     private var iOSPill: some View {
-        HStack(spacing: 10) {
+        HStack(spacing: 12) {
+            if isRegularWidth {
+                padLeadingTransport
+            }
+
             Button {
                 appModel.nowPlayingPresented = true
             } label: {
@@ -37,7 +44,12 @@ struct PlaybackPill: View {
             .buttonStyle(.plain)
             .accessibilityLabel("\(controller.current?.title ?? "Not Playing"), \(controller.current?.artist ?? "")")
             .accessibilityHint("Opens Now Playing")
-            buttons
+
+            if isRegularWidth {
+                padTrailingControls
+            } else {
+                buttons
+            }
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 8)
@@ -356,6 +368,84 @@ struct PlaybackPill: View {
             partyButton.frame(width: 40, height: 40)
         }
         .foregroundStyle(.primary)
+    }
+
+    private var padLeadingTransport: some View {
+        HStack(spacing: 4) {
+            Button {
+                guard controller.canPlayPrevious else { return }
+                Haptics.play(.skipPrevious)
+                controller.previous()
+            } label: {
+                Image(systemName: "backward.fill")
+                    .font(.system(size: 15, weight: .semibold))
+                    .frame(width: 34, height: 34)
+                    .contentShape(.rect)
+            }
+            .buttonStyle(.plain)
+            .disabled(!controller.canPlayPrevious)
+
+            if controller.isBuffering {
+                ProgressView()
+                    .controlSize(.small)
+                    .frame(width: 34, height: 34)
+            } else {
+                Button {
+                    Haptics.play(controller.isPlaying ? .pause : .resume)
+                    controller.togglePlayPause()
+                } label: {
+                    Image(systemName: controller.isPlaying ? "pause.fill" : "play.fill")
+                        .font(.system(size: 18, weight: .semibold))
+                        .frame(width: 34, height: 34)
+                        .contentShape(.rect)
+                }
+                .buttonStyle(.plain)
+                .disabled(controller.current == nil && !controller.isBuffering)
+            }
+
+            Button {
+                guard controller.canPlayNext else { return }
+                Haptics.play(.skipNext)
+                controller.next()
+            } label: {
+                Image(systemName: "forward.fill")
+                    .font(.system(size: 15, weight: .semibold))
+                    .frame(width: 34, height: 34)
+                    .contentShape(.rect)
+            }
+            .buttonStyle(.plain)
+            .foregroundStyle(
+                PartyStore.shared.state.controlsLocked ? Color.primary.opacity(0.3) : Color.primary
+            )
+            .disabled(!controller.canPlayNext || PartyStore.shared.state.controlsLocked)
+        }
+        .foregroundStyle(.primary)
+    }
+
+    private var padTrailingControls: some View {
+        HStack(spacing: 6) {
+            Button {
+                appModel.nowPlayingPresented = true
+                PlatformSettings.shared.putString(key: "last_player_screen", value: "LYRICS")
+            } label: {
+                Image(.bchLyrics)
+                    .resizable()
+                    .scaledToFit()
+                    .frame(width: 15, height: 15)
+                    .frame(width: 32, height: 32)
+                    .contentShape(.rect)
+            }
+            .buttonStyle(.plain)
+            .foregroundStyle(.secondary)
+            .accessibilityLabel("Lyrics")
+
+            AirPlayRouteButton()
+                .frame(width: 22, height: 22)
+                .frame(width: 32, height: 32)
+                .accessibilityLabel("AirPlay")
+
+            partyButton.frame(width: 32, height: 32)
+        }
     }
     #endif
 }

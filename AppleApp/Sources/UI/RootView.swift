@@ -208,7 +208,10 @@ struct RootView: View {
                 Tab(value: AppModel.Tab.libraryYouTube) {
                     LibraryView(lockedSection: .youtube).modifier(MacPlaybackChrome())
                 } label: {
-                    sidebarLabel("Recent", image: .bchLibrary)
+                    // Upstream has no distinct Recent glyph; the `bchLibrary`
+                    // shelves are already taken by Albums below. The repeat-clock
+                    // SF Symbol stays distinct from History's plain `bchClock`.
+                    Label("Recent", systemImage: "clock.arrow.circlepath")
                 }
                 Tab(value: AppModel.Tab.librarySongs) {
                     LibraryView(lockedSection: .songs).modifier(MacPlaybackChrome())
@@ -218,20 +221,37 @@ struct RootView: View {
                 Tab(value: AppModel.Tab.libraryAlbums) {
                     LibraryView(lockedSection: .albums).modifier(MacPlaybackChrome())
                 } label: {
-                    // Upstream glyphs throughout, per UI spec §6 — these two were
-                    // SF Symbols sitting next to `.bchLibrary` and `.bchMusicNote`
-                    // in the same sidebar, which read as a mistake.
+                    // Songs keeps the music note and Albums keeps the library
+                    // shelves — the more fitting half of each conflicted pair.
                     sidebarLabel("Albums", image: .bchLibrary)
                 }
                 Tab(value: AppModel.Tab.libraryArtists) {
                     LibraryView(lockedSection: .artists).modifier(MacPlaybackChrome())
                 } label: {
-                    sidebarLabel("Artists", image: .bchMusicNote)
+                    // Upstream has no distinct Artists glyph and the music note
+                    // is already taken by Songs above; the mic reads as the
+                    // performer rather than the track.
+                    Label("Artists", systemImage: "music.mic")
                 }
-                Tab(value: AppModel.Tab.libraryDownloads) {
-                    LibraryView(lockedSection: .downloads).modifier(MacPlaybackChrome())
+                Tab(value: AppModel.Tab.libraryPlaylists) {
+                    LibraryView(lockedSection: .playlists).modifier(MacPlaybackChrome())
                 } label: {
-                    sidebarLabel("Downloads", image: .bchDownload)
+                    Label("Playlists", systemImage: "music.note.list")
+                }
+                Tab(value: AppModel.Tab.librarySubscriptions) {
+                    LibraryView(lockedSection: .subscriptions).modifier(MacPlaybackChrome())
+                } label: {
+                    Label("Subscriptions", systemImage: "bell")
+                }
+                Tab(value: AppModel.Tab.libraryPodcasts) {
+                    LibraryView(lockedSection: .podcasts).modifier(MacPlaybackChrome())
+                } label: {
+                    Label("Podcasts", systemImage: "radio")
+                }
+                Tab(value: AppModel.Tab.libraryOnDevice) {
+                    LibraryView(lockedSection: .ondevice).modifier(MacPlaybackChrome())
+                } label: {
+                    Label("On Device", systemImage: "externaldrive")
                 }
                 Tab(value: AppModel.Tab.libraryHistory) {
                     LibraryView(lockedSection: .history).modifier(MacPlaybackChrome())
@@ -259,21 +279,84 @@ struct RootView: View {
                 sidebarLabel("Search", image: .bchSearch)
             }
             #else
-            Tab("Home", image: "bch-home", value: AppModel.Tab.home) {
-                HomeView(feed: homeFeed)
-            }
-            Tab("Explore", image: "bch-explore", value: AppModel.Tab.explore) {
-                ExploreView()
-            }
-            Tab("Library", image: "bch-library", value: AppModel.Tab.library) {
-                LibraryView()
-            }
-            Tab("Search", image: "bch-search", value: AppModel.Tab.search, role: .search) {
-                SearchView()
+            if UIDevice.current.userInterfaceIdiom == .pad {
+                Tab("Home", image: "bch-home", value: AppModel.Tab.home) {
+                    HomeView(feed: homeFeed)
+                }
+                Tab("Explore", image: "bch-explore", value: AppModel.Tab.explore) {
+                    ExploreView()
+                }
+                TabSection("Library") {
+                    Tab(value: AppModel.Tab.libraryYouTube) {
+                        LibraryView(lockedSection: .youtube)
+                    } label: {
+                        Label("Recent", systemImage: "clock.arrow.circlepath")
+                    }
+                    Tab("Songs", image: "bch-music-note", value: AppModel.Tab.librarySongs) {
+                        LibraryView(lockedSection: .songs)
+                    }
+                    Tab("Albums", image: "bch-library", value: AppModel.Tab.libraryAlbums) {
+                        LibraryView(lockedSection: .albums)
+                    }
+                    Tab(value: AppModel.Tab.libraryArtists) {
+                        LibraryView(lockedSection: .artists)
+                    } label: {
+                        Label("Artists", systemImage: "music.mic")
+                    }
+                    Tab(value: AppModel.Tab.libraryPlaylists) {
+                        LibraryView(lockedSection: .playlists)
+                    } label: {
+                        Label("Playlists", systemImage: "music.note.list")
+                    }
+                    Tab(value: AppModel.Tab.librarySubscriptions) {
+                        LibraryView(lockedSection: .subscriptions)
+                    } label: {
+                        Label("Subscriptions", systemImage: "bell")
+                    }
+                    Tab(value: AppModel.Tab.libraryPodcasts) {
+                        LibraryView(lockedSection: .podcasts)
+                    } label: {
+                        Label("Podcasts", systemImage: "radio")
+                    }
+                    Tab(value: AppModel.Tab.libraryOnDevice) {
+                        LibraryView(lockedSection: .ondevice)
+                    } label: {
+                        Label("On Device", systemImage: "externaldrive")
+                    }
+                    Tab("History", image: "bch-clock", value: AppModel.Tab.libraryHistory) {
+                        LibraryView(lockedSection: .history)
+                    }
+                    if WebDavStore.shared.isConfigured {
+                        Tab(value: AppModel.Tab.libraryWebDav) {
+                            LibraryView(lockedSection: .webdav)
+                        } label: {
+                            Label("WebDAV", systemImage: "cloud")
+                        }
+                    }
+                }
+                Tab("Search", image: "bch-search", value: AppModel.Tab.search, role: .search) {
+                    SearchView()
+                }
+            } else {
+                Tab("Home", image: "bch-home", value: AppModel.Tab.home) {
+                    HomeView(feed: homeFeed)
+                }
+                Tab("Explore", image: "bch-explore", value: AppModel.Tab.explore) {
+                    ExploreView()
+                }
+                Tab("Library", image: "bch-library", value: AppModel.Tab.library) {
+                    LibraryView()
+                }
+                Tab("Search", image: "bch-search", value: AppModel.Tab.search, role: .search) {
+                    SearchView()
+                }
             }
             #endif
         }
         .tabViewStyle(.sidebarAdaptable)
+        #if os(iOS)
+        .defaultAdaptableTabBarPlacement(.sidebar)
+        #endif
         #if os(macOS)
         .environment(\.sidebarRowSize, .medium)
         .toolbar {
@@ -344,6 +427,9 @@ struct RootView: View {
         if tab == .library { return .libraryYouTube }
         return tab
         #else
+        if UIDevice.current.userInterfaceIdiom == .pad && tab == .library {
+            return .libraryYouTube
+        }
         return tab
         #endif
     }
@@ -372,8 +458,9 @@ struct PlaybackPillMount: ViewModifier {
     private func fallbackMount(_ content: Content) -> some View {
         content.safeAreaInset(edge: .bottom) {
             PlaybackPill()
-                // Upstream's MiniPlayer and FloatingBottomBar share PAGE_GUTTER
-                // (10dp), and the mini-player sits 8dp above the tab capsule.
+                // Clamped to 720pt so it centers elegantly on iPad while taking
+                // natural width on iPhone.
+                .frame(maxWidth: 720)
                 .padding(.horizontal, 10)
                 .padding(.bottom, 8)
         }
@@ -414,16 +501,10 @@ private struct NowPlayingSheetSizing: ViewModifier {
     @Environment(\.horizontalSizeClass) private var sizeClass
 
     func body(content: Content) -> some View {
-        if sizeClass == .regular {
-            content
-                .presentationSizing(.page)
-                .presentationDragIndicator(.visible)
-        } else {
-            content
-                .presentationDetents([.large])
-                .presentationDragIndicator(.visible)
-                .presentationCornerRadius(24)
-        }
+        content
+            .presentationDetents([.large])
+            .presentationDragIndicator(.visible)
+            .presentationCornerRadius(24)
     }
 }
 

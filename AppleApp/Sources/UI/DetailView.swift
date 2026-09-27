@@ -15,6 +15,9 @@ struct DetailView: View {
     let initialTitle: String
     @Environment(PlaybackController.self) private var controller
     @Environment(\.colorScheme) private var colorScheme
+    #if os(iOS)
+    @Environment(\.horizontalSizeClass) private var sizeClass
+    #endif
     @State private var page: DetailPageModel?
     @State private var error: String?
     @State private var loading = true
@@ -48,6 +51,14 @@ struct DetailView: View {
     /// Narrows the track list in place, like upstream's search circle in the
     /// release header. Off until tapped, so a long list reads as a list first.
     @State private var searching = false
+
+    private var useDesktopHeader: Bool {
+        #if os(macOS)
+        true
+        #else
+        sizeClass == .regular
+        #endif
+    }
 
     var body: some View {
         Group {
@@ -106,7 +117,11 @@ struct DetailView: View {
 
             ScrollView {
                 VStack(spacing: 0) {
-                    headerView(page, tint: tint, isArtist: isArtist, artHeight: artHeight)
+                    if useDesktopHeader && !isArtist {
+                        desktopHeaderView(page, tint: tint, isArtist: isArtist)
+                    } else {
+                        headerView(page, tint: tint, isArtist: isArtist, artHeight: artHeight)
+                    }
 
                     VStack(alignment: .leading, spacing: 0) {
                         if !page.songs.isEmpty {
@@ -244,6 +259,81 @@ struct DetailView: View {
             .buttonStyle(ProfileCircleButtonStyle())
             .accessibilityLabel("More Options")
         }
+    }
+
+    /// Apple Music split header for iPad and Mac: artwork card on the left,
+    /// title, credits, metadata, and full action row on the right.
+    private func desktopHeaderView(
+        _ page: DetailPageModel,
+        tint: ArtworkPalette.PageTint,
+        isArtist: Bool
+    ) -> some View {
+        let lines = headerLines(page)
+        let credit = lines.credit.isEmpty ? (page.songs.first?.artist ?? "") : lines.credit
+        let artistId = page.songs.first?.artistId
+
+        return HStack(alignment: .bottom, spacing: 32) {
+            ZStack {
+                ArtworkView(url: page.thumbnailUrl, data: headerArt, side: 240)
+                    .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+                    .shadow(color: .black.opacity(0.24), radius: 16, y: 8)
+                if let canvasURL {
+                    CanvasPlayer(url: canvasURL, fallbackURL: canvasFallbackURL, isPlaying: true)
+                        .frame(width: 240, height: 240)
+                        .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+                }
+            }
+
+            VStack(alignment: .leading, spacing: 8) {
+                Text(isArtist ? "ARTIST" : (kind(of: page) == .playlist ? "PLAYLIST" : "ALBUM"))
+                    .font(.caption.weight(.bold))
+                    .foregroundStyle(.secondary)
+                    .tracking(1)
+
+                Text(page.title.isEmpty ? initialTitle : page.title)
+                    .font(.system(size: 32, weight: .bold))
+                    .lineLimit(2)
+
+                if !credit.isEmpty {
+                    if let artistId, kind(of: page) != .artist {
+                        NavigationLink(destination: DetailView(browseId: artistId, initialTitle: credit)) {
+                            Text(credit)
+                                .font(.title3.weight(.semibold))
+                                .foregroundStyle(tint.accent)
+                                .lineLimit(1)
+                        }
+                        .buttonStyle(.plain)
+                    } else {
+                        Text(credit)
+                            .font(.title3.weight(.semibold))
+                            .foregroundStyle(tint.accent)
+                            .lineLimit(1)
+                    }
+                }
+
+                if !lines.meta.isEmpty {
+                    Text(lines.meta)
+                        .font(.subheadline)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                }
+
+                if isArtist, page.subscriberCountText != nil || page.monthlyListenerCount != nil {
+                    artistStatsRow(page: page, tint: tint)
+                }
+
+                if !page.songs.isEmpty {
+                    actionRow(page, tint: tint, isArtist: isArtist)
+                        .padding(.top, 8)
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        .padding(.horizontal, 32)
+        .padding(.top, 28)
+        .padding(.bottom, 20)
+        .frame(maxWidth: 860)
+        .frame(maxWidth: .infinity, alignment: .leading)
     }
 
     /// Header zone: hero artwork with gradient fade, MergeBand glass, and pinned title/credit/actions.

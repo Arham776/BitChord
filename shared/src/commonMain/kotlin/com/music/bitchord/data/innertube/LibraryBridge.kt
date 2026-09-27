@@ -2,6 +2,7 @@ package com.music.bitchord.data.innertube
 
 import com.music.bitchord.data.model.HomeFeed
 import com.music.bitchord.data.model.HomeShelf
+import com.music.bitchord.data.model.Song
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -9,6 +10,7 @@ import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.launch
+import kotlinx.serialization.builtins.ListSerializer
 import kotlinx.serialization.json.Json
 
 /**
@@ -18,6 +20,8 @@ import kotlinx.serialization.json.Json
  */
 object LibraryBridge {
 
+    private const val LIBRARY_SONGS = "FEmusic_liked_videos"
+
     private val bridgeScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
     private val json = Json { ignoreUnknownKeys = true }
 
@@ -26,10 +30,37 @@ object LibraryBridge {
         "Albums" to "FEmusic_liked_albums",
         "Artists" to "FEmusic_library_corpus_track_artists",
         "Subscriptions" to "FEmusic_library_corpus_artists",
+        "Podcasts" to "FEmusic_library_non_music_audio_list",
     )
 
     fun interface FeedCallback {
         fun onResult(json: String?, message: String?)
+    }
+
+    /**
+     * Songs explicitly added to the library (`FEmusic_liked_videos`) —
+     * distinct from Liked Music, which is a rating, not membership. Same
+     * `[Song]` JSON contract as the history bridge, decoded Apple-side into
+     * `[YouTubeSong]`.
+     */
+    fun librarySongs(callback: FeedCallback) {
+        bridgeScope.launch {
+            try {
+                Innertube.ensureSessionScope()
+                if (Innertube.cookie == null) {
+                    callback.onResult(
+                        json.encodeToString(ListSerializer(Song.serializer()), emptyList()),
+                        null,
+                    )
+                    return@launch
+                }
+                val songs = InnertubeParser.collectSongsDeep(Innertube.browse(LIBRARY_SONGS))
+                    .distinctBy { it.videoId }
+                callback.onResult(json.encodeToString(ListSerializer(Song.serializer()), songs), null)
+            } catch (e: Throwable) {
+                callback.onResult(null, e.message ?: e.toString())
+            }
+        }
     }
 
     fun library(callback: FeedCallback) {

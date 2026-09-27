@@ -21,9 +21,7 @@ struct HomeView: View {
                 .navigationTitle("Listen Now")
                 .toolbar {
                     #if os(iOS)
-                    // Match upstream FrostedTopBar's root-page leading mark.
-                    // Keep Home as the large in-feed title while the brand mark
-                    // occupies the top bar's leading position.
+                    // Upstream FrostedTopBar's root-page leading BitChord logo.
                     ToolbarItem(placement: .topBarLeading) {
                         TopBarLeadingMark()
                     }
@@ -351,6 +349,7 @@ private extension Array {
 /// Explore tab — upstream shows mood and genre categories here.
 struct ExploreView: View {
     @State private var moods = MoodGenreLoader()
+    @Environment(\.horizontalSizeClass) private var sizeClass
 
     var body: some View {
         NavigationStack {
@@ -403,7 +402,7 @@ struct ExploreView: View {
                 RoundedRectangle(cornerRadius: 6, style: .continuous)
                     .fill(.quaternary)
                     .frame(width: 140, height: 22)
-                LazyVGrid(columns: Self.moodColumns, spacing: 14) {
+                LazyVGrid(columns: moodColumns, spacing: 14) {
                     ForEach(0..<10, id: \.self) { _ in
                         RoundedRectangle(cornerRadius: 12, style: .continuous)
                             .fill(.quaternary)
@@ -419,7 +418,7 @@ struct ExploreView: View {
                     Text(section.title)
                         .font(.title3.weight(.bold))
                         .foregroundStyle(.primary)
-                    LazyVGrid(columns: Self.moodColumns, spacing: 14) {
+                    LazyVGrid(columns: moodColumns, spacing: 14) {
                         ForEach(section.items) { item in
                             NavigationLink {
                                 MoodGenrePlaylistsView(category: item)
@@ -435,17 +434,22 @@ struct ExploreView: View {
         }
     }
 
-    /// Two across on iPhone like upstream's `MoodGenreGrid` (pairs chunked by
-    /// two at half the guttered width); adaptive on Mac, where a fixed pair
-    /// would read as a list in a wide window.
-    #if os(iOS)
-    private static let moodColumns = [
-        GridItem(.flexible(), spacing: 14),
-        GridItem(.flexible(), spacing: 14),
-    ]
-    #else
-    private static let moodColumns = [GridItem(.adaptive(minimum: 180, maximum: 260), spacing: 14)]
-    #endif
+    /// Two across on iPhone like upstream's `MoodGenreGrid`; adaptive on iPad and Mac
+    /// where wide windows comfortably host 4 to 6 categories across.
+    private var moodColumns: [GridItem] {
+        #if os(macOS)
+        [GridItem(.adaptive(minimum: 180, maximum: 260), spacing: 14)]
+        #else
+        if sizeClass == .regular {
+            return [GridItem(.adaptive(minimum: 180, maximum: 260), spacing: 14)]
+        } else {
+            return [
+                GridItem(.flexible(), spacing: 14),
+                GridItem(.flexible(), spacing: 14),
+            ]
+        }
+        #endif
+    }
 }
 
 /// One category button: a 100pt gradient card with a rotated sleeve cropped
@@ -675,16 +679,19 @@ struct LibraryView: View {
     @Environment(AuthController.self) private var auth
     @Environment(AppModel.self) private var appModel
     @State private var local = LocalLibrary.shared
-    /// When set (macOS sidebar `TabSection` rows), this destination is shown directly.
+    /// When set (sidebar `TabSection` rows on macOS and iPad), this destination
+    /// is shown directly. The section page owns its navigation title and
+    /// toolbar — nothing outer may add its own, or the two sets merge.
     var lockedSection: Section? = nil
 
     enum Section: String, CaseIterable, Identifiable {
-        case youtube, songs, albums, artists, playlists, downloads, history, webdav
+        case youtube, songs, albums, artists, playlists, subscriptions, podcasts, ondevice, downloads, history, webdav
         var id: String { rawValue }
         var label: String {
             switch self {
             case .youtube: "Recent"
             case .webdav: "WebDAV"
+            case .ondevice: "On Device"
             default: rawValue.capitalized
             }
         }
@@ -694,43 +701,57 @@ struct LibraryView: View {
 
     var body: some View {
         NavigationStack {
-            content
-                .navigationTitle(lockedSection?.label ?? "Library")
+            if let locked = lockedSection {
+                // One header only. The section page below owns its title and
+                // trailing buttons; an outer `.navigationTitle`/`.toolbar`
+                // here would merge with the inner set — two scan-folder
+                // pluses and two profile discs side by side, with the outer
+                // title ("Songs") fighting the inner one ("Local Music").
+                lockedContent(locked)
+            } else {
+                LibraryLandingView(onPickFolder: { pickFolder() })
+                .navigationTitle("Library")
                 .toolbar {
                     #if os(iOS)
-                    if lockedSection == nil {
-                        ToolbarItem(placement: .topBarLeading) {
-                            TopBarLeadingMark()
-                        }
+                    ToolbarItem(placement: .topBarLeading) {
+                        TopBarLeadingMark()
                     }
                     ToolbarItemGroup(placement: .topBarTrailing) {
-                        if lockedSection == nil {
+                        // One shared pill for the action buttons — not a glass
+                        // disc each. (The account disc beside it stays solo,
+                        // like on every other tab.)
+                        HStack(spacing: 2) {
                             NavigationLink {
                                 HistoryView()
                             } label: {
                                 Image(systemName: "clock")
-                                    .font(.system(size: 14, weight: .medium))
+                                    .font(.system(size: 15, weight: .medium))
                                     .foregroundStyle(.primary)
-                                    .frame(width: 34, height: 34)
-                                    .background(.ultraThinMaterial, in: Circle())
-                                    .overlay(Circle().strokeBorder(Color.white.opacity(0.22), lineWidth: 0.6))
+                                    .frame(width: 40, height: 34)
+                                    .contentShape(.rect)
                             }
                             .buttonStyle(ProfileCircleButtonStyle())
                             .accessibilityLabel("Listening History")
-                        }
 
-                        Button {
-                            pickFolder()
-                        } label: {
-                            Image(systemName: "plus")
-                                .font(.system(size: 15, weight: .medium))
-                                .foregroundStyle(.primary)
-                                .frame(width: 34, height: 34)
-                                .background(.ultraThinMaterial, in: Circle())
-                                .overlay(Circle().strokeBorder(Color.white.opacity(0.22), lineWidth: 0.6))
+                            Divider()
+                                .frame(height: 20)
+                                .opacity(0.5)
+
+                            Button {
+                                pickFolder()
+                            } label: {
+                                Image(systemName: "plus")
+                                    .font(.system(size: 15, weight: .medium))
+                                    .foregroundStyle(.primary)
+                                    .frame(width: 40, height: 34)
+                                    .contentShape(.rect)
+                            }
+                            .buttonStyle(ProfileCircleButtonStyle())
+                            .accessibilityLabel("Scan a folder")
                         }
-                        .buttonStyle(ProfileCircleButtonStyle())
-                        .accessibilityLabel("Scan a folder")
+                        .padding(.horizontal, 6)
+                        .background(.ultraThinMaterial, in: Capsule())
+                        .overlay(Capsule().strokeBorder(Color.white.opacity(0.22), lineWidth: 0.6))
 
                         TopBarAccountButton()
                     }
@@ -748,32 +769,32 @@ struct LibraryView: View {
                     }
                     #endif
                 }
-                .onAppear {
-                    local.restoreViewPreferences()
-                }
-                .fileImporter(isPresented: $pickingFolder, allowedContentTypes: [.folder]) { result in
-                    if case .success(let url) = result {
-                        local.scanPicked(url)
-                    }
-                }
+            }
+        }
+        .onAppear {
+            local.restoreViewPreferences()
+        }
+        .fileImporter(isPresented: $pickingFolder, allowedContentTypes: [.folder]) { result in
+            if case .success(let url) = result {
+                local.scanPicked(url)
+            }
         }
     }
 
     @ViewBuilder
-    private var content: some View {
-        if let locked = lockedSection {
-            switch locked {
-            case .youtube: YoutubeLibraryView()
-            case .songs: LocalMusicView(initialTab: .songs, onPickFolder: { pickFolder() })
-            case .albums: LocalMusicView(initialTab: .albums, onPickFolder: { pickFolder() })
-            case .artists: LocalMusicView(initialTab: .artists, onPickFolder: { pickFolder() })
-            case .playlists: LocalPlaylistsView()
-            case .downloads: DownloadsView()
-            case .webdav: WebDavLibraryView()
-            case .history: HistoryView()
-            }
-        } else {
-            LibraryLandingView(onPickFolder: { pickFolder() })
+    private func lockedContent(_ locked: Section) -> some View {
+        switch locked {
+        case .youtube: YoutubeLibraryView()
+        case .songs: UnifiedSongsView(title: locked.label, onPickFolder: { pickFolder() })
+        case .albums: UnifiedAlbumsView(title: locked.label, onPickFolder: { pickFolder() })
+        case .artists: UnifiedArtistsView(title: locked.label, onPickFolder: { pickFolder() })
+        case .playlists: SavedPlaylistsView()
+        case .subscriptions: SavedShelfView(shelfName: "Subscriptions", title: "Subscriptions", emptySubtitle: "Channels you subscribe to show up here.")
+        case .podcasts: SavedShelfView(shelfName: "Podcasts", title: "Podcasts", emptySubtitle: "Podcasts you follow show up here.")
+        case .ondevice: OnDeviceView()
+        case .downloads: DownloadsView()
+        case .webdav: WebDavLibraryView()
+        case .history: HistoryView()
         }
     }
 
@@ -805,8 +826,8 @@ struct LibraryLandingView: View {
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 26) {
-                // 1. Replay Banner
-                ReplayBanner { appModel.replayPresented = true }
+                // 1. Replay hero: cards when there is listening data, banner before.
+                ReplayHeroSection { page in appModel.openReplay(at: page) }
 
                 // 2. On Device Shelf
                 onDeviceShelf
@@ -1145,6 +1166,9 @@ struct DownloadsView: View {
         #if os(iOS)
         .navigationBarTitleDisplayMode(.large)
         .toolbar {
+            ToolbarItem(placement: .topBarLeading) {
+                TopBarLeadingMark()
+            }
             ToolbarItem(placement: .topBarTrailing) {
                 TopBarAccountButton()
             }
@@ -1313,11 +1337,18 @@ struct DownloadsView: View {
     }
 }
 
-/// Dedicated Local Music destination supporting Songs, Albums, and Artists tabs.
+/// The scanned-folder library with its in-page Songs/Albums/Artists picker.
+///
+/// This is the iPhone drill-down behind the On Device card. The sidebar's
+/// Songs/Albums/Artists rows are NOT this screen: they are unified pages
+/// (saved cloud collections + this device's files) built from the same
+/// section pieces below.
 struct LocalMusicView: View {
     var initialTab: Tab = .songs
+    /// Navigation title. The sidebar row's name when opened from it
+    /// ("Songs"/"Albums"/"Artists"); "Local Music" on the iPhone drill-down.
+    var title: String = "Local Music"
     var onPickFolder: (() -> Void)? = nil
-    @Environment(PlaybackController.self) private var controller
     @State private var local = LocalLibrary.shared
     @State private var selectedTab: Tab = .songs
     @State private var pickingFolder = false
@@ -1329,18 +1360,22 @@ struct LocalMusicView: View {
         var id: String { rawValue }
     }
 
-    init(initialTab: Tab = .songs, onPickFolder: (() -> Void)? = nil) {
+    init(initialTab: Tab = .songs, title: String = "Local Music", onPickFolder: (() -> Void)? = nil) {
         self.initialTab = initialTab
+        self.title = title
         self.onPickFolder = onPickFolder
         _selectedTab = State(initialValue: initialTab)
     }
 
     var body: some View {
         content
-            .navigationTitle("Local Music")
+            .navigationTitle(title)
             #if os(iOS)
             .navigationBarTitleDisplayMode(.large)
             .toolbar {
+                ToolbarItem(placement: .topBarLeading) {
+                    TopBarLeadingMark()
+                }
                 ToolbarItemGroup(placement: .topBarTrailing) {
                     Button {
                         pickFolder()
@@ -1380,13 +1415,8 @@ struct LocalMusicView: View {
             }
             .safeAreaInset(edge: .top, spacing: 0) {
                 if local.scanned {
-                    VStack(spacing: 0) {
-                        tabPicker
-                        if selectedTab == .songs {
-                            songsToolbar
-                        }
-                    }
-                    .background(.ultraThinMaterial)
+                    tabPicker
+                        .background(.ultraThinMaterial)
                 }
             }
     }
@@ -1417,23 +1447,43 @@ struct LocalMusicView: View {
 
     @ViewBuilder
     private var content: some View {
+        switch selectedTab {
+        case .songs:
+            LocalSongsBrowser(onPickFolder: pickFolder)
+        case .albums:
+            LocalAlbumGrid(onPickFolder: pickFolder)
+        case .artists:
+            LocalArtistList(onPickFolder: pickFolder)
+        }
+    }
+}
+
+/// The Songs half of the scanned-folder library: filter, sort, Play/Shuffle,
+/// list/grid. Shared by the Local Music page and the unified Songs row.
+struct LocalSongsBrowser: View {
+    var onPickFolder: () -> Void
+    @Environment(PlaybackController.self) private var controller
+    @State private var local = LocalLibrary.shared
+
+    @ViewBuilder
+    var body: some View {
         if !local.scanned {
             EmptyStateView(
                 icon: Image(.bchLibrary),
                 title: "Scan your music",
                 subtitle: "Pick a folder — BitChord reads its tags, artwork and plays it with gapless and crossfade.",
                 buttonTitle: "Choose Folder"
-            ) { pickFolder() }
+            ) { onPickFolder() }
         } else if local.tracks.isEmpty {
             EmptyStateView(
                 icon: Image(.bchMusicNote),
                 title: "No audio files here",
                 subtitle: "The folder you selected didn't contain any supported audio files.",
                 buttonTitle: "Choose Another Folder"
-            ) { pickFolder() }
+            ) { onPickFolder() }
         } else {
-            switch selectedTab {
-            case .songs:
+            VStack(spacing: 0) {
+                songsToolbar
                 if local.visibleTracks.isEmpty {
                     EmptyStateView(
                         icon: Image(.bchSearch),
@@ -1444,52 +1494,13 @@ struct LocalMusicView: View {
                 } else {
                     songsContent
                 }
-            case .albums:
-                albumGrid
-            case .artists:
-                artistList
             }
         }
     }
 
     private var songsToolbar: some View {
         HStack(spacing: 10) {
-            HStack(spacing: 6) {
-                Image(systemName: "magnifyingglass")
-                    .foregroundStyle(.secondary)
-                    .accessibilityHidden(true)
-                TextField("Filter this library", text: Bindable(local).query)
-                    .textFieldStyle(.plain)
-                    .accessibilityLabel("Filter this library")
-                if !local.query.isEmpty {
-                    Button {
-                        local.query = ""
-                    } label: {
-                        Image(systemName: "xmark.circle.fill")
-                            .foregroundStyle(.secondary)
-                    }
-                    .buttonStyle(.plain)
-                    .accessibilityLabel("Clear the filter")
-                }
-            }
-            .padding(.horizontal, 10)
-            .padding(.vertical, 6)
-            .background(.quaternary, in: Capsule())
-
-            Spacer(minLength: 8)
-
-            Menu {
-                Picker("Sort By", selection: Bindable(local).sort) {
-                    ForEach(local.sortOptions) { Text($0.label).tag($0) }
-                }
-                .pickerStyle(.inline)
-            } label: {
-                Label(local.sort.label, systemImage: "arrow.up.arrow.down")
-                    .labelStyle(.titleAndIcon)
-            }
-            .menuStyle(.borderlessButton)
-            .fixedSize()
-            .help("Sort this library")
+            SongFilterControls(local: local)
 
             Picker("View", selection: Bindable(local).viewType) {
                 ForEach(LocalViewType.allCases) { type in
@@ -1575,63 +1586,1004 @@ struct LocalMusicView: View {
         .padding(.horizontal, 24)
         .padding(.vertical, 6)
     }
+}
 
-    private var albumGrid: some View {
-        Group {
-            if local.albumGroups.isEmpty {
-                EmptyStateView(
-                    icon: Image(.bchLibrary),
-                    title: "No albums yet",
-                    subtitle: "Albums group themselves once a folder with tagged music is scanned.",
-                    buttonTitle: "Choose Folder"
-                ) { pickFolder() }
-            } else {
-                ScrollView {
-                    LazyVGrid(columns: [GridItem(.adaptive(minimum: 170), spacing: 18)], spacing: 22) {
-                        ForEach(local.albumGroups, id: \.name) { group in
-                            Button {
-                                controller.play(group.tracks.map(QueueEntry.from), at: 0)
-                            } label: {
-                                VStack(alignment: .leading, spacing: 8) {
-                                    ArtworkView(url: nil, data: group.tracks.first?.artwork, side: 170)
-                                        .clipShape(.rect(cornerRadius: 10, style: .continuous))
-                                    Text(group.name)
-                                        .font(.callout.weight(.semibold))
-                                        .lineLimit(1)
-                                    Text(group.artist)
-                                        .font(.caption)
-                                        .foregroundStyle(.secondary)
-                                        .lineLimit(1)
-                                }
-                            }
-                            .buttonStyle(.plain)
-                        }
+/// Filter capsule + sort menu for song lists, without the list/grid toggle.
+/// Shared by the full browser and the unified Songs row's device section.
+struct SongFilterControls: View {
+    @Bindable var local: LocalLibrary
+
+    var body: some View {
+        HStack(spacing: 10) {
+            HStack(spacing: 6) {
+                Image(systemName: "magnifyingglass")
+                    .foregroundStyle(.secondary)
+                    .accessibilityHidden(true)
+                TextField("Filter this library", text: $local.query)
+                    .textFieldStyle(.plain)
+                    .accessibilityLabel("Filter this library")
+                if !local.query.isEmpty {
+                    Button {
+                        local.query = ""
+                    } label: {
+                        Image(systemName: "xmark.circle.fill")
+                            .foregroundStyle(.secondary)
                     }
-                    .padding(20)
+                    .buttonStyle(.plain)
+                    .accessibilityLabel("Clear the filter")
                 }
+            }
+            .padding(.horizontal, 10)
+            .padding(.vertical, 6)
+            .background(.quaternary, in: Capsule())
+
+            Spacer(minLength: 8)
+
+            Menu {
+                Picker("Sort By", selection: $local.sort) {
+                    ForEach(local.sortOptions) { Text($0.label).tag($0) }
+                }
+                .pickerStyle(.inline)
+            } label: {
+                Label(local.sort.label, systemImage: "arrow.up.arrow.down")
+                    .labelStyle(.titleAndIcon)
+            }
+            .menuStyle(.borderlessButton)
+            .fixedSize()
+            .help("Sort this library")
+        }
+    }
+}
+
+/// The Albums half of the scanned-folder library. Shared by the Local Music
+/// page and the unified Albums row's On This Device section.
+struct LocalAlbumGrid: View {
+    var onPickFolder: () -> Void
+    @State private var local = LocalLibrary.shared
+
+    @ViewBuilder
+    var body: some View {
+        if !local.scanned {
+            EmptyStateView(
+                icon: Image(.bchLibrary),
+                title: "Scan your music",
+                subtitle: "Pick a folder — BitChord reads its tags, artwork and plays it with gapless and crossfade.",
+                buttonTitle: "Choose Folder"
+            ) { onPickFolder() }
+        } else if local.albumGroups.isEmpty {
+            EmptyStateView(
+                icon: Image(.bchLibrary),
+                title: "No albums yet",
+                subtitle: "Albums group themselves once a folder with tagged music is scanned.",
+                buttonTitle: "Choose Folder"
+            ) { onPickFolder() }
+        } else {
+            ScrollView {
+                LazyVGrid(columns: [GridItem(.adaptive(minimum: 170), spacing: 18)], spacing: 22) {
+                    ForEach(local.albumGroups, id: \.name) { group in
+                        LocalAlbumCell(group: group)
+                    }
+                }
+                .padding(20)
             }
         }
     }
+}
 
-    private var artistList: some View {
+/// One scanned-folder album: sleeve, name, artist. Tapping plays the album.
+struct LocalAlbumCell: View {
+    let group: (name: String, artist: String, tracks: [LocalTrack])
+    @Environment(PlaybackController.self) private var controller
+
+    var body: some View {
+        Button {
+            controller.play(group.tracks.map(QueueEntry.from), at: 0)
+        } label: {
+            VStack(alignment: .leading, spacing: 8) {
+                ArtworkView(url: nil, data: group.tracks.first?.artwork, side: 170)
+                    .clipShape(.rect(cornerRadius: 10, style: .continuous))
+                Text(group.name)
+                    .font(.callout.weight(.semibold))
+                    .lineLimit(1)
+                Text(group.artist)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+            }
+        }
+        .buttonStyle(.plain)
+    }
+}
+
+/// The Artists half of the scanned-folder library. Shared by the Local Music
+/// page and the unified Artists row's On This Device section.
+struct LocalArtistList: View {
+    var onPickFolder: () -> Void
+    @State private var local = LocalLibrary.shared
+
+    @ViewBuilder
+    var body: some View {
+        if !local.scanned {
+            EmptyStateView(
+                icon: Image(.bchLibrary),
+                title: "Scan your music",
+                subtitle: "Pick a folder — BitChord reads its tags, artwork and plays it with gapless and crossfade.",
+                buttonTitle: "Choose Folder"
+            ) { onPickFolder() }
+        } else if local.artistGroups.isEmpty {
+            EmptyStateView(
+                icon: Image(.bchLibrary),
+                title: "No artists yet",
+                subtitle: "Artists group themselves once a folder with tagged music is scanned.",
+                buttonTitle: "Choose Folder"
+            ) { onPickFolder() }
+        } else {
+            List {
+                ForEach(local.artistGroups, id: \.name) { group in
+                    ArtistGroupRow(group: group)
+                        .listRowInsets(EdgeInsets(top: 4, leading: 24, bottom: 4, trailing: 24))
+                }
+            }
+            .listStyle(.plain)
+        }
+    }
+}
+
+/// A saved-collections grid straight from one signed-in library shelf
+/// (Subscriptions, Podcasts). Cards navigate to their detail pages like
+/// every other shelf grid.
+struct SavedShelfView: View {
+    var shelfName = "Subscriptions"
+    var title = "Subscriptions"
+    var emptySubtitle = "Channels you subscribe to show up here."
+    @Environment(AuthController.self) private var auth
+    @State private var shelves: [FeedShelf] = []
+    @State private var loading = true
+    @State private var error: String?
+
+    private var items: [ShelfCard] {
+        libraryShelf(titled: shelfName, in: shelves)?.items ?? []
+    }
+
+    var body: some View {
         Group {
-            if local.artistGroups.isEmpty {
+            if !auth.signedIn {
                 EmptyStateView(
                     icon: Image(.bchLibrary),
-                    title: "No artists yet",
-                    subtitle: "Artists group themselves once a folder with tagged music is scanned.",
-                    buttonTitle: "Choose Folder"
-                ) { pickFolder() }
+                    title: "Sign in for your library",
+                    subtitle: emptySubtitle,
+                    buttonTitle: "Sign In"
+                ) { auth.loginPresented = true }
+            } else if loading {
+                ScrollView { FeedSkeleton() }
+            } else if let error, items.isEmpty {
+                EmptyStateView(
+                    icon: Image(.bchLibrary),
+                    title: "\(title) couldn't load",
+                    subtitle: error,
+                    buttonTitle: "Retry"
+                ) { Task { await load() } }
+            } else if items.isEmpty {
+                EmptyStateView(
+                    icon: Image(.bchLibrary),
+                    title: "Nothing here yet",
+                    subtitle: emptySubtitle,
+                    buttonTitle: nil, action: nil
+                )
+            } else {
+                ScrollView {
+                    LazyVGrid(columns: [GridItem(.adaptive(minimum: 150, maximum: 180), spacing: 16)], spacing: 20) {
+                        ForEach(items) { card in
+                            ShelfCardView(card: card)
+                        }
+                    }
+                    .padding(.horizontal, 24)
+                    .padding(.vertical, 20)
+                }
+                .refreshable { await load() }
+            }
+        }
+        .navigationTitle(title)
+        #if os(iOS)
+        .navigationBarTitleDisplayMode(.large)
+        .toolbar {
+            ToolbarItem(placement: .topBarLeading) {
+                TopBarLeadingMark()
+            }
+            ToolbarItem(placement: .topBarTrailing) {
+                TopBarAccountButton()
+            }
+        }
+        #endif
+        .task(id: auth.sessionEpoch) { await load() }
+    }
+
+    private func load() async {
+        guard auth.signedIn else {
+            loading = false
+            shelves = []
+            return
+        }
+        loading = true
+        error = nil
+        do {
+            shelves = try await InnertubeFeed.shared.library()
+        } catch {
+            self.error = error.localizedDescription
+        }
+        loading = false
+    }
+}
+
+/// The Playlists row: the signed-in Playlists shelf with the New Playlist
+/// tile leading, like the library landing's playlist row but full-page.
+struct SavedPlaylistsView: View {
+    var title = "Playlists"
+    @Environment(AuthController.self) private var auth
+    @Environment(AppModel.self) private var appModel
+    @State private var shelves: [FeedShelf] = []
+    @State private var loading = true
+    @State private var error: String?
+
+    private var items: [ShelfCard] {
+        libraryShelf(titled: "playlists", in: shelves)?.items ?? []
+    }
+
+    var body: some View {
+        Group {
+            if !auth.signedIn {
+                EmptyStateView(
+                    icon: Image(.bchLibrary),
+                    title: "Sign in for your playlists",
+                    subtitle: "Playlists you save show up here.",
+                    buttonTitle: "Sign In"
+                ) { auth.loginPresented = true }
+            } else if loading {
+                ScrollView { FeedSkeleton() }
+            } else if let error, items.isEmpty {
+                EmptyStateView(
+                    icon: Image(.bchLibrary),
+                    title: "Playlists couldn't load",
+                    subtitle: error,
+                    buttonTitle: "Retry"
+                ) { Task { await load() } }
+            } else {
+                ScrollView {
+                    LazyVGrid(columns: [GridItem(.adaptive(minimum: 150, maximum: 180), spacing: 16)], spacing: 20) {
+                        NewPlaylistTile {
+                            appModel.playlistPicker = PlaylistPickerRequest(videoId: "", title: "")
+                        }
+                        ForEach(items) { card in
+                            ShelfCardView(card: card)
+                        }
+                    }
+                    .padding(.horizontal, 24)
+                    .padding(.vertical, 20)
+                }
+                .refreshable { await load() }
+            }
+        }
+        .navigationTitle(title)
+        #if os(iOS)
+        .navigationBarTitleDisplayMode(.large)
+        .toolbar {
+            ToolbarItem(placement: .topBarLeading) {
+                TopBarLeadingMark()
+            }
+            ToolbarItem(placement: .topBarTrailing) {
+                TopBarAccountButton()
+            }
+        }
+        #endif
+        .task(id: auth.sessionEpoch) { await load() }
+    }
+
+    private func load() async {
+        guard auth.signedIn else {
+            loading = false
+            shelves = []
+            return
+        }
+        loading = true
+        error = nil
+        do {
+            shelves = try await InnertubeFeed.shared.library()
+        } catch {
+            self.error = error.localizedDescription
+        }
+        loading = false
+    }
+}
+
+/// The On Device row: everything that lives on this hardware — downloads,
+/// the scanned folder, the remote share — the destinations upstream's
+/// On Device shelf cards open.
+struct OnDeviceView: View {
+    var title = "On Device"
+    @State private var downloadStore = DownloadStore.shared
+    @State private var local = LocalLibrary.shared
+
+    var body: some View {
+        List {
+            NavigationLink(destination: DownloadsView()) {
+                deviceRow(
+                    systemImage: "arrow.down.circle.fill", tint: .accentColor,
+                    title: "Downloads",
+                    subtitle: "\(downloadStore.items.count) downloaded song\(downloadStore.items.count == 1 ? "" : "s")"
+                )
+            }
+            NavigationLink(destination: LocalMusicView()) {
+                deviceRow(
+                    systemImage: "folder.fill", tint: .indigo,
+                    title: "Local Music",
+                    subtitle: local.scanned ? "\(local.tracks.count) song\(local.tracks.count == 1 ? "" : "s")" : "Choose a folder to scan"
+                )
+            }
+            NavigationLink(destination: WebDavLibraryView()) {
+                deviceRow(
+                    systemImage: "cloud.fill", tint: .teal,
+                    title: "WebDAV",
+                    subtitle: WebDavStore.shared.isConfigured ? "Connected" : "Not configured"
+                )
+            }
+        }
+        .listStyle(.plain)
+        .navigationTitle(title)
+        #if os(iOS)
+        .navigationBarTitleDisplayMode(.large)
+        .toolbar {
+            ToolbarItem(placement: .topBarLeading) {
+                TopBarLeadingMark()
+            }
+            ToolbarItem(placement: .topBarTrailing) {
+                TopBarAccountButton()
+            }
+        }
+        #endif
+        .onAppear {
+            downloadStore.refresh()
+            local.restoreViewPreferences()
+        }
+    }
+
+    private func deviceRow(systemImage: String, tint: Color, title: String, subtitle: String) -> some View {
+        HStack(spacing: 14) {
+            ZStack {
+                Circle()
+                    .fill(tint.opacity(0.12))
+                    .frame(width: 48, height: 48)
+                Image(systemName: systemImage)
+                    .font(.system(size: 20, weight: .medium))
+                    .foregroundStyle(tint)
+            }
+            VStack(alignment: .leading, spacing: 3) {
+                Text(title)
+                    .font(.body.weight(.medium))
+                Text(subtitle)
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+            }
+            Spacer(minLength: 0)
+        }
+        .padding(.vertical, 4)
+        .listRowInsets(EdgeInsets(top: 2, leading: 24, bottom: 2, trailing: 12))
+    }
+}
+
+/// The signed-in library shelf coined under this title by the shared bridge
+/// (`LibraryBridge` fetches Playlists/Albums/Artists/Subscriptions in
+/// parallel). Titles are matched case-insensitively like the Playlists shelf.
+private func libraryShelf(titled name: String, in shelves: [FeedShelf]) -> FeedShelf? {
+    let wanted = name.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    return shelves.first {
+        $0.title.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == wanted
+    }
+}
+
+/// The Songs row: liked tracks from the signed-in library on top, this
+/// device's scanned songs below. Either half alone is a complete page, so
+/// the row is never the empty "choose a folder" wall it used to be.
+struct UnifiedSongsView: View {
+    var title = "Songs"
+    var onPickFolder: (() -> Void)? = nil
+    @Environment(PlaybackController.self) private var controller
+    @Environment(AuthController.self) private var auth
+    @State private var local = LocalLibrary.shared
+    @State private var pickingFolder = false
+    @State private var songs: [YouTubeSong] = []
+    @State private var songsLoading = true
+    @State private var songsError: String?
+
+    private var cloudEntries: [QueueEntry] { songs.map(songEntry) }
+
+    private func songEntry(_ song: YouTubeSong) -> QueueEntry {
+        QueueEntry(
+            id: song.videoId, title: song.title, artist: song.artist,
+            source: "yt:\(song.videoId)", thumbnailUrl: song.thumbnailUrl,
+            durationText: song.durationText, albumName: song.albumName,
+            artworkData: nil, isLocal: false
+        )
+    }
+
+    var body: some View {
+        Group {
+            if !auth.signedIn && !local.scanned {
+                EmptyStateView(
+                    icon: Image(.bchMusicNote),
+                    title: "Your songs live here",
+                    subtitle: "Songs you add to your YouTube Music library — or a folder you scan on this device.",
+                    buttonTitle: "Sign In"
+                ) { auth.loginPresented = true }
             } else {
                 List {
-                    ForEach(local.artistGroups, id: \.name) { group in
-                        ArtistGroupRow(group: group)
-                            .listRowInsets(EdgeInsets(top: 4, leading: 24, bottom: 4, trailing: 24))
+                    if auth.signedIn {
+                        Section("Your Songs") {
+                            if songsLoading {
+                                ProgressView()
+                                    .frame(maxWidth: .infinity)
+                                    .listRowSeparator(.hidden)
+                            } else if let songsError, songs.isEmpty {
+                                VStack(alignment: .leading, spacing: 6) {
+                                    Text(songsError)
+                                        .font(.subheadline)
+                                        .foregroundStyle(.secondary)
+                                    Button("Try again") {
+                                        Task { await loadSongs() }
+                                    }
+                                    .font(.subheadline.weight(.semibold))
+                                    .foregroundStyle(.tint)
+                                }
+                            } else if songs.isEmpty {
+                                Text("Songs you add to your library show up here.")
+                                    .font(.subheadline)
+                                    .foregroundStyle(.secondary)
+                            } else {
+                                ForEach(Array(songs.enumerated()), id: \.element.id) { index, song in
+                                    SongRow(
+                                        entry: songEntry(song),
+                                        play: { controller.play(cloudEntries, at: index) },
+                                        playNext: { controller.playNext(songEntry(song)) },
+                                        addToQueue: { controller.addToQueue(songEntry(song)) }
+                                    )
+                                }
+                            }
+                        }
+                    }
+                    Section("On This Device") {
+                        if !local.scanned {
+                            Button {
+                                pickFolder()
+                            } label: {
+                                HStack {
+                                    Text("Scan a folder to see its songs here too.")
+                                        .font(.subheadline)
+                                        .foregroundStyle(.secondary)
+                                    Spacer(minLength: 0)
+                                    Image(systemName: "chevron.right")
+                                        .font(.caption.weight(.semibold))
+                                        .foregroundStyle(.tertiary)
+                                }
+                            }
+                            .buttonStyle(.plain)
+                        } else {
+                            SongFilterControls(local: local)
+                                .listRowSeparator(.hidden)
+                                .listRowInsets(EdgeInsets(top: 4, leading: 24, bottom: 4, trailing: 24))
+                            if local.visibleTracks.isEmpty {
+                                Text(local.tracks.isEmpty ? "No audio files in the scanned folder." : "Nothing matches the current filter.")
+                                    .font(.subheadline)
+                                    .foregroundStyle(.secondary)
+                            } else {
+                                ForEach(Array(local.visibleTracks.enumerated()), id: \.element.id) { index, track in
+                                    SongRow(
+                                        entry: QueueEntry.from(track),
+                                        play: {
+                                            controller.play(local.visibleTracks.map(QueueEntry.from), at: index)
+                                        },
+                                        playNext: { controller.playNext(QueueEntry.from(track)) },
+                                        addToQueue: { controller.addToQueue(QueueEntry.from(track)) }
+                                    )
+                                }
+                            }
+                        }
                     }
                 }
                 .listStyle(.plain)
             }
         }
+        .navigationTitle(title)
+        #if os(iOS)
+        .navigationBarTitleDisplayMode(.large)
+        .toolbar {
+            ToolbarItem(placement: .topBarLeading) {
+                TopBarLeadingMark()
+            }
+            ToolbarItemGroup(placement: .topBarTrailing) {
+                Button {
+                    pickFolder()
+                } label: {
+                    Image(systemName: "plus")
+                        .font(.system(size: 15, weight: .medium))
+                        .foregroundStyle(.primary)
+                        .frame(width: 34, height: 34)
+                        .background(.ultraThinMaterial, in: Circle())
+                        .overlay(Circle().strokeBorder(Color.white.opacity(0.22), lineWidth: 0.6))
+                }
+                .buttonStyle(ProfileCircleButtonStyle())
+                .accessibilityLabel("Scan a folder")
+
+                TopBarAccountButton()
+            }
+        }
+        #else
+        .toolbar {
+            ToolbarItem(placement: .primaryAction) {
+                Button {
+                    pickFolder()
+                } label: {
+                    Image(.bchPlus)
+                        .resizable()
+                        .scaledToFit()
+                        .frame(width: 15)
+                }
+                .help("Scan a folder")
+            }
+        }
+        #endif
+        .fileImporter(isPresented: $pickingFolder, allowedContentTypes: [.folder]) { result in
+            if case .success(let url) = result {
+                local.scanPicked(url)
+            }
+        }
+        .task(id: auth.sessionEpoch) { await loadSongs() }
+    }
+
+    private func loadSongs() async {
+        guard auth.signedIn else {
+            songsLoading = false
+            songs = []
+            return
+        }
+        songsLoading = true
+        songsError = nil
+        do {
+            songs = try await InnertubeFeed.shared.librarySongs()
+        } catch {
+            self.songsError = error.localizedDescription
+        }
+        songsLoading = false
+    }
+
+    private func pickFolder() {
+        if let onPickFolder {
+            onPickFolder()
+        } else {
+            #if os(macOS)
+            local.chooseFolder()
+            #else
+            pickingFolder = true
+            #endif
+        }
+    }
+}
+
+/// The Albums row: saved albums from the signed-in library, then this
+/// device's scanned albums. Same contract as Songs: each half stands alone.
+struct UnifiedAlbumsView: View {
+    var title = "Albums"
+    var onPickFolder: (() -> Void)? = nil
+    @Environment(AuthController.self) private var auth
+    @State private var local = LocalLibrary.shared
+    @State private var pickingFolder = false
+    @State private var shelves: [FeedShelf] = []
+    @State private var loading = true
+    @State private var error: String?
+
+    private var saved: [ShelfCard] {
+        libraryShelf(titled: "albums", in: shelves)?.items ?? []
+    }
+
+    private var hasCloud: Bool { !saved.isEmpty }
+    private var hasDevice: Bool { local.scanned && !local.albumGroups.isEmpty }
+
+    var body: some View {
+        Group {
+            if auth.signedIn && loading {
+                ScrollView { FeedSkeleton() }
+            } else if let error, !hasDevice {
+                EmptyStateView(
+                    icon: Image(.bchLibrary),
+                    title: "Albums couldn't load",
+                    subtitle: error,
+                    buttonTitle: "Retry"
+                ) { Task { await load() } }
+            } else if !hasCloud && !hasDevice {
+                combinedEmpty
+            } else {
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 22) {
+                        if hasCloud {
+                            collectionSection(title: "Saved Albums", items: saved)
+                        }
+                        if local.scanned {
+                            if hasDevice {
+                                VStack(alignment: .leading, spacing: 10) {
+                                    Text("On This Device")
+                                        .font(.title3.weight(.bold))
+                                        .padding(.horizontal, 24)
+                                    LazyVGrid(columns: [GridItem(.adaptive(minimum: 170), spacing: 18)], spacing: 22) {
+                                        ForEach(local.albumGroups, id: \.name) { group in
+                                            LocalAlbumCell(group: group)
+                                        }
+                                    }
+                                    .padding(.horizontal, 20)
+                                }
+                            } else {
+                                Text("No albums in the scanned folder.")
+                                    .font(.subheadline)
+                                    .foregroundStyle(.secondary)
+                                    .padding(.horizontal, 24)
+                            }
+                        } else if hasCloud {
+                            scanPrompt(kind: "albums")
+                        }
+                    }
+                    .padding(.vertical, 20)
+                }
+                .refreshable { await load() }
+            }
+        }
+        .navigationTitle(title)
+        #if os(iOS)
+        .navigationBarTitleDisplayMode(.large)
+        .toolbar {
+            ToolbarItem(placement: .topBarLeading) {
+                TopBarLeadingMark()
+            }
+            ToolbarItemGroup(placement: .topBarTrailing) {
+                Button {
+                    pickFolder()
+                } label: {
+                    Image(systemName: "plus")
+                        .font(.system(size: 15, weight: .medium))
+                        .foregroundStyle(.primary)
+                        .frame(width: 34, height: 34)
+                        .background(.ultraThinMaterial, in: Circle())
+                        .overlay(Circle().strokeBorder(Color.white.opacity(0.22), lineWidth: 0.6))
+                }
+                .buttonStyle(ProfileCircleButtonStyle())
+                .accessibilityLabel("Scan a folder")
+
+                TopBarAccountButton()
+            }
+        }
+        #else
+        .toolbar {
+            ToolbarItem(placement: .primaryAction) {
+                Button {
+                    pickFolder()
+                } label: {
+                    Image(.bchPlus)
+                        .resizable()
+                        .scaledToFit()
+                        .frame(width: 15)
+                }
+                .help("Scan a folder")
+            }
+        }
+        #endif
+        .fileImporter(isPresented: $pickingFolder, allowedContentTypes: [.folder]) { result in
+            if case .success(let url) = result {
+                local.scanPicked(url)
+            }
+        }
+        .task(id: auth.sessionEpoch) { await load() }
+    }
+
+    private func collectionSection(title: String, items: [ShelfCard]) -> some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text(title)
+                .font(.title3.weight(.bold))
+                .padding(.horizontal, 24)
+            LazyVGrid(columns: [GridItem(.adaptive(minimum: 150, maximum: 180), spacing: 16)], spacing: 20) {
+                ForEach(items) { card in
+                    ShelfCardView(card: card)
+                }
+            }
+            .padding(.horizontal, 24)
+        }
+    }
+
+    private func scanPrompt(kind: String) -> some View {
+        Button {
+            pickFolder()
+        } label: {
+            HStack(spacing: 12) {
+                Image(.bchLibrary)
+                    .resizable()
+                    .scaledToFit()
+                    .frame(width: 30, height: 30)
+                    .foregroundStyle(.secondary)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("On This Device")
+                        .font(.callout.weight(.semibold))
+                        .foregroundStyle(.primary)
+                    Text("Scan a folder to see its \(kind) here too.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                Spacer(minLength: 0)
+                Image(systemName: "chevron.right")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.tertiary)
+            }
+            .padding(.horizontal, 24)
+            .padding(.vertical, 8)
+            .contentShape(.rect)
+        }
+        .buttonStyle(.plain)
+    }
+
+    @ViewBuilder
+    private var combinedEmpty: some View {
+        if !auth.signedIn && !local.scanned {
+            EmptyStateView(
+                icon: Image(.bchLibrary),
+                title: "Your albums live here",
+                subtitle: "Save albums on YouTube Music — or scan a folder on this device.",
+                buttonTitle: "Sign In"
+            ) { auth.loginPresented = true }
+        } else if local.scanned {
+            EmptyStateView(
+                icon: Image(.bchMusicNote),
+                title: "No audio files here",
+                subtitle: "The folder you selected didn't contain any supported audio files.",
+                buttonTitle: "Choose Another Folder"
+            ) { pickFolder() }
+        } else {
+            EmptyStateView(
+                icon: Image(.bchLibrary),
+                title: "No saved albums yet",
+                subtitle: "Albums you save on YouTube Music show up here — or scan a folder on this device.",
+                buttonTitle: "Choose Folder"
+            ) { pickFolder() }
+        }
+    }
+
+    private func pickFolder() {
+        if let onPickFolder {
+            onPickFolder()
+        } else {
+            #if os(macOS)
+            local.chooseFolder()
+            #else
+            pickingFolder = true
+            #endif
+        }
+    }
+
+    private func load() async {
+        guard auth.signedIn else {
+            loading = false
+            shelves = []
+            return
+        }
+        loading = true
+        error = nil
+        do {
+            shelves = try await InnertubeFeed.shared.library()
+        } catch {
+            self.error = error.localizedDescription
+        }
+        loading = false
+    }
+}
+
+/// The Artists row: saved artists from the signed-in library, then this
+/// device's scanned artists. Same contract as Songs and Albums.
+struct UnifiedArtistsView: View {
+    var title = "Artists"
+    var onPickFolder: (() -> Void)? = nil
+    @Environment(AuthController.self) private var auth
+    @State private var local = LocalLibrary.shared
+    @State private var pickingFolder = false
+    @State private var shelves: [FeedShelf] = []
+    @State private var loading = true
+    @State private var error: String?
+
+    private var saved: [ShelfCard] {
+        libraryShelf(titled: "artists", in: shelves)?.items ?? []
+    }
+
+    private var hasCloud: Bool { !saved.isEmpty }
+    private var hasDevice: Bool { local.scanned && !local.artistGroups.isEmpty }
+
+    var body: some View {
+        Group {
+            if auth.signedIn && loading {
+                ScrollView { FeedSkeleton() }
+            } else if let error, !hasDevice {
+                EmptyStateView(
+                    icon: Image(.bchLibrary),
+                    title: "Artists couldn't load",
+                    subtitle: error,
+                    buttonTitle: "Retry"
+                ) { Task { await load() } }
+            } else if !hasCloud && !hasDevice {
+                combinedEmpty
+            } else {
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 22) {
+                        if hasCloud {
+                            VStack(alignment: .leading, spacing: 10) {
+                                Text("Saved Artists")
+                                    .font(.title3.weight(.bold))
+                                    .padding(.horizontal, 24)
+                                LazyVGrid(columns: [GridItem(.adaptive(minimum: 150, maximum: 180), spacing: 16)], spacing: 20) {
+                                    ForEach(saved) { card in
+                                        ShelfCardView(card: card)
+                                    }
+                                }
+                                .padding(.horizontal, 24)
+                            }
+                        }
+                        if local.scanned {
+                            if hasDevice {
+                                VStack(alignment: .leading, spacing: 6) {
+                                    Text("On This Device")
+                                        .font(.title3.weight(.bold))
+                                        .padding(.horizontal, 24)
+                                    LazyVStack(spacing: 2) {
+                                        ForEach(local.artistGroups, id: \.name) { group in
+                                            ArtistGroupRow(group: group)
+                                                .padding(.horizontal, 24)
+                                        }
+                                    }
+                                }
+                            } else {
+                                Text("No artists in the scanned folder.")
+                                    .font(.subheadline)
+                                    .foregroundStyle(.secondary)
+                                    .padding(.horizontal, 24)
+                            }
+                        } else if hasCloud {
+                            scanPrompt(kind: "artists")
+                        }
+                    }
+                    .padding(.vertical, 20)
+                }
+                .refreshable { await load() }
+            }
+        }
+        .navigationTitle(title)
+        #if os(iOS)
+        .navigationBarTitleDisplayMode(.large)
+        .toolbar {
+            ToolbarItem(placement: .topBarLeading) {
+                TopBarLeadingMark()
+            }
+            ToolbarItemGroup(placement: .topBarTrailing) {
+                Button {
+                    pickFolder()
+                } label: {
+                    Image(systemName: "plus")
+                        .font(.system(size: 15, weight: .medium))
+                        .foregroundStyle(.primary)
+                        .frame(width: 34, height: 34)
+                        .background(.ultraThinMaterial, in: Circle())
+                        .overlay(Circle().strokeBorder(Color.white.opacity(0.22), lineWidth: 0.6))
+                }
+                .buttonStyle(ProfileCircleButtonStyle())
+                .accessibilityLabel("Scan a folder")
+
+                TopBarAccountButton()
+            }
+        }
+        #else
+        .toolbar {
+            ToolbarItem(placement: .primaryAction) {
+                Button {
+                    pickFolder()
+                } label: {
+                    Image(.bchPlus)
+                        .resizable()
+                        .scaledToFit()
+                        .frame(width: 15)
+                }
+                .help("Scan a folder")
+            }
+        }
+        #endif
+        .fileImporter(isPresented: $pickingFolder, allowedContentTypes: [.folder]) { result in
+            if case .success(let url) = result {
+                local.scanPicked(url)
+            }
+        }
+        .task(id: auth.sessionEpoch) { await load() }
+    }
+
+    private func scanPrompt(kind: String) -> some View {
+        Button {
+            pickFolder()
+        } label: {
+            HStack(spacing: 12) {
+                Image(.bchLibrary)
+                    .resizable()
+                    .scaledToFit()
+                    .frame(width: 30, height: 30)
+                    .foregroundStyle(.secondary)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("On This Device")
+                        .font(.callout.weight(.semibold))
+                        .foregroundStyle(.primary)
+                    Text("Scan a folder to see its \(kind) here too.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                Spacer(minLength: 0)
+                Image(systemName: "chevron.right")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.tertiary)
+            }
+            .padding(.horizontal, 24)
+            .padding(.vertical, 8)
+            .contentShape(.rect)
+        }
+        .buttonStyle(.plain)
+    }
+
+    @ViewBuilder
+    private var combinedEmpty: some View {
+        if !auth.signedIn && !local.scanned {
+            EmptyStateView(
+                icon: Image(.bchLibrary),
+                title: "Your artists live here",
+                subtitle: "Follow artists on YouTube Music — or scan a folder on this device.",
+                buttonTitle: "Sign In"
+            ) { auth.loginPresented = true }
+        } else if local.scanned {
+            EmptyStateView(
+                icon: Image(.bchMusicNote),
+                title: "No audio files here",
+                subtitle: "The folder you selected didn't contain any supported audio files.",
+                buttonTitle: "Choose Another Folder"
+            ) { pickFolder() }
+        } else {
+            EmptyStateView(
+                icon: Image(.bchLibrary),
+                title: "No saved artists yet",
+                subtitle: "Artists you follow on YouTube Music show up here — or scan a folder on this device.",
+                buttonTitle: "Choose Folder"
+            ) { pickFolder() }
+        }
+    }
+
+    private func pickFolder() {
+        if let onPickFolder {
+            onPickFolder()
+        } else {
+            #if os(macOS)
+            local.chooseFolder()
+            #else
+            pickingFolder = true
+            #endif
+        }
+    }
+
+    private func load() async {
+        guard auth.signedIn else {
+            loading = false
+            shelves = []
+            return
+        }
+        loading = true
+        error = nil
+        do {
+            shelves = try await InnertubeFeed.shared.library()
+        } catch {
+            self.error = error.localizedDescription
+        }
+        loading = false
     }
 }
 
@@ -1735,6 +2687,9 @@ struct HistoryView: View {
         #if os(iOS)
         .navigationBarTitleDisplayMode(.large)
         .toolbar {
+            ToolbarItem(placement: .topBarLeading) {
+                TopBarLeadingMark()
+            }
             ToolbarItem(placement: .topBarTrailing) {
                 TopBarAccountButton()
             }
@@ -1761,6 +2716,11 @@ struct HistoryView: View {
 }
 
 /// Signed-in YouTube Music library: playlists, albums, artists.
+///
+/// Upstream's `library()` feed — the same shelves `LibraryLandingView` shows
+/// signed-in users on iPhone. The sidebar's Recent row is this feed as a
+/// destination (it owns its title and toolbar like every other locked
+/// section, since the hosting `LibraryView` adds no outer chrome).
 private struct YoutubeLibraryView: View {
     @Environment(AuthController.self) private var auth
     @Environment(AppModel.self) private var appModel
@@ -1796,7 +2756,7 @@ private struct YoutubeLibraryView: View {
             } else {
                 ScrollView {
                     VStack(alignment: .leading, spacing: 28) {
-                        ReplayBanner { appModel.replayPresented = true }
+                        ReplayHeroSection { page in appModel.openReplay(at: page) }
                         ForEach(pinnedShelves(shelves)) { shelf in
                             VStack(alignment: .leading, spacing: 8) {
                                 HStack {
@@ -1831,6 +2791,18 @@ private struct YoutubeLibraryView: View {
                 .refreshable { await load() }
             }
         }
+        .navigationTitle("Recent")
+        #if os(iOS)
+        .navigationBarTitleDisplayMode(.large)
+        .toolbar {
+            ToolbarItem(placement: .topBarLeading) {
+                TopBarLeadingMark()
+            }
+            ToolbarItem(placement: .topBarTrailing) {
+                TopBarAccountButton()
+            }
+        }
+        #endif
         .task(id: auth.sessionEpoch) { await load() }
     }
 
@@ -1996,6 +2968,9 @@ private struct LocalPlaylistsView: View {
         #if os(iOS)
         .navigationBarTitleDisplayMode(.large)
         .toolbar {
+            ToolbarItem(placement: .topBarLeading) {
+                TopBarLeadingMark()
+            }
             ToolbarItemGroup(placement: .topBarTrailing) {
                 if auth.signedIn {
                     Button {

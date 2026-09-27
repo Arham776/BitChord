@@ -363,6 +363,9 @@ final class PlaybackController {
     private var lastPersistAt = Date.distantPast
 
     private var positionTimer: Timer?
+    /// The system-primary check only needs to run every few seconds while the
+    /// app is visible, even though transport position is sampled four times a second.
+    @ObservationIgnored private var lastNowPlayingClaimCheck = Date.distantPast
     private var started = false
     /// The output stream must exist before a restored track is loaded into the
     /// engine. Keeping the startup task lets each load await that one boot
@@ -533,6 +536,10 @@ final class PlaybackController {
                 self.position = self.engine.positionSeconds()
                 self.positionSampledAt = Date()
                 self.nowPlaying.update(position: self.position)
+                if Date().timeIntervalSince(self.lastNowPlayingClaimCheck) >= 2 {
+                    self.lastNowPlayingClaimCheck = Date()
+                    self.nowPlaying.reclaimAfterOtherAudioStops()
+                }
                 // The periodic output-health NSLog that used to sit here is
                 // gone: every figure it carried — buffered frames, silent
                 // callbacks, rebuilds, xruns and the output peak — is on the
@@ -2668,6 +2675,9 @@ final class PlaybackController {
                 }
             }
         }
+        // Frozen before the concurrent work below: capturing the `var` itself
+        // in `MainActor.run` is a Swift 6 error.
+        let swapPos = effectivePos
         do {
             // Same track, better source: the engine opens the replacement and
             // equal-power crossfades into it *in place* (upstream
@@ -2685,7 +2695,7 @@ final class PlaybackController {
                     source: path,
                     title: entry.title,
                     artist: entry.artist,
-                    startSeconds: effectivePos,
+                    startSeconds: swapPos,
                     plan: nil,
                     headers: stream.headers,
                     claimedKbps: Swift.UInt32(stream.format.kbps ?? 0),
@@ -2703,12 +2713,12 @@ final class PlaybackController {
                 self.loadedSourcePath = info.source
                 self.duration = info.durationSeconds
                 // The playhead is continuous across a swap; the engine keeps it.
-                self.position = effectivePos
+                self.position = swapPos
                 self.nerd = engine.nerdStats()
                 self.racingLossless = false
                 if playing { self.state = .playing }
                 log.record(
-                    "upgraded to \(stream.format.summary) in place at \(Int(effectivePos * 1000))ms",
+                    "upgraded to \(stream.format.summary) in place at \(Int(swapPos * 1000))ms",
                     about: mediaId
                 )
             }

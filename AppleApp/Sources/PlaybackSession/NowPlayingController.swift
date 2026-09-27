@@ -8,6 +8,7 @@ import MediaPlayer
 import BitChordShared
 #if os(iOS)
 import NowPlaying
+import AVFoundation
 #endif
 
 /// Lock-screen / media-key / Bluetooth controls (spec §3.2 NowPlayingController).
@@ -168,6 +169,17 @@ final class NowPlayingController {
 #endif
     }
 
+    /// A foreground music session can regain the system slot after the other
+    /// app finishes. The system does not deliver this event to background apps,
+    /// so playback's existing timer checks while BitChord is visible.
+    func reclaimAfterOtherAudioStops() {
+#if os(iOS)
+        if #available(iOS 27, *), let model = modern as? ModernNowPlaying {
+            model.reclaimAfterOtherAudioStops()
+        }
+#endif
+    }
+
     private func artworkFromBytes(_ data: Data?) -> MPMediaItemArtwork? {
         guard let data else { return nil }
 #if os(iOS)
@@ -305,6 +317,7 @@ private final class ModernNowPlaying: MediaSessionRepresentable {
               !primaryRequestInFlight else { return }
         if session == nil { session = MediaSession(self) }
         guard let session else { return }
+        guard !session.isSystemPrimary else { return }
         primaryRequestInFlight = true
         Task { @MainActor in
             defer { primaryRequestInFlight = false }
@@ -314,6 +327,13 @@ private final class ModernNowPlaying: MediaSessionRepresentable {
                 NSLog("[BitChord] Now Playing primary request failed: \(error)")
             }
         }
+    }
+
+    func reclaimAfterOtherAudioStops() {
+        guard rate > 0,
+              session?.isSystemPrimary != true,
+              !AVAudioSession.sharedInstance().isOtherAudioPlaying else { return }
+        requestPrimaryIfPossible()
     }
 }
 #endif

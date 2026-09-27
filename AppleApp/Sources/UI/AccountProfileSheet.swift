@@ -526,4 +526,3 @@ struct TopBarLeadingMark: View {
             .accessibilityHidden(true)
     }
 }
-
