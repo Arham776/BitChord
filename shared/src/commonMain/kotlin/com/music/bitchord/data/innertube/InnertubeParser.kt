@@ -1,6 +1,7 @@
 package com.music.bitchord.data.innertube
 
 import com.music.bitchord.data.model.Account
+import com.music.bitchord.data.model.ArtistSubscriptionState
 import com.music.bitchord.data.model.BrowseItem
 import com.music.bitchord.data.model.BrowseType
 import com.music.bitchord.data.model.HomeShelf
@@ -20,6 +21,7 @@ import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.contentOrNull
+import kotlinx.serialization.json.booleanOrNull
 
 /**
  * Port of upstream `data/innertube/InnertubeParser.kt` — the search subset.
@@ -515,6 +517,7 @@ object InnertubeParser {
         val description: String?,
         val subscriberCountText: String?,
         val monthlyListenerCount: String?,
+        val subscription: ArtistSubscriptionState?,
     )
 
     /**
@@ -562,7 +565,28 @@ object InnertubeParser {
             description = parseDescription(response),
             subscriberCountText = subscriberCount(header),
             monthlyListenerCount = monthlyListeners(header),
+            subscription = subscription(header),
         )
+    }
+
+    /** Read current signed-in subscribe state and target channel from the header action. */
+    private fun subscription(header: JsonElement?): ArtistSubscriptionState? {
+        val immersive = header.o("musicImmersiveHeaderRenderer") ?: return null
+        val buttons = listOfNotNull(
+            immersive.o("subscriptionButton2").o("subscribeButtonRenderer"),
+            immersive.o("subscriptionButton").o("subscribeButtonRenderer"),
+        )
+        return buttons.firstNotNullOfOrNull { button ->
+            val subscribed = (button["subscribed"] as? JsonPrimitive)?.booleanOrNull
+                ?: return@firstNotNullOfOrNull null
+            val channelId = button.s("channelId")
+                ?: button.a("serviceEndpoints")?.firstNotNullOfOrNull { endpoint ->
+                    endpoint.o("subscribeEndpoint").a("channelIds")
+                        ?.firstOrNull().let { (it as? JsonPrimitive)?.contentOrNull }
+                }
+                ?: return@firstNotNullOfOrNull null
+            ArtistSubscriptionState(channelId = channelId, subscribed = subscribed)
+        }
     }
 
     /**

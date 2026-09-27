@@ -76,6 +76,7 @@ object DetailBridge {
                     description = artistPage.description,
                     subscriberCountText = artistPage.subscriberCountText,
                     monthlyListenerCount = artistPage.monthlyListenerCount,
+                    subscription = artistPage.subscription,
                 )
                 callback.onResult(
                     json.encodeToString(DetailPage.serializer(), page),

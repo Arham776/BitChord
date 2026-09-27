@@ -42,6 +42,7 @@ object PlayerBridge {
                     kbps = resolved.kbps,
                     mimeType = resolved.mimeType,
                     headers = resolved.headers,
+                    loudnessDb = resolved.loudnessDb,
                 )
                 callback.onResult(json.encodeToString(StreamPayload.serializer(), payload), null)
             } catch (e: StreamResolver.PermanentlyUnplayableException) {
@@ -74,5 +75,7 @@ object PlayerBridge {
         val kbps: Int,
         val mimeType: String,
         val headers: Map<String, String> = emptyMap(),
+        /** Absent (null) on payloads minted before the figure was parsed. */
+        val loudnessDb: Double? = null,
     )
 }

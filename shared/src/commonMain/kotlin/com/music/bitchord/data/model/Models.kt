@@ -203,12 +203,20 @@ data class DetailPage(
     val description: String? = null,
     val subscriberCountText: String? = null,
     val monthlyListenerCount: String? = null,
+    val subscription: ArtistSubscriptionState? = null,
     /** Token for the rest of the track list — null once it is all in. */
     val continuation: String? = null,
     val suggestedSongs: List<Song> = emptyList(),
     val libraryPlaylistId: String? = null,
     val librarySaved: Boolean? = null,
     val playlistOwned: Boolean? = null,
+)
+
+/** Channel id and current follow state from an artist header's subscribe button. */
+@Serializable
+data class ArtistSubscriptionState(
+    val channelId: String,
+    val subscribed: Boolean,
 )
 
 /** The next page of a paged track list (a big playlist's continuation). */

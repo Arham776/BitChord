@@ -7,11 +7,18 @@ import kotlinx.cinterop.ExperimentalForeignApi
 import kotlinx.cinterop.addressOf
 import kotlinx.cinterop.convert
 import kotlinx.cinterop.usePinned
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.launch
 import platform.Foundation.NSMutableData
+import platform.Foundation.NSFileManager
+import platform.Foundation.NSLock
 import platform.Foundation.NSTemporaryDirectory
 import platform.Foundation.NSUUID
 import platform.Foundation.writeToFile
@@ -45,14 +52,24 @@ import platform.posix.fwrite
 object StreamDownloadBridge {
 
     private val bridgeScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+    private val jobsLock = NSLock()
+    private val downloadJobs = mutableMapOf<String, Job>()
 
     fun interface DownloadCallback {
         fun onResult(path: String?, message: String?)
     }
 
     /** Wait for the whole file, then [callback]. Prefetch / cache path. */
-    fun download(url: String, headers: Map<String, String>, callback: DownloadCallback) {
-        streamToFile(url, headers, ready = DownloadCallback { _, _ -> }, done = callback)
+    fun download(downloadId: String, url: String, headers: Map<String, String>, callback: DownloadCallback) {
+        startStream(downloadId, url, headers, ready = DownloadCallback { _, _ -> }, done = callback)
+    }
+
+    /** Stops the active network/file job for one download, if it has started. */
+    fun cancel(downloadId: String) {
+        jobsLock.lock()
+        val job = downloadJobs.remove(downloadId)
+        jobsLock.unlock()
+        job?.cancel()
     }
 
     /**
@@ -78,14 +95,24 @@ object StreamDownloadBridge {
      * to forget the URL and stand the client down — which is the response that
      * actually changes the next attempt.
      */
-    @OptIn(ExperimentalForeignApi::class)
     fun streamToFile(
         url: String,
         headers: Map<String, String>,
         ready: DownloadCallback,
         done: DownloadCallback,
     ) {
-        bridgeScope.launch {
+        startStream(null, url, headers, ready, done)
+    }
+
+    @OptIn(ExperimentalForeignApi::class)
+    private fun startStream(
+        downloadId: String?,
+        url: String,
+        headers: Map<String, String>,
+        ready: DownloadCallback,
+        done: DownloadCallback,
+    ) {
+        val job = bridgeScope.launch(start = CoroutineStart.LAZY) {
             var tmpPath: String? = null
             var file: CPointer<FILE>? = null
             try {
@@ -131,6 +158,8 @@ object StreamDownloadBridge {
 
                     val data = try {
                         Http.getBytes(url, rangeHeaders)
+                    } catch (e: CancellationException) {
+                        throw e
                     } catch (e: Throwable) {
                         val code = httpCodeOf(e)
                         if (code != null && code in REFUSAL_CODES) {
@@ -141,6 +170,7 @@ object StreamDownloadBridge {
                         }
                         throw e
                     }
+                    currentCoroutineContext().ensureActive()
 
                     if (data.isEmpty()) {
                         consecutiveEmpty++
@@ -169,6 +199,7 @@ object StreamDownloadBridge {
                     offset += data.size
 
                     if (!readyFired) {
+                        currentCoroutineContext().ensureActive()
                         readyFired = true
                         DebugLog.d("first chunk ready: $path ($offset bytes)")
                         ready.onResult(path, null)
@@ -182,14 +213,26 @@ object StreamDownloadBridge {
                 file = null
 
                 if (!readyFired) {
+                    currentCoroutineContext().ensureActive()
                     done.onResult(null, "Download returned no bytes")
                     return@launch
                 }
 
+                currentCoroutineContext().ensureActive()
                 NSMutableData().writeToFile("$path.complete", atomically = true)
                 DebugLog.d("stream complete: $path ($offset bytes)")
+                currentCoroutineContext().ensureActive()
                 done.onResult(path, null)
+            } catch (e: CancellationException) {
+                // A cancelled row must not leave a partial file that could be
+                // mistaken for a completed download or resumed by the player.
+                tmpPath?.let { path ->
+                    listOf(path, "$path.len", "$path.grow", "$path.complete").forEach {
+                        NSFileManager.defaultManager.removeItemAtPath(it, null)
+                    }
+                }
             } catch (e: Throwable) {
+                currentCoroutineContext().ensureActive()
                 DebugLog.e("stream failed", e)
                 // Marked complete either way: a half-written file left looking
                 // unfinished would be re-read forever by the growing-file reader.
@@ -210,6 +253,17 @@ object StreamDownloadBridge {
                 file?.let { fclose(it) }
             }
         }
+        if (downloadId != null) {
+            jobsLock.lock()
+            downloadJobs[downloadId] = job
+            jobsLock.unlock()
+            job.invokeOnCompletion {
+                jobsLock.lock()
+                if (downloadJobs[downloadId] === job) downloadJobs.remove(downloadId)
+                jobsLock.unlock()
+            }
+        }
+        job.start()
     }
 
     /** The status code out of [Http]'s refusal message, if it was a refusal. */

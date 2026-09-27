@@ -19,8 +19,9 @@ import kotlinx.serialization.json.Json
 
 /**
  * Home / Explore / history, matching upstream `YtMusicRepository`:
- * Home = recently played (signed-in) + FEmusic_home + FEmusic_new_releases,
- * plus FEmusic_home's continuation for signed-in paging.
+ * Home = recently played (signed-in) + FEmusic_home + the upstream
+ * FEmusic_new_releases and FEmusic_explore supplements, plus FEmusic_home's
+ * continuation for signed-in paging.
  */
 object HomeBridge {
 
@@ -28,7 +29,7 @@ object HomeBridge {
     private val json = Json { ignoreUnknownKeys = true }
 
     private const val HISTORY = "FEmusic_history"
-    private const val RECENT_TITLE = "Recently played"
+    private const val RECENT_TITLE = "Recents"
     private const val RECENT_LIMIT = 20
 
     fun interface FeedCallback {
@@ -62,10 +63,15 @@ object HomeBridge {
                         runCatching { InnertubeParser.parseHome(Innertube.browse("FEmusic_new_releases")) }
                             .getOrDefault(emptyList())
                     }
+                    val explore = async {
+                        runCatching { InnertubeParser.parseHome(Innertube.browse("FEmusic_explore")) }
+                            .getOrDefault(emptyList())
+                    }
                     val home = homeRaw.await()
                     val shelves = listOfNotNull(recent.await()) +
                         InnertubeParser.parseHome(home) +
-                        newReleases.await()
+                        newReleases.await() +
+                        explore.await()
                     HomeFeed(
                         shelves = shelves.distinctBy { it.title.lowercase() },
                         continuation = InnertubeParser.continuationToken(home),

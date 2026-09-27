@@ -732,6 +732,19 @@ object Innertube {
         }
     }
 
+    /** Follow or unfollow a YouTube channel by the id supplied on its artist page. */
+    suspend fun setSubscribed(channelId: String, subscribed: Boolean) {
+        requireSession()
+        val endpoint = if (subscribed) "subscription/subscribe" else "subscription/unsubscribe"
+        val response = postMusic(endpoint) {
+            putJsonArray("channelIds") { add(channelId) }
+        }
+        response["error"]?.let { error ->
+            val message = error.jsonObject["message"]?.jsonPrimitive?.contentOrNull
+            error("YouTube Music refused the subscription change: ${message ?: error}")
+        }
+    }
+
     suspend fun sendFeedback(token: String) {
         requireSession()
         postMusic("feedback") {

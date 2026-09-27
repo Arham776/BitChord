@@ -361,7 +361,7 @@ object StreamResolver {
                 continue
             }
 
-            val picked = firstPlayable(videoId, client, formats, errors)
+            val picked = firstPlayable(videoId, client, formats, errors, loudnessDbOf(response))
             if (picked == null) {
                 standDown(videoId, client)
                 refused(videoId, client)
@@ -411,6 +411,7 @@ object StreamResolver {
         client: PlayerClient,
         formats: List<AudioFormat>,
         errors: MutableList<String>,
+        loudnessDb: Double? = null,
     ): ResolvedStream? {
         for (format in formats) {
             val url = format.url ?: format.signatureCipher?.let { cipher ->
@@ -425,11 +426,25 @@ object StreamResolver {
                 kbps = format.kbps,
                 mimeType = format.mimeType,
                 headers = client.mediaHeaders(),
+                loudnessDb = loudnessDb,
             )
         }
         errors += "${client.clientName}: ${formats.size} format(s), none unlocked"
         return null
     }
+
+    /**
+     * Per-track loudness from the player response, upstream's figure for the
+     * normalizer (`playerConfig.audioConfig.loudnessDb`). Read off whichever
+     * client won the walk — it describes the track, not the client, so the
+     * first response that carries one wins. Absent more often than not (many
+     * clients omit `audioConfig` entirely); null then, and the engine plays
+     * at unity.
+     */
+    private fun loudnessDbOf(response: JsonObject): Double? =
+        ((response["playerConfig"] as? JsonObject)?.get("audioConfig") as? JsonObject)
+            ?.get("loudnessDb")
+            ?.let { (it as? JsonPrimitive)?.content?.toDoubleOrNull() }
 
     /**
      * Record a refusal, and decide what it means.
@@ -508,6 +523,7 @@ object StreamResolver {
                 PlayerClient.WEB_REMIX,
                 formats,
                 mutableListOf(),
+                loudnessDbOf(response),
             ) ?: return null
             if (probe(picked.url, PlayerClient.WEB_REMIX.mediaHeaders(), picked.mimeType) != ProbeVerdict.OK) {
                 DebugLog.d("$videoId: signed-in WEB_REMIX URL did not probe clean")
@@ -693,6 +709,13 @@ object StreamResolver {
         val kbps: Int,
         val mimeType: String,
         val headers: Map<String, String>,
+        /**
+         * Per-track loudness from the player response (`playerConfig /
+         * audioConfig / loudnessDb`), upstream's `Stream.loudnessDb`. Null
+         * when the response carries none — the normalizer stays off rather
+         * than inventing a figure.
+         */
+        val loudnessDb: Double? = null,
     )
 
     private class Resolved(val stream: ResolvedStream, val at: TimeMark)

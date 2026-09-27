@@ -27,7 +27,7 @@ import com.music.bitchord.data.remote.WebDavConfig
  */
 enum class AudioQuality(val maxKbps: Int, val label: String) {
     LOW(64, "Low"),
-    MEDIUM(128, "Medium"),
+    MEDIUM(Int.MAX_VALUE, "Medium"),
     HIGH(Int.MAX_VALUE, "High"),
     LOSSLESS(Int.MAX_VALUE, "Lossless"),
     ;
@@ -44,13 +44,14 @@ enum class AudioQuality(val maxKbps: Int, val label: String) {
      * can answer at all.
      */
     fun permits(kind: com.music.bitchord.data.sources.SourceKind): Boolean = when (this) {
-        LOW, MEDIUM -> !kind.canServeLossless
-        HIGH, LOSSLESS -> true
+        LOW, MEDIUM -> kind == com.music.bitchord.data.sources.SourceKind.YOUTUBE
+        HIGH -> !kind.canServeLossless
+        LOSSLESS -> true
     }
 
     companion object {
         fun fromName(raw: String): AudioQuality =
-            entries.firstOrNull { it.name.equals(raw, ignoreCase = true) } ?: HIGH
+            entries.firstOrNull { it.name.equals(raw, ignoreCase = true) } ?: LOSSLESS
     }
 }
 
@@ -148,7 +149,7 @@ object AppSettings {
     }
 
     private val _audioQualityWifi = MutableStateFlow(
-        AudioQuality.fromName(settings.getString("audio_quality_wifi", "HIGH")),
+        AudioQuality.fromName(settings.getString("audio_quality_wifi", "LOSSLESS")),
     )
     val audioQualityWifi: StateFlow<AudioQuality> = _audioQualityWifi.asStateFlow()
     fun setAudioQualityWifi(value: String) {
@@ -158,7 +159,7 @@ object AppSettings {
     }
 
     private val _audioQualityCellular = MutableStateFlow(
-        AudioQuality.fromName(settings.getString("audio_quality_cellular", "HIGH")),
+        AudioQuality.fromName(settings.getString("audio_quality_cellular", "LOSSLESS")),
     )
     val audioQualityCellular: StateFlow<AudioQuality> = _audioQualityCellular.asStateFlow()
     fun setAudioQualityCellular(value: String) {
@@ -203,6 +204,15 @@ object AppSettings {
     fun setCanvasOverCellular(value: Boolean) {
         _canvasOverCellular.value = value
         settings.putBoolean("canvas_over_cellular", value)
+    }
+
+    private val _prioritizeSpotifyCanvas = MutableStateFlow(
+        settings.getBoolean("prioritize_spotify_canvas", false),
+    )
+    val prioritizeSpotifyCanvas: StateFlow<Boolean> = _prioritizeSpotifyCanvas.asStateFlow()
+    fun setPrioritizeSpotifyCanvas(value: Boolean) {
+        _prioritizeSpotifyCanvas.value = value
+        settings.putBoolean("prioritize_spotify_canvas", value)
     }
 
     // ---- Appearance --------------------------------------------------------
@@ -663,6 +673,170 @@ object AppSettings {
         settings.putBoolean("replay_genres", value)
     }
 
+    // ---- Audio output & performance (upstream parity) -----------------------
+    //
+    // The hardware-facing half of these (PCM word length, USB route, loudness
+    // stage) is owned by the platform engine, not here: this tier holds the
+    // choice, the engine applies what it can, and the Audio Pipeline readout
+    // names what is actually in effect. Persisting the key with upstream's name
+    // is what keeps a settings dump readable across ports.
+
+    /**
+     * Requested PCM word length at the output boundary: PCM_16 or FLOAT_32,
+     * upstream's two rungs (Media3's sink has no packed-24 path, and neither
+     * does this port's engine). A stored PCM_24 predates the rung's removal
+     * and migrates to the lossless path; anything else unknown falls back to
+     * PCM_16.
+     */
+    private val _outputPcmMode = MutableStateFlow(
+        when (settings.getString("output_pcm_mode", "PCM_16")) {
+            "FLOAT_32", "PCM_24" -> "FLOAT_32"
+            else -> "PCM_16"
+        },
+    )
+    val outputPcmMode: StateFlow<String> = _outputPcmMode.asStateFlow()
+    fun setOutputPcmMode(value: String) {
+        val mode = if (value == "FLOAT_32") value else "PCM_16"
+        _outputPcmMode.value = mode
+        settings.putString("output_pcm_mode", mode)
+    }
+
+    /** Prefer an attached USB audio output over the system's normal route. */
+    private val _preferUsbDac = MutableStateFlow(settings.getBoolean("prefer_usb_dac", false))
+    val preferUsbDac: StateFlow<Boolean> = _preferUsbDac.asStateFlow()
+    fun setPreferUsbDac(value: Boolean) {
+        _preferUsbDac.value = value
+        settings.putBoolean("prefer_usb_dac", value)
+    }
+
+    /**
+     * Level every track to the same loudness. On by default: a queue drawn from
+     * several sources spans several mastering eras, and the gap between them is
+     * routinely fifteen decibels — every streaming service normalizes by default
+     * for the same reason.
+     */
+    private val _loudnessNormalization = MutableStateFlow(settings.getBoolean("loudness_normalization", true))
+    val loudnessNormalization: StateFlow<Boolean> = _loudnessNormalization.asStateFlow()
+    fun setLoudnessNormalization(value: Boolean) {
+        _loudnessNormalization.value = value
+        settings.putBoolean("loudness_normalization", value)
+    }
+
+    /** CPU budget for Automix's background analysis, not its audible mix. */
+    private val _automixPerformanceMode = MutableStateFlow(
+        settings.getString("automix_performance", "BALANCED").takeIf {
+            it == "EFFICIENT" || it == "BALANCED" || it == "PERFORMANCE"
+        } ?: "BALANCED",
+    )
+    val automixPerformanceMode: StateFlow<String> = _automixPerformanceMode.asStateFlow()
+    fun setAutomixPerformanceMode(value: String) {
+        val mode = if (value == "EFFICIENT" || value == "PERFORMANCE") value else "BALANCED"
+        _automixPerformanceMode.value = mode
+        settings.putString("automix_performance", mode)
+    }
+
+    /** Inference threads for [automixPerformanceMode]: 1, 2 or 4. */
+    fun automixInferenceThreads(): Int = when (_automixPerformanceMode.value) {
+        "EFFICIENT" -> 1
+        "PERFORMANCE" -> 4
+        else -> 2
+    }
+
+    /** Requests a sustained high-refresh UI. Off keeps the system's own policy. */
+    private val _highPerformanceMode = MutableStateFlow(settings.getBoolean("high_performance_mode", false))
+    val highPerformanceMode: StateFlow<Boolean> = _highPerformanceMode.asStateFlow()
+    fun setHighPerformanceMode(value: Boolean) {
+        _highPerformanceMode.value = value
+        settings.putBoolean("high_performance_mode", value)
+    }
+
+    /** Preferred UI refresh rate in Hz while [highPerformanceMode] is on. */
+    private val _performanceRefreshRate = MutableStateFlow(
+        settings.getInt("performance_refresh_rate", 60).coerceIn(30, 240),
+    )
+    val performanceRefreshRate: StateFlow<Int> = _performanceRefreshRate.asStateFlow()
+    fun setPerformanceRefreshRate(value: Int) {
+        _performanceRefreshRate.value = value.coerceIn(30, 240)
+        settings.putInt("performance_refresh_rate", _performanceRefreshRate.value)
+    }
+
+    /**
+     * Keep downloads in Music/BitChord where other music apps can see them.
+     * Off keeps downloads in this app's private storage.
+     */
+    private val _exportDownloads = MutableStateFlow(settings.getBoolean("export_downloads", false))
+    val exportDownloads: StateFlow<Boolean> = _exportDownloads.asStateFlow()
+    fun setExportDownloads(value: Boolean) {
+        _exportDownloads.value = value
+        settings.putBoolean("export_downloads", value)
+    }
+
+    /** Hides the "Playing from" / "Played by" caption on the main player. */
+    private val _hideSongStatus = MutableStateFlow(settings.getBoolean("hide_song_status", false))
+    val hideSongStatus: StateFlow<Boolean> = _hideSongStatus.asStateFlow()
+    fun setHideSongStatus(value: Boolean) {
+        _hideSongStatus.value = value
+        settings.putBoolean("hide_song_status", value)
+    }
+
+    /**
+     * Prefer the catalogue audio release when the selected result is a music
+     * video. The video itself still plays first so its metadata appears
+     * immediately while the catalogue match is resolved.
+     */
+    private val _preferMusicOnly = MutableStateFlow(settings.getBoolean("prefer_music_only", false))
+    val preferMusicOnly: StateFlow<Boolean> = _preferMusicOnly.asStateFlow()
+    fun setPreferMusicOnly(value: Boolean) {
+        _preferMusicOnly.value = value
+        settings.putBoolean("prefer_music_only", value)
+    }
+
+    /** Aligns the matching playback moment when switching between versions. */
+    private val _smartVersionAlignment = MutableStateFlow(settings.getBoolean("smart_version_alignment", true))
+    val smartVersionAlignment: StateFlow<Boolean> = _smartVersionAlignment.asStateFlow()
+    fun setSmartVersionAlignment(value: Boolean) {
+        _smartVersionAlignment.value = value
+        settings.putBoolean("smart_version_alignment", value)
+    }
+
+    /** Hides short clips, recorder output and non-music formats from Local Music. */
+    private val _filterNonMusicAudio = MutableStateFlow(settings.getBoolean("filter_non_music_audio", true))
+    val filterNonMusicAudio: StateFlow<Boolean> = _filterNonMusicAudio.asStateFlow()
+    fun setFilterNonMusicAudio(value: Boolean) {
+        _filterNonMusicAudio.value = value
+        settings.putBoolean("filter_non_music_audio", value)
+    }
+
+    /** Puts the legacy single-wash backdrop back on the player. */
+    private val _legacyMeshGradient = MutableStateFlow(settings.getBoolean("legacy_mesh_gradient", false))
+    val legacyMeshGradient: StateFlow<Boolean> = _legacyMeshGradient.asStateFlow()
+    fun setLegacyMeshGradient(value: Boolean) {
+        _legacyMeshGradient.value = value
+        settings.putBoolean("legacy_mesh_gradient", value)
+    }
+
+    /**
+     * Which artist a scrobble credits: the full track credit ("track") or the
+     * lead name alone ("album"). Mirrors upstream's per-service
+     * `primaryArtistOnly` flags as one choice, since both services receive the
+     * same payload from the same call site.
+     */
+    private val _scrobblePrimaryArtist = MutableStateFlow(
+        settings.getString("scrobble_primary_artist", "track").takeIf {
+            it == "album"
+        } ?: "track",
+    )
+    val scrobblePrimaryArtist: StateFlow<String> = _scrobblePrimaryArtist.asStateFlow()
+    fun setScrobblePrimaryArtist(value: String) {
+        val mode = if (value == "album") "album" else "track"
+        _scrobblePrimaryArtist.value = mode
+        settings.putString("scrobble_primary_artist", mode)
+    }
+
+    /** The lead name of a multi-artist credit — upstream `PrimaryArtist`. */
+    fun primaryArtist(credit: String): String =
+        credit.split(Regex("""\s*,\s*|\s+&\s+|\s+＆\s+"""), limit = 2).first().trim().ifBlank { credit }
+
     /**
      * The account this device is signed in as, as far as Listen Together cares.
      *
@@ -799,13 +973,17 @@ object AppSettings {
             "crossfade_seconds", "smart_fade_enabled", "spatial_audio", "autoplay",
             "skip_silence", "playback_speed", "audio_quality_wifi", "audio_quality_cellular",
             "download_quality", "wifi_only_downloads", "show_nerd_stats", "animated_canvas",
-            "canvas_over_cellular", "theme_mode", "reduce_dynamic_blur", "reduce_animation",
+            "canvas_over_cellular", "prioritize_spotify_canvas", "theme_mode", "reduce_dynamic_blur", "reduce_animation",
             "full_bleed_artwork", "synced_lyrics", "convert_video_to_audio", "swipe_to_play_next",
             "dont_repeat_suggestions", "hide_volume_bar", "lyrics_sources", "lyrics_source_order",
             "audio_cache_limit_bytes",
             "eq_gains", "pinned_playlists", "jiosaavn_enabled", "stop_when_backgrounded",
             "prioritize_syllable_sync", "replay_genres", "scrobble_min_duration", "scrobble_delay_percent",
-            "scrobble_delay_seconds", "discord_rpc_enabled", "discord_status",
+            "scrobble_delay_seconds", "output_pcm_mode", "prefer_usb_dac", "loudness_normalization",
+            "automix_performance", "high_performance_mode", "performance_refresh_rate",
+            "export_downloads", "hide_song_status", "prefer_music_only", "smart_version_alignment",
+            "filter_non_music_audio", "legacy_mesh_gradient", "scrobble_primary_artist",
+            "discord_rpc_enabled", "discord_status",
             "discord_activity_type", "discord_activity_name", "discord_swap_title",
             "discord_use_details", "discord_advanced_mode", "discord_button_1_text",
             "discord_button_1_visible", "discord_button_2_text", "discord_button_2_visible",
@@ -817,16 +995,21 @@ object AppSettings {
         )
         val parts = keys.map { key ->
             val value = when (key) {
-                "crossfade_seconds", "scrobble_min_duration", "scrobble_delay_seconds" ->
+                "crossfade_seconds", "scrobble_min_duration", "scrobble_delay_seconds",
+                "performance_refresh_rate" ->
                     settings.getInt(key, 0).toString()
                 "audio_cache_limit_bytes" -> settings.getLong(key, DEFAULT_CACHE_LIMIT_BYTES).toString()
                 "scrobble_delay_percent", "playback_speed" -> settings.getFloat(key, 0f).toString()
                 "smart_fade_enabled", "spatial_audio", "autoplay", "skip_silence",
                 "wifi_only_downloads", "show_nerd_stats", "animated_canvas", "canvas_over_cellular",
+                "prioritize_spotify_canvas",
                 "reduce_dynamic_blur", "reduce_animation", "full_bleed_artwork", "synced_lyrics",
                 "convert_video_to_audio", "swipe_to_play_next", "dont_repeat_suggestions",
                 "hide_volume_bar", "jiosaavn_enabled", "stop_when_backgrounded",
                 "prioritize_syllable_sync", "replay_genres", "discord_rpc_enabled", "discord_swap_title",
+                "prefer_usb_dac", "loudness_normalization", "high_performance_mode",
+                "export_downloads", "hide_song_status", "prefer_music_only", "smart_version_alignment",
+                "filter_non_music_audio", "legacy_mesh_gradient",
                 "discord_use_details", "discord_advanced_mode", "discord_info_dismissed",
                 "discord_button_1_visible", "discord_button_2_visible",
                 -> when (key) {
@@ -865,6 +1048,7 @@ object AppSettings {
                 "show_nerd_stats" -> setShowNerdStats(value.toBoolean())
                 "animated_canvas" -> setAnimatedCanvas(value.toBoolean())
                 "canvas_over_cellular" -> setCanvasOverCellular(value.toBoolean())
+                "prioritize_spotify_canvas" -> setPrioritizeSpotifyCanvas(value.toBoolean())
                 "theme_mode" -> setThemeMode(value)
                 "reduce_dynamic_blur" -> setReduceDynamicBlur(value.toBoolean())
                 "reduce_animation" -> setReduceAnimation(value.toBoolean())
@@ -886,6 +1070,19 @@ object AppSettings {
                 "scrobble_min_duration" -> setScrobbleMinDuration(value.toIntOrNull() ?: 30)
                 "scrobble_delay_percent" -> setScrobbleDelayPercent(value.toFloatOrNull() ?: 0.5f)
                 "scrobble_delay_seconds" -> setScrobbleDelaySeconds(value.toIntOrNull() ?: 180)
+                "output_pcm_mode" -> setOutputPcmMode(value)
+                "prefer_usb_dac" -> setPreferUsbDac(value.toBoolean())
+                "loudness_normalization" -> setLoudnessNormalization(value.toBoolean())
+                "automix_performance" -> setAutomixPerformanceMode(value)
+                "high_performance_mode" -> setHighPerformanceMode(value.toBoolean())
+                "performance_refresh_rate" -> setPerformanceRefreshRate(value.toIntOrNull() ?: 60)
+                "export_downloads" -> setExportDownloads(value.toBoolean())
+                "hide_song_status" -> setHideSongStatus(value.toBoolean())
+                "prefer_music_only" -> setPreferMusicOnly(value.toBoolean())
+                "smart_version_alignment" -> setSmartVersionAlignment(value.toBoolean())
+                "filter_non_music_audio" -> setFilterNonMusicAudio(value.toBoolean())
+                "legacy_mesh_gradient" -> setLegacyMeshGradient(value.toBoolean())
+                "scrobble_primary_artist" -> setScrobblePrimaryArtist(value)
                 "discord_rpc_enabled" -> setDiscordRpcEnabled(value.toBoolean())
                 "discord_status" -> setDiscordStatus(value)
                 "discord_activity_type" -> setDiscordActivityType(value)

@@ -4,6 +4,7 @@ import com.music.bitchord.data.DebugLog
 import com.music.bitchord.data.innertube.Innertube
 import com.music.bitchord.data.settings.PlatformSettings
 import kotlinx.serialization.builtins.ListSerializer
+import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.Json
 
 /**
@@ -46,6 +47,14 @@ object AccountStore {
 
     private const val KEY = "account_sessions"
 
+    /** The active account belongs with the accounts it selects. Older installs
+     * stored only the list; [load] accepts that shape and upgrades on next save. */
+    @Serializable
+    private data class StoredState(
+        val accounts: List<GoogleAccountSession>,
+        val activeAccountId: String? = null,
+    )
+
     /**
      * The active selection, kept here as well as inside the blob.
      *
@@ -56,10 +65,6 @@ object AccountStore {
      */
     private var activeAccountId: String? = null
     private var activeProfileId: String? = null
-
-    init {
-        load()
-    }
 
     /** Every stored account, in the order it was added. */
     fun accounts(): List<GoogleAccountSession> = load()
@@ -96,6 +101,13 @@ object AccountStore {
         return ActiveSelection(account, profile)
     }
 
+    /** Reapply the saved cookie and channel at launch or after a rejected
+     * candidate. No write is made, so a locked Keychain is left untouched. */
+    fun restore() {
+        accounts()
+        apply()
+    }
+
     /**
      * Records a signed-in account, replacing any with the same id, and selects
      * it.
@@ -111,8 +123,8 @@ object AccountStore {
         name: String = "",
         email: String = "",
         profiles: List<YouTubeProfile> = emptyList(),
-    ) {
-        if (cookie.isBlank()) return
+    ): Boolean {
+        if (cookie.isBlank()) return false
         val all = accounts().toMutableList()
         val id = accountId.ifBlank { sessionIdOf(cookie, null) }
         val session = GoogleAccountSession(
@@ -125,19 +137,29 @@ object AccountStore {
         )
         val at = all.indexOfFirst { it.accountId == id }
         if (at >= 0) all[at] = session else all.add(session)
-        save(all)
-        select(id, session.activeProfileId)
+        activeAccountId = id
+        activeProfileId = session.activeProfileId
+        if (!save(all)) {
+            load()
+            return false
+        }
+        apply()
+        return true
     }
 
     /** Forgets an account. The selection moves to whatever is left, or to none. */
-    fun forget(accountId: String) {
+    fun forget(accountId: String): Boolean {
         val all = accounts().filterNot { it.accountId == accountId }
-        save(all)
         if (activeAccountId == accountId) {
-            activeAccountId = null
-            activeProfileId = null
+            activeAccountId = all.firstOrNull()?.accountId
+            activeProfileId = all.firstOrNull()?.activeProfileId
+        }
+        if (!save(all)) {
+            load()
+            return false
         }
         apply()
+        return true
     }
 
     /**
@@ -148,23 +170,28 @@ object AccountStore {
      * and the library is the other's, and nothing on screen contradicts
      * anything.
      */
-    fun select(accountId: String?, profileId: String?) {
-        val account = accounts().firstOrNull { it.accountId == accountId }
-            ?: return
+    fun select(accountId: String?, profileId: String?): Boolean {
+        val all = accounts()
+        val account = all.firstOrNull { it.accountId == accountId }
+            ?: return false
         // Set only after the account is known to exist, so a selection naming a
         // forgotten account cannot leave the headers pointing at a cookie that
         // is no longer stored.
         activeAccountId = account.accountId
         val profile = account.profiles.firstOrNull { it.profileId == profileId }
         activeProfileId = profile?.profileId
-        save(accounts().map {
+        if (!save(all.map {
             if (it.accountId == account.accountId) {
                 it.copy(activeProfileId = activeProfileId)
             } else {
                 it
             }
-        })
+        })) {
+            load()
+            return false
+        }
         apply()
+        return true
     }
 
     /**
@@ -175,8 +202,7 @@ object AccountStore {
     fun step(forward: Boolean): Boolean {
         val all = accounts()
         val next = adjacentProfile(all, activeAccountId, activeProfileId, forward) ?: return false
-        select(next.first, next.second)
-        return true
+        return select(next.first, next.second)
     }
 
     /**
@@ -206,24 +232,39 @@ object AccountStore {
 
     private fun load(): List<GoogleAccountSession> {
         val raw = PlatformSettings.getSecret(KEY) ?: return emptyList()
-        return runCatching { json.decodeFromString(ListSerializer(GoogleAccountSession.serializer()), raw) }
-            .getOrDefault(emptyList())
+        val state = runCatching { json.decodeFromString(StoredState.serializer(), raw) }.getOrNull()
+            ?: StoredState(
+                accounts = runCatching {
+                    json.decodeFromString(ListSerializer(GoogleAccountSession.serializer()), raw)
+                }.getOrDefault(emptyList()),
+            )
+        val valid = state.accounts
             // A record with no cookie is unusable — there is nothing to sign a
             // request with — so it is dropped rather than surfaced as an account
             // that cannot be selected.
             .filter { it.cookie.isNotBlank() }
+        val active = valid.firstOrNull { it.accountId == state.activeAccountId } ?: valid.firstOrNull()
+        activeAccountId = active?.accountId
+        activeProfileId = active?.activeProfileId
+        return valid
     }
 
-    private fun save(all: List<GoogleAccountSession>) {
+    private fun save(all: List<GoogleAccountSession>): Boolean {
         if (all.isEmpty()) {
             PlatformSettings.putSecret(KEY, null)
             activeAccountId = null
             activeProfileId = null
-            return
+            return PlatformSettings.getSecret(KEY) == null
         }
+        val encoded = json.encodeToString(
+            StoredState.serializer(), StoredState(all, activeAccountId)
+        )
         PlatformSettings.putSecret(
             KEY,
-            json.encodeToString(ListSerializer(GoogleAccountSession.serializer()), all),
+            encoded,
         )
+        val saved = PlatformSettings.getSecret(KEY) == encoded
+        if (!saved) DebugLog.w("could not persist account sessions")
+        return saved
     }
 }

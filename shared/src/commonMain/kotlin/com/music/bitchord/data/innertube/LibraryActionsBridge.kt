@@ -56,6 +56,17 @@ object LibraryActionsBridge {
         }
     }
 
+    fun setSubscribed(channelId: String, subscribed: Boolean, callback: DoneCallback) {
+        scope.launch {
+            try {
+                Innertube.setSubscribed(channelId, subscribed)
+                callback.onResult(true, null)
+            } catch (e: Throwable) {
+                callback.onResult(false, e.message ?: e.toString())
+            }
+        }
+    }
+
     fun sendFeedback(token: String, callback: DoneCallback) {
         scope.launch {
             try {
