@@ -223,6 +223,17 @@ struct LyricsSourcesSheet: View {
     @State private var syllableSync = PlatformSettings.shared.getBoolean(key: "prioritize_syllable_sync", default: false)
     @State private var paxSenixKey = PlatformSettings.shared.getSecret(key: "paxsenix_api_key") ?? ""
 
+    /// Re-run the lookup for the track that is playing.
+    ///
+    /// Everything on this screen used to apply to the *next* track only: the
+    /// settings were written, the current lyric was left exactly as it was, and
+    /// there was no way from the player to ask again — so a wrong or missing
+    /// lyric was unfixable without disabling sources globally and replaying the
+    /// track. Upstream has a per-track provider picker; this is the part of it
+    /// that makes the screen's own controls mean something where the listener is
+    /// standing.
+    var onSearchAgain: (() -> Void)? = nil
+
     var body: some View {
         NavigationStack {
             List {
@@ -273,6 +284,22 @@ struct LyricsSourcesSheet: View {
             .toolbar {
                 ToolbarItem(placement: .confirmationAction) {
                     Button("Done") { dismiss() }
+                }
+            }
+            .safeAreaInset(edge: .bottom) {
+                if onSearchAgain != nil {
+                    // Outside the List on purpose: this is an action on the
+                    // track, not another setting, and it belongs next to the
+                    // button that dismisses the sheet.
+                    Button {
+                        dismiss()
+                        onSearchAgain?()
+                    } label: {
+                        Label("Search again for this track", systemImage: "arrow.clockwise")
+                            .frame(maxWidth: .infinity)
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .padding()
                 }
             }
             .onChange(of: selection) { _, value in AppSettings.shared.setLyricsSources(value: value) }

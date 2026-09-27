@@ -86,6 +86,11 @@ struct AudioPipelineSheet: View {
                             row("Output rebuilds", "\(controller.outputHealth.outputRebuilds)")
                             row("Device xruns", "\(controller.outputHealth.outputXruns)")
                             row("Output peak", String(format: "%.4f", controller.outputHealth.outputPeak))
+                            // A quality upgrade fades one recording into another
+                            // copy of itself, and how alike the two encodings are
+                            // is what decides whether that fade is level-flat.
+                            // Measured on the blended samples; “—” until one runs.
+                            row("Upgrade correlation", upgradeCorrelation)
                         }
                     }
                     note("Values are read from the engine as it runs. “—” is a figure the system does not report, not one this app chose to hide.")
@@ -180,6 +185,15 @@ struct AudioPipelineSheet: View {
     private var bitDepth: String { (nerd?.bitDepth ?? 0) > 0 ? "\(nerd!.bitDepth)-bit" : "—" }
     private var bitrate: String { (nerd?.kbps ?? 0) > 0 ? "\(nerd!.kbps) kbps" : "—" }
     private var sourceRate: String { (nerd?.sampleRate ?? 0) > 0 ? "\(nerd!.sampleRate) Hz" : "—" }
+    /// The last quality upgrade's measured correlation, and what it implies for
+    /// the fade. The swap uses a linear gain pair, which is flat when the two
+    /// encodings are identical; `10·log10((1+ρ)/2)` is how far from flat it sits
+    /// at any other correlation (−0.11 dB at ρ=0.95, −1.25 dB at ρ=0.5).
+    private var upgradeCorrelation: String {
+        guard let rho = nerd?.swapCorrelation else { return "—" }
+        let deviationDb = 10 * log10((1 + rho) / 2)
+        return String(format: "ρ=%.3f (%.2f dB from flat)", rho, deviationDb)
+    }
     private var channels: String {
         let n = nerd?.channels ?? 0
         guard n > 0 else { return "—" }
@@ -372,6 +386,7 @@ struct OutputDeviceSheet: View {
                         row("Output rebuilds", "\(controller.outputHealth.outputRebuilds)")
                         row("Device xruns", "\(controller.outputHealth.outputXruns)")
                         row("Output peak", String(format: "%.4f", controller.outputHealth.outputPeak))
+                        row("Upgrade correlation", upgradeCorrelation)
                     } header: {
                         Text("Playback Diagnostics")
                     } footer: {
@@ -404,6 +419,13 @@ struct OutputDeviceSheet: View {
     }
 
     private var device: OutputDeviceRec { controller.outputDevice }
+    private var nerd: NerdStatsRec? { controller.nerd }
+
+    private var upgradeCorrelation: String {
+        guard let rho = nerd?.swapCorrelation else { return "—" }
+        let deviationDb = 10 * log10((1 + rho) / 2)
+        return String(format: "ρ=%.3f (%.2f dB from flat)", rho, deviationDb)
+    }
 
     private var deviceName: String {
         device.started && !device.name.isEmpty ? device.name : "Not open yet"

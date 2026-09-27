@@ -59,7 +59,7 @@ struct NowPlayingView: View {
                 .environment(controller)
         }
         .sheet(isPresented: $showLyricsSources) {
-            LyricsSourcesSheet()
+            LyricsSourcesSheet(onSearchAgain: { controller.refetchLyrics() })
         }
         // The offset is adjusted *against the track playing*, so the effect has to
         // be visible while the sheet is still open — a control that only took
@@ -468,10 +468,18 @@ struct NowPlayingView: View {
         case .main:
             Color.clear
         case .lyrics:
+            // Frame-driven, not poll-driven. `controller.position` only moves
+            // when the transport tick reads the engine — four times a second —
+            // so a word highlight judged against it can only change on those
+            // four ticks, and steps in 250 ms jumps. Upstream drives the pane
+            // from a frame clock for exactly this reason. The interpolated
+            // position is still the engine's measurement; the TimelineView only
+            // decides how often we ask where it has got to.
+            TimelineView(.animation) { timeline in
             LyricsPane(
                 lines: controller.displayedLyrics,
                 loading: controller.lyricsLoading,
-                position: controller.position,
+                position: controller.livePosition(at: timeline.date),
                 hasTrack: controller.current != nil,
                 sourceLabel: controller.lyricsSourceLabel,
                 onSeek: { controller.seek(to: $0) },
@@ -483,6 +491,7 @@ struct NowPlayingView: View {
                 onRevealControls: { revealLyricsControls() },
                 onFocusLyrics: { hideLyricsControls() }
             )
+            }
         case .queue:
             UpNextPane()
         }
@@ -2007,7 +2016,14 @@ struct LyricsPane: View {
                                         line: line,
                                         active: activeRows.contains(index),
                                         distance: abs(index - leadIndex),
-                                        position: position,
+                                        // The *adjusted* clock, the one the line
+                                        // focus above already uses. Handing the
+                                        // sweep the raw transport meant the
+                                        // offset moved the line but not the
+                                        // bright word, so touching the offset
+                                        // control — the one gesture meant to
+                                        // fix sync — put the two out of step.
+                                        position: Double(adjustedPositionMs) / 1000,
                                         onTap: {
                                             if !sourceVisible {
                                                 onRevealControls?()

@@ -20,6 +20,15 @@ struct WebDavLibraryView: View {
 
     var body: some View {
         content
+            .navigationTitle("WebDAV")
+            #if os(iOS)
+            .navigationBarTitleDisplayMode(.large)
+            .toolbar {
+                ToolbarItem(placement: .topBarTrailing) {
+                    TopBarAccountButton()
+                }
+            }
+            #endif
             .task(id: store.url) {
                 // Keyed on the address, so pointing the app at a different share
                 // re-reads rather than showing the old one's albums — and a share that

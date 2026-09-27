@@ -448,7 +448,10 @@ struct SongRow: View {
             }
             if auth.signedIn, let vid = entry.videoId {
                 Button {
-                    Task { _ = await LibraryActions.rate(videoId: vid, status: LibraryActions.cachedLike(vid) == "LIKE" ? "INDIFFERENT" : "LIKE") }
+                    // Through the controller, so this row's heart reports a
+                    // refusal the same way the player's does. It used to call
+                    // `rate` directly and discard the answer.
+                    controller.toggleLike(videoId: vid)
                 } label: {
                     Label(LibraryActions.cachedLike(vid) == "LIKE" ? "Unlike" : "Like", systemImage: LibraryActions.cachedLike(vid) == "LIKE" ? "heart.fill" : "heart")
                 }

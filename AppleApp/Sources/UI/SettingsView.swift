@@ -10,6 +10,7 @@ import AppKit
 /// Apple Settings-style grouped form. Structure and copy follow upstream;
 /// chrome is System Settings / iOS Settings: glyph wells, drill-downs, footers.
 struct SettingsView: View {
+    var embedded: Bool = false
     @Environment(\.dismiss) private var dismiss
     @Environment(PlaybackController.self) private var controller
     @Environment(AuthController.self) private var auth
@@ -63,6 +64,7 @@ struct SettingsView: View {
     @State private var playbackSpeed = Double(PlatformSettings.shared.getFloat(key: "playback_speed", default: 1))
     @State private var jiosaavn = PlatformSettings.shared.getBoolean(key: "jiosaavn_enabled", default: true)
     @State private var stopBackground = PlatformSettings.shared.getBoolean(key: "stop_when_backgrounded", default: false)
+    @State private var mixWithOtherAudio = PlatformSettings.shared.getBoolean(key: "mix_with_other_audio", default: true)
     @State private var syllableSync = PlatformSettings.shared.getBoolean(key: "prioritize_syllable_sync", default: false)
     @State private var language = PlatformSettings.shared.getString(key: "app_language", default: "")
     @State private var spotifyCookie = PlatformSettings.shared.getString(key: "spotify_spdc_token", default: "")
@@ -85,18 +87,27 @@ struct SettingsView: View {
     private var metered: Bool { NetworkQuality.shared.metered }
 
     var body: some View {
-        NavigationStack {
-            settingsForm
-                .navigationTitle("Settings")
-                .searchable(text: $search, prompt: "Search settings")
-                .searchSuggestions { searchSuggestions }
-                #if os(iOS)
-                .toolbar {
-                    ToolbarItem(placement: .confirmationAction) {
-                        Button("Done") { dismiss() }
-                    }
+        Group {
+            if embedded {
+                settingsForm
+                    .navigationTitle("Settings")
+                    .searchable(text: $search, prompt: "Search settings")
+                    .searchSuggestions { searchSuggestions }
+            } else {
+                NavigationStack {
+                    settingsForm
+                        .navigationTitle("Settings")
+                        .searchable(text: $search, prompt: "Search settings")
+                        .searchSuggestions { searchSuggestions }
+                        #if os(iOS)
+                        .toolbar {
+                            ToolbarItem(placement: .confirmationAction) {
+                                Button("Done") { dismiss() }
+                            }
+                        }
+                        #endif
                 }
-                #endif
+            }
         }
         #if os(macOS)
         .frame(minWidth: 560, idealWidth: 620, minHeight: 720)
@@ -122,6 +133,7 @@ struct SettingsView: View {
             controller: controller,
             crossfade: $crossfade,
             spatial: $spatial,
+            mixWithOtherAudio: $mixWithOtherAudio,
             automix: $automix,
             automixPerf: $automixPerf,
             skipSilence: $skipSilence,
@@ -624,6 +636,14 @@ struct SettingsView: View {
                 subtitle: "Widens stereo tracks for a more immersive feel",
                 isOn: $spatial
             )
+#if os(iOS)
+            SettingsToggleLine(
+                glyph: .musicOnly,
+                title: "Play Alongside Other Apps",
+                subtitle: "Keeps other music and podcasts playing. On iOS 18–26, system Now Playing controls may favor the other app. Takes effect on the next play.",
+                isOn: $mixWithOtherAudio
+            )
+#endif
             NavigationLink {
                 EqualizerView()
             } label: {
@@ -2123,6 +2143,7 @@ private struct SettingsPlaybackPersist: ViewModifier {
     var controller: PlaybackController
     @Binding var crossfade: Int
     @Binding var spatial: Bool
+    @Binding var mixWithOtherAudio: Bool
     @Binding var automix: Bool
     @Binding var automixPerf: String
     @Binding var skipSilence: Bool
@@ -2141,6 +2162,9 @@ private struct SettingsPlaybackPersist: ViewModifier {
             .onChange(of: spatial) { _, value in
                 AppSettings.shared.setSpatialAudio(value: value)
                 controller.updateSpatial(enabled: value)
+            }
+            .onChange(of: mixWithOtherAudio) { _, value in
+                PlatformSettings.shared.putBoolean(key: "mix_with_other_audio", value: value)
             }
             .onChange(of: automix) { _, value in
                 AppSettings.shared.setSmartFadeEnabled(value: value)
