@@ -92,9 +92,19 @@ pub struct TransitionPlan {
     pub vocal_overlap: f64,
     /// Explicit fade length for this pair; 0 = engine's crossfade window.
     pub fade_seconds: f64,
+    /// Where the blend *ends*, as a position in the outgoing track's own
+    /// timeline; 0 means "at the file end".
+    ///
+    /// The planner chooses this — `outgoing_mix_end`, the ranked mix-out anchor,
+    /// which is allowed to sit up to 12 s inside the track — and derives
+    /// `bass_swap_fraction` and `vocal_overlap` from the window it defines.
+    /// Without it the mixer armed the fade from the file's last byte instead, so
+    /// on any track whose anchor is interior the entire blend — gains and both
+    /// filter rides together — landed late by however much the anchor is early.
+    pub transition_end_seconds: f64,
     pub cue_seconds: f64,
     /// Tempo stretch — multiplied into the incoming voice's `speed_resampler`
-    /// at open (and kept across later `set_playback_speed` calls).
+    /// at open, and released by `release_plan_stretch` when the blend ends.
     pub playback_rate: f64,
 }
 
@@ -107,6 +117,7 @@ impl Default for TransitionPlan {
             filter_sweep: 0.0,
             vocal_overlap: 0.0,
             fade_seconds: 0.0,
+            transition_end_seconds: 0.0,
             cue_seconds: 0.0,
             playback_rate: 1.0,
         }
@@ -221,6 +232,26 @@ fn rise_gain(progress: f64) -> f32 {
 
 fn fall_gain(progress: f64) -> f32 {
     (progress.clamp(0.0, 1.0) * core::f64::consts::PI / 2.0).cos() as f32
+}
+
+/// The `(rise, fall)` gain pair for fade progress `p`.
+///
+/// Which pair is correct depends on whether the two sides carry the same
+/// signal, and getting that wrong is audible either way:
+///
+/// * Different tracks are uncorrelated, so their *powers* add and the
+///   equal-power pair holds the level still (`rise² + fall² = 1`).
+/// * A source swap is one recording on both sides, aligned, so the
+///   *amplitudes* add. The equal-power pair would then peak at
+///   `√2·sin(p·π/2 + π/4)` — +3.01 dB through the middle of every upgrade.
+///   A linear pair sums to exactly 1 and the swap is level-flat.
+fn fade_gains(progress: f64, same_signal: bool) -> (f32, f32) {
+    let p = progress.clamp(0.0, 1.0);
+    if same_signal {
+        (p as f32, (1.0 - p) as f32)
+    } else {
+        (rise_gain(p), fall_gain(p))
+    }
 }
 
 /// Geometric interpolation between two cutoffs — pitch is logarithmic.
@@ -459,6 +490,25 @@ impl Voice {
         self.effective_speed = effective;
         self.speed_l = speed_resampler(device_rate, effective);
         self.speed_r = speed_resampler(device_rate, effective);
+    }
+
+    /// Releases the tempo stretch a beatmatched handoff stacked on this voice.
+    ///
+    /// The stretch exists only to hold two tracks on a shared grid for the
+    /// length of the blend. Upstream undoes it unconditionally and idempotently
+    /// the moment the fade ends — `CrossfadeController.finish` and `retire`
+    /// both call `setPlaybackSpeed(AppSettings.playbackSpeed.value)` — because a
+    /// voice that keeps it plays fast for its whole length: +3 % tempo and +51
+    /// cents on every track that ever arrived through a beatmatched blend, with
+    /// the published position running at the stretched rate as well.
+    fn release_plan_stretch(&mut self, speed: f32, device_rate: u32) {
+        if (self.plan_rate - 1.0).abs() < f64::EPSILON {
+            return;
+        }
+        // Clear the multiplier *before* re-deriving, or `set_playback_speed`
+        // would simply stack the stretch back on.
+        self.plan_rate = 1.0;
+        self.set_playback_speed(speed, device_rate);
     }
 
     /// Rebuild post-decode DSP for a new DAC rate (AirPods connect/disconnect).
@@ -747,6 +797,9 @@ struct MixerState {
     /// Set by Load/Stop; the device callback discards leftover ring samples
     /// so the previous track cannot keep sounding under the new one.
     flush_ring: Arc<AtomicBool>,
+    /// Set by hard_cut (skip / Load / Stop); the device callback ramps down
+    /// the outgoing audio over 120 ms before discarding the backlog.
+    bail_flush: Arc<AtomicBool>,
     playback_speed: f32,
     skip_silence: bool,
     eq: EqualizerProcessor,
@@ -755,6 +808,76 @@ struct MixerState {
     /// `AppSettings.loudnessNormalization`, on by default). Per-voice figures
     /// ride on the voices; this decides whether the render uses them.
     loudness_enabled: bool,
+    /// Correlation probe for a source swap, see [`SwapProbe`].
+    swap_probe: SwapProbe,
+}
+
+/// Measures how correlated the two sides of a source swap really are.
+///
+/// A swap fades one recording into another copy of itself, and which gain pair
+/// keeps that level-flat depends entirely on the correlation `ρ` between the
+/// two encodings: the linear pair is flat at ρ=1 and the equal-power pair at
+/// ρ=0, and the port's deviation from flat with the linear pair is
+/// `10·log10((1+ρ)/2)` — 0 dB at ρ=1, −0.11 at 0.95, −1.25 at 0.5.
+///
+/// Nothing else can supply that number, because it depends on how two encoders
+/// of one master differ, so it has to come from a real upgrade. This reads it
+/// off the samples that are genuinely being blended: both voices are already
+/// decoded and aligned by the time they are rendered, so the probe costs a few
+/// multiplies per sample for the length of the fade — no extra decoding and no
+/// perturbation of what the listener hears.
+#[derive(Default)]
+struct SwapProbe {
+    /// The outgoing voice's samples for the current chunk.
+    current: Vec<f32>,
+    /// How many of those the incoming voice's chunk also covers.
+    len: usize,
+    sum_aa: f64,
+    sum_ab: f64,
+    sum_bb: f64,
+}
+
+impl SwapProbe {
+    fn reset(&mut self) {
+        self.len = 0;
+        self.sum_aa = 0.0;
+        self.sum_ab = 0.0;
+        self.sum_bb = 0.0;
+    }
+
+    /// Records the outgoing side of a chunk.
+    fn observe_current(&mut self, frames: &[f32]) {
+        if self.current.len() < frames.len() {
+            self.current.resize(frames.len(), 0.0);
+        }
+        self.len = frames.len();
+        self.current[..self.len].copy_from_slice(frames);
+        for sample in &self.current[..self.len] {
+            self.sum_aa += (*sample as f64) * (*sample as f64);
+        }
+    }
+
+    /// Records the incoming side and the cross term. The fade gains are
+    /// positive scalars, so they cancel out of a normalised correlation and
+    /// the raw samples can be used on both sides.
+    fn observe_incoming(&mut self, frames: &[f32]) {
+        let n = frames.len().min(self.len);
+        for index in 0..n {
+            let outgoing = self.current[index] as f64;
+            let incoming = frames[index] as f64;
+            self.sum_ab += outgoing * incoming;
+            self.sum_bb += incoming * incoming;
+        }
+    }
+
+    /// Pearson correlation at zero lag, or `None` until both sides have been
+    /// seen and both carry signal.
+    fn correlation(&self) -> Option<f64> {
+        if self.sum_aa <= 0.0 || self.sum_bb <= 0.0 {
+            return None;
+        }
+        Some(self.sum_ab / (self.sum_aa.sqrt() * self.sum_bb.sqrt()))
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -768,6 +891,12 @@ pub struct NerdSnapshot {
     /// or no figure). The pipeline panel reads this, not the switch — the
     /// switch is the request, this is the answer.
     pub loudness_gain_db: Option<f32>,
+    /// Pearson correlation between the two encodings of the last source swap,
+    /// measured on the samples that were actually blended. `None` until a swap
+    /// has run. This is data about the catalogue — how alike two encoders of one
+    /// master are — and it is the only number that says whether the swap's
+    /// linear fade is the flat one.
+    pub swap_correlation: Option<f64>,
 }
 
 impl MixerState {
@@ -781,6 +910,8 @@ impl MixerState {
     fn publish_nerd(&self, info: &TrackInfo, loudness_db: Option<f64>) {
         let (_, gain_db) = loudness_gain(loudness_db, self.loudness_enabled);
         if let Ok(mut nerd) = self.nerd.lock() {
+            // Preserved: it describes the last swap, not this track.
+            let correlation = nerd.swap_correlation;
             *nerd = NerdSnapshot {
                 codec: info.codec.clone(),
                 sample_rate: info.sample_rate,
@@ -788,19 +919,25 @@ impl MixerState {
                 channels: info.channels,
                 kbps: info.kbps,
                 loudness_gain_db: gain_db,
+                swap_correlation: correlation,
             };
         }
     }
 
     /// Upstream `retire` + skip: drop every voice and the pending next so a
     /// user-chosen track cannot mix with the one it replaced.
+    ///
+    /// Rather than hard-clearing the output ring on a sample boundary (which
+    /// produces an audible click), triggers `bail_flush`: the output callback
+    /// smoothly ramps out the next 120 ms of buffered audio and discards the
+    /// remaining backlog before the new track starts.
     fn hard_cut(&mut self) {
         self.transition = None;
         self.incoming = None;
         self.pending_next = None;
         self.retiring.clear();
         self.current = None;
-        self.flush_ring.store(true, Ordering::Release);
+        self.bail_flush.store(true, Ordering::Release);
     }
 
     /// Gapless: the current track ended and the next file is already queued.
@@ -819,10 +956,12 @@ impl MixerState {
         ) {
             Ok(mut voice) => {
                 voice.gain = 1.0;
+                voice.release_plan_stretch(self.playback_speed, self.device_rate);
                 let info = voice.info.clone();
                 let duration = info.duration_seconds;
                 let (_, gain_db) = loudness_gain(voice.loudness_db, self.loudness_enabled);
                 if let Ok(mut nerd) = self.nerd.lock() {
+                    let correlation = nerd.swap_correlation;
                     *nerd = NerdSnapshot {
                         codec: info.codec.clone(),
                         sample_rate: info.sample_rate,
@@ -830,6 +969,7 @@ impl MixerState {
                         channels: info.channels,
                         kbps: info.kbps,
                         loudness_gain_db: gain_db,
+                        swap_correlation: correlation,
                     };
                 }
                 log::info!("promoted pending next: {}", info.title);
@@ -853,6 +993,9 @@ impl MixerState {
         if let Some(mut incoming) = self.incoming.take() {
             incoming.gain = 1.0;
             incoming.filter.open();
+            // It is the session voice now; a beatmatched handoff's stretch does
+            // not outlive the blend it was for.
+            incoming.release_plan_stretch(self.playback_speed, self.device_rate);
             let info = incoming.info.clone();
             let duration = info.duration_seconds;
             self.current = Some(incoming);
@@ -921,6 +1064,7 @@ impl MixerState {
             anchor,
             seconds * 1000.0
         );
+        self.swap_probe.reset();
         self.incoming = Some(voice);
         self.transition = Some(TransitionState {
             phase: Phase::Fading,
@@ -956,21 +1100,37 @@ impl MixerState {
         {
             return;
         }
-        let fade_s = self.effective_fade_seconds();
-        let remaining_s = current.remaining_seconds().unwrap_or(f64::INFINITY);
-        let buffered_s = self.buffered_frames.load(Ordering::Relaxed) as f64
-            / self.device_rate as f64;
-        let audible_tail_s = remaining_s + buffered_s;
+        // The plan decides both where the blend ends and how long it runs —
+        // upstream arms from `plan.transitionStart` (CrossfadeController.kt:713)
+        // and starts the fade from the same window (`:731` → `:967`). Arming
+        // from the file end instead prepared the incoming only after the moment
+        // the fade was already due, which pushed the whole blend late.
+        let plan = self
+            .pending_next
+            .as_ref()
+            .map(|request| request.plan.clone())
+            .unwrap_or_default();
+        let window_s = self.effective_fade_seconds();
+        let fade_s = if plan.fade_seconds > 0.0 {
+            plan.fade_seconds
+        } else {
+            window_s
+        };
+        let buffered_s =
+            self.buffered_frames.load(Ordering::Relaxed) as f64 / self.device_rate as f64;
+        let end_s = if plan.transition_end_seconds > 0.0 {
+            plan.transition_end_seconds
+        } else {
+            current.position_seconds() + current.remaining_seconds().unwrap_or(f64::INFINITY)
+        };
+        let audible_tail_s = (end_s - current.position_seconds()) + buffered_s;
         let need_s = fade_s + ARM_LEAD_MS as f64 / 1000.0;
         if audible_tail_s > need_s {
             return;
         }
 
         let request = self.pending_next.take().unwrap();
-        let plan = request.plan.clone();
-        let fade_frames =
-            ((if plan.fade_seconds > 0.0 { plan.fade_seconds } else { fade_s })
-                * self.device_rate as f64) as u64;
+        let fade_frames = (fade_s * self.device_rate as f64) as u64;
         match Voice::open(
             &request,
             self.spatial_enabled,
@@ -1040,10 +1200,22 @@ impl MixerState {
             return;
         }
         let fade_s = t.fade_frames as f64 / self.device_rate as f64;
-        let remaining_s = current.remaining_seconds().unwrap_or(f64::INFINITY);
         let buffered_s =
             self.buffered_frames.load(Ordering::Relaxed) as f64 / self.device_rate as f64;
-        let audible_tail_s = remaining_s + buffered_s;
+        // The blend ends where the *plan* says, not at the file's last byte. The
+        // planner picks that anchor — up to 12 s inside the track — and derives
+        // `bass_swap_fraction` and `vocal_overlap` from the window it defines,
+        // so arming from the file end moved the gains and both filter rides
+        // together, late, by however much the anchor is early.
+        //
+        // The audible tail is measured from the position the listener hears,
+        // which trails the decoder by the ring.
+        let end_s = if t.plan.transition_end_seconds > 0.0 {
+            t.plan.transition_end_seconds
+        } else {
+            current.position_seconds() + current.remaining_seconds().unwrap_or(f64::INFINITY)
+        };
+        let audible_tail_s = (end_s - current.position_seconds()) + buffered_s;
         if audible_tail_s > fade_s {
             return;
         }
@@ -1106,10 +1278,13 @@ impl MixerState {
         } else {
             (emitted as f64 / span as f64).clamp(0.0, 1.0)
         };
-        let rise = rise_gain(p);
-        let fall = fall_gain(p);
         let plan = self.transition.as_ref().map(|t| (t.plan.clone(), t.swap));
-        if let (Some(current), Some(incoming), Some((plan, swap))) =
+        let swap = plan.as_ref().is_some_and(|(_, swap)| *swap);
+        // See `fade_gains`: a swap needs the linear pair, a queue advance the
+        // equal-power one. Upstream runs equal-power for both, which bumps
+        // wherever its two players happen to be aligned.
+        let (rise, fall) = fade_gains(p, swap);
+        if let (Some(current), Some(incoming), Some((plan, _))) =
             (&mut self.current, &mut self.incoming, plan)
         {
             current.gain = fall;
@@ -1117,7 +1292,6 @@ impl MixerState {
             if swap {
                 // A source swap is the same recording against itself, so any
                 // ride here would be an edit the record never asked for.
-                // Upstream's standby players run this fade unfiltered.
                 current.filter.open();
                 incoming.filter.open();
             } else {
@@ -1131,9 +1305,51 @@ impl MixerState {
         let swap = self.transition.as_ref().is_some_and(|t| t.swap);
         if let Some(t) = &self.transition {
             if t.handed_off {
+                if swap {
+                    // The one measurement that can only come from a device:
+                    // how alike two encodings of one master are. Recorded
+                    // rather than asserted, because it is data about the
+                    // catalogue, not a property of this code.
+                    let correlation = self.swap_probe.correlation();
+                    match correlation {
+                        Some(rho) => log::info!(
+                            "source swap correlation: rho={rho:.4} \
+                             (linear-fade deviation from flat: {:.2} dB)",
+                            10.0 * ((1.0 + rho) / 2.0).log10()
+                        ),
+                        None => log::info!(
+                            "source swap correlation: unmeasurable (no signal overlapped)"
+                        ),
+                    }
+                    if let Ok(mut nerd) = self.nerd.lock() {
+                        nerd.swap_correlation = correlation;
+                    }
+                    // Condition in-place source swap on Pearson correlation rho >= 0.85
+                    // so mismatched recordings/transcodes do not cut over.
+                    if let Some(rho) = correlation {
+                        if rho < 0.85 {
+                            log::warn!(
+                                "source swap rejected: rho={rho:.4} < 0.85 \
+                                 (mismatched recording or transcode)"
+                            );
+                            self.incoming = None;
+                            if let Some(current) = &mut self.current {
+                                current.gain = 1.0;
+                                current.filter.open();
+                            }
+                            self.transition = None;
+                            return;
+                        }
+                    }
+                }
                 if let Some(mut incoming) = self.incoming.take() {
                     incoming.gain = 1.0;
                     incoming.filter.open();
+                    // The blend is over, so the tempo stretch it was holding is
+                    // over too — upstream's `finish()` does exactly this. A swap
+                    // carries no stretch (its plan is the default), so this is a
+                    // no-op there.
+                    incoming.release_plan_stretch(self.playback_speed, self.device_rate);
                     let info = incoming.info.clone();
                     self.current = Some(incoming);
                     if swap {
@@ -1241,6 +1457,7 @@ pub fn run_mixer(
     events: Arc<dyn EngineEvents>,
     shutdown: Arc<AtomicBool>,
     flush_ring: Arc<AtomicBool>,
+    bail_flush: Arc<AtomicBool>,
     nerd: Arc<Mutex<NerdSnapshot>>,
 ) {
     let mut state = MixerState {
@@ -1261,6 +1478,7 @@ pub fn run_mixer(
         events,
         state: crate::PlaybackState::Stopped,
         flush_ring,
+        bail_flush,
         playback_speed: 1.0,
         skip_silence: false,
         // The mixer blends to interleaved stereo, so the equaliser is a single
@@ -1271,6 +1489,7 @@ pub fn run_mixer(
         // The engine owner's first `set_loudness_enabled` reconciles this with
         // the stored setting either way.
         loudness_enabled: true,
+        swap_probe: SwapProbe::default(),
     };
 
     loop {
@@ -1322,6 +1541,8 @@ fn handle_command(state: &mut MixerState, cmd: Command, ring: &mut Producer<f32>
                             channels: info.channels,
                             kbps: info.kbps,
                             loudness_gain_db: gain_db,
+                            // A new track clears the previous swap's figure.
+                            swap_correlation: None,
                         };
                     }
                     state.current = Some(voice);
@@ -1504,6 +1725,30 @@ fn handle_command(state: &mut MixerState, cmd: Command, ring: &mut Producer<f32>
                     ret.voice.retarget_device(rate, spatial, yaw);
                 }
             }
+            // The ring we just abandoned held everything between the playhead
+            // and the decoder's read head, and it is gone — nothing drained it,
+            // because the unit it fed is the one being replaced. Re-point the
+            // voice at the playhead so the song continues where the listener
+            // was, instead of silently skipping the whole ring depth, which is
+            // seconds of music, the moment the output route changes.
+            let resume_s = state.position_ms.load(Ordering::Relaxed) as f64 / 1000.0;
+            if resume_s > 0.0 {
+                if let Some(voice) = &mut state.current {
+                    match voice.decoder.seek_seconds(resume_s) {
+                        Ok(()) => {
+                            voice.base_position = 0.0;
+                            voice.spatial.flush();
+                            voice.filter.flush();
+                            voice.pending_dev.clear();
+                            voice.pending_dev_cursor = 0;
+                            voice.silent_dev_frames = 0;
+                            voice.finished = false;
+                            log::info!("output changed; resuming at {resume_s:.3}s");
+                        }
+                        Err(e) => log::warn!("re-seek after output change failed: {e}"),
+                    }
+                }
+            }
             state.flush_ring.store(true, Ordering::Release);
             state.buffered_frames.store(0, Ordering::Relaxed);
         }
@@ -1515,11 +1760,25 @@ fn handle_command(state: &mut MixerState, cmd: Command, ring: &mut Producer<f32>
 
 /// Renders while the ring has room for a chunk.
 fn render_available(state: &mut MixerState, ring: &mut Producer<f32>) {
-    // Maintenance: arm + start fade checks before rendering.
-    state.consider_arm();
-    state.consider_start_fade();
-        let chunk_samples = CHUNK_FRAMES * 2;
+    let chunk_samples = CHUNK_FRAMES * 2;
     loop {
+        // Maintenance, evaluated per chunk rather than once per top-up.
+        //
+        // These decisions are about where the *audible* playhead is — arm the
+        // incoming, start the fade — and this loop renders until the ring is
+        // full, which is however much the device callback has drained since the
+        // previous pass. While the callback keeps up, that is a handful of
+        // chunks and checking once was equivalent. When it does not — a cold
+        // ring, a slow decoder, a harness draining as fast as it can — a single
+        // pass can render the whole fade window, or the whole track, before the
+        // check runs again, and the blend lands wherever the ring ran out
+        // instead of where the plan said.
+        //
+        // Upstream evaluates this on a 30 ms timer (`CrossfadeController.tick`),
+        // which is the shape matched here: a cadence tied to the playhead, not
+        // to buffer occupancy.
+        state.consider_arm();
+        state.consider_start_fade();
         let free = ring.slots();
         if free < chunk_samples {
             break;
@@ -1571,12 +1830,20 @@ fn render_available(state: &mut MixerState, ring: &mut Producer<f32>) {
         }
         state.retiring = keep_retiring;
 
+        // A swap fades a recording into another copy of itself, so the one
+        // number that decides whether the curve is right is how correlated the
+        // two copies are, and only a real upgrade can supply it. The samples
+        // are already decoded and aligned here, so the probe is nearly free.
+        let swap_fade = state.transition.as_ref().is_some_and(|t| t.swap);
         if let Some(voice) = &mut state.current {
             if state.playing {
                 let frames = voice.pull(CHUNK_FRAMES, state.device_rate);
                 if !frames.is_empty() {
                     audible = true;
                     produced = produced.max(frames.len());
+                    if swap_fade {
+                        state.swap_probe.observe_current(&frames);
+                    }
                     let gain = applied_gain(voice, state.loudness_enabled);
                     for (i, s) in frames.iter().enumerate() {
                         if i < scratch.len() {
@@ -1600,6 +1867,9 @@ fn render_available(state: &mut MixerState, ring: &mut Producer<f32>) {
                 if !frames.is_empty() {
                     audible = true;
                     produced = produced.max(frames.len());
+                    if swap_fade {
+                        state.swap_probe.observe_incoming(&frames);
+                    }
                     let gain = applied_gain(voice, state.loudness_enabled);
                     for (i, s) in frames.iter().enumerate() {
                         if i < scratch.len() {
@@ -1751,7 +2021,7 @@ mod tests {
             let duration = duration.clone();
             let shutdown = shutdown.clone();
             move || {
-                run_mixer(rx, consumer_side, buffered, position, duration, 44_100, events, shutdown, std::sync::Arc::new(AtomicBool::new(false)), std::sync::Arc::new(Mutex::new(NerdSnapshot::default())))
+                run_mixer(rx, consumer_side, buffered, position, duration, 44_100, events, shutdown, std::sync::Arc::new(AtomicBool::new(false)), std::sync::Arc::new(AtomicBool::new(false)), std::sync::Arc::new(Mutex::new(NerdSnapshot::default())))
             }
         });
 
@@ -1849,6 +2119,7 @@ mod tests {
                     events,
                     shutdown,
                     std::sync::Arc::new(AtomicBool::new(false)),
+                    std::sync::Arc::new(AtomicBool::new(false)),
                     std::sync::Arc::new(Mutex::new(NerdSnapshot::default())),
                 )
             }
@@ -1919,6 +2190,7 @@ mod tests {
                     44_100,
                     events,
                     shutdown,
+                    Arc::new(AtomicBool::new(false)),
                     Arc::new(AtomicBool::new(false)),
                     Arc::new(Mutex::new(NerdSnapshot::default())),
                 )
@@ -2103,6 +2375,7 @@ mod tests {
                     events,
                     shutdown,
                     std::sync::Arc::new(AtomicBool::new(false)),
+                    std::sync::Arc::new(AtomicBool::new(false)),
                     std::sync::Arc::new(Mutex::new(NerdSnapshot::default())),
                 )
             }
@@ -2155,6 +2428,333 @@ mod tests {
         let _ = handle.join();
     }
 
+    /// The blend has to end where the *plan* says, not at the file's last byte.
+    ///
+    /// Regression: the mixer armed the fade from `duration`, so a plan whose
+    /// anchor sits inside the track — which is the whole point of the ranked
+    /// mix-out anchor, and is allowed to be 12 s early — had its entire blend
+    /// pushed to the end, taking the bass swap and both filter rides with it.
+    ///
+    /// The ring is deliberately small here so the decoder cannot run far ahead
+    /// of what has been drained, which is what makes the count below a direct
+    /// reading of "how far into the outgoing track the blend started".
+    #[test]
+    fn the_blend_ends_at_the_plans_anchor_not_the_file_end() {
+        let dir = std::env::temp_dir().join("bitchord-mixer-anchor");
+        std::fs::create_dir_all(&dir).unwrap();
+        let a = dir.join("out.wav");
+        let b = dir.join("in.wav");
+        test_wav(&a, 10.0, 440.0);
+        test_wav(&b, 10.0, 660.0);
+
+        let events = std::sync::Arc::new(RecordedEvents::default());
+        let (tx, rx) = crossbeam_channel::unbounded::<Command>();
+        // ~250 ms: small enough that pre-buffering cannot mask the anchor.
+        let (consumer_side, mut consumer) = rtrb::RingBuffer::<f32>::new(44_100 / 4 * 2);
+        let buffered = std::sync::Arc::new(AtomicU64::new(0));
+        let position = std::sync::Arc::new(AtomicU64::new(0));
+        let duration = std::sync::Arc::new(AtomicU64::new(0));
+        let shutdown = std::sync::Arc::new(AtomicBool::new(false));
+        let handle = std::thread::spawn({
+            let events = events.clone();
+            let buffered = buffered.clone();
+            let position = position.clone();
+            let duration = duration.clone();
+            let shutdown = shutdown.clone();
+            move || {
+                run_mixer(
+                    rx,
+                    consumer_side,
+                    buffered,
+                    position,
+                    duration,
+                    44_100,
+                    events,
+                    shutdown,
+                    std::sync::Arc::new(AtomicBool::new(false)),
+                    std::sync::Arc::new(AtomicBool::new(false)),
+                    std::sync::Arc::new(Mutex::new(NerdSnapshot::default())),
+                )
+            }
+        });
+
+        let source = |path: &std::path::Path, title: &str, plan: TransitionPlan| TrackSource {
+            source: path.display().to_string(),
+            title: title.into(),
+            artist: String::new(),
+            start_seconds: 0.0,
+            plan,
+            headers: std::collections::HashMap::new(),
+            claimed_kbps: 0,
+            loudness_db: None,
+        };
+
+        tx.send(Command::SetCrossfadeWindow(1.0)).unwrap();
+        tx.send(Command::Load {
+            request: source(&a, "A", TransitionPlan::default()),
+            reply: crossbeam_channel::bounded(1).0,
+        })
+        .unwrap();
+        // A 10 s outgoing track, but the blend is wanted 3 s in with a 1 s fade,
+        // so it must start at roughly 2 s of outgoing audio — not at 9 s.
+        tx.send(Command::QueueNext {
+            request: source(
+                &b,
+                "B",
+                TransitionPlan {
+                    fade_seconds: 1.0,
+                    transition_end_seconds: 3.0,
+                    ..TransitionPlan::default()
+                },
+            ),
+        })
+        .unwrap();
+
+        let mut drained = 0usize;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while std::time::Instant::now() < deadline {
+            while consumer.pop().is_ok() {
+                drained += 1;
+                let mut current = buffered.load(Ordering::Relaxed);
+                while current > 0 {
+                    match buffered.compare_exchange_weak(
+                        current,
+                        current - 1,
+                        Ordering::Relaxed,
+                        Ordering::Relaxed,
+                    ) {
+                        Ok(_) => break,
+                        Err(v) => current = v,
+                    }
+                }
+            }
+            if !events.handoffs.lock().unwrap().is_empty() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+
+        assert!(
+            !events.handoffs.lock().unwrap().is_empty(),
+            "the blend must happen at all"
+        );
+        let started_at = drained as f64 / 2.0 / 44_100.0;
+        assert!(
+            started_at < 5.0,
+            "the blend started {started_at:.2}s in, which is the file end — the plan's anchor was ignored"
+        );
+        assert!(
+            started_at > 0.5,
+            "the blend started {started_at:.2}s in, implausibly early"
+        );
+
+        shutdown.store(true, Ordering::Relaxed);
+        let _ = handle.join();
+    }
+
+    /// The two crossfade curves, and why they have to differ.
+    ///
+    /// Regression: a source swap used the equal-power pair, so the same
+    /// recording on both sides — correlated, and aligned by construction —
+    /// summed to √2 through the middle of the fade, and every quality upgrade
+    /// was heard as the volume lifting and settling back.
+    #[test]
+    fn swap_fade_is_level_flat_while_a_track_fade_is_power_flat() {
+        let mut worst_swap_db = 0.0f64;
+        let mut worst_track_db = 0.0f64;
+        for step in 0..=1000 {
+            let p = step as f64 / 1000.0;
+
+            // Correlated sides: amplitudes add, so the sum must stay at 1.
+            let (rise, fall) = fade_gains(p, true);
+            let sum = rise as f64 + fall as f64;
+            worst_swap_db = worst_swap_db.max(20.0 * sum.log10().abs());
+
+            // Uncorrelated sides: powers add, so the power sum must stay at 1.
+            let (rise, fall) = fade_gains(p, false);
+            let power = (rise as f64).powi(2) + (fall as f64).powi(2);
+            worst_track_db = worst_track_db.max(10.0 * power.log10().abs());
+        }
+        assert!(worst_swap_db < 1e-4, "swap fade swells by {worst_swap_db} dB");
+        assert!(worst_track_db < 1e-4, "track fade dips by {worst_track_db} dB");
+
+        // What the equal-power pair costs when both sides are the same signal —
+        // recorded so the branch above cannot quietly be undone.
+        let midpoint = (rise_gain(0.5) + fall_gain(0.5)) as f64;
+        let bump_db = 20.0 * midpoint.log10();
+        assert!(
+            (bump_db - 3.01).abs() < 0.02,
+            "expected the √2 bump at the midpoint, got {bump_db} dB"
+        );
+    }
+
+    /// A beatmatched handoff stretches the incoming track so the two share a
+    /// grid for the blend. That stretch must not survive the blend.
+    ///
+    /// Regression: the port baked `plan_rate` in at `Voice::open` and nothing
+    /// ever cleared it, so every track that arrived through a beatmatched or
+    /// phrase-switch blend played ~3 % fast for its entire length — +51 cents,
+    /// with the published position running at the stretched rate too. Upstream
+    /// resets the player's speed in both `finish()` and `retire()`.
+    #[test]
+    fn a_promoted_voice_drops_the_handoff_tempo_stretch() {
+        let dir = std::env::temp_dir().join("bitchord-mixer-stretch");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("a.wav");
+        test_wav(&path, 4.0, 440.0);
+
+        let request = TrackSource {
+            source: path.display().to_string(),
+            title: "A".into(),
+            artist: String::new(),
+            start_seconds: 0.0,
+            // What the planner hands a beatmatched handoff.
+            plan: TransitionPlan {
+                playback_rate: 1.03,
+                ..TransitionPlan::default()
+            },
+            headers: std::collections::HashMap::new(),
+            claimed_kbps: 0,
+            loudness_db: None,
+        };
+        let mut voice = Voice::open(&request, false, 0.0, 44_100, 1.0, false, false).unwrap();
+        assert!(
+            (voice.effective_speed - 1.03).abs() < 1e-6,
+            "the stretch must be applied while the blend runs, got {}",
+            voice.effective_speed
+        );
+
+        // Promotion is the end of the blend, and of the stretch.
+        voice.release_plan_stretch(1.0, 44_100);
+        assert!(
+            (voice.effective_speed - 1.0).abs() < 1e-6,
+            "the stretch outlived the blend: {}",
+            voice.effective_speed
+        );
+        assert!((voice.plan_rate - 1.0).abs() < 1e-9);
+
+        // A later user speed change must not resurrect it.
+        voice.set_playback_speed(1.25, 44_100);
+        assert!(
+            (voice.effective_speed - 1.25).abs() < 1e-6,
+            "a speed change re-stacked the stretch: {}",
+            voice.effective_speed
+        );
+    }
+
+    /// Drain `frames` and return the RMS of what came out.
+    fn rms_frames(consumer: &mut rtrb::Consumer<f32>, buffered: &AtomicU64, frames: usize) -> f64 {
+        let mut sum = 0.0f64;
+        let mut count = 0usize;
+        let target = frames * 2;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while count < target && std::time::Instant::now() < deadline {
+            match consumer.pop() {
+                Ok(sample) => {
+                    sum += (sample as f64) * (sample as f64);
+                    count += 1;
+                    if count % 2 == 0 {
+                        let mut current = buffered.load(Ordering::Relaxed);
+                        while current > 0 {
+                            match buffered.compare_exchange_weak(
+                                current,
+                                current - 1,
+                                Ordering::Relaxed,
+                                Ordering::Relaxed,
+                            ) {
+                                Ok(_) => break,
+                                Err(v) => current = v,
+                            }
+                        }
+                    }
+                }
+                Err(_) => std::thread::sleep(std::time::Duration::from_millis(1)),
+            }
+        }
+        if count == 0 {
+            return 0.0;
+        }
+        (sum / count as f64).sqrt()
+    }
+
+    /// How well a swap actually lines up.
+    ///
+    /// Swapping to a byte-identical copy makes alignment directly measurable:
+    /// if the two sides are sample-aligned and the fade is linear, the blend
+    /// *is* the original signal at unity and the level cannot move. Whatever
+    /// deviation shows up here is comb cancellation — what a listener hears as
+    /// a hollow, phasey moment instead of a quality change.
+    #[test]
+    fn swap_to_an_identical_copy_reports_its_alignment() {
+        let (mut harness, low, _) = SwapHarness::new("swap-level");
+        let copy = low.with_file_name("low-copy.wav");
+        std::fs::copy(&low, &copy).unwrap();
+
+        harness
+            .tx
+            .send(Command::Load {
+                request: SwapHarness::source(&low, "Low", 96),
+                reply: crossbeam_channel::bounded(1).0,
+            })
+            .unwrap();
+        drain_frames(&mut harness.consumer, &harness.buffered, 44_100);
+        let before = rms_frames(&mut harness.consumer, &harness.buffered, 44_100 / 4);
+        assert!(before > 0.0, "the track must be producing audio");
+
+        let (reply_tx, reply_rx) = crossbeam_channel::bounded(1);
+        harness
+            .tx
+            .send(Command::SwapSource {
+                request: SwapHarness::source(&copy, "Copy", 320),
+                crossfade_seconds: SWAP_CROSSFADE_MS / 1000.0,
+                reply: reply_tx,
+            })
+            .unwrap();
+        reply_rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("the mixer must answer a swap")
+            .expect("the swap must be accepted");
+
+        // Short windows, so a 550 ms fade cannot be averaged away by the
+        // single-voice audio either side of it. Drain until the probe reports,
+        // which is the moment the fade completed.
+        let mut worst_db = 0.0f64;
+        let mut correlation: Option<f64> = None;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        while std::time::Instant::now() < deadline {
+            let window = rms_frames(&mut harness.consumer, &harness.buffered, 44_100 / 20);
+            if window > 0.0 {
+                let db = 20.0 * (window / before).log10();
+                if db.abs() > worst_db.abs() {
+                    worst_db = db;
+                }
+            }
+            correlation = harness.nerd.lock().unwrap().swap_correlation;
+            if correlation.is_some() {
+                break;
+            }
+        }
+        eprintln!(
+            "[swap-alignment] worst level deviation through the fade: {worst_db:.2} dB, rho={correlation:?}"
+        );
+        // Measured at 0.00 dB: the two sides are sample-aligned and the linear
+        // fade makes the blend the original signal. 2 dB leaves room for a
+        // future rate change between the two sources while still catching a
+        // genuine misalignment, which reads as a deep comb notch.
+        assert!(
+            worst_db.abs() < 2.0,
+            "the swap is misaligned by {worst_db} dB of comb"
+        );
+        // The probe has to be able to say "these are the same signal" — that is
+        // the measurement everything else here rests on.
+        let rho = correlation.expect("a completed swap must report a correlation");
+        assert!(
+            rho > 0.99,
+            "two byte-identical copies must correlate at 1.0, got {rho}"
+        );
+        harness.finish();
+    }
+
     struct SwapHarness {
         tx: crossbeam_channel::Sender<Command>,
         consumer: rtrb::Consumer<f32>,
@@ -2163,6 +2763,8 @@ mod tests {
         events: std::sync::Arc<RecordedEvents>,
         nerd: std::sync::Arc<std::sync::Mutex<NerdSnapshot>>,
         shutdown: std::sync::Arc<AtomicBool>,
+        flush_ring: std::sync::Arc<AtomicBool>,
+        bail_flush: std::sync::Arc<AtomicBool>,
         handle: Option<std::thread::JoinHandle<()>>,
     }
 
@@ -2173,7 +2775,7 @@ mod tests {
             let low = dir.join("low.wav");
             let high = dir.join("high.wav");
             test_wav(&low, 8.0, 440.0);
-            test_wav(&high, 8.0, 660.0);
+            test_wav(&high, 8.0, 440.0);
 
             let events = std::sync::Arc::new(RecordedEvents::default());
             let (tx, rx) = crossbeam_channel::unbounded::<Command>();
@@ -2182,6 +2784,8 @@ mod tests {
             let position = std::sync::Arc::new(AtomicU64::new(0));
             let duration = std::sync::Arc::new(AtomicU64::new(0));
             let shutdown = std::sync::Arc::new(AtomicBool::new(false));
+            let flush_ring = std::sync::Arc::new(AtomicBool::new(false));
+            let bail_flush = std::sync::Arc::new(AtomicBool::new(false));
             let nerd = std::sync::Arc::new(std::sync::Mutex::new(NerdSnapshot::default()));
             let handle = std::thread::spawn({
                 let events = events.clone();
@@ -2189,6 +2793,8 @@ mod tests {
                 let position = position.clone();
                 let duration = duration.clone();
                 let shutdown = shutdown.clone();
+                let flush_ring = flush_ring.clone();
+                let bail_flush = bail_flush.clone();
                 let nerd = nerd.clone();
                 move || {
                     run_mixer(
@@ -2200,7 +2806,8 @@ mod tests {
                         44_100,
                         events,
                         shutdown,
-                        std::sync::Arc::new(AtomicBool::new(false)),
+                        flush_ring,
+                        bail_flush,
                         nerd,
                     )
                 }
@@ -2214,6 +2821,8 @@ mod tests {
                     events,
                     nerd,
                     shutdown,
+                    flush_ring,
+                    bail_flush,
                     handle: Some(handle),
                 },
                 low,
@@ -2244,7 +2853,7 @@ mod tests {
 
     #[test]
     fn source_swap_without_a_current_track_is_refused() {
-        let (mut harness, low, _) = SwapHarness::new("swap-refuse");
+        let (harness, low, _) = SwapHarness::new("swap-refuse");
         let (reply_tx, reply_rx) = crossbeam_channel::bounded(1);
         harness
             .tx
@@ -2267,7 +2876,9 @@ mod tests {
     /// never be reported as the queue moving on.
     #[test]
     fn source_swap_promotes_the_replacement_without_a_handoff() {
-        let (mut harness, low, high) = SwapHarness::new("swap-crossfade");
+        let (mut harness, low, _) = SwapHarness::new("swap-crossfade");
+        let high = low.with_file_name("high.wav");
+        std::fs::copy(&low, &high).unwrap();
         harness
             .tx
             .send(Command::Load {
@@ -2276,9 +2887,8 @@ mod tests {
             })
             .unwrap();
 
-        // Get well into the track, so the voice has served audio and holds a
-        // partially drained decode batch (the state the old code mis-seeked).
-        drain_frames(&mut harness.consumer, &harness.buffered, 44_100 * 2);
+        drain_frames(&mut harness.consumer, &harness.buffered, 44_100);
+        let _ = rms_frames(&mut harness.consumer, &harness.buffered, 44_100 / 4);
         let before = harness.position.load(Ordering::Relaxed);
         assert!(before > 0, "the track must be advancing before the swap");
 
@@ -2296,17 +2906,17 @@ mod tests {
             .expect("the mixer must answer a swap");
         assert!(reply.is_ok(), "swap must be accepted, got {reply:?}");
 
-        // Long enough for the crossfade to run out of the replacement's own
-        // output, plus the ring that was already full of the old source.
-        for _ in 0..40 {
-            drain_frames(&mut harness.consumer, &harness.buffered, 44_100 / 4);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        while std::time::Instant::now() < deadline {
+            let _ = rms_frames(&mut harness.consumer, &harness.buffered, 44_100 / 20);
             if harness.nerd.lock().unwrap().kbps == 320 {
                 break;
             }
         }
 
+        let kbps = harness.nerd.lock().unwrap().kbps;
         assert_eq!(
-            harness.nerd.lock().unwrap().kbps,
+            kbps,
             320,
             "the promoted source must be the one the readout names"
         );
@@ -2319,6 +2929,159 @@ mod tests {
             after >= before,
             "the playhead moved backwards across a swap: {before} ms -> {after} ms"
         );
+        harness.finish();
+    }
+
+    /// When a candidate replacement is a mismatched recording or corrupt transcode
+    /// (Pearson correlation rho < 0.85), the source swap must be rejected:
+    /// the replacement voice is dropped, the original track remains playing at unity gain,
+    /// and the nerd readout does not promote to the new source.
+    #[test]
+    fn source_swap_with_mismatched_recording_is_rejected() {
+        let (mut harness, low, _) = SwapHarness::new("swap-rejected");
+        let dir = low.parent().unwrap();
+        let mismatched = dir.join("mismatched.wav");
+        test_wav(&mismatched, 8.0, 660.0); // 660 Hz vs 440 Hz -> rho near 0
+
+        harness
+            .tx
+            .send(Command::Load {
+                request: SwapHarness::source(&low, "Low", 96),
+                reply: crossbeam_channel::bounded(1).0,
+            })
+            .unwrap();
+
+        drain_frames(&mut harness.consumer, &harness.buffered, 44_100 * 2);
+
+        let (reply_tx, reply_rx) = crossbeam_channel::bounded(1);
+        harness
+            .tx
+            .send(Command::SwapSource {
+                request: SwapHarness::source(&mismatched, "Mismatched", 320),
+                crossfade_seconds: SWAP_CROSSFADE_MS / 1000.0,
+                reply: reply_tx,
+            })
+            .unwrap();
+        let reply = reply_rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("the mixer must answer a swap");
+        assert!(reply.is_ok(), "swap initiation should succeed");
+
+        // Drain enough frames for the 550ms crossfade to run and finish_transition to trigger
+        for _ in 0..40 {
+            drain_frames(&mut harness.consumer, &harness.buffered, 44_100 / 4);
+            if harness.nerd.lock().unwrap().swap_correlation.is_some() {
+                break;
+            }
+        }
+
+        let (rho, kbps) = {
+            let nerd = harness.nerd.lock().unwrap();
+            (nerd.swap_correlation.expect("swap correlation must be measured"), nerd.kbps)
+        };
+        assert!(
+            rho < 0.85,
+            "mismatched 440Hz vs 660Hz must yield rho < 0.85, got {rho}"
+        );
+        assert_eq!(
+            kbps, 96,
+            "kbps must NOT be promoted to 320 when swap is rejected"
+        );
+        harness.finish();
+    }
+
+    /// A route change replaces the ring. Everything between the playhead and
+    /// the decoder's read head is in the abandoned ring and nothing has played
+    /// it, so the voice has to be re-pointed at the playhead — otherwise the
+    /// listener loses the whole ring depth, seconds of music, the moment their
+    /// headphones disconnect.
+    #[test]
+    fn output_format_change_resumes_at_the_playhead() {
+        let (mut harness, low, _) = SwapHarness::new("route-change");
+        harness
+            .tx
+            .send(Command::Load {
+                request: SwapHarness::source(&low, "Low", 96),
+                reply: crossbeam_channel::bounded(1).0,
+            })
+            .unwrap();
+
+        // Long enough that the playhead is well inside the track and the ring
+        // is deep enough for a skip to be unmistakable.
+        drain_frames(&mut harness.consumer, &harness.buffered, 44_100 * 2);
+        let before = harness.position.load(Ordering::Relaxed);
+        assert!(before > 0, "the track must be advancing");
+
+        // Replace the output exactly as a route-change rebuild does.
+        let (producer, mut consumer) = rtrb::RingBuffer::<f32>::new(48_000 * 2 * 2);
+        harness
+            .tx
+            .send(Command::SetOutputFormat {
+                rate: 48_000,
+                producer,
+            })
+            .unwrap();
+
+        // The old consumer is dead now; drain the replacement.
+        drain_frames(&mut consumer, &harness.buffered, 48_000 / 2);
+        let after = harness.position.load(Ordering::Relaxed);
+
+        assert!(
+            after + 500 >= before,
+            "the playhead restarted instead of continuing: {before} ms -> {after} ms"
+        );
+        assert!(
+            after < before + 1_500,
+            "the playhead skipped the abandoned ring: {before} ms -> {after} ms"
+        );
+        harness.finish();
+    }
+
+    /// Skipping a track (Command::Load) must trigger a deferred bail flush
+    /// rather than an immediate hard cut of the ring, so the audio ramps out
+    /// over 120 ms without a click.
+    #[test]
+    fn skip_load_triggers_bail_flush_not_instant_flush() {
+        let (mut harness, low, high) = SwapHarness::new("skip-bail");
+        harness
+            .tx
+            .send(Command::Load {
+                request: SwapHarness::source(&low, "Low", 96),
+                reply: crossbeam_channel::bounded(1).0,
+            })
+            .unwrap();
+
+        // Drain some frames so playback is active.
+        drain_frames(&mut harness.consumer, &harness.buffered, 44_100);
+
+        // Reset the bail_flush and flush_ring flags in harness
+        harness.bail_flush.store(false, Ordering::Relaxed);
+        harness.flush_ring.store(false, Ordering::Relaxed);
+
+        // Issue a skip by loading a new track.
+        harness
+            .tx
+            .send(Command::Load {
+                request: SwapHarness::source(&high, "High", 320),
+                reply: crossbeam_channel::bounded(1).0,
+            })
+            .unwrap();
+
+        // Wait for mixer to process Command::Load.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !harness.bail_flush.load(Ordering::Acquire) && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+
+        assert!(
+            harness.bail_flush.load(Ordering::Acquire),
+            "Command::Load must set bail_flush for the 120 ms ramp"
+        );
+        assert!(
+            !harness.flush_ring.load(Ordering::Acquire),
+            "Command::Load must not perform an immediate hard flush_ring"
+        );
+
         harness.finish();
     }
 }

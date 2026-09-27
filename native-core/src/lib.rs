@@ -28,6 +28,14 @@ pub mod mixer;
 /// class still decides how it competes with everything else in the app for the
 /// CPU. A render thread that gets scheduled late misses a real-time deadline,
 /// the ring drains, and the dropout is audible as a stutter.
+///
+/// This used to be built only for macOS, on the reading that the class was a
+/// desktop concern. iOS has the same API and the same problem, and the cost of
+/// the omission was worse there: a Darwin thread inherits its creator's class,
+/// and the mixer is spawned from the engine-startup task, which is `.utility` —
+/// so the decoder ran in the same band as the artwork fetches and the automix
+/// analysis it is supposed to outrank, and every page the listener opened took
+/// the CPU it needed. That is the "navigation makes the music stutter" report.
 mod qos {
     /// Puts the calling thread in the user-interactive class.
     ///
@@ -35,7 +43,7 @@ mod qos {
     /// gesture runs at rather than claiming a higher band than the UI, so this
     /// cannot outrank the main thread. It only stops the mixer being starved
     /// by it.
-    #[cfg(target_os = "macos")]
+    #[cfg(target_vendor = "apple")]
     pub fn raise_current_thread() {
         // SAFETY: `pthread_set_qos_class_self_np` reads the calling thread's
         // QoS and stores a class on it. No pointer argument, nothing to get
@@ -47,7 +55,7 @@ mod qos {
 
     /// Nothing to raise: only Apple platforms express a scheduling class here,
     /// and on the others the equivalent is the platform's own audio policy.
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(target_vendor = "apple"))]
     pub fn raise_current_thread() {}
 }
 pub mod metadata;
@@ -101,6 +109,11 @@ pub struct TransitionPlanRec {
     pub vocal_overlap: f64,
     /// Explicit fade length for this pair; 0 = engine's crossfade window.
     pub fade_seconds: f64,
+    /// Where the blend ends, as a position in the outgoing track's timeline;
+    /// 0 = the file end. The planner picks it (the ranked mix-out anchor) and
+    /// derives the bass swap and vocal overlap from the window it defines, so
+    /// the mixer has to arm from it rather than from the file's last byte.
+    pub transition_end_seconds: f64,
     /// Where the incoming track is cued (Automix mix-in point). 0 = top.
     pub cue_seconds: f64,
     /// Tempo stretch — applied by the mixer via `speed_resampler`
@@ -117,6 +130,7 @@ impl From<TransitionPlanRec> for TransitionPlan {
             filter_sweep: rec.filter_sweep,
             vocal_overlap: rec.vocal_overlap,
             fade_seconds: rec.fade_seconds,
+            transition_end_seconds: rec.transition_end_seconds,
             cue_seconds: rec.cue_seconds,
             playback_rate: rec.playback_rate,
         }
@@ -168,6 +182,11 @@ pub struct NerdStatsRec {
     /// Applied loudness correction in dB (`None` = unity: switch off or no
     /// figure). The pipeline panel reads this, not the setting.
     pub loudness_gain_db: Option<f32>,
+    /// Pearson correlation between the two encodings of the last source swap,
+    /// measured on the samples that were blended. `None` until one has run.
+    /// The swap fades a recording into another copy of itself, so this is what
+    /// decides whether its linear fade is the level-flat one.
+    pub swap_correlation: Option<f64>,
 }
 
 #[derive(uniffi::Record, Debug, Clone)]
@@ -295,6 +314,7 @@ pub struct PlayerEngine {
     duration_ms: Arc<AtomicU64>,
     volume_bits: Arc<AtomicU32>,
     flush_ring: Arc<AtomicBool>,
+    bail_flush: Arc<AtomicBool>,
     /// When set, the device callback outputs silence immediately — pause must
     /// not wait for the mixer to drain ~2 s of already-queued samples.
     output_paused: Arc<AtomicBool>,
@@ -448,6 +468,7 @@ impl PlayerEngine {
             duration_ms: Arc::new(AtomicU64::new(0)),
             volume_bits: Arc::new(AtomicU32::new(1.0f32.to_bits())),
             flush_ring: Arc::new(AtomicBool::new(false)),
+            bail_flush: Arc::new(AtomicBool::new(false)),
             output_paused: Arc::new(AtomicBool::new(false)),
             started: AtomicBool::new(false),
             stream: Arc::new(Mutex::new(None)),
@@ -537,6 +558,7 @@ impl PlayerEngine {
         let events = self.events.clone();
         let shutdown = Arc::new(AtomicBool::new(false));
         let mixer_flush = self.flush_ring.clone();
+        let mixer_bail = self.bail_flush.clone();
         let nerd = self.nerd.clone();
 
         std::thread::Builder::new()
@@ -553,6 +575,7 @@ impl PlayerEngine {
                     events,
                     shutdown,
                     mixer_flush,
+                    mixer_bail,
                     nerd,
                 )
             })
@@ -562,6 +585,7 @@ impl PlayerEngine {
             commands: self.commands.clone(),
             stream: self.stream.clone(),
             rebuilding: self.rebuilding.clone(),
+            rebuild_forced: Arc::new(AtomicBool::new(false)),
             output_rate: self.output_rate.clone(),
             output_channels: self.output_channels.clone(),
             requested_rate: self.requested_rate.clone(),
@@ -574,6 +598,7 @@ impl PlayerEngine {
             output_xruns: self.output_xruns.clone(),
             output_peak: self.output_peak.clone(),
             flush_ring: self.flush_ring.clone(),
+            bail_flush: self.bail_flush.clone(),
             output_paused: self.output_paused.clone(),
             pcm_mode: self.pcm_mode.clone(),
             prefer_usb: self.prefer_usb.clone(),
@@ -626,6 +651,10 @@ impl PlayerEngine {
         }
     }
 
+    pub fn next_energy_dip(&self, source: String, position_seconds: f64) -> Option<f64> {
+        analyzer::next_energy_dip(&source, position_seconds)
+    }
+
     pub fn queue_next(&self, request: LoadRequest) -> Result<(), EngineError> {
         self.send(Command::QueueNext { request: to_track_source(request) })
     }
@@ -641,8 +670,7 @@ impl PlayerEngine {
     }
 
     pub fn stop(&self) -> Result<(), EngineError> {
-        self.output_paused.store(true, Ordering::Release);
-        self.flush_ring.store(true, Ordering::Release);
+        self.bail_flush.store(true, Ordering::Release);
         self.send(Command::Stop)
     }
 
@@ -692,6 +720,25 @@ impl PlayerEngine {
             output_rebuilds: self.output_rebuilds.load(Ordering::Relaxed),
             output_xruns: self.output_xruns.load(Ordering::Relaxed),
             output_peak: f32::from_bits(self.output_peak.load(Ordering::Relaxed)),
+        }
+    }
+
+    /// Re-opens the output stream on whatever route is current now.
+    ///
+    /// The app calls this after a route change or an interruption, because it
+    /// owns the `AVAudioSession` and is the only side that can re-activate it:
+    /// a RemoteIO unit built while the session is down is never pulled by the
+    /// audio daemon, which looks exactly like a mixer with nothing to say.
+    /// `force` skips the reuse check — see `on_stream_error` for why a route
+    /// change can never be detected by that check on iOS.
+    pub fn request_output_rebuild(&self, force: bool) -> Result<(), EngineError> {
+        let control = self.control.lock().unwrap().clone();
+        match control {
+            Some(control) => {
+                control.request_rebuild(force);
+                Ok(())
+            }
+            None => Err(EngineError::NotStarted),
         }
     }
 
@@ -819,6 +866,7 @@ impl PlayerEngine {
             channels: snap.channels,
             kbps: snap.kbps,
             loudness_gain_db: snap.loudness_gain_db,
+            swap_correlation: snap.swap_correlation,
         }
     }
 
@@ -898,6 +946,9 @@ struct OutputControl {
     commands: crossbeam_channel::Sender<Command>,
     stream: Arc<Mutex<Option<cpal::Stream>>>,
     rebuilding: Arc<AtomicBool>,
+    /// A forced rebuild arrived while one was already running. The worker
+    /// re-runs for it rather than dropping it — see `request_rebuild`.
+    rebuild_forced: Arc<AtomicBool>,
     output_rate: Arc<AtomicU32>,
     output_channels: Arc<AtomicU32>,
     requested_rate: Arc<AtomicU32>,
@@ -910,6 +961,7 @@ struct OutputControl {
     output_xruns: Arc<AtomicU64>,
     output_peak: Arc<AtomicU32>,
     flush_ring: Arc<AtomicBool>,
+    bail_flush: Arc<AtomicBool>,
     output_paused: Arc<AtomicBool>,
     pcm_mode: Arc<AtomicU32>,
     prefer_usb: Arc<AtomicBool>,
@@ -919,8 +971,19 @@ impl OutputControl {
     fn on_stream_error(&self, err: cpal::Error) {
         match err.kind() {
             ErrorKind::DeviceChanged => {
+                // The route moved, and this has to force the rebuild. The
+                // "is the existing stream still good?" comparison inside
+                // `rebuild` cannot see a route change on iOS: cpal reports one
+                // singleton "Default Device", so the name never changes, and
+                // `choose_format` returns the AVAudioSession's own rate and
+                // channel count because the app pins them, so those never
+                // change either. Every term of that test is therefore true, and
+                // a non-forced rebuild returned Ok having done nothing — which
+                // is how unplugging AirPods left a stream whose device had
+                // gone: silence, never recovered, with the mixer filling a ring
+                // that nothing drains.
                 log::info!("output route changed: {err}");
-                self.request_rebuild(false);
+                self.request_rebuild(true);
             }
             ErrorKind::StreamInvalidated => {
                 log::info!("output stream invalidated: {err}");
@@ -939,32 +1002,55 @@ impl OutputControl {
     }
 
     fn request_rebuild(&self, force: bool) {
+        if force {
+            self.rebuild_forced.store(true, Ordering::Release);
+        }
         if self.rebuilding.swap(true, Ordering::AcqRel) {
+            // A rebuild is already in flight. A forced request must not simply
+            // be dropped: it is the app saying the session is active now, and
+            // the run already under way may well have built its unit before
+            // that was true. The worker below re-runs for it.
             return;
         }
+        // This worker owns the rebuild; the flag only had to survive the race
+        // above, and leaving it set would earn a needless second pass.
+        self.rebuild_forced.store(false, Ordering::Release);
         let ctrl = self.clone();
         let _ = std::thread::Builder::new()
             .name("native-core-output-rebuild".into())
             .spawn(move || {
-                for attempt in 0..20 {
-                    std::thread::sleep(std::time::Duration::from_millis(250));
-                    match ctrl.rebuild(force) {
-                        Ok(()) => break,
-                        Err(EngineError::NoOutputDevice) if attempt < 19 => {
-                            log::info!("waiting for an output device…");
-                        }
-                        // Route changes can also race CoreAudio while the new
-                        // unit is being created. Keep retrying transient stream
-                        // setup failures; a single failed attempt must not leave
-                        // the engine permanently without an output callback.
-                        Err(e) if attempt < 19 => {
-                            log::info!("output rebuild attempt {} failed: {e}", attempt + 1);
-                        }
-                        Err(e) => {
-                            log::warn!("output rebuild failed: {e}");
-                            break;
+                let mut force = force;
+                loop {
+                    for attempt in 0..20 {
+                        std::thread::sleep(std::time::Duration::from_millis(250));
+                        match ctrl.rebuild(force) {
+                            Ok(()) => break,
+                            Err(EngineError::NoOutputDevice) if attempt < 19 => {
+                                log::info!("waiting for an output device…");
+                            }
+                            // Route changes can also race CoreAudio while the
+                            // new unit is being created. Keep retrying
+                            // transient stream setup failures; a single failed
+                            // attempt must not leave the engine permanently
+                            // without an output callback.
+                            Err(e) if attempt < 19 => {
+                                log::info!("output rebuild attempt {} failed: {e}", attempt + 1);
+                            }
+                            Err(e) => {
+                                log::warn!("output rebuild failed: {e}");
+                                break;
+                            }
                         }
                     }
+                    // A forced request that arrived while this ran is the app
+                    // saying the session is up. Honour it before finishing, so
+                    // the unit is never left built against a session that was
+                    // down.
+                    if !ctrl.rebuild_forced.swap(false, Ordering::AcqRel) {
+                        break;
+                    }
+                    log::info!("re-running the output rebuild for a later route event");
+                    force = true;
                 }
                 ctrl.rebuilding.store(false, Ordering::Release);
             });
@@ -998,15 +1084,38 @@ impl OutputControl {
             return Ok(());
         }
 
+        let cap = (rate.max(192_000) as usize) * 2 * 2;
+        let (producer, consumer) = rtrb::RingBuffer::<f32>::new(cap);
+
+        // Prove the replacement before giving anything up. Opening it first
+        // means a failed attempt — a route still settling, the session not yet
+        // re-activated, CoreAudio racing us — leaves the previous stream
+        // exactly where it was, still draining the ring the mixer is still
+        // filling. Tearing the old stream down first instead made every
+        // transient failure permanent: no stream to play and a producer nothing
+        // reads, so the mixer filled its ring once and then sat still for good.
+        //
+        // The new stream starts against an empty ring and simply outputs
+        // silence until it is switched in below; the old one keeps playing real
+        // audio throughout.
+        let stream = open_output_stream(
+            &device,
+            rate,
+            channels,
+            self.pcm_mode.load(Ordering::Relaxed) == 0,
+            consumer,
+            self,
+        )?;
+        stream
+            .play()
+            .map_err(|e| EngineError::StreamInit(e.to_string()))?;
+
+        // From here the swap cannot fail. Mute both units for the handover so
+        // the outgoing ring's backlog — seconds of it — cannot double the
+        // incoming audio while it drains.
         let user_paused = self.output_paused.load(Ordering::Acquire);
         self.output_paused.store(true, Ordering::Release);
         self.flush_ring.store(true, Ordering::Release);
-        // Drop the old stream so its callback/consumer die before we
-        // hand the mixer a new producer.
-        *self.stream.lock().unwrap() = None;
-
-        let cap = (rate.max(192_000) as usize) * 2 * 2;
-        let (producer, consumer) = rtrb::RingBuffer::<f32>::new(cap);
         if self
             .commands
             .send(Command::SetOutputFormat { rate, producer })
@@ -1015,35 +1124,12 @@ impl OutputControl {
             self.output_paused.store(user_paused, Ordering::Release);
             return Err(EngineError::NotStarted);
         }
+        // Hand the new stream in and drop the old one, whose device has gone.
+        let previous = self.stream.lock().unwrap().replace(stream);
+        drop(previous);
+        self.output_paused.store(user_paused, Ordering::Release);
         self.output_rate.store(rate, Ordering::Relaxed);
         self.output_channels.store(channels as u32, Ordering::Relaxed);
-
-        let stream_result = (|| {
-            let stream = open_output_stream(
-                &device,
-                rate,
-                channels,
-                self.pcm_mode.load(Ordering::Relaxed) == 0,
-                consumer,
-                self,
-            )?;
-            stream
-                .play()
-                .map_err(|e| EngineError::StreamInit(e.to_string()))?;
-            Ok::<_, EngineError>(stream)
-        })();
-        let stream = match stream_result {
-            Ok(stream) => stream,
-            Err(error) => {
-                // Every early return after muting the callback must restore
-                // the user's pause state. Otherwise a transient CoreAudio
-                // setup failure makes all later callbacks output silence.
-                self.output_paused.store(user_paused, Ordering::Release);
-                return Err(error);
-            }
-        };
-        *self.stream.lock().unwrap() = Some(stream);
-        self.output_paused.store(user_paused, Ordering::Release);
         // A rebuild after a route change is a *different* device, so the name
         // is re-read here rather than left as the one the first start found.
         *self.device_name.lock().unwrap() = device.to_string();
@@ -1125,6 +1211,7 @@ fn open_output_stream(
     let callback_underruns = control.callback_underruns.clone();
     let output_peak = control.output_peak.clone();
     let flush_ring = control.flush_ring.clone();
+    let bail_flush = control.bail_flush.clone();
     let paused = control.output_paused.clone();
     let err_ctrl = control.clone();
     // PCM_16 opens the unit as int16: the ring stays f32 throughout (mix, EQ
@@ -1141,6 +1228,11 @@ fn open_output_stream(
     };
     if pcm16 {
         let mut scratch: Vec<f32> = Vec::new();
+        let mut bail_ramp = BailRamp {
+            buffer: Vec::with_capacity((sample_rate as usize * 120 / 1000) * 2),
+            cursor: 0,
+            total_frames: 0,
+        };
         device
             .build_output_stream(
                 config,
@@ -1149,7 +1241,20 @@ fn open_output_stream(
                         scratch.resize(data.len(), 0.0);
                     }
                     let frames = &mut scratch[..data.len()];
-                    render_f32(&mut consumer, &volume, &buffered, &callback_underruns, &output_peak, &flush_ring, &paused, channels, frames);
+                    render_f32(
+                        &mut consumer,
+                        &volume,
+                        &buffered,
+                        &callback_underruns,
+                        &output_peak,
+                        &flush_ring,
+                        &bail_flush,
+                        &paused,
+                        &mut bail_ramp,
+                        sample_rate,
+                        channels,
+                        frames,
+                    );
                     for (out, s) in data.iter_mut().zip(frames.iter()) {
                         *out = clamp16_from_float(*s);
                     }
@@ -1159,11 +1264,29 @@ fn open_output_stream(
             )
             .map_err(|e| EngineError::StreamInit(e.to_string()))
     } else {
+        let mut bail_ramp = BailRamp {
+            buffer: Vec::with_capacity((sample_rate as usize * 120 / 1000) * 2),
+            cursor: 0,
+            total_frames: 0,
+        };
         device
             .build_output_stream(
                 config,
                 move |data: &mut [f32], _| {
-                    render_f32(&mut consumer, &volume, &buffered, &callback_underruns, &output_peak, &flush_ring, &paused, channels, data);
+                    render_f32(
+                        &mut consumer,
+                        &volume,
+                        &buffered,
+                        &callback_underruns,
+                        &output_peak,
+                        &flush_ring,
+                        &bail_flush,
+                        &paused,
+                        &mut bail_ramp,
+                        sample_rate,
+                        channels,
+                        data,
+                    );
                 },
                 move |err| err_ctrl.on_stream_error(err),
                 None,
@@ -1190,10 +1313,17 @@ fn clamp16_from_float(f: f32) -> i16 {
     (scaled + 0.5).floor() as i16
 }
 
+#[derive(Default)]
+struct BailRamp {
+    buffer: Vec<f32>,
+    cursor: usize,
+    total_frames: usize,
+}
+
 /// Drains the mixer's ring into `data`: volume applied, underruns zero-filled,
-/// leftover-ring flush and pause-silence handled. The one render path both
-/// output formats share — the word length is a property of the unit, not of
-/// the mix.
+/// leftover-ring flush, 120 ms deferred bail ramp-out, and pause-silence handled.
+/// The one render path both output formats share — the word length is a property
+/// of the unit, not of the mix.
 #[allow(clippy::too_many_arguments)]
 fn render_f32(
     consumer: &mut rtrb::Consumer<f32>,
@@ -1202,11 +1332,36 @@ fn render_f32(
     callback_underruns: &Arc<AtomicU64>,
     output_peak: &Arc<AtomicU32>,
     flush_ring: &Arc<AtomicBool>,
+    bail_flush: &Arc<AtomicBool>,
     paused: &Arc<AtomicBool>,
+    bail_ramp: &mut BailRamp,
+    sample_rate: u32,
     channels: usize,
     data: &mut [f32],
 ) {
     if flush_ring.swap(false, Ordering::AcqRel) {
+        bail_ramp.buffer.clear();
+        bail_ramp.cursor = 0;
+        bail_ramp.total_frames = 0;
+        while consumer.pop().is_ok() {}
+        buffered.store(0, Ordering::Relaxed);
+    }
+    if bail_flush.swap(false, Ordering::AcqRel) {
+        // 120 ms ramp-down (matching upstream BAIL_MS).
+        // The mixer ring always contains interleaved stereo (2 channels).
+        let bail_frames = ((sample_rate as usize * 120) / 1000).max(1);
+        let bail_samples = bail_frames * 2;
+        bail_ramp.buffer.clear();
+        bail_ramp.cursor = 0;
+        for _ in 0..bail_samples {
+            match consumer.pop() {
+                Ok(sample) => bail_ramp.buffer.push(sample),
+                Err(_) => break,
+            }
+        }
+        bail_ramp.total_frames = (bail_ramp.buffer.len() / 2).max(1);
+        // Deferred flush: discard the remaining old audio backlog in the ring,
+        // so the new track can enter an empty ring without playing seconds of the old track.
         while consumer.pop().is_ok() {}
         buffered.store(0, Ordering::Relaxed);
     }
@@ -1217,9 +1372,23 @@ fn render_f32(
     }
     let vol = f32::from_bits(volume.load(Ordering::Relaxed));
     let mut underflowed = false;
-    let mut pop = || match consumer.pop() {
-        Ok(sample) => sample,
-        Err(_) => { underflowed = true; 0.0 }
+    let mut pop = || {
+        if bail_ramp.cursor < bail_ramp.buffer.len() {
+            let sample = bail_ramp.buffer[bail_ramp.cursor];
+            let frame_index = bail_ramp.cursor / 2;
+            let progress = (frame_index as f64 / bail_ramp.total_frames as f64).clamp(0.0, 1.0);
+            let bail_gain = (progress * core::f64::consts::PI / 2.0).cos() as f32;
+            bail_ramp.cursor += 1;
+            sample * bail_gain
+        } else {
+            match consumer.pop() {
+                Ok(sample) => sample,
+                Err(_) => {
+                    underflowed = true;
+                    0.0
+                }
+            }
+        }
     };
     match channels {
         1 => {
@@ -1349,6 +1518,7 @@ fn plan_automix_impl_with_tier(
         filter_sweep: plan.filter_sweep,
         vocal_overlap: plan.vocal_overlap,
         fade_seconds: plan.fade_seconds,
+        transition_end_seconds: plan.transition_end_seconds,
         cue_seconds: plan.cue_seconds,
         playback_rate: plan.playback_rate,
     }
@@ -1370,6 +1540,13 @@ pub fn write_track_tags(
     artwork: Vec<u8>,
 ) -> bool {
     metadata::write_track_tags(&path, &title, &artist, &album, &artwork)
+}
+
+/// Locates the next local energy dip in the audio curve for the given source
+/// within [position_seconds + 0.1, position_seconds + 2.0].
+#[uniffi::export]
+pub fn next_energy_dip(source: String, position_seconds: f64) -> Option<f64> {
+    analyzer::next_energy_dip(&source, position_seconds)
 }
 
 /// Load Automix ONNX graphs. Paths are bundle-resolved by Swift; empty unloads.
@@ -1515,5 +1692,72 @@ mod tests {
         assert_eq!(loudness_gain(Some(-7.0), false), (1.0, None));
         assert_eq!(loudness_gain(None, true), (1.0, None));
         assert_eq!(loudness_gain(Some(f64::NAN), true), (1.0, None));
+    }
+
+    #[test]
+    fn bail_flush_ramps_output_down_over_120ms_and_flushes_backlog() {
+        use super::{render_f32, BailRamp};
+        use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64};
+        use std::sync::Arc;
+
+        let rate = 48_000u32;
+        let channels = 2usize;
+        let total_samples = (rate as usize * 2) * channels;
+        let (mut producer, mut consumer) = rtrb::RingBuffer::<f32>::new(total_samples * 2);
+        for _ in 0..total_samples {
+            producer.push(1.0).unwrap();
+        }
+
+        let volume = Arc::new(AtomicU32::new(1.0f32.to_bits()));
+        let buffered = Arc::new(AtomicU64::new((total_samples / channels) as u64));
+        let underruns = Arc::new(AtomicU64::new(0));
+        let peak = Arc::new(AtomicU32::new(0));
+        let flush_ring = Arc::new(AtomicBool::new(false));
+        let bail_flush = Arc::new(AtomicBool::new(true));
+        let paused = Arc::new(AtomicBool::new(false));
+        let mut bail_ramp = BailRamp {
+            buffer: Vec::with_capacity((rate as usize * 120 / 1000) * 2),
+            cursor: 0,
+            total_frames: 0,
+        };
+
+        let chunk_size = 512;
+        let mut output_samples = Vec::new();
+        let total_chunks = ((rate as usize * 150 / 1000) * channels) / chunk_size;
+
+        let mut chunk = vec![0.0f32; chunk_size];
+        for _ in 0..total_chunks {
+            render_f32(
+                &mut consumer,
+                &volume,
+                &buffered,
+                &underruns,
+                &peak,
+                &flush_ring,
+                &bail_flush,
+                &paused,
+                &mut bail_ramp,
+                rate,
+                channels,
+                &mut chunk,
+            );
+            output_samples.extend_from_slice(&chunk);
+        }
+
+        let bail_samples = (rate as usize * 120 / 1000) * 2;
+        assert_eq!(bail_ramp.buffer.len(), bail_samples);
+        assert!((output_samples[0] - 1.0).abs() < 1e-3);
+        let mid_sample = bail_samples / 2;
+        let mid_val = output_samples[mid_sample];
+        assert!((mid_val - std::f32::consts::FRAC_1_SQRT_2).abs() < 0.05, "expected ~0.707 at midpoint, got {mid_val}");
+
+        let end_sample = bail_samples - 2;
+        assert!(output_samples[end_sample] < 0.05, "expected near 0.0 at end of ramp, got {}", output_samples[end_sample]);
+
+        for (i, &s) in output_samples[bail_samples..].iter().enumerate() {
+            assert_eq!(s, 0.0, "sample at +{}ms beyond bail should be silent, got {s}", (bail_samples + i) / (rate as usize * 2 / 1000));
+        }
+
+        assert!(consumer.pop().is_err());
     }
 }

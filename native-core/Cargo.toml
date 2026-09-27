@@ -64,8 +64,13 @@ rten-tensor = "0.26"
 # — so a mixer that can be scheduled below the app work competing with it
 # underruns, and an underrun is a dropout. Nothing outside this crate needs it.
 #
+# `target_vendor`, not `target_os = "macos"`: iOS has the same pthread QoS API
+# and needs it more, because a Darwin thread inherits its creator's class and
+# the mixer is spawned from a `.utility` startup task. Gating this to macOS left
+# the decoder running in the same band as the artwork fetches it should outrank.
+#
 # Kept last deliberately: a `[target.…]` table ends the `[dependencies]` table
 # it follows, so anything written after one of these silently becomes a
 # target-specific dependency instead.
-[target.'cfg(target_os = "macos")'.dependencies]
+[target.'cfg(target_vendor = "apple")'.dependencies]
 libc = "0.2"

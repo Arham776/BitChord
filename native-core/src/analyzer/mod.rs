@@ -20,7 +20,7 @@ mod vocal;
 
 pub use beat::Grid;
 pub use models::{analyzer_ready, configure};
-pub use plan::plan_pair;
+pub use plan::{next_energy_dip, plan_pair};
 
 const PI: f64 = core::f64::consts::PI;
 

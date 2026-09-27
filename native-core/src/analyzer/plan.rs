@@ -5,6 +5,7 @@ use super::beat::{self, Grid, WINDOW_SECONDS};
 use super::resample;
 use super::vocal;
 use crate::mixer::{TransitionPlan, TransitionStyle};
+use std::sync::Arc;
 
 const MIN_BEATMATCH_CONFIDENCE: f64 = 0.55;
 const MIN_DJ_CONFIDENCE: f64 = 0.2;
@@ -22,6 +23,14 @@ const AUTO_FALLBACK_SECONDS: f64 = 8.0;
 /// Upstream `MIN_SMART_DURATION_SECONDS` — a track shorter than this gets a
 /// plain crossfade rather than a smart transition.
 const MIN_SMART_DURATION_SECONDS: f64 = 45.0;
+/// Upstream `TrackAnalyzer.MIN_DECODED_FRACTION` — how much of the container's
+/// stated duration must actually decode before the whole-track pass is trusted.
+///
+/// Not 1.0: a decoder legitimately comes up a frame or two short of the
+/// container's rounding, and refusing over that would refuse everything. Not
+/// lower either: the failure this catches is a still-downloading file, and the
+/// cost of trusting one is a mix-out anchor placed where the bytes ran out.
+const MIN_DECODED_FRACTION: f64 = 0.95;
 /// Pickup inside this margin of the end is the outro, not a mix-in
 /// (upstream `incomingCuePoint`: `pickup < duration - 10`).
 const MIX_IN_END_MARGIN_SECONDS: f64 = 10.0;
@@ -90,6 +99,179 @@ enum Tier {
     Plain,
 }
 
+/// Analysis cache — the difference between planning as a decision and planning
+/// as a workload.
+///
+/// One [`analyze`] is three decodes of the same file (whole track, head window,
+/// vocal window), a resample, and two ONNX passes, which for a four-minute
+/// track is seconds of CPU. The app asks for the same pair over and over:
+/// `syncEngineQueueNext` alone is reached from nine call sites, and each one
+/// re-plans the track that follows the current one. Uncached, that is the whole
+/// analysis re-run for every transport command — and it runs at the same
+/// priority band as the audio decoder, which is why opening a page could be
+/// heard as a stutter.
+///
+/// The plan itself is *not* cached: it also depends on the crossfade setting,
+/// the caller's text and the album flag, all of which are cheap to re-apply.
+/// Only the analysis — the expensive, purely file-derived half — is kept.
+///
+/// The compute runs under the lock on purpose. Two callers asking for the same
+/// track is the common case, and serialising means the second one waits and
+/// then hits, instead of both decoding the same file at once.
+mod analysis_cache {
+    use super::Analysis;
+    use std::collections::{HashMap, VecDeque};
+    use std::sync::{Arc, Mutex, OnceLock};
+
+    /// Enough for the head and tail of a queue; beyond that, re-decoding costs
+    /// less than holding it. Each entry is tens to hundreds of kilobytes.
+    const CAPACITY: usize = 6;
+
+    type Key = (String, u64, bool);
+
+    #[derive(Default)]
+    struct Cache {
+        entries: HashMap<Key, Arc<Analysis>>,
+        /// Insertion order, for eviction. A key never appears twice: it is only
+        /// pushed on a miss, and a hit returns before that.
+        order: VecDeque<Key>,
+    }
+
+    fn cache() -> &'static Mutex<Cache> {
+        static CACHE: OnceLock<Mutex<Cache>> = OnceLock::new();
+        CACHE.get_or_init(|| Mutex::new(Cache::default()))
+    }
+
+    /// File length is part of the key because a streamed download is appended
+    /// to under a stable path: a still-growing file must produce a fresh
+    /// analysis, and a finished one must keep hitting.
+    fn len_of(path: &str) -> u64 {
+        std::fs::metadata(path).map(|m| m.len()).unwrap_or(0)
+    }
+
+    pub(super) fn get_or_compute(
+        path: &str,
+        skip_vocals: bool,
+        compute: impl FnOnce() -> Analysis,
+    ) -> Arc<Analysis> {
+        let key: Key = (path.to_string(), len_of(path), skip_vocals);
+        // A panic while analysing must not poison the cache for the session.
+        let mut guard = cache().lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(hit) = guard.entries.get(&key) {
+            return hit.clone();
+        }
+        let analysis = Arc::new(compute());
+        guard.entries.insert(key.clone(), analysis.clone());
+        guard.order.push_back(key);
+        while guard.order.len() > CAPACITY {
+            if let Some(evicted) = guard.order.pop_front() {
+                guard.entries.remove(&evicted);
+            }
+        }
+        analysis
+    }
+
+    pub(super) fn get_cached_energy_curve(path: &str) -> Option<Vec<super::audio_analysis::EnergyPoint>> {
+        let norm_path = path.strip_prefix("file://").unwrap_or(path);
+        let guard = cache().lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        guard.entries.iter().find(|(k, _)| {
+            let k_norm = k.0.strip_prefix("file://").unwrap_or(&k.0);
+            k_norm == norm_path
+        }).map(|(_, v)| v.energy_curve.clone())
+    }
+}
+
+/// Locates the next local energy dip in the audio curve for the given source
+/// within [position_seconds + 0.1, position_seconds + 2.0].
+/// Used to defer source swap execution so crossfades happen in a valley.
+pub fn next_energy_dip(source: &str, position_seconds: f64) -> Option<f64> {
+    let curve = analysis_cache::get_cached_energy_curve(source)?;
+    find_next_energy_dip(&curve, position_seconds)
+}
+
+pub(crate) fn find_next_energy_dip(
+    curve: &[audio_analysis::EnergyPoint],
+    position_seconds: f64,
+) -> Option<f64> {
+    if curve.is_empty() {
+        return None;
+    }
+    let window_start = position_seconds + 0.1;
+    let window_end = position_seconds + 2.0;
+
+    let current_energy = curve
+        .iter()
+        .min_by(|a, b| {
+            (a.time - position_seconds)
+                .abs()
+                .total_cmp(&(b.time - position_seconds).abs())
+        })
+        .map(|p| p.energy)
+        .unwrap_or(1.0);
+
+    let candidates: Vec<(usize, &audio_analysis::EnergyPoint)> = curve
+        .iter()
+        .enumerate()
+        .filter(|(_, p)| p.time >= window_start && p.time <= window_end)
+        .collect();
+
+    if candidates.is_empty() {
+        return None;
+    }
+
+    let mut local_minima = Vec::new();
+    for (idx, p) in &candidates {
+        let left_energy = if *idx > 0 { curve[*idx - 1].energy } else { p.energy };
+        let right_energy = if *idx + 1 < curve.len() { curve[*idx + 1].energy } else { p.energy };
+        if p.energy <= left_energy && p.energy <= right_energy {
+            local_minima.push(*p);
+        }
+    }
+
+    if let Some(best) = local_minima
+        .iter()
+        .filter(|p| p.energy < current_energy * 0.95 || p.energy < 0.7)
+        .min_by(|a, b| a.energy.total_cmp(&b.energy))
+    {
+        return Some(best.time);
+    }
+
+    if let Some((_, min_cand)) = candidates
+        .iter()
+        .min_by(|(_, a), (_, b)| a.energy.total_cmp(&b.energy))
+    {
+        if min_cand.energy < current_energy * 0.8 && min_cand.energy < 0.6 {
+            return Some(min_cand.time);
+        }
+    }
+
+    None
+}
+
+/// [`analyze`], memoised on the file's identity and the vocal-model switch.
+fn analyze_cached(
+    path: &str,
+    skip_vocals: bool,
+    decode: &impl Fn(&str, f64, f64, bool) -> Option<(Vec<f32>, u32, f64)>,
+    duration: f64,
+) -> Arc<Analysis> {
+    if duration <= 0.0 {
+        // A caller that handed us something that is not a readable audio file —
+        // a `yt:<videoId>` identifier rather than a path, most likely — lands
+        // here, and the degradation is otherwise silent: `analyze` skips its
+        // whole-track branch because the window is `duration` seconds long, so
+        // `bpm` stays 0 and `assess` can only return `Tier::Plain`. Every
+        // transition becomes a plain crossfade and nothing says why. The other
+        // side of the pair still analyses normally, which is what made this so
+        // hard to see: the plan's cue looked right.
+        log::warn!(
+            "automix: no duration for {path} — whole-track analysis and tempo verdict \
+             skipped, so this pair can only plan a plain crossfade (not a readable audio file?)"
+        );
+    }
+    analysis_cache::get_or_compute(path, skip_vocals, || analyze(path, skip_vocals, decode, duration))
+}
+
 pub fn plan_pair(
     outgoing_path: &str,
     incoming_path: &str,
@@ -111,7 +293,7 @@ pub fn plan_pair(
     if blocked_text(outgoing_text) || blocked_text(incoming_text) {
         return plain_fallback(fade);
     }
-    let out = analyze(outgoing_path, skip_vocals, &decode, duration_of(outgoing_path));
+    let out = analyze_cached(outgoing_path, skip_vocals, &decode, duration_of(outgoing_path));
 
     // Upstream gapless path (TransitionPlanner.kt:893-905): an album played
     // through in order gets a seamless 0.12 s handoff instead of a mix, unless
@@ -132,13 +314,14 @@ pub fn plan_pair(
                 filter_sweep: 0.0,
                 vocal_overlap: 0.0,
                 fade_seconds: GAPLESS_FADE_SECONDS,
+                transition_end_seconds: 0.0,
                 cue_seconds: 0.0,
                 playback_rate: 1.0,
             };
         }
     }
 
-    let inc = analyze(incoming_path, skip_vocals, &decode, duration_of(incoming_path));
+    let inc = analyze_cached(incoming_path, skip_vocals, &decode, duration_of(incoming_path));
 
     // The most ambitious move: a beat-matched, harmonically-compatible pair gets
     // a WSOLA phrase-switch before the adaptive overlap (upstream `phraseSwitch`).
@@ -157,6 +340,7 @@ fn plain_fallback(fade: f64) -> TransitionPlan {
         filter_sweep: 0.0,
         vocal_overlap: 0.0,
         fade_seconds: fade,
+        transition_end_seconds: 0.0,
         cue_seconds: 0.0,
         playback_rate: 1.0,
     }
@@ -211,15 +395,42 @@ fn analyze(
     // bands, structure, and the DSP vocal heuristic. This is upstream's
     // `AnalyzeAudio`, the evidence the policy works from when the Beat This!
     // model is absent (which is the shipped state).
+    //
+    // The buffer is kept so the head window below can read it rather than
+    // decoding the same file again: three decodes per track was the port's
+    // shape, and the whole-track pass is the expensive one — measured at 2.8 s
+    // of a 4.2 s plan for a pair of four-minute tracks, more than twice both
+    // ONNX models together.
+    let mut whole: Option<(Vec<f32>, u32)> = None;
     if duration > 0.0 {
         if let Some((mono, rate, _)) = decode(path, 0.0, duration, true) {
-            let mono_analysis = resample(&mono, rate as f64, audio_analysis::ANALYSIS_RATE);
-            let audio = audio_analysis::analyze_audio(
-                &mono_analysis,
-                audio_analysis::ANALYSIS_RATE,
-                duration,
-            );
-            analysis.bpm = audio.bpm;
+            let decoded_seconds = if rate > 0 {
+                mono.len() as f64 / rate as f64
+            } else {
+                0.0
+            };
+            if decoded_seconds < duration * MIN_DECODED_FRACTION {
+                // Upstream refuses a short whole-track decode outright rather
+                // than publishing it (`TrackAnalyzer.structure`). An analysis
+                // that stops where the bytes ran out is indistinguishable,
+                // downstream, from a track that simply goes quiet: `content_end`
+                // lands at the end of the *bytes* and the mix-out anchor with
+                // it, and the audible symptom is the track faded out minutes
+                // early. A missing analysis degrades to a plain crossfade; a
+                // confidently wrong one does not degrade at all. This is exactly
+                // a still-downloading file.
+                log::warn!(
+                    "whole-track analysis refused for {path}: decoded \
+                     {decoded_seconds:.1}s of a {duration:.1}s container"
+                );
+            } else {
+                let mono_analysis = resample(&mono, rate as f64, audio_analysis::ANALYSIS_RATE);
+                let audio = audio_analysis::analyze_audio(
+                    &mono_analysis,
+                    audio_analysis::ANALYSIS_RATE,
+                    duration,
+                );
+                analysis.bpm = audio.bpm;
             analysis.beat_interval = audio.beat_interval;
             analysis.beat_confidence = audio.beat_confidence;
             analysis.downbeats = audio.downbeats;
@@ -238,12 +449,22 @@ fn analyze(
             analysis.vocal_activity_mask = audio.vocal_activity_mask;
             analysis.beats = audio.beats;
             analysis.vocal_probability = audio.vocal_probability;
+            }
+            whole = Some((mono, rate));
         }
     }
 
     // The Beat This! ONNX grid, when loaded, overrides the DSP tempo with a
-    // stronger beat/downbeat grid on the head window.
-    if let Some((mono, rate, offset)) = decode(path, 0.0, head_len, true) {
+    // stronger beat/downbeat grid on the head window — which is the head of the
+    // buffer just decoded, so it is a slice rather than a second decode. The
+    // fallback exists only for the case where the whole-track decode failed
+    // outright.
+    if let Some((mono, rate)) = whole.as_ref() {
+        let head_samples = ((head_len * *rate as f64) as usize).min(mono.len());
+        if let Some(grid) = beat::track(&mono[..head_samples], *rate as f64, 0.0) {
+            fill_grid(&mut analysis, grid);
+        }
+    } else if let Some((mono, rate, offset)) = decode(path, 0.0, head_len, true) {
         if let Some(grid) = beat::track(&mono, rate as f64, offset) {
             fill_grid(&mut analysis, grid);
         }
@@ -686,6 +907,7 @@ fn plan_from(outgoing: &Analysis, incoming: &Analysis, fade: f64) -> TransitionP
             filter_sweep: 0.0,
             vocal_overlap: 0.0,
             fade_seconds: fade,
+            transition_end_seconds: 0.0,
             cue_seconds: cue,
             playback_rate: 1.0,
         };
@@ -799,6 +1021,8 @@ fn plan_from(outgoing: &Analysis, incoming: &Analysis, fade: f64) -> TransitionP
         filter_sweep: if same_beat { 0.0 } else { FILTER_SWEEP },
         vocal_overlap,
         fade_seconds,
+        // The window every ride above was computed against.
+        transition_end_seconds: outgoing_mix_end,
         cue_seconds: cue,
         playback_rate,
     }
@@ -1246,6 +1470,7 @@ fn plan_wsola_transition(outgoing: &Analysis, incoming: &Analysis) -> Option<Tra
         filter_sweep: 0.0,
         vocal_overlap,
         fade_seconds: transition_end - transition_start,
+        transition_end_seconds: transition_end,
         cue_seconds: incoming_cue_time,
         playback_rate: (stretch_ratio * 10_000.0).round() / 10_000.0,
     })
@@ -1263,6 +1488,45 @@ fn phrase_switch(outgoing: &Analysis, incoming: &Analysis) -> Option<TransitionP
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// The cache is what stops a transport command from re-decoding both tracks.
+    /// It must key on the file's *content identity*, not just its path: a
+    /// streamed download is appended to under a stable name, and serving a
+    /// half-downloaded file's analysis forever would misplace every cue.
+    #[test]
+    fn analysis_cache_hits_by_identity_and_misses_when_the_file_grows() {
+        let dir = std::env::temp_dir().join("bitchord-plan-cache");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("growing.bin");
+        std::fs::write(&path, vec![0u8; 1024]).unwrap();
+        let key = path.to_string_lossy().to_string();
+
+        let computed = AtomicUsize::new(0);
+        let mut compute = || {
+            computed.fetch_add(1, Ordering::SeqCst);
+            Analysis::default()
+        };
+
+        let first = analysis_cache::get_or_compute(&key, false, &mut compute);
+        let second = analysis_cache::get_or_compute(&key, false, &mut compute);
+        assert_eq!(computed.load(Ordering::SeqCst), 1, "a repeat must be a hit");
+        assert!(Arc::ptr_eq(&first, &second), "a hit returns the same analysis");
+
+        // The same path with more bytes is a different file as far as planning
+        // is concerned.
+        std::fs::write(&path, vec![0u8; 2048]).unwrap();
+        let _ = analysis_cache::get_or_compute(&key, false, &mut compute);
+        assert_eq!(
+            computed.load(Ordering::SeqCst),
+            2,
+            "a grown file must be analysed again, not served from the cache"
+        );
+
+        // The vocal-model switch is part of the identity too.
+        let _ = analysis_cache::get_or_compute(&key, true, &mut compute);
+        assert_eq!(computed.load(Ordering::SeqCst), 3);
+    }
 
     fn analysis(first_beat: f64, duration: f64, downbeats: Vec<f64>) -> Analysis {
         Analysis {
@@ -1453,5 +1717,28 @@ mod tests {
     fn incoming_cue_rejects_pickup_in_the_last_ten_seconds() {
         let cue = incoming_cue(&analysis(175.0, 180.0, vec![175.0, 177.0, 179.0]));
         assert_eq!(cue, 0.0);
+    }
+
+    #[test]
+    fn next_energy_dip_detects_local_valley_in_window() {
+        let curve = vec![
+            super::audio_analysis::EnergyPoint { time: 0.0, energy: 0.9 },
+            super::audio_analysis::EnergyPoint { time: 0.5, energy: 0.8 },
+            super::audio_analysis::EnergyPoint { time: 1.0, energy: 0.25 }, // dip
+            super::audio_analysis::EnergyPoint { time: 1.5, energy: 0.75 },
+            super::audio_analysis::EnergyPoint { time: 2.0, energy: 0.85 },
+        ];
+        // At position 0.0, window is [0.1, 2.0]. Local minimum at 1.0s.
+        let dip = find_next_energy_dip(&curve, 0.0);
+        assert_eq!(dip, Some(1.0));
+
+        // When flat: no dip found
+        let flat_curve = vec![
+            super::audio_analysis::EnergyPoint { time: 0.0, energy: 0.9 },
+            super::audio_analysis::EnergyPoint { time: 0.5, energy: 0.91 },
+            super::audio_analysis::EnergyPoint { time: 1.0, energy: 0.92 },
+            super::audio_analysis::EnergyPoint { time: 1.5, energy: 0.90 },
+        ];
+        assert_eq!(find_next_energy_dip(&flat_curve, 0.0), None);
     }
 }

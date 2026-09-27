@@ -86,7 +86,10 @@ fn open_audio_decoder(
 ) -> Result<Box<dyn AudioDecoder>, DecodeError> {
     let codecs = symphonia::default::get_codecs();
     let opts = AudioDecoderOptions::default();
-    log::info!(
+    // Per decode, and a decode is now a routine event, so this is `debug`.
+    // The one-line summary (`opened …: codec=… rate=… duration=…`) stays at
+    // `info`, where it describes the result rather than the attempt.
+    log::debug!(
         "audio params extra={}B ch={:?} rate={:?} profile={:?}",
         audio.extra_data.as_ref().map(|d| d.len()).unwrap_or(0),
         audio.channels.as_ref().map(|c| c.count()),
