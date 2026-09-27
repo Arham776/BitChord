@@ -57,7 +57,9 @@ struct BitChordApp: App {
                         Task { await reloadAutomixModels() }
                     }
                     Task { await reloadAutomixModels() }
-                    controller.startEngineIfNeeded()
+                    // Engine is started on-demand when the user actually begins
+                    // playback (via playQueue, togglePlayPause, or remote commands)
+                    // so opening the app never interrupts other audio playing on the device.
                     // After the shell is up and the first frame has been drawn: an
                     // offer as the window appears reads as chrome, and one that
                     // arrives a moment later reads as a question.

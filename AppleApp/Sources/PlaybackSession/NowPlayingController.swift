@@ -6,6 +6,9 @@ import UIKit
 #endif
 import MediaPlayer
 import BitChordShared
+#if os(iOS)
+import NowPlaying
+#endif
 
 /// Lock-screen / media-key / Bluetooth controls (spec §3.2 NowPlayingController).
 /// MPNowPlayingInfoCenter + MPRemoteCommandCenter work identically on macOS
@@ -17,36 +20,56 @@ final class NowPlayingController {
     private var artworkURL: String?
     private var lastRequestedURL: String?
     private var handlers: [Any] = []
+#if os(iOS)
+    private var modern: AnyObject?
+#endif
 
     init() {
+#if os(iOS)
+        if #available(iOS 27, *) {
+            let model = ModernNowPlaying()
+            model.delegate = self
+            modern = model
+            return
+        }
+        DispatchQueue.main.async {
+            UIApplication.shared.beginReceivingRemoteControlEvents()
+        }
+#endif
         let center = MPRemoteCommandCenter.shared()
+        center.playCommand.isEnabled = true
         handlers.append(center.playCommand.addTarget { [weak self] _ in
             self?.onPlay?()
             return .success
         })
+        center.pauseCommand.isEnabled = true
         handlers.append(center.pauseCommand.addTarget { [weak self] _ in
             self?.onPause?()
             return .success
         })
+        center.togglePlayPauseCommand.isEnabled = true
         handlers.append(center.togglePlayPauseCommand.addTarget { [weak self] _ in
             self?.onToggle?()
             return .success
         })
+        center.nextTrackCommand.isEnabled = true
         handlers.append(center.nextTrackCommand.addTarget { [weak self] _ in
             self?.onNext?()
             return .success
         })
+        center.previousTrackCommand.isEnabled = true
         handlers.append(center.previousTrackCommand.addTarget { [weak self] _ in
             self?.onPrevious?()
             return .success
         })
-        center.changePlaybackPositionCommand.addTarget { [weak self] event in
+        center.changePlaybackPositionCommand.isEnabled = true
+        handlers.append(center.changePlaybackPositionCommand.addTarget { [weak self] event in
             guard let position = (event as? MPChangePlaybackPositionCommandEvent)?.positionTime else {
                 return .commandFailed
             }
             self?.onSeek?(position)
             return .success
-        }
+        })
     }
 
     var onPlay: (() -> Void)?
@@ -57,13 +80,28 @@ final class NowPlayingController {
     var onSeek: ((Double) -> Void)?
 
     func update(title: String, artist: String, duration: Double,
-                artworkData: Data?, thumbnailUrl: String?, isPlaying: Bool) {
+                artworkData: Data?, thumbnailUrl: String?, isPlaying: Bool,
+                position: Double? = nil) {
+#if os(iOS)
+        if #available(iOS 27, *), let model = modern as? ModernNowPlaying {
+            model.update(title: title, artist: artist, duration: duration,
+                         artworkData: artworkData, thumbnailUrl: thumbnailUrl,
+                         isPlaying: isPlaying, position: position)
+            return
+        }
+#endif
         var info: [String: Any] = [
             MPMediaItemPropertyTitle: title,
             MPMediaItemPropertyArtist: artist,
             MPMediaItemPropertyPlaybackDuration: duration,
             MPNowPlayingInfoPropertyPlaybackRate: isPlaying ? Double(PlatformSettings.shared.getFloat(key: "playback_speed", default: 1)) : 0.0,
+            MPNowPlayingInfoPropertyMediaType: MPNowPlayingInfoMediaType.audio.rawValue,
         ]
+        if let position {
+            info[MPNowPlayingInfoPropertyElapsedPlaybackTime] = position
+        } else if let old = MPNowPlayingInfoCenter.default().nowPlayingInfo?[MPNowPlayingInfoPropertyElapsedPlaybackTime] {
+            info[MPNowPlayingInfoPropertyElapsedPlaybackTime] = old
+        }
         if let item = artworkFromBytes(artworkData) {
             info[MPMediaItemPropertyArtwork] = item
             artworkURL = thumbnailUrl
@@ -82,15 +120,52 @@ final class NowPlayingController {
     }
 
     func update(position: Double) {
+#if os(iOS)
+        if #available(iOS 27, *), let model = modern as? ModernNowPlaying {
+            model.position = position
+            return
+        }
+#endif
         var info = MPNowPlayingInfoCenter.default().nowPlayingInfo ?? [:]
         info[MPNowPlayingInfoPropertyElapsedPlaybackTime] = position
+        info[MPNowPlayingInfoPropertyMediaType] = MPNowPlayingInfoMediaType.audio.rawValue
         MPNowPlayingInfoCenter.default().nowPlayingInfo = info
     }
 
-    func updateRate(_ rate: Double) {
+    func updateRate(_ rate: Double, position: Double? = nil) {
+#if os(iOS)
+        if #available(iOS 27, *), let model = modern as? ModernNowPlaying {
+            model.rate = rate
+            if let position { model.position = position }
+            if rate > 0 { model.requestPrimaryIfPossible() }
+            return
+        }
+#endif
         var info = MPNowPlayingInfoCenter.default().nowPlayingInfo ?? [:]
         info[MPNowPlayingInfoPropertyPlaybackRate] = rate
+        if let position {
+            info[MPNowPlayingInfoPropertyElapsedPlaybackTime] = position
+        }
+        info[MPNowPlayingInfoPropertyMediaType] = MPNowPlayingInfoMediaType.audio.rawValue
         MPNowPlayingInfoCenter.default().nowPlayingInfo = info
+    }
+
+    // NOTE: `MPNowPlayingInfoCenter.playbackState` is *not* used here, and
+    // cannot be. It requires the restricted entitlement
+    // `com.apple.mediaremote.set-playback-state`, which Apple grants by
+    // exception; without it every assignment is ignored and logged as
+    // "[MRNowPlaying] Ignoring setPlaybackState because application does not
+    // contain entitlement ...". It was tried, and the device log is the proof.
+    //
+    // iOS 27 uses NowPlaying.MediaSession above. On iOS 18–26 the system
+    // chooses which mixing app owns its single prominent control surface.
+
+    func requestPrimaryIfPossible() {
+#if os(iOS)
+        if #available(iOS 27, *), let model = modern as? ModernNowPlaying {
+            model.requestPrimaryIfPossible()
+        }
+#endif
     }
 
     private func artworkFromBytes(_ data: Data?) -> MPMediaItemArtwork? {
@@ -136,6 +211,7 @@ final class NowPlayingController {
                 info[MPMediaItemPropertyArtist] = artist
                 info[MPMediaItemPropertyPlaybackDuration] = duration
                 info[MPMediaItemPropertyArtwork] = item
+                info[MPNowPlayingInfoPropertyMediaType] = MPNowPlayingInfoMediaType.audio.rawValue
                 info[MPNowPlayingInfoPropertyPlaybackRate] = isPlaying
                     ? Double(PlatformSettings.shared.getFloat(key: "playback_speed", default: 1))
                     : 0.0
@@ -144,6 +220,103 @@ final class NowPlayingController {
         }
     }
 }
+
+#if os(iOS)
+/// iOS 27 publishes an explicit media session, including its playback state.
+/// Keep it separate from the legacy MediaPlayer path: Apple says not to publish
+/// the same local playback through both APIs.
+@available(iOS 27, *)
+@Observable
+@MainActor
+private final class ModernNowPlaying: MediaSessionRepresentable {
+    let id = "bitchord-player"
+    weak var delegate: NowPlayingController?
+    var title = ""
+    var artist = ""
+    var duration: Double = 0
+    var position: Double = 0
+    var rate: Double = 0
+    var artworkData: Data?
+    var artworkURL: String?
+    private var session: MediaSession<ModernNowPlaying>?
+    private var primaryRequestInFlight = false
+
+    var content: (any MediaContentRepresentable)? {
+        guard !title.isEmpty else { return nil }
+        let imageData = artworkData
+        let imageURL = artworkURL
+        let artwork: Artwork? = (imageData != nil || imageURL != nil)
+            ? Artwork(id: "\(title)|\(artist)|\(imageURL ?? "embedded")") { _ in
+                if let imageData { return try ArtworkRepresentation(data: imageData) }
+                guard let imageURL,
+                      let url = URL(string: SharedArtwork.sized(imageURL, 544) ?? imageURL)
+                else { throw ArtworkRepresentation.ArtworkRepresentationError.noRepresentationAvailable }
+                let (data, _) = try await URLSession.shared.data(from: url)
+                return try ArtworkRepresentation(data: data)
+            }
+            : nil
+        return MusicContent(
+            id: "\(title)|\(artist)", songTitle: title, artistName: artist,
+            albumName: "", type: .audio,
+            duration: duration > 0 ? .finite(duration) : nil,
+            artwork: artwork
+        )
+    }
+
+    var playbackSnapshot: MediaPlaybackSnapshot? {
+        guard !title.isEmpty else { return nil }
+        return MediaPlaybackSnapshot(
+            state: rate > 0 ? .playing(rate: Float(rate)) : .paused,
+            elapsedTime: position
+        )
+    }
+
+    var commands: [MediaCommand] {
+        [
+            .play { [weak self] in self?.delegate?.onPlay?() },
+            .pause { [weak self] in self?.delegate?.onPause?() },
+            .togglePlayPause { [weak self] in self?.delegate?.onToggle?() },
+            .next { [weak self] in self?.delegate?.onNext?() },
+            .previous { [weak self] in self?.delegate?.onPrevious?() },
+            .seekToPosition { [weak self] seconds in self?.delegate?.onSeek?(seconds) },
+        ]
+    }
+
+    func update(title: String, artist: String, duration: Double,
+                artworkData: Data?, thumbnailUrl: String?, isPlaying: Bool,
+                position: Double?) {
+        if self.title != title || self.artist != artist {
+            self.position = position ?? 0
+        } else if let position {
+            self.position = position
+        }
+        self.title = title
+        self.artist = artist
+        self.duration = duration
+        self.artworkData = artworkData
+        self.artworkURL = thumbnailUrl
+        self.rate = isPlaying
+            ? Double(PlatformSettings.shared.getFloat(key: "playback_speed", default: 1)) : 0
+        if isPlaying { requestPrimaryIfPossible() }
+    }
+
+    func requestPrimaryIfPossible() {
+        guard UIApplication.shared.applicationState == .active,
+              !primaryRequestInFlight else { return }
+        if session == nil { session = MediaSession(self) }
+        guard let session else { return }
+        primaryRequestInFlight = true
+        Task { @MainActor in
+            defer { primaryRequestInFlight = false }
+            do {
+                try await session.requestToBecomeSystemPrimary()
+            } catch {
+                NSLog("[BitChord] Now Playing primary request failed: \(error)")
+            }
+        }
+    }
+}
+#endif
 
 /// Publishes the widget snapshot into the App Group container
 /// (spec §3.2 WidgetStatePublisher / §9): ready-to-play semantics, no

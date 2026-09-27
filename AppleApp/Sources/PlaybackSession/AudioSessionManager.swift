@@ -1,4 +1,5 @@
 import AVFoundation
+import BitChordShared
 
 /// Background audio session (spec §3.2). iOS needs `.playback` + activation
 /// for lock-screen / Control Center continuity; macOS has no AVAudioSession.
@@ -52,7 +53,22 @@ enum AudioSessionManager {
 #if os(iOS)
         let session = AVAudioSession.sharedInstance()
         do {
-            try session.setCategory(.playback, mode: .default, options: [])
+            // Playback is mixable by default so starting BitChord does not stop
+            // another music app. Deactivation on pause is still necessary to
+            // release the output session promptly. The setting permits an
+            // exclusive session when the listener explicitly wants one.
+            let mixing = PlatformSettings.shared.getBoolean(
+                key: "mix_with_other_audio", default: true
+            )
+            var options: AVAudioSession.CategoryOptions = [.allowAirPlay, .allowBluetoothA2DP]
+            if mixing {
+                options.insert(.mixWithOthers)
+            }
+            try session.setCategory(
+                .playback,
+                mode: .default,
+                options: options
+            )
             try session.setActive(true)
         } catch {
             // Worth surfacing: a session that will not activate is a session with
@@ -65,27 +81,225 @@ enum AudioSessionManager {
         // outputs means nothing is plugged in — reported as "no format" so the
         // engine asks the device instead of guessing.
         //
-        // Note: on iOS built-in speakers and standard headphones, `portDescription.channels`
-        // is nil (it is only non-nil for multi-channel USB devices). Use
-        // `session.outputNumberOfChannels` first, falling back to 2 channels.
-        // One line that separates "the mix was silent" from "the mix never
-        // reached the speaker". `outputVolume` here is the *system* volume for
-        // this session: a zero here silences a perfectly healthy engine.
-        let output = session.currentRoute.outputs.first
-        NSLog("[BitChord] audio session category=%@ volume=%.2f route=%@ rate=%.0f ch=%d",
-              session.category.rawValue,
-              session.outputVolume,
-              output.map { "\($0.portType.rawValue)/\($0.portName)" } ?? "none",
-              session.sampleRate,
-              session.outputNumberOfChannels)
-
+        // Note: on iOS built-in speakers and standard headphones,
+        // `portDescription.channels` is nil (it is only non-nil for
+        // multi-channel USB devices). Use `session.outputNumberOfChannels`
+        // first, falling back to 2 channels.
         let hardwareChannels = session.outputNumberOfChannels
         let routeChannels = session.currentRoute.outputs.first?.channels?.count ?? 0
-        let channels = hardwareChannels > 0 ? hardwareChannels : (routeChannels > 0 ? routeChannels : (session.currentRoute.outputs.isEmpty ? 0 : 2))
+        let channels = hardwareChannels > 0
+            ? hardwareChannels
+            : (routeChannels > 0 ? routeChannels : (session.currentRoute.outputs.isEmpty ? 0 : 2))
+
+        // One line that separates "the mix was silent" from "the mix never
+        // reached the speaker". `outputVolume` is the *system* volume for this
+        // session: a zero here silences a perfectly healthy engine.
+        //
+        // The options and other-audio flags help diagnose interruptions that
+        // happen outside the engine. An interruption is a gap the engine's
+        // counters cannot show: the output ring can be full and the callback
+        // punctual while the system takes the audio away underneath both.
+        let output = session.currentRoute.outputs.first
+        NSLog("[BitChord] audio session %@",
+              "category=\(session.category.rawValue) mode=\(session.mode.rawValue) "
+              + "options=\(session.categoryOptions.rawValue) volume=\(session.outputVolume) "
+              + "route=\(output.map { "\($0.portType.rawValue)/\($0.portName)" } ?? "none") "
+              + "rate=\(session.sampleRate) ch=\(channels) "
+              + "otherAudio=\(session.isOtherAudioPlaying) "
+              + "shouldSilenceSecondary=\(session.secondaryAudioShouldBeSilencedHint)")
+
         guard channels > 0, session.sampleRate > 0 else { return nil }
         return Format(rate: session.sampleRate, channels: UInt32(channels))
 #else
         return nil
+#endif
+    }
+
+    /// Deactivates the playback session and notifies other audio apps that
+    /// they may resume or take back exclusive hardware access.
+    static func deactivate() async {
+#if os(iOS)
+        do {
+            try AVAudioSession.sharedInstance().setActive(false, options: [.notifyOthersOnDeactivation])
+            NSLog("[BitChord] audio session deactivated (.notifyOthersOnDeactivation)")
+        } catch {
+            NSLog("[BitChord] audio session deactivation failed: \(error.localizedDescription)")
+        }
+#endif
+    }
+
+    /// Watches the session for output-route changes and calls `handler` on each.
+    ///
+    /// Returns the observer tokens; the caller holds them for as long as it
+    /// wants the callbacks, and the observers die with them.
+    ///
+    /// cpal already sees the *device* half of a route change and rebuilds the
+    /// audio unit itself. What it cannot do is re-activate the session, because
+    /// the session is the app's — and a unit built while the session is down is
+    /// never pulled by the audio daemon, which is silent in exactly the way a
+    /// working engine is not. So this is the half only the app can supply.
+    ///
+    /// `.oldDeviceUnavailable` is the one that matters most: it is what putting
+    /// AirPods down looks like, and it leaves the previous unit pointing at a
+    /// device that has gone.
+    @discardableResult
+    static func observeRouteChanges(
+        _ handler: @escaping () -> Void,
+        onOldDeviceUnavailable: (() -> Void)? = nil
+    ) -> [NSObjectProtocol] {
+#if os(iOS)
+        let center = NotificationCenter.default
+        let token = center.addObserver(
+            forName: AVAudioSession.routeChangeNotification,
+            object: nil,
+            queue: .main
+        ) { note in
+            guard let raw = note.userInfo?[AVAudioSessionRouteChangeReasonKey] as? UInt,
+                  let reason = AVAudioSession.RouteChangeReason(rawValue: raw)
+            else { return }
+            switch reason {
+            case .oldDeviceUnavailable:
+                NSLog("[BitChord] audio route device unavailable (e.g. headphones unplugged)")
+                onOldDeviceUnavailable?()
+                handler()
+            case .newDeviceAvailable,
+                 .routeConfigurationChange, .categoryChange, .override:
+                NSLog("[BitChord] audio route changed (reason %d)", raw)
+                handler()
+            default:
+                break
+            }
+        }
+        return [token]
+#else
+        _ = handler
+        _ = onOldDeviceUnavailable
+        return []
+#endif
+    }
+
+    /// Observes audio session interruptions (phone calls, Siri, other apps).
+    ///
+    /// When an interruption begins, the audio hardware is reclaimed; the app
+    /// pauses playback and deactivates its session. When the interruption ends,
+    /// `shouldResume` dictates whether playback should automatically resume.
+    @discardableResult
+    static func observeInterruptions(
+        began: @escaping () -> Void,
+        ended: @escaping (_ shouldResume: Bool) -> Void
+    ) -> [NSObjectProtocol] {
+#if os(iOS)
+        let center = NotificationCenter.default
+        let token = center.addObserver(
+            forName: AVAudioSession.interruptionNotification,
+            object: nil,
+            queue: .main
+        ) { note in
+            guard let raw = note.userInfo?[AVAudioSessionInterruptionTypeKey] as? UInt,
+                  let type = AVAudioSession.InterruptionType(rawValue: raw)
+            else { return }
+            switch type {
+            case .began:
+                began()
+            case .ended:
+                let optionRaw = note.userInfo?[AVAudioSessionInterruptionOptionKey] as? UInt ?? 0
+                let shouldResume = AVAudioSession.InterruptionOptions(rawValue: optionRaw)
+                    .contains(.shouldResume)
+                ended(shouldResume)
+            @unknown default:
+                break
+            }
+        }
+        return [token]
+#else
+        _ = began
+        _ = ended
+        return []
+#endif
+    }
+
+    /// Watches the session for the events that take the audio away without the
+    /// engine's own counters moving: interruptions, requests to silence
+    /// secondary audio, and a media-services reset.
+    ///
+    /// This is the blind spot that makes "using a page stutters the music" hard
+    /// to diagnose. Everything on our side can look healthy at the same moment —
+    /// output ring full, callback punctual, no underruns, no rebuilds — because
+    /// the sound was never ours to lose: the system ducked it, interrupted it, or
+    /// asked us to stand down for something else. None of that reached the log,
+    /// and cpal handles the interruption stop/resume pair internally without
+    /// reporting it.
+    ///
+    /// A page-scoped stutter can come from keyboard or other system audio.
+    /// iOS's advisory that another app wants the primary audio slot — Siri, a
+    /// navigation prompt, an alert.
+    ///
+    /// The hint lets the caller lower volume under a primary audio prompt.
+    ///
+    /// Separate from [observeSessionEvents], which formats the same notification
+    /// into a log line: this one carries the value a caller can act on.
+    @discardableResult
+    static func observeSecondaryAudioSilence(
+        _ handler: @escaping (Bool) -> Void
+    ) -> [NSObjectProtocol] {
+#if os(iOS)
+        let session = AVAudioSession.sharedInstance()
+        return [NotificationCenter.default.addObserver(
+            forName: AVAudioSession.silenceSecondaryAudioHintNotification,
+            object: nil,
+            queue: .main
+        ) { _ in
+            // Read from the session rather than the notification's userInfo:
+            // the hint's payload has changed shape across releases, and the
+            // session property is the same answer in one documented place.
+            handler(session.secondaryAudioShouldBeSilencedHint)
+        }]
+#else
+        return []
+#endif
+    }
+
+    @discardableResult
+    static func observeSessionEvents(_ handler: @escaping (String) -> Void) -> [NSObjectProtocol] {
+#if os(iOS)
+        let center = NotificationCenter.default
+        let session = AVAudioSession.sharedInstance()
+        var tokens: [NSObjectProtocol] = []
+
+        tokens.append(center.addObserver(
+            forName: AVAudioSession.interruptionNotification,
+            object: nil,
+            queue: .main
+        ) { note in
+            let raw = note.userInfo?[AVAudioSessionInterruptionTypeKey] as? UInt ?? 0
+            let began = AVAudioSession.InterruptionType(rawValue: raw) == .began
+            let optionRaw = note.userInfo?[AVAudioSessionInterruptionOptionKey] as? UInt ?? 0
+            let shouldResume = AVAudioSession.InterruptionOptions(rawValue: optionRaw)
+                .contains(.shouldResume)
+            handler("audio interruption \(began ? "began" : "ended") shouldResume=\(shouldResume)")
+        })
+
+        tokens.append(center.addObserver(
+            forName: AVAudioSession.silenceSecondaryAudioHintNotification,
+            object: nil,
+            queue: .main
+        ) { _ in
+            handler("secondary-audio hint: otherAudio=\(session.isOtherAudioPlaying) "
+                    + "shouldSilence=\(session.secondaryAudioShouldBeSilencedHint)")
+        })
+
+        tokens.append(center.addObserver(
+            forName: AVAudioSession.mediaServicesWereResetNotification,
+            object: nil,
+            queue: .main
+        ) { _ in
+            handler("audio media services were reset")
+        })
+
+        return tokens
+#else
+        _ = handler
+        return []
 #endif
     }
 }

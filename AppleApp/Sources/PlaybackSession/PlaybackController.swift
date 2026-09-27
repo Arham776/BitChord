@@ -339,9 +339,27 @@ final class PlaybackController {
     private var unshuffledQueue: [QueueEntry]?
     /// Id the engine currently has loaded — nil after a cold restore until Play.
     private var engineLoadedId: String?
-    private var restoredStart: Double?
-    private var audioHealthLogUntil = Date.distantPast
-    private var lastAudioHealthLog = Date.distantPast
+    /// The file the engine actually opened for the loaded track, as it reports
+    /// it back. Kept because `QueueEntry.source` is **not** a path for a
+    /// YouTube track — it is `yt:<videoId>` (see `QueueEntry.youtube`) — and the
+    /// planner needs something it can decode. Handing it the identifier made
+    /// `duration_of` return 0, which skips the whole-track analysis, leaves
+    /// `bpm` at 0, and drops every plan to `Tier::Plain`: a plain crossfade on
+    /// essentially all normal streaming playback, with the smart path never
+    /// reached. Skipping the plan (as the load path does when it cannot get a
+    /// path) is also wrong — it forgoes the cue and the arm — so the path is
+    /// remembered instead.
+    private var loadedSourcePath: String?
+    /// Where a restored session left off, **and which track it was left on**.
+    ///
+    /// The id is the whole point. Held as a bare `Double?` the position was
+    /// consumed by whichever track loaded next, so pressing Next during the
+    /// window between `restoreSession` (which sets this and clears
+    /// `engineLoadedId`) and the first play started a *different* song that far
+    /// in — the log's `requested_start=13.013s` on a track the listener had just
+    /// skipped to. A resume position belongs to a track, so it is stored with
+    /// one.
+    private var restoredStart: (entryId: String, position: Double)?
     private var lastPersistAt = Date.distantPast
 
     private var positionTimer: Timer?
@@ -359,9 +377,72 @@ final class PlaybackController {
     private let nowPlaying = NowPlayingController()
     private let widgetPublisher = WidgetStatePublisher()
     private let headTracker = HeadTracker()
+    /// Session route-change observers. Held so they stay registered for the
+    /// life of the controller; releasing them is what unsubscribes.
+    private var routeObservers: [NSObjectProtocol] = []
+    /// Tracks if playback was interrupted by phone calls, Siri, or other exclusive audio.
+    private var wasInterrupted = false
 
     init() {
         engine.registerCallback(callback: EngineCallbacks(controller: self))
+        // The engine rebuilds the *device* on a route change; only the app can
+        // re-activate the session it rebuilds against. See `outputRouteChanged`.
+        // Also pause if the old device became unavailable (e.g. headphones unplugged).
+        routeObservers = AudioSessionManager.observeRouteChanges(
+            { [weak self] in
+                Task { @MainActor in self?.outputRouteChanged() }
+            },
+            onOldDeviceUnavailable: { [weak self] in
+                Task { @MainActor in
+                    guard let self, self.isPlaying else { return }
+                    self.togglePlayPause()
+                }
+            }
+        )
+        // Handle interruptions cleanly: when an incoming call, Siri, navigation,
+        // or another app begins, pause engine, notify nowPlaying, and deactivate
+        // session so the other app has exclusive audio access. When interruption
+        // ends with .shouldResume, automatically resume playback.
+        routeObservers += AudioSessionManager.observeInterruptions(
+            began: { [weak self] in
+                Task { @MainActor in
+                    guard let self else { return }
+                    NSLog("[BitChord] Audio interruption began")
+                    if self.isPlaying {
+                        self.wasInterrupted = true
+                        self.state = .paused
+                        try? self.engine.pause()
+                        self.nowPlaying.updateRate(0.0, position: self.position)
+                        Task.detached(priority: .utility) {
+                            await AudioSessionManager.deactivate()
+                        }
+                    }
+                }
+            },
+            ended: { [weak self] shouldResume in
+                Task { @MainActor in
+                    guard let self else { return }
+                    NSLog("[BitChord] Audio interruption ended, shouldResume=\(shouldResume)")
+                    if self.wasInterrupted {
+                        self.wasInterrupted = false
+                        if shouldResume {
+                            self.togglePlayPause()
+                        }
+                    }
+                }
+            }
+        )
+        // Log secondary audio events and media reset notifications
+        routeObservers += AudioSessionManager.observeSessionEvents { event in
+            NSLog("[BitChord] %@", event)
+        }
+        // And the one session signal that asks for an action rather than a line
+        // in the log: another app wants the primary audio slot. Duck, don't
+        // pause — the music is the thing this app promises not to take away, and
+        // the prompt is the thing that has to be heard over it.
+        routeObservers += AudioSessionManager.observeSecondaryAudioSilence { [weak self] shouldSilence in
+            Task { @MainActor in self?.applyDuck(shouldSilence) }
+        }
         nowPlaying.onToggle = { [weak self] in self?.togglePlayPause() }
         nowPlaying.onPlay = { [weak self] in
             guard let self, !self.isPlaying else { return }
@@ -450,19 +531,14 @@ final class PlaybackController {
                 self.pollWidgetCommands()
                 guard self.state == .playing else { return }
                 self.position = self.engine.positionSeconds()
+                self.positionSampledAt = Date()
                 self.nowPlaying.update(position: self.position)
-                let now = Date()
-                if now < self.audioHealthLogUntil, now.timeIntervalSince(self.lastAudioHealthLog) >= 5 {
-                    self.lastAudioHealthLog = now
-                    let health = self.engine.outputHealth()
-                    // `peak` is what actually left the device callback: a
-                    // non-zero peak with no audible sound points at the route /
-                    // session, while a zero peak points at the mix itself.
-                    NSLog("[BitChord] output position=%.2f buffer=%llu underruns=%llu rebuilds=%llu xruns=%llu volume=%.2f peak=%.4f",
-                          self.position, health.bufferedFrames, health.callbackUnderruns,
-                          health.outputRebuilds, health.outputXruns, self.volume,
-                          health.outputPeak)
-                }
+                // The periodic output-health NSLog that used to sit here is
+                // gone: every figure it carried — buffered frames, silent
+                // callbacks, rebuilds, xruns and the output peak — is on the
+                // Audio Pipeline sheet, live and without a console. It was the
+                // loudest thing in the log, five lines a second after every
+                // load, and it answered its question.
                 self.tickSleep()
                 self.tickScrobble()
                 self.tickHistory()
@@ -477,13 +553,91 @@ final class PlaybackController {
 
     /// A running output can survive in the background while iOS temporarily
     /// deactivates its audio session. Reassert playback activation on return
-    /// when there is an active or resumable track; leave an idle app alone.
+    /// only when actively playing; do not hijack audio when paused or idle.
     func reactivateAudioSessionAfterForeground() {
-        guard started,
-              state == .playing || (state == .paused && engineLoadedId != nil)
-        else { return }
+        guard started, state == .playing else { return }
+        Task.detached(priority: .userInitiated) { [weak self] in
+            _ = await AudioSessionManager.activate()
+            await MainActor.run { [weak self] in
+                guard let self, self.state == .playing else { return }
+                self.nowPlaying.requestPrimaryIfPossible()
+            }
+        }
+    }
+
+    /// The output route moved under us — AirPods put down, a device connected,
+    /// the route reconfigured.
+    ///
+    /// The engine hears about this directly from CoreAudio and rebuilds the
+    /// audio unit. Two things still have to happen here, and they are the
+    /// reason this handler exists at all:
+    ///
+    /// 1. The session is the app's, so only the app can re-activate it. A unit
+    ///    built while the session is down is never pulled by the audio daemon —
+    ///    silent, with the mixer cheerfully filling a ring that nothing drains.
+    /// 2. That has to be ordered *before* the rebuild. Activation lands in
+    ///    milliseconds and `requestOutputRebuild` is not dropped when a rebuild
+    ///    is already running, so this second pass runs after the session is up
+    ///    even if CoreAudio's own rebuild beat us to it.
+    private func outputRouteChanged() {
+        guard started, state == .playing else { return }
+        let engine = self.engine
         Task.detached(priority: .userInitiated) {
             _ = await AudioSessionManager.activate()
+            do {
+                try engine.requestOutputRebuild(force: true)
+            } catch {
+                NSLog("[BitChord] output rebuild after route change failed: \(error)")
+            }
+        }
+    }
+
+    /// How far down a duck goes: −16 dB.
+    ///
+    /// Audible as "quieter", not as "gone". A navigation prompt reads clearly
+    /// over it and the listener's own music does not stop, which is the promise
+    /// this app makes about coexisting with other audio.
+    private static let duckGain: Double = 0.16
+
+    /// The ramp in flight, if any.
+    ///
+    /// Held so a new instruction cancels the one it interrupts — two ramps
+    /// writing the output gain at once is a fight the engine cannot arbitrate.
+    @ObservationIgnored private var duckTask: Task<Void, Never>?
+    /// Whether a duck is currently applied, so repeat notifications are free.
+    @ObservationIgnored private var isDucked = false
+
+    /// Quieter while iOS says another app wants the primary audio slot.
+    ///
+    /// Three deliberate choices:
+    ///
+    /// - **Duck, not pause.** The session is mixable, so the system will not
+    ///   stop us; whether to get out of the way is ours to decide, and stopping
+    ///   the music for a two-second prompt is not the trade this app makes.
+    /// - **Ramp, not step.** The engine applies the gain per sample, so a jump
+    ///   is a click. Twenty steps of ~10 ms is ~200 ms to −16 dB: fast enough to
+    ///   be out of the way when a prompt starts, slow enough not to be heard as
+    ///   a jump.
+    /// - **The output, not `volume`.** This calls the engine directly instead of
+    ///   going through the published `volume`, so the slider keeps showing what
+    ///   the listener chose while the *output* is quieter. Ducking by writing
+    ///   `volume` would have moved their control and then had to guess what to
+    ///   put it back to.
+    private func applyDuck(_ shouldDuck: Bool) {
+        guard shouldDuck != isDucked else { return }
+        isDucked = shouldDuck
+        duckTask?.cancel()
+        let from = Float(volume * (shouldDuck ? 1.0 : Self.duckGain))
+        let to = Float(volume * (shouldDuck ? Self.duckGain : 1.0))
+        let engine = self.engine
+        duckTask = Task.detached(priority: .userInitiated) {
+            let steps = 20
+            for step in 1...steps {
+                if Task.isCancelled { return }
+                let progress = Float(step) / Float(steps)
+                engine.setVolume(gain: from + (to - from) * progress)
+                try? await Task.sleep(for: .milliseconds(10))
+            }
         }
     }
 
@@ -591,7 +745,8 @@ final class PlaybackController {
         // started by the old source must not be able to `loadTrack` into the new.
         playGeneration &+= 1
         engineLoadedId = nil
-        restoredStart = resumeAt
+        loadedSourcePath = nil
+        rememberRestoredStart(resumeAt)
         loadCurrent(playingIndex)
     }
 
@@ -618,6 +773,14 @@ final class PlaybackController {
         )
     }
 
+    /// Remember where the track at `playingIndex` was left, so the resume can
+    /// only ever be applied back to it. See `restoredStart`.
+    private func rememberRestoredStart(_ position: Double, of entryId: String? = nil) {
+        let id = entryId
+            ?? (queue.indices.contains(playingIndex) ? queue[playingIndex].id : current?.id)
+        restoredStart = id.map { (entryId: $0, position: position) }
+    }
+
     func restoreSession() {
         guard let snap = LastPlayed.load() else { return }
         let savedContext = PlatformSettings.shared.getString(key: "last_playback_context", default: "")
@@ -630,8 +793,9 @@ final class PlaybackController {
         repeatMode = snap.repeatMode
         shuffleEnabled = snap.shuffleEnabled
         volume = snap.volume
-        restoredStart = snap.position
+        rememberRestoredStart(snap.position, of: current?.id)
         engineLoadedId = nil
+        loadedSourcePath = nil
         state = .paused
         if let entry = current {
             nowPlaying.update(
@@ -647,6 +811,7 @@ final class PlaybackController {
 
     func playNext(_ entry: QueueEntry) {
         noteLocalIntent()
+        let wasEmpty = queue.isEmpty
         let at = min(playingIndex + 1, queue.count)
         queue.insert(entry, at: at)
         if var original = unshuffledQueue {
@@ -654,6 +819,12 @@ final class PlaybackController {
             unshuffledQueue = original
         }
         persistSession()
+        // As `addToQueue`: "play next" on an idle player is a request to play.
+        if wasEmpty, isIdle {
+            playingIndex = 0
+            loadCurrent(0)
+            return
+        }
         syncEngineQueueNext()
     }
 
@@ -708,12 +879,33 @@ final class PlaybackController {
         return (after..<fromAutoplay.count).first { fromAutoplay[$0] } ?? fromAutoplay.count
     }
 
+    /// Upstream `addToQueue`: the item joins the end of what the *listener*
+    /// queued, which outranks whatever AutoPlay lined up behind it.
+    ///
+    /// Adding to an idle player is also how playback *starts*. Upstream inserts
+    /// into the player's own playlist, and ExoPlayer takes an item added to an
+    /// empty playlist as the thing to play; the port appended to its model and
+    /// called `syncEngineQueueNext`, which looks at the item *after* the
+    /// playing one — and with nothing playing there is no such item. The song
+    /// then simply sat there until Next was pressed.
     func addToQueue(_ entry: QueueEntry) {
         noteLocalIntent()
+        let wasEmpty = queue.isEmpty
         queue.append(entry)
         unshuffledQueue?.append(entry)
         persistSession()
+        if wasEmpty, isIdle {
+            // Nothing was playing and nothing was queued: this is the queue.
+            playingIndex = 0
+            loadCurrent(0)
+            return
+        }
         syncEngineQueueNext()
+    }
+
+    /// Nothing loaded into the engine and nothing on its way there.
+    private var isIdle: Bool {
+        engineLoadedId == nil && state != .playing && state != .buffering
     }
 
     /// Told when *the listener* uses this device's controls, so a party can stop
@@ -758,7 +950,8 @@ final class PlaybackController {
             return
         }
         if engineLoadedId != current?.id {
-            let start = restoredStart
+            // Only when it is still the track the position was saved for.
+            let start = restoredStart.flatMap { $0.entryId == current?.id ? $0.position : nil }
             restoredStart = nil
             loadCurrent(playingIndex, startAt: start)
             return
@@ -769,7 +962,11 @@ final class PlaybackController {
             // device callback before the mixer thread runs Pause.
             state = .paused
             try? engine.pause()
+            nowPlaying.updateRate(0.0, position: position)
             persistSession()
+            Task.detached(priority: .utility) {
+                await AudioSessionManager.deactivate()
+            }
         } else {
             // The session may have been interrupted or deactivated while this
             // loaded track was paused. Reactivate it off the main thread before
@@ -788,6 +985,8 @@ final class PlaybackController {
                     do {
                         try engine.play()
                         self.state = .playing
+                        let speed = Double(PlatformSettings.shared.getFloat(key: "playback_speed", default: 1))
+                        self.nowPlaying.updateRate(speed, position: self.position)
                     } catch {
                         self.lastError = "Audio output could not resume: \(error)"
                     }
@@ -1144,6 +1343,7 @@ final class PlaybackController {
         lastError = nil
         state = .buffering
         engineLoadedId = nil
+        loadedSourcePath = nil
         nowPlaying.update(
             title: entry.title, artist: entry.artist,
             duration: 0, artworkData: entry.artworkData,
@@ -1627,12 +1827,11 @@ final class PlaybackController {
     }
 
     private func loadDidSucceed(entry: QueueEntry, index: Int, info: TrackInfoRec, startAt: Double = 0) {
-        audioHealthLogUntil = Date().addingTimeInterval(30)
-        lastAudioHealthLog = .distantPast
         NSLog("[BitChord] loaded track at %.2fs (duration %.2fs)", startAt, info.durationSeconds)
         playingIndex = index
         current = entry
         engineLoadedId = entry.id
+        loadedSourcePath = info.source
         position = startAt
         duration = info.durationSeconds
         lastError = nil
@@ -1706,7 +1905,14 @@ final class PlaybackController {
         let nextId = next.id
         let engine = self.engine
         let automix = automixEnabled
-        let currentSource = current?.source ?? ""
+        // The *file* the engine opened, not `current.source` — which for a
+        // YouTube track is `yt:<videoId>` and not something the planner can
+        // decode. Passing the identifier made `duration_of` return 0, which
+        // skips the whole-track analysis, leaves `bpm` at 0, and drops the plan
+        // to `Tier::Plain`. The incoming side still analysed fine, so the only
+        // symptom was a plausible-looking cue sitting on top of a plain 12 s
+        // crossfade — which was every transition on normal streaming playback.
+        let currentSource = loadedSourcePath ?? ""
         let currentText = current?.itemText ?? ""
         let nextText = next.itemText
         let albumSequential = !shuffleEnabled && (current?.sameAlbum(as: next) ?? false)
@@ -1807,6 +2013,7 @@ final class PlaybackController {
                 thumbnailUrl: entry.thumbnailUrl, isPlaying: true
             )
             engineLoadedId = entry.id
+            loadedSourcePath = info.source
             beginSmartMixIfNeeded()
             lookForBetterCopy(entry, codec: info.codec, kbps: info.kbps)
         }
@@ -1820,6 +2027,10 @@ final class PlaybackController {
             sleepAfterTrack = false
             try? engine.pause()
             state = .paused
+            nowPlaying.updateRate(0.0, position: position)
+            Task.detached(priority: .utility) {
+                await AudioSessionManager.deactivate()
+            }
             return
         }
         if let current, current.source.hasPrefix("yt:") {
@@ -1842,12 +2053,42 @@ final class PlaybackController {
         case .off:
             state = .stopped
             position = 0
+            nowPlaying.updateRate(0.0, position: 0)
+            Task.detached(priority: .utility) {
+                await AudioSessionManager.deactivate()
+            }
         }
     }
 
     fileprivate func handleDuration(_ seconds: Double) {
         duration = seconds
         publishSmartWindow()
+        // The lyric lookup may have gone out before the container said how long
+        // the track is — the one field that lets most of these providers choose
+        // between takes — and a lookup made blind is not evidence that there are
+        // no lyrics. Upstream defers and re-runs on the length; so does this.
+        if lyricsMissedWithoutDuration, seconds > 0, let entry = current {
+            lyricsMissedWithoutDuration = false
+            fetchLyrics(for: entry)
+        }
+    }
+
+    /// Whether the lookup for the current track went out without a duration and
+    /// came back empty. See [handleDuration].
+    @ObservationIgnored private var lyricsMissedWithoutDuration = false
+
+    /// Look again for the track that is playing.
+    ///
+    /// The "Change" sheet edits *which* sources are enabled and in what order,
+    /// and those settings only ever applied to the next track: nothing re-ran
+    /// the lookup for the one on screen, so a wrong or missing lyric could not
+    /// be fixed from the player at all — the only way was to disable sources
+    /// globally and play the track again. Upstream has a per-track provider
+    /// picker for this; re-running with the settings the listener just changed
+    /// is the part that makes those settings mean something.
+    func refetchLyrics() {
+        guard let entry = current else { return }
+        fetchLyrics(for: entry)
     }
 
     fileprivate func handleError(_ message: String) {
@@ -1892,6 +2133,7 @@ final class PlaybackController {
         }
         lyricsLoading = true
         let durationMs = Swift.Int64((entry.durationSeconds > 0 ? entry.durationSeconds : duration) * 1000)
+        lyricsMissedWithoutDuration = durationMs <= 0
         LyricsBridge.shared.fetchAttributed(
             title: entry.title,
             artist: entry.artist,
@@ -1908,6 +2150,9 @@ final class PlaybackController {
                     // The search finished either way, which is what the deck's
                     // strip reads to tell "none" apart from "looking".
                     self.attemptedLyrics = true
+                    // An answer means the blind lookup is moot; only an empty
+                    // one leaves the door open for `handleDuration` to re-run.
+                    if !lines.isEmpty { self.lyricsMissedWithoutDuration = false }
                 }
             }
         )
@@ -2050,16 +2295,67 @@ final class PlaybackController {
         if isPlaying { togglePlayPause() }
     }
 
+    /// The heart in the player, for whatever is playing.
     func toggleLike() {
         guard let vid = current?.videoId else { return }
-        let next = LibraryActions.cachedLike(vid) == "LIKE" ? "INDIFFERENT" : "LIKE"
-        Task { _ = await LibraryActions.rate(videoId: vid, status: next) }
+        toggleLike(videoId: vid)
+    }
+
+    /// The heart for a named track — the row swipe and the long-press menu use
+    /// this one, so there is a single like path rather than three that disagree.
+    ///
+    /// `LibraryActions.toggleLike` owns the optimistic write and its rollback;
+    /// this adds the reporting, which every call site used to skip by writing
+    /// the result to `_`. A refused rating was therefore invisible *and*
+    /// permanent — the heart kept a status the account did not have. `lastError`
+    /// is the app's single failure surface (RootView turns it into a toast), so
+    /// a like that YouTube refuses is said out loud in the same place a
+    /// playback failure is.
+    func toggleLike(videoId: String) {
+        Task { @MainActor [weak self] in
+            if let failure = await LibraryActions.toggleLike(videoId: videoId) {
+                self?.lastError = failure
+            }
+        }
     }
 
     var isLiked: Bool {
         _ = LikeStore.shared.epoch
         guard let vid = current?.videoId else { return false }
         return LibraryActions.cachedLike(vid) == "LIKE"
+    }
+
+    /// When [position] was last read from the engine. See [livePosition].
+    @ObservationIgnored private var positionSampledAt = Date.distantPast
+
+    /// The transport position, advanced between engine polls.
+    ///
+    /// `position` is the engine's answer, four times a second. Judging a word
+    /// highlight against it means the highlight can only change on those four
+    /// ticks — up to 250 ms late, in 250 ms steps, and frozen for as long as the
+    /// engine is not reporting. Upstream keeps a reconciler and a per-frame
+    /// advance for exactly this ([LyricClock]), added on the grounds that a
+    /// twice-a-second clock is "far too coarse for a highlight".
+    ///
+    /// So the lyric pane reads this instead: the last reported position plus the
+    /// wall clock since it arrived, which the pane drives at frame rate through
+    /// a `TimelineView(.animation)`.
+    ///
+    /// Only while `state == .playing`, deliberately. Paused, buffering or
+    /// seeking, the answer is exactly `position` — interpolation must never
+    /// invent motion the engine is not making. The `elapsed < 1` bound is the
+    /// same instinct for a stalled tick: past a second, the honest answer is the
+    /// last measurement rather than a guess with a second of drift in it.
+    ///
+    /// Rate is taken as 1.0. A beatmatched transition stretches the *incoming* by
+    /// up to 5 %, which over one 250 ms poll is 12 ms of error and is reset by the
+    /// next poll — the alternative is threading the mixer's tempo back here to
+    /// position a highlight.
+    func livePosition(at now: Date) -> Double {
+        guard state == .playing else { return position }
+        let elapsed = now.timeIntervalSince(positionSampledAt)
+        guard elapsed > 0, elapsed < 1 else { return position }
+        return position + elapsed
     }
 
     private func maybeAutoplay(force: Bool = false) {
@@ -2340,15 +2636,37 @@ final class PlaybackController {
             log.record("upgrade audition failed", about: mediaId)
             return
         }
-        let again = await MainActor.run { () -> (Double, Bool, Double?)? in
+        let again = await MainActor.run { () -> (Double, Bool, Double?, String?)? in
             guard self.playGeneration == generation, self.current?.id == mediaId else { return nil }
             if self.smartMixInProgress { return nil }
-            return (self.position, self.isPlaying, self.currentLoudnessDb)
+            return (self.position, self.isPlaying, self.currentLoudnessDb, self.loadedSourcePath)
         }
-        guard let (nowPos, playing, loudnessDb) = again else {
+        guard let (nowPos, playing, loudnessDb, priorSource) = again else {
             QualityUpgrade.shelve(mediaId, stream: stream)
             log.record("upgrade proved but the queue moved on; shelved", about: mediaId)
             return
+        }
+        // Low-energy swap placement: defer swap execution to the next local energy
+        // dip in the audio curve (within 0.1–2.0s) so the 550ms crossfade begins at
+        // the valley, making the seam inaudible.
+        var effectivePos = nowPos
+        if playing, let currentSource = priorSource {
+            if let dipTime = engine.nextEnergyDip(source: currentSource, positionSeconds: nowPos) {
+                let delay = dipTime - nowPos
+                if delay >= 0.1 && delay <= 2.0 {
+                    log.record("delaying swap by \(Int(delay * 1000))ms for energy dip at \(Int(dipTime * 1000))ms", about: mediaId)
+                    try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
+                    let stillValid = await MainActor.run { () -> Double? in
+                        guard self.playGeneration == generation, self.current?.id == mediaId, self.isPlaying else { return nil }
+                        return self.position
+                    }
+                    guard let updatedPos = stillValid else {
+                        QualityUpgrade.shelve(mediaId, stream: stream)
+                        return
+                    }
+                    effectivePos = updatedPos
+                }
+            }
         }
         do {
             // Same track, better source: the engine opens the replacement and
@@ -2367,7 +2685,7 @@ final class PlaybackController {
                     source: path,
                     title: entry.title,
                     artist: entry.artist,
-                    startSeconds: nowPos,
+                    startSeconds: effectivePos,
                     plan: nil,
                     headers: stream.headers,
                     claimedKbps: Swift.UInt32(stream.format.kbps ?? 0),
@@ -2382,16 +2700,40 @@ final class PlaybackController {
                 guard self.playGeneration == generation, self.current?.id == mediaId else { return }
                 QualityUpgrade.unshelve(mediaId)
                 self.engineLoadedId = entry.id
+                self.loadedSourcePath = info.source
                 self.duration = info.durationSeconds
                 // The playhead is continuous across a swap; the engine keeps it.
-                self.position = nowPos
+                self.position = effectivePos
                 self.nerd = engine.nerdStats()
                 self.racingLossless = false
                 if playing { self.state = .playing }
                 log.record(
-                    "upgraded to \(stream.format.summary) in place at \(Int(nowPos * 1000))ms",
+                    "upgraded to \(stream.format.summary) in place at \(Int(effectivePos * 1000))ms",
                     about: mediaId
                 )
+            }
+            // Monitor swap crossfade completion: verify Pearson correlation rho >= 0.85.
+            // If the engine rejected the swap due to mismatched recording or transcode,
+            // roll back the source path and mark the track refused for upgrades.
+            Task { [weak self] in
+                let waitSeconds = QualityUpgrade.swapCrossfadeSeconds + 0.2
+                try? await Task.sleep(nanoseconds: UInt64(waitSeconds * 1_000_000_000))
+                guard let self = self else { return }
+                await MainActor.run {
+                    guard self.playGeneration == generation, self.current?.id == mediaId else { return }
+                    let currentNerd = self.engine.nerdStats()
+                    self.nerd = currentNerd
+                    if let rho = currentNerd.swapCorrelation, rho < 0.85 {
+                        QualityUpgrade.refuseUpgrades(mediaId)
+                        if let prior = priorSource {
+                            self.loadedSourcePath = prior
+                        }
+                        log.record(
+                            "swap rejected by engine (rho=\(String(format: "%.3f", rho)) < 0.85); reverted to original source",
+                            about: mediaId
+                        )
+                    }
+                }
             }
         } catch EngineError.LoadFailed(let message)
             where message.contains("transition is already running") {
@@ -2411,6 +2753,10 @@ final class PlaybackController {
         pendingAutomixPlan = plan
         analysisTier = Self.tierName(plan)
         publishSmartWindow()
+        // The audit's per-transition NSLog lived here. It did its job — it is
+        // how the `yt:` identifier bug was caught, and how the anchor was
+        // confirmed reaching the mixer — and the tier it printed is on the
+        // player already. The engine logs the plan it actually renders.
     }
 
     private func publishSmartWindow() {

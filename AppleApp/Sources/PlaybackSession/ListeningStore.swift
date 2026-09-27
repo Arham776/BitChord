@@ -58,6 +58,33 @@ final class ListeningStore {
     private var lastSampleAt: Date?
     private var playedThisTrack: TimeInterval = 0
     private var playCounted = false
+
+    /// Persistence, off the main thread and coalesced.
+    ///
+    /// [`onSample`] is driven by the playback tick, four times a second, and it
+    /// used to end in [`persist`] — which is two JSON encodes, an atomic file
+    /// write with a remove/move pair, and a `UserDefaults` encode, all on the
+    /// main thread. That was the app's largest source of main-thread I/O while
+    /// music played, and it is felt twice over: the UI hitches, and the audio
+    /// decoder — which used to run in the same priority band — loses the CPU it
+    /// needs to keep the output ring fed.
+    ///
+    /// Updating the in-memory model is cheap and stays where it is. Encoding and
+    /// writing it is not, so that half moves to a serial background queue, and
+    /// bursts are coalesced: only the newest snapshot is written, and a write
+    /// that lands while another is queued replaces it rather than joining a
+    /// queue. State below is main-thread only; the writer hops back to clear it.
+    private let persistQueue = DispatchQueue(
+        label: "com.example.bitchord.listening-persist",
+        qos: .utility
+    )
+    /// Fastest the store will rewrite the disk while a track is playing. The
+    /// model is in memory regardless, so the exposure is at most this much
+    /// listening time if the app is killed outright.
+    private let persistInterval: TimeInterval = 2
+    private var pendingPersist: (month: StoredBucket, bucket: Bucket)?
+    private var persistRunning = false
+    private var lastPersistAt = Date.distantPast
     /// Filled by Replay after `ArtistFacts.warmup` so genre ranking is MainActor-cheap.
     var knownGenres: [String: [String]] = [:]
 
@@ -227,9 +254,32 @@ final class ListeningStore {
     }
 
     func persist() {
-        writeMonth(open.snapshot())
-        if let data = try? JSONEncoder().encode(bucket) {
-            UserDefaults.standard.set(data, forKey: v1Key)
+        pendingPersist = (open.snapshot(), bucket)
+        schedulePersist()
+    }
+
+    /// Starts a writer unless one is already running or the interval has not
+    /// elapsed. The snapshot taken in `persist` is always the newest, so a
+    /// burst of samples collapses into one write of the final state — and the
+    /// write that lands while another is queued replaces it instead of queueing
+    /// behind it.
+    private func schedulePersist() {
+        guard !persistRunning, let snapshot = pendingPersist else { return }
+        pendingPersist = nil
+        persistRunning = true
+        let wait = max(0, persistInterval - Date().timeIntervalSince(lastPersistAt))
+        persistQueue.asyncAfter(deadline: .now() + wait) { [weak self] in
+            guard let self else { return }
+            self.writeMonth(snapshot.month)
+            if let data = try? JSONEncoder().encode(snapshot.bucket) {
+                UserDefaults.standard.set(data, forKey: self.v1Key)
+            }
+            DispatchQueue.main.async {
+                self.lastPersistAt = Date()
+                self.persistRunning = false
+                // Anything recorded while this ran still has to land.
+                self.schedulePersist()
+            }
         }
     }
 
