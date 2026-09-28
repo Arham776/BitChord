@@ -60,6 +60,7 @@ mod qos {
 }
 pub mod metadata;
 pub mod spatial;
+pub mod time_stretch;
 pub mod transition_filter;
 
 // ---- FFI data types ---------------------------------------------------------
@@ -115,10 +116,32 @@ pub struct TransitionPlanRec {
     /// the mixer has to arm from it rather than from the file's last byte.
     pub transition_end_seconds: f64,
     /// Where the incoming track is cued (Automix mix-in point). 0 = top.
+    ///
+    /// Bounded by the planner: a mix-in is the top of the incoming track's own
+    /// intro, snapped to a downbeat, and never more than `MAX_CUE_SECONDS` /
+    /// `MAX_CUE_BEATS` / `MAX_CUE_FRACTION` into the file. 0 also means "no
+    /// usable beat grid", in which case the next record plays from the top
+    /// rather than from a guess.
     pub cue_seconds: f64,
-    /// Tempo stretch — applied by the mixer via `speed_resampler`
-    /// (ExoPlayer `setPlaybackSpeed` parity).
+    /// Tempo stretch — applied by the mixer. Pitch-preserving: the handoff
+    /// stretch runs through WSOLA (`time_stretch`), held for the blend, then
+    /// glided back to unity over `post_glide_seconds`.
     pub playback_rate: f64,
+    /// See `mixer::TransitionPlan::bed_fraction`.
+    pub bed_fraction: f64,
+    /// See `mixer::TransitionPlan::bed_gain_db`.
+    pub bed_gain_db: f64,
+    /// See `mixer::TransitionPlan::dip_depth`.
+    pub dip_depth: f64,
+    /// See `mixer::TransitionPlan::dip_width`.
+    pub dip_width: f64,
+    /// See `mixer::TransitionPlan::post_glide_seconds`.
+    pub post_glide_seconds: f64,
+    /// The outgoing track's length as the planner measured it. See
+    /// `mixer::TransitionPlan::outgoing_duration_seconds` — it is what makes a
+    /// transition schedulable when the container declares no duration of its
+    /// own.
+    pub outgoing_duration_seconds: f64,
 }
 
 impl From<TransitionPlanRec> for TransitionPlan {
@@ -133,6 +156,12 @@ impl From<TransitionPlanRec> for TransitionPlan {
             transition_end_seconds: rec.transition_end_seconds,
             cue_seconds: rec.cue_seconds,
             playback_rate: rec.playback_rate,
+            bed_fraction: rec.bed_fraction,
+            bed_gain_db: rec.bed_gain_db,
+            dip_depth: rec.dip_depth,
+            dip_width: rec.dip_width,
+            post_glide_seconds: rec.post_glide_seconds,
+            outgoing_duration_seconds: rec.outgoing_duration_seconds,
         }
     }
 }
@@ -157,6 +186,16 @@ pub struct LoadRequest {
     /// and substitutes). Upstream's `StreamResolver.loudnessDbFor`; the mixer
     /// stays at unity gain without one.
     pub loudness_db: Option<f64>,
+    /// Track length the caller knows (catalogue response or local metadata).
+    ///
+    /// Not a convenience field: it is what makes a transition schedulable at
+    /// all. Plenty of containers declare no duration — a bare MP3 with no Xing
+    /// tag, a progressively-fetched MP4 whose `moov` has not arrived, most WebM
+    /// — and with no end to schedule against the mixer cannot arm the incoming
+    /// track, so the queue advances by a cut rather than a blend. The
+    /// container's own figure still wins where it has one; this is the
+    /// fallback.
+    pub duration_seconds: Option<f64>,
 }
 
 #[derive(uniffi::Record, Debug, Clone)]
@@ -424,6 +463,16 @@ impl AutomixTier {
     /// Whether the vocal-separation model runs for this plan.
     fn runs_vocal_model(self) -> bool {
         self != AutomixTier::Efficient
+    }
+
+    /// Label for the plan log, so a transition can be traced back to the tier
+    /// that produced it.
+    fn name(self) -> &'static str {
+        match self {
+            AutomixTier::Efficient => "EFFICIENT",
+            AutomixTier::Balanced => "BALANCED",
+            AutomixTier::Performance => "PERFORMANCE",
+        }
     }
 }
 
@@ -1457,6 +1506,10 @@ fn to_track_source(request: LoadRequest) -> TrackSource {
         headers: request.headers.unwrap_or_default(),
         claimed_kbps: request.claimed_kbps.unwrap_or(0),
         loudness_db: request.loudness_db.filter(|db| db.is_finite()),
+        duration_seconds: request
+            .duration_seconds
+            .filter(|d| d.is_finite() && *d > 0.0)
+            .unwrap_or(0.0),
     }
 }
 
@@ -1495,6 +1548,7 @@ fn plan_automix_impl_with_tier(
         album_sequential,
         crossfade_seconds,
         skip_vocals,
+        tier.name(),
         |path, start, dur, mono| {
             decode_region_impl(path, start, dur, mono)
                 .ok()
@@ -1521,6 +1575,12 @@ fn plan_automix_impl_with_tier(
         transition_end_seconds: plan.transition_end_seconds,
         cue_seconds: plan.cue_seconds,
         playback_rate: plan.playback_rate,
+        bed_fraction: plan.bed_fraction,
+        bed_gain_db: plan.bed_gain_db,
+        dip_depth: plan.dip_depth,
+        dip_width: plan.dip_width,
+        post_glide_seconds: plan.post_glide_seconds,
+        outgoing_duration_seconds: plan.outgoing_duration_seconds,
     }
 }
 
@@ -1569,7 +1629,10 @@ fn decode_region_impl(
 ) -> Result<DecodedRegion, String> {
     let kind = decode::SourceKind::parse(source);
     let empty_headers = std::collections::HashMap::new();
-    let mut decoder = decode::SymphoniaDecoder::open(&kind, &empty_headers).map_err(|e| e.to_string())?;
+    // Analysis must not wait out a download. Playback still does: a plan that
+    // blocks until the file is complete is a plan that arrives after the blend.
+    let mut decoder = decode::SymphoniaDecoder::open_available(&kind, &empty_headers)
+        .map_err(|e| e.to_string())?;
     if start_seconds > 0.0 {
         decoder.seek_seconds(start_seconds).map_err(|e| e.to_string())?;
     }

@@ -24,6 +24,7 @@ use crate::decode::resampler::StreamResampler;
 use crate::decode::{SourceKind, SymphoniaDecoder};
 use crate::eq::{EqCurve, EqualizerProcessor};
 use crate::spatial::SpatialRenderer;
+use crate::time_stretch::TimeStretch;
 use crate::transition_filter::TransitionFilter;
 
 /// Callback surface — the UniFFI-generated Swift side implements this.
@@ -69,6 +70,18 @@ pub struct TrackSource {
     /// one — normalizing against a made-up number would be worse than not
     /// normalizing.
     pub loudness_db: Option<f64>,
+    /// Track length the *caller* knows, from the catalogue response or local
+    /// metadata. 0 = unknown.
+    ///
+    /// The decoder can only report a duration the container declares, and plenty
+    /// of what this engine plays declares none: a bare MP3 without a Xing/LAME
+    /// duration tag, a progressively-fetched MP4 whose `moov` has not arrived
+    /// yet, most WebM. That is not a cosmetic gap — a transition is *scheduled*
+    /// against the end of the outgoing track, so with no end there is nowhere
+    /// to schedule it, the incoming is never armed, and the queue advances by a
+    /// cut at end-of-stream. The caller resolved the track and already has the
+    /// number, so it is passed in rather than re-derived.
+    pub duration_seconds: f64,
 }
 
 /// Port of upstream `playback.smart.TransitionStyle`.
@@ -103,9 +116,32 @@ pub struct TransitionPlan {
     /// filter rides together — landed late by however much the anchor is early.
     pub transition_end_seconds: f64,
     pub cue_seconds: f64,
-    /// Tempo stretch — multiplied into the incoming voice's `speed_resampler`
-    /// at open, and released by `release_plan_stretch` when the blend ends.
+    /// Tempo stretch for the incoming voice's WSOLA stage. Held for the whole
+    /// blend, then glided back to unity over `post_glide_seconds`.
     pub playback_rate: f64,
+    /// Fade progress where the incoming bed ends and the rise into the swap
+    /// begins. 0 means there is no bed — an equal-power fade or a gapless cut.
+    pub bed_fraction: f64,
+    /// Incoming level during the bed, in dB. About −14 is "playing underneath".
+    pub bed_gain_db: f64,
+    /// Depth of the one-beat dip in the incoming track just before the bass
+    /// swap, 0…1. 0 means the rise is monotonic. The outgoing track never dips.
+    pub dip_depth: f64,
+    /// Width of that dip as a fraction of the fade. One beat of the shared grid.
+    pub dip_width: f64,
+    /// How long after the blend the incoming tempo glides home, in seconds.
+    /// 0 releases the stretch as the blend ends.
+    pub post_glide_seconds: f64,
+    /// The outgoing track's length, as the planner measured it. 0 = unknown.
+    ///
+    /// A transition is scheduled against a planned mix-out anchor or the
+    /// outgoing track's end. The decoder cannot always report its duration;
+    /// this value lets a plain overlap start before end-of-stream in that case.
+    ///
+    /// The planner has the figure already — it measured the track to find its
+    /// mix-out anchor — so it travels with the plan rather than being asked for
+    /// again.
+    pub outgoing_duration_seconds: f64,
 }
 
 impl Default for TransitionPlan {
@@ -120,6 +156,12 @@ impl Default for TransitionPlan {
             transition_end_seconds: 0.0,
             cue_seconds: 0.0,
             playback_rate: 1.0,
+            bed_fraction: 0.0,
+            bed_gain_db: 0.0,
+            dip_depth: 0.0,
+            dip_width: 0.0,
+            post_glide_seconds: 0.0,
+            outgoing_duration_seconds: 0.0,
         }
     }
 }
@@ -199,6 +241,16 @@ const ARM_TIMEOUT_MS: u64 = 12_000;
 /// Leave this much of the incoming track after a cue so a mix-in cannot
 /// land in the outro (upstream `MIN_INCOMING_CLEARANCE_SECONDS`).
 const MIN_INCOMING_CLEARANCE_S: f64 = 5.0;
+/// Longest mix-in the mixer will open a track at, in seconds and as a fraction
+/// of its duration. The planner owns the decision (`analyzer::plan`) and adds a
+/// beat-based bound on top; these are the two the mixer can restate, so a plan
+/// that somehow arrives too deep is caught before it reaches `seek_seconds`.
+///
+/// The fraction is a floor for short material, not a ceiling for long: 6 % of a
+/// one-minute clip is under four seconds, and an eight-second skip there is an
+/// eighth of the record.
+const MAX_CUE_SECONDS: f64 = 8.0;
+const MAX_CUE_FRACTION: f64 = 0.06;
 /// Upstream `swapCurrentToVersion`'s `swapCrossfadeMs` — the equal-power
 /// crossfade a same-track source swap (quality upgrade, alternate version)
 /// runs over. Long enough to hide a decoder swap, short enough that a
@@ -224,14 +276,86 @@ const BLEND_EXIT_LOW_PASS_HZ: f64 = 2_200.0;
 const BLEND_EXIT_CLASH_FROM: f64 = 0.12;
 const BLEND_EXIT_CLASH_LOW_PASS_HZ: f64 = 1_100.0;
 
+/// Deepest dip a plan may ask for, as a fraction of the incoming gain.
+///
+/// A one-beat notch of this depth is about −9 dB on the record being brought
+/// in. The outgoing track is untouched, so the blend dips a few dB and
+/// recovers. Deeper than this reads as the transition losing the thread.
+pub(crate) const MAX_DUCK_DEPTH: f64 = 0.65;
 
-/// Equal-power pair: rise² + fall² = 1, so the blend never dips.
+/// How long the incoming bed takes to rise out of silence, so the blend does
+/// not open on a step.
+const BED_ATTACK_SECONDS: f64 = 0.040;
+
+/// Equal-power fall: `cos` of the half turn. Used by the bail ramp and as half
+/// of the plain crossfade.
+fn fall_gain(progress: f64) -> f32 {
+    (progress.clamp(0.0, 1.0) * core::f64::consts::PI / 2.0).cos() as f32
+}
+
 fn rise_gain(progress: f64) -> f32 {
     (progress.clamp(0.0, 1.0) * core::f64::consts::PI / 2.0).sin() as f32
 }
 
-fn fall_gain(progress: f64) -> f32 {
-    (progress.clamp(0.0, 1.0) * core::f64::consts::PI / 2.0).cos() as f32
+/// Smoothstep: zero slope at both ends.
+fn smoothstep(p: f64) -> f64 {
+    let p = p.clamp(0.0, 1.0);
+    p * p * (3.0 - 2.0 * p)
+}
+
+fn db_to_gain(db: f64) -> f64 {
+    10.0_f64.powf(db / 20.0)
+}
+
+/// One-beat notch in the incoming gain, centred just before the bass swap.
+///
+/// Incoming only. The record already playing is the reference; dipping it
+/// would dip the song the listener came for. Because the notch sits in a gain
+/// that is otherwise climbing, the shape is "gains, quickly loses, gains".
+fn dip_gain(progress: f64, plan: &TransitionPlan) -> f32 {
+    let depth = plan.dip_depth.clamp(0.0, MAX_DUCK_DEPTH);
+    if depth <= 0.0 {
+        return 1.0;
+    }
+    let width = plan.dip_width.clamp(0.015, 0.25);
+    let swap = plan.bass_swap_fraction.clamp(0.05, 0.95);
+    let centre = (swap - width * 0.5).clamp(0.02, 0.95);
+    let x = (progress.clamp(0.0, 1.0) - centre) / (width * 0.5);
+    (1.0 - depth * (-x * x).exp()) as f32
+}
+
+/// DJ envelope: a ramp across the whole blend, with a bed at the open.
+///
+/// * The incoming track eases up from silence over ~40 ms, then climbs to
+///   unity across the rest of the blend. A one-beat dip can still notch that
+///   climb just before the low end changes hands.
+/// * The outgoing track stays at full level while that bed is opening, then
+///   follows a cos fall over the same span the incoming is climbing. The two
+///   move together. Holding the outgoing at unity until a late swap, then
+///   dropping it, is a cut once the blend itself is short.
+fn automix_gains(progress: f64, plan: &TransitionPlan) -> (f32, f32) {
+    let p = progress.clamp(0.0, 1.0);
+    let swap = plan.bass_swap_fraction.clamp(0.15, 0.92);
+    let bed_end = plan.bed_fraction.clamp(0.05, swap - 0.02);
+    let bed = db_to_gain(plan.bed_gain_db).clamp(0.02, 0.5);
+    let attack = if plan.fade_seconds > 0.0 {
+        (BED_ATTACK_SECONDS / plan.fade_seconds).clamp(0.004, 0.12)
+    } else {
+        0.02
+    };
+    let rise = if p <= attack {
+        bed * smoothstep(p / attack)
+    } else {
+        let t = ((p - attack) / (1.0 - attack)).clamp(0.0, 1.0);
+        bed + (1.0 - bed) * smoothstep(t)
+    };
+    let fall = if p <= bed_end {
+        1.0
+    } else {
+        let t = ((p - bed_end) / (1.0 - bed_end)).clamp(0.0, 1.0);
+        (t * core::f64::consts::PI / 2.0).cos()
+    };
+    ((rise * dip_gain(p, plan) as f64) as f32, fall as f32)
 }
 
 /// The `(rise, fall)` gain pair for fade progress `p`.
@@ -239,12 +363,13 @@ fn fall_gain(progress: f64) -> f32 {
 /// Which pair is correct depends on whether the two sides carry the same
 /// signal, and getting that wrong is audible either way:
 ///
-/// * Different tracks are uncorrelated, so their *powers* add and the
-///   equal-power pair holds the level still (`rise² + fall² = 1`).
-/// * A source swap is one recording on both sides, aligned, so the
-///   *amplitudes* add. The equal-power pair would then peak at
-///   `√2·sin(p·π/2 + π/4)` — +3.01 dB through the middle of every upgrade.
-///   A linear pair sums to exactly 1 and the swap is level-flat.
+/// * Different tracks with no DJ envelope are uncorrelated, so their powers
+///   add and the equal-power pair holds the level still (`rise² + fall² = 1`).
+/// * A source swap is one recording on both sides, aligned, so the amplitudes
+///   add. The equal-power pair would then peak at `√2·sin(p·π/2 + π/4)` —
+///   +3.01 dB through the middle of every upgrade. A linear pair sums to 1.
+/// * A planned DJ blend is neither: [`automix_gains`] holds the outgoing track
+///   up while the incoming one plays underneath, then hands over.
 fn fade_gains(progress: f64, same_signal: bool) -> (f32, f32) {
     let p = progress.clamp(0.0, 1.0);
     if same_signal {
@@ -386,9 +511,36 @@ struct Voice {
     /// output — the "make the music sound rushed" failure upstream raised
     /// `MIN_SILENCE_US` to avoid.
     silent_dev_frames: u64,
+    /// The listener's own speed, applied by the speed resampler. Allowed to
+    /// move pitch — that is what a speed control is.
+    ///
+    /// Kept strictly separate from `plan_rate`: folding the handoff stretch
+    /// into this resampler is exactly what made it a pitch bend, and the two
+    /// being distinguishable here is what stops that coming back.
     effective_speed: f32,
-    /// Automix tempo stretch; multiplied into `effective_speed`.
+    /// Automix handoff stretch, applied by WSOLA so it moves tempo without
+    /// moving pitch. `None` whenever the rate is unity.
+    stretch: Option<TimeStretch>,
+    /// The handoff stretch has come home to unity and the stage is holding
+    /// unplaced samples. It is drained into the output on the next pull rather
+    /// than dropped, so retiring it is a handover and not a ~12 ms splice.
+    stretch_draining: bool,
+    /// Automix tempo stretch target; drives `stretch` and nothing else.
     plan_rate: f64,
+    /// The stretch the plan asked for. Held for the blend, then the value the
+    /// post-blend glide walks back to unity from.
+    base_plan_rate: f64,
+    /// Post-blend glide length, from the plan. 0 means release at the blend end.
+    post_glide_seconds: f64,
+    /// Output frames the glide spans, and how many have been rendered. Both
+    /// zero unless a glide is in progress.
+    glide_total_frames: u64,
+    glide_done_frames: u64,
+    /// The track length this voice plans against, if known. `None` means the
+    /// container declared none and the caller supplied none, and every
+    /// transition that would be scheduled against the end of this track is
+    /// therefore impossible.
+    known_duration: Option<f64>,
     /// Catalogue loudness figure for the normalization stage (`None` = no
     /// figure, no correction). The master switch lives on the mixer state, so
     /// this is the measurement only.
@@ -422,9 +574,18 @@ impl Voice {
         let mut spatial = SpatialRenderer::new(device_rate);
         spatial.set_enabled(spatial_enabled && decoder.channels() >= 2);
         spatial.set_head_yaw(head_yaw);
-        let duration = decoder.duration_seconds().unwrap_or(0.0);
+        let decoder_duration = decoder.duration_seconds();
+        let mut duration = known_duration(decoder_duration, request.duration_seconds);
+        // A download still in progress reports the container length of the
+        // bytes on disk. Scheduling the blend against that starts the next
+        // song in the middle of this one, over whatever fragment has arrived.
+        // The catalogue figure is the length the blend has to land on.
+        if source_still_growing(&request.source) && request.duration_seconds > duration + 1.0 {
+            duration = request.duration_seconds;
+        }
         let start = if cue {
-            clamp_start_seconds(request.start_seconds, duration)
+            let cleared = clamp_start_seconds(request.start_seconds, duration);
+            bound_mix_in_depth(cleared, &request.plan, duration)
         } else {
             request.start_seconds.max(0.0)
         };
@@ -432,11 +593,15 @@ impl Voice {
             decoder.seek_seconds(start).map_err(|e| e.to_string())?;
         }
         log::info!(
-            "voice opened: title={:?} requested_start={:.3}s clamped_start={:.3}s actual_start={:.3}s source_rate={} device_rate={}",
+            "voice opened: title={:?} requested_start={:.3}s clamped_start={:.3}s actual_start={:.3}s \
+             duration={:.1}s (container={:?} declared={:.1}s) source_rate={} device_rate={}",
             request.title,
             request.start_seconds,
             start,
             decoder.position_seconds(),
+            duration,
+            decoder_duration,
+            request.duration_seconds,
             src_rate,
             device_rate,
         );
@@ -445,7 +610,14 @@ impl Voice {
         } else {
             1.0
         };
-        let effective = (playback_speed as f64 * plan_rate).clamp(0.5, 2.0) as f32;
+        // The handoff stretch is *not* engaged here. It exists to hold two
+        // records on one grid for the length of a blend, and `start_fade` is
+        // where a blend begins — a `Load` (a tap on the queue, a skip) carries
+        // the same plan record but has no blend to serve, and opening the stage
+        // on it would leave a track playing 3 % slow for its whole length with
+        // nothing to release it. `plan_rate` is recorded either way so the
+        // glide has a number to walk from.
+        let effective = (playback_speed as f64).clamp(0.5, 2.0) as f32;
         Ok(Voice {
             resample_l: StreamResampler::new(src_rate, device_rate),
             resample_r: StreamResampler::new(src_rate, device_rate),
@@ -477,19 +649,62 @@ impl Voice {
             skip_silence,
             silent_dev_frames: 0,
             effective_speed: effective,
+            stretch: None,
+            stretch_draining: false,
             plan_rate,
+            base_plan_rate: plan_rate,
+            post_glide_seconds: request.plan.post_glide_seconds.max(0.0),
+            glide_total_frames: 0,
+            glide_done_frames: 0,
+            known_duration: (duration > 0.0).then_some(duration),
             loudness_db: request.loudness_db,
         })
     }
 
     fn set_playback_speed(&mut self, speed: f32, device_rate: u32) {
-        let effective = (speed as f64 * self.plan_rate).clamp(0.5, 2.0) as f32;
+        let effective = (speed as f64).clamp(0.5, 2.0) as f32;
         if (effective - self.effective_speed).abs() < 0.001 {
             return;
         }
         self.effective_speed = effective;
         self.speed_l = speed_resampler(device_rate, effective);
         self.speed_r = speed_resampler(device_rate, effective);
+    }
+
+    /// Moves the automix handoff stretch to `rate`.
+    ///
+    /// Engages the WSOLA stage on the way up and retires it on the way back to
+    /// unity. Retiring is a flush-and-drop rather than a bypass: at a rate of
+    /// exactly 1.0 the stage reconstructs its input sample for sample, so the
+    /// drained tail meets the pass-through with nothing to hear — which is what
+    /// lets the glide land on unity at the end of a blend and leave nothing
+    /// behind but the audio.
+    fn set_plan_rate(&mut self, rate: f64) {
+        let rate = if rate.is_finite() && rate > 0.0 { rate } else { 1.0 };
+        self.plan_rate = rate;
+        if (rate - 1.0).abs() <= 1e-4 {
+            // Hold the stage until the next pull drains it.
+            self.stretch_draining = self.stretch.is_some();
+        } else if let Some(stretch) = self.stretch.as_mut() {
+            stretch.set_rate(rate);
+        } else {
+            self.stretch = Some(TimeStretch::new(rate));
+        }
+    }
+
+    /// The natural end of a stretched stream: drain the stage into the pending
+    /// buffer and drop it. Returns the drained samples so the caller can splice
+    /// them in ahead of whatever comes next.
+    fn drain_stretch(&mut self) -> Vec<f32> {
+        match self.stretch.as_mut() {
+            Some(stretch) => {
+                stretch.flush();
+                let tail = stretch.take();
+                self.stretch = None;
+                tail
+            }
+            None => Vec::new(),
+        }
     }
 
     /// Releases the tempo stretch a beatmatched handoff stacked on this voice.
@@ -501,14 +716,61 @@ impl Voice {
     /// voice that keeps it plays fast for its whole length: +3 % tempo and +51
     /// cents on every track that ever arrived through a beatmatched blend, with
     /// the published position running at the stretched rate as well.
+    ///
+    /// The guarantee for a voice that never got to glide: a skip, a bail, a
+    /// cut at end-of-stream. Snaps the rate to unity and drains the stage on
+    /// the next pull. A finished blend does not come here first — it calls
+    /// [`Voice::begin_tempo_glide`] and this runs when that glide lands.
     fn release_plan_stretch(&mut self, speed: f32, device_rate: u32) {
-        if (self.plan_rate - 1.0).abs() < f64::EPSILON {
+        self.glide_total_frames = 0;
+        self.glide_done_frames = 0;
+        if (self.plan_rate - 1.0).abs() < f64::EPSILON && !self.stretch_draining {
             return;
         }
         // Clear the multiplier *before* re-deriving, or `set_playback_speed`
         // would simply stack the stretch back on.
         self.plan_rate = 1.0;
+        self.stretch_draining = self.stretch.is_some();
         self.set_playback_speed(speed, device_rate);
+    }
+
+    /// Starts the post-blend walk from the matched tempo back to the record's
+    /// own. No-op when the plan asked for none, in which case the caller
+    /// releases immediately.
+    fn begin_tempo_glide(&mut self, device_rate: u32) {
+        if self.post_glide_seconds <= 0.05 || (self.base_plan_rate - 1.0).abs() < 1e-4 {
+            return;
+        }
+        let frames = (self.post_glide_seconds * device_rate.max(1) as f64)
+            .round()
+            .max(1.0) as u64;
+        self.glide_total_frames = frames;
+        self.glide_done_frames = 0;
+        self.set_plan_rate(self.base_plan_rate);
+    }
+
+    /// Sets the stretch to where the glide has reached. Call once per rendered
+    /// chunk, before the pull, then [`Voice::note_glide_frames`] with what
+    /// came out.
+    fn drive_tempo_glide(&mut self, device_rate: u32, speed: f32) {
+        if self.glide_total_frames == 0 {
+            return;
+        }
+        let p = (self.glide_done_frames as f64 / self.glide_total_frames as f64).clamp(0.0, 1.0);
+        if p >= 1.0 {
+            self.release_plan_stretch(speed, device_rate);
+            return;
+        }
+        let target = glided_plan_rate(self.base_plan_rate, p);
+        if (target - self.plan_rate).abs() >= 1e-5 {
+            self.set_plan_rate(target);
+        }
+    }
+
+    fn note_glide_frames(&mut self, frames: u64) {
+        if self.glide_total_frames > 0 {
+            self.glide_done_frames = self.glide_done_frames.saturating_add(frames);
+        }
     }
 
     /// Rebuild post-decode DSP for a new DAC rate (AirPods connect/disconnect).
@@ -530,7 +792,21 @@ impl Voice {
     }
 
     fn position_seconds(&self) -> f64 {
-        self.base_position + self.decoder.position_seconds()
+        let decoder = self.base_position + self.decoder.position_seconds();
+        // The WSOLA stage holds roughly a frame of input it has not placed yet,
+        // so the decoder runs that far ahead of the audio the listener is
+        // hearing. Bounded at `FRAME + SEARCH` — about 12 ms — and only while a
+        // handoff stretch is running, but a playhead that leads the sound is
+        // the same bug as one that trails it.
+        (decoder - self.stretch_latency_seconds()).max(0.0)
+    }
+
+    /// How far ahead of the output the decoder is running, in source seconds.
+    fn stretch_latency_seconds(&self) -> f64 {
+        self.stretch
+            .as_ref()
+            .map(|stretch| stretch.latency_frames() / self.device_rate.max(1) as f64)
+            .unwrap_or(0.0)
     }
 
     /// Where this voice's *next served sample* sits on the source timeline.
@@ -552,10 +828,15 @@ impl Voice {
     }
 
     /// Remaining source-domain seconds the decoder still holds, if known.
+    ///
+    /// `info.duration_seconds` rather than the decoder's own figure, so a
+    /// container that declares no length still schedules: `remaining_seconds`
+    /// is what the arming and the fade start are both measured against, and
+    /// `None` here means "there is no end to schedule against", which is a cut,
+    /// not a blend.
     fn remaining_seconds(&self) -> Option<f64> {
-        let total = self.decoder.duration_seconds()?;
-        let pos = self.decoder.position_seconds();
-        Some((total - pos).max(0.0))
+        let total = self.known_duration?;
+        Some((total - self.decoder.position_seconds()).max(0.0))
     }
 
     /// Pulls up to `frames` device-domain interleaved stereo frames.
@@ -578,6 +859,27 @@ impl Voice {
         };
         serve_pending(&mut out, self);
 
+        // The handoff stretch has landed on unity: flush the stage and serve
+        // what it was still holding before decoding anything more, so the
+        // handover to the plain path is sample-continuous.
+        if self.stretch_draining {
+            self.stretch_draining = false;
+            let tail = self.drain_stretch();
+            if !tail.is_empty() {
+                let remaining = want - out.len();
+                let take = tail.len().min(remaining);
+                out.extend_from_slice(&tail[..take]);
+                self.emitted_dev_frames += (take / 2) as u64;
+                if take < tail.len() {
+                    self.pending_dev = tail;
+                    self.pending_dev_cursor = take;
+                }
+                if out.len() >= want {
+                    return out;
+                }
+            }
+        }
+
         while out.len() < want && !self.finished {
             let src = self.decoder.read_stereo(4096).unwrap_or_default();
             if src.is_empty() {
@@ -591,6 +893,22 @@ impl Voice {
                 for i in 0..n {
                     self.pending_dev.push(tail_l[i]);
                     self.pending_dev.push(tail_r[i]);
+                }
+                // A stretch still running at end of stream gets flushed, or the
+                // last few milliseconds of the record are simply gone. The
+                // resampler tail goes *through* it rather than being pasted onto
+                // its output, so the two arrive in the order the chain actually
+                // produced them.
+                if self.stretch.is_some() {
+                    let input = core::mem::take(&mut self.pending_dev);
+                    let mut tail = self
+                        .stretch
+                        .as_mut()
+                        .expect("checked above")
+                        .process_and_take(&input);
+                    let mut rest = self.drain_stretch();
+                    tail.append(&mut rest);
+                    self.pending_dev = tail;
                 }
                 // Device-domain DSP (spatial, then transition filter) — same
                 // order as upstream's sink processors, at the rate the DAC hears.
@@ -623,6 +941,19 @@ impl Voice {
             for i in 0..n {
                 self.pending_dev.push(speed_l[i]);
                 self.pending_dev.push(speed_r[i]);
+            }
+            // The handoff stretch runs here: in the device domain, after the
+            // listener's own speed (which is allowed to move pitch) and before
+            // the spatial and transition stages — so the blend's EQ is shaping
+            // the stretched signal rather than being stretched itself, and a
+            // filter sweep lands on the beat it was aimed at.
+            if self.stretch.is_some() {
+                let input = core::mem::take(&mut self.pending_dev);
+                self.pending_dev = self
+                    .stretch
+                    .as_mut()
+                    .expect("checked above")
+                    .process_and_take(&input);
             }
             // Classify silence on the dry buffer. Spatial's 0.82 makeup
             // would otherwise pull quiet music under the threshold whenever
@@ -699,9 +1030,61 @@ pub fn loudness_gain(loudness_db: Option<f64>, enabled: bool) -> (f32, Option<f3
     }
 }
 
+/// The track length the engine will plan a transition against.
+///
+/// The container's own figure wins when it has one — it is measured from the
+/// bytes actually being decoded, and a catalogue figure can be a rounding of a
+/// different edit of the same record. The caller's figure is the fallback for
+/// the containers that declare nothing, which is where a transition either gets
+/// scheduled or does not happen at all.
+fn known_duration(container: Option<f64>, declared: f64) -> f64 {
+    container
+        .filter(|d| d.is_finite() && *d > 0.0)
+        .or_else(|| Some(declared).filter(|d| d.is_finite() && *d > 0.0))
+        .unwrap_or(0.0)
+}
+
+/// `.grow` without `.complete` is a stream that has not finished arriving.
+fn source_still_growing(path: &str) -> bool {
+    if path.is_empty() || path.contains("://") {
+        return false;
+    }
+    let grow = format!("{path}.grow");
+    let complete = format!("{path}.complete");
+    std::path::Path::new(&grow).is_file() && !std::path::Path::new(&complete).exists()
+}
+
 fn speed_resampler(device_rate: u32, speed: f32) -> StreamResampler {
     let speed = speed.clamp(0.5, 2.0) as f64;
     StreamResampler::with_rates(device_rate as f64 * speed, device_rate as f64)
+}
+
+/// The stretch ratio at fade progress `p`: `base` walked to unity, or unity if
+/// there is nothing to walk.
+///
+/// A *step* in the rate is a step in pitch as well as tempo:
+/// `release_plan_stretch` undoing a 3 % stretch is 51 cents arriving in one
+/// frame, at whatever gain the blend had reached. Upstream does exactly that,
+/// and James Cridland's write-up of Apple's AutoMix names the audible artefact
+/// of the smoother version of the same trick — "a bit of obvious speed slowing"
+/// — as the mark of a real transition rather than a fault. What makes it read as
+/// a move rather than a glitch is the ramp.
+///
+/// Geometric, because rate is a ratio: an exponential sweep is a constant slope
+/// in cents per second, so the ear hears an even glide rather than a fast start
+/// and a slow crawl. At `p = 1` it is exactly 1.0, which is the whole point —
+/// the release then finds the rate already at unity and is a no-op, so there is
+/// nothing to snap.
+fn glided_plan_rate(base: f64, p: f64) -> f64 {
+    if !base.is_finite() || base <= 0.0 || (base - 1.0).abs() < 1e-6 {
+        return 1.0;
+    }
+    let p = p.clamp(0.0, 1.0);
+    if p >= 1.0 {
+        1.0
+    } else {
+        base.powf(1.0 - p)
+    }
 }
 
 fn is_silent(interleaved: &[f32]) -> bool {
@@ -745,6 +1128,34 @@ fn clamp_start_seconds(requested: f64, duration: f64) -> f64 {
     requested
 }
 
+/// The last bound on a planned mix-in, applied to the value about to reach
+/// `seek_seconds`.
+///
+/// The planner already applies this three ways, so this is deliberately
+/// redundant. It is here because of how the original bug got so far: nothing
+/// between the analysis and the decoder was willing to disagree with the layer
+/// above it, and a plan asking to start the next record a minute in was obeyed
+/// all the way down. A redundant check costs a comparison.
+///
+/// Only a *planned* mix-in is bounded. `start_seconds` doubles as a resume
+/// position — `loadCurrent(startAt:)` after a cold restore carries a timestamp
+/// minutes into the track and no plan — and clamping that would throw the
+/// listener back to the top of a song they had just reopened.
+fn bound_mix_in_depth(requested: f64, plan: &TransitionPlan, duration: f64) -> f64 {
+    if requested <= 0.0 || duration <= 0.0 || plan.cue_seconds <= 0.0 {
+        return requested;
+    }
+    let ceiling = MAX_CUE_SECONDS.min(duration * MAX_CUE_FRACTION);
+    if requested > ceiling {
+        log::warn!(
+            "planned mix-in at {requested:.1}s exceeds the {MAX_CUE_SECONDS}s / \
+             {MAX_CUE_FRACTION} bound for a {duration:.1}s track; starting at 0"
+        );
+        return 0.0;
+    }
+    requested
+}
+
 // ---- Transition state -------------------------------------------------------
 
 #[derive(PartialEq, Clone, Copy)]
@@ -778,6 +1189,9 @@ struct MixerState {
     current: Option<Voice>,
     incoming: Option<Voice>,
     pending_next: Option<TrackSource>,
+    /// Latched once a transition has been found unschedulable, so the warning
+    /// about it is one line per track rather than one per chunk.
+    warned_no_duration: bool,
     transition: Option<TransitionState>,
     retiring: Vec<RetiringVoice>,
     playing: bool,
@@ -1034,6 +1448,27 @@ impl MixerState {
         if self.transition.is_some() {
             return Err("a transition is already running".into());
         }
+        // The blend has not armed yet, but it is inside the window where it
+        // will. A 550 ms source swap would take the only transition slot, the
+        // song change would never arm, and the next track would cut in.
+        if self.pending_next.is_some() {
+            if let Some(current) = &self.current {
+                let plan = self
+                    .pending_next
+                    .as_ref()
+                    .map(|request| request.plan.clone())
+                    .unwrap_or_default();
+                let fade_s = self.blend_seconds(
+                    plan.fade_seconds,
+                    current.known_duration.unwrap_or(0.0),
+                );
+                let tail = self.audible_tail_s(&plan, current);
+                let horizon = fade_s + ARM_LEAD_MS as f64 / 1000.0;
+                if tail.is_finite() && tail <= horizon {
+                    return Err("a transition is already running".into());
+                }
+            }
+        }
         let anchor = self
             .current
             .as_ref()
@@ -1082,6 +1517,156 @@ impl MixerState {
 
     /// Arms a transition when the current track's audible tail is close
     /// enough. Returns true if a transition was created.
+    /// Where the outgoing track ends, on its own timeline, or `INFINITY` when
+    /// nothing knows.
+    ///
+    /// The planned anchor is authoritative for when to transition. The
+    /// duration figures are the fallback when no anchor was analyzed.
+    ///
+    /// 1. `transition_end_seconds` — the planner's ranked mix-out anchor, which
+    ///    is where the blend is meant to *finish* and can sit up to 12 s inside
+    ///    the track. Using it is what stops a whole blend landing late.
+    /// 2. `outgoing_duration_seconds` — the planner's measurement of the track,
+    ///    which exists for exactly the case the decoder cannot cover.
+    /// 3. The live decoder's own remaining time, which is the file end and is
+    ///    `None` for a container that declares no length.
+    ///
+    /// The second is not redundant with the third on purpose: the planner reads
+    /// the track through the metadata reader to find its mix-out anchor, so it
+    /// has a figure in hand whether or not the decoder that will play the track
+    /// was able to work one out.
+    fn outgoing_end_s(&self, plan: &TransitionPlan, current: &Voice) -> f64 {
+        if plan.transition_end_seconds > 0.0 {
+            return plan.transition_end_seconds;
+        }
+        if current.known_duration.is_some() {
+            return current.known_duration.unwrap_or(0.0);
+        }
+        if plan.outgoing_duration_seconds > 0.0 {
+            return plan.outgoing_duration_seconds;
+        }
+        current.position_seconds() + current.remaining_seconds().unwrap_or(f64::INFINITY)
+    }
+
+    /// The audible tail left in the outgoing track, in seconds, or `INFINITY`
+    /// when the end is unknown and therefore unschedulable.
+    fn audible_tail_s(&self, plan: &TransitionPlan, current: &Voice) -> f64 {
+        let end_s = self.outgoing_end_s(plan, current);
+        if !end_s.is_finite() {
+            return f64::INFINITY;
+        }
+        let buffered_s =
+            self.buffered_frames.load(Ordering::Relaxed) as f64 / self.device_rate as f64;
+        (end_s - current.position_seconds()).max(0.0) + buffered_s
+    }
+
+    /// A later plan for the track already armed, applied only while the fade
+    /// has not started.
+    ///
+    /// The safety overlap is queued as soon as the next file's first bytes
+    /// exist, and the analysed plan can take longer than that. Dropping the
+    /// analysed plan because the safety one already armed is how a blend that
+    /// was ready still played out to the file's last byte.
+    fn upgrade_armed_plan(&mut self, request: TrackSource) {
+        let still_waiting = self
+            .transition
+            .as_ref()
+            .is_some_and(|transition| transition.phase == Phase::Arming && !transition.swap);
+        if !still_waiting {
+            log::debug!("queueNext ignored; transition already fading");
+            return;
+        }
+        let cue = request.start_seconds.max(0.0);
+        let track = self
+            .current
+            .as_ref()
+            .and_then(|voice| voice.known_duration)
+            .unwrap_or(0.0);
+        let fade_s = self.blend_seconds(request.plan.fade_seconds, track);
+        let rate = if request.plan.playback_rate > 0.05 {
+            request.plan.playback_rate
+        } else {
+            1.0
+        };
+        let glide = request.plan.post_glide_seconds.max(0.0);
+        if let Some(transition) = &mut self.transition {
+            if fade_s > 0.0 {
+                transition.fade_frames = (fade_s * self.device_rate as f64) as u64;
+            }
+            transition.plan = request.plan;
+        }
+        if let Some(voice) = &mut self.incoming {
+            voice.base_plan_rate = rate;
+            voice.plan_rate = rate;
+            voice.post_glide_seconds = glide;
+            if (voice.decoder.position_seconds() - cue).abs() > 0.05 {
+                voice.base_position = 0.0;
+                voice.spatial.flush();
+                voice.filter.flush();
+                voice.pending_dev.clear();
+                voice.pending_dev_cursor = 0;
+                voice.silent_dev_frames = 0;
+                voice.finished = false;
+                if let Err(e) = voice.decoder.seek_seconds(cue) {
+                    log::warn!("could not move the armed cue to {cue:.2}s: {e}");
+                }
+            }
+        }
+        log::info!(
+            "updated armed transition: fade={fade_s:.1}s cue={cue:.2}s rate={rate:.4}"
+        );
+    }
+
+    /// Opens a different file on a transition that has not started sounding.
+    ///
+    /// This is how a better encode of the next record joins the blend: the
+    /// ramp the listener hears is the song change, not a second crossfade
+    /// laid on top of it. Once the fade is audible the voice stays — swapping
+    /// it then is the cut this exists to avoid.
+    fn retarget_armed_source(&mut self, request: TrackSource) {
+        match Voice::open(
+            &request,
+            self.spatial_enabled,
+            self.head_yaw,
+            self.device_rate,
+            self.playback_speed,
+            self.skip_silence,
+            true,
+        ) {
+            Ok(mut voice) => {
+                voice.gain = 0.0;
+                let track = self
+                    .current
+                    .as_ref()
+                    .and_then(|current| current.known_duration)
+                    .unwrap_or(0.0);
+                let fade_s = self.blend_seconds(request.plan.fade_seconds, track);
+                let rate = if request.plan.playback_rate > 0.05 {
+                    request.plan.playback_rate
+                } else {
+                    1.0
+                };
+                voice.base_plan_rate = rate;
+                voice.plan_rate = rate;
+                voice.post_glide_seconds = request.plan.post_glide_seconds.max(0.0);
+                if let Some(transition) = &mut self.transition {
+                    if fade_s > 0.0 {
+                        transition.fade_frames = (fade_s * self.device_rate as f64) as u64;
+                    }
+                    transition.plan = request.plan;
+                }
+                log::info!(
+                    "retargeted armed transition to {} fade={fade_s:.1}s",
+                    voice.info.source
+                );
+                self.incoming = Some(voice);
+            }
+            Err(e) => {
+                log::warn!("could not retarget the armed transition: {e}");
+            }
+        }
+    }
+
     fn consider_arm(&mut self) {
         if self.transition.is_some() || self.pending_next.is_none() || !self.playing {
             return;
@@ -1095,7 +1680,7 @@ impl MixerState {
         // Unknown or implausibly short duration (muxed MP4 used to report
         // AAC packet counts as PCM frames): wait for real EOS instead of
         // blending immediately. Upstream uses ExoPlayer's container duration.
-        if current.decoder.duration_seconds().unwrap_or(0.0) < 2.0
+        if current.known_duration.unwrap_or(0.0) < 2.0
             && current.position_seconds() < 2.0
         {
             return;
@@ -1110,20 +1695,31 @@ impl MixerState {
             .as_ref()
             .map(|request| request.plan.clone())
             .unwrap_or_default();
-        let window_s = self.effective_fade_seconds();
+        let window_s = self.effective_fade_seconds(current.known_duration.unwrap_or(0.0));
         let fade_s = if plan.fade_seconds > 0.0 {
-            plan.fade_seconds
+            self.blend_seconds(plan.fade_seconds, current.known_duration.unwrap_or(0.0))
         } else {
             window_s
         };
-        let buffered_s =
-            self.buffered_frames.load(Ordering::Relaxed) as f64 / self.device_rate as f64;
-        let end_s = if plan.transition_end_seconds > 0.0 {
-            plan.transition_end_seconds
-        } else {
-            current.position_seconds() + current.remaining_seconds().unwrap_or(f64::INFINITY)
-        };
-        let audible_tail_s = (end_s - current.position_seconds()) + buffered_s;
+        let audible_tail_s = self.audible_tail_s(&plan, current);
+        if !audible_tail_s.is_finite() {
+            // There is no end to schedule against, so there is no blend: the
+            // incoming is never armed and the queue advances by a cut at
+            // end-of-stream. Worth saying out loud, because from the outside it
+            // is indistinguishable from a crossfade setting of zero.
+            if !self.warned_no_duration {
+                self.warned_no_duration = true;
+                log::warn!(
+                    "no transition can be scheduled for {:?}: neither the container nor the \
+                     caller knows how long it is, so there is no end to schedule against. The \
+                     next track will be cut in at the end rather than mixed. Pass \
+                     LoadRequest.durationSeconds, or have the planner set \
+                     TransitionPlan.outgoing_duration_seconds.",
+                    current.info.title,
+                );
+            }
+            return;
+        }
         let need_s = fade_s + ARM_LEAD_MS as f64 / 1000.0;
         if audible_tail_s > need_s {
             return;
@@ -1163,18 +1759,32 @@ impl MixerState {
         }
     }
 
-    fn effective_fade_seconds(&self) -> f64 {
+    fn effective_fade_seconds(&self, total: f64) -> f64 {
         // A fade that swallows a third of a song stops being a transition —
         // upstream's `fadeFor` cap. Applied against the *current* track.
         let window = self.crossfade_window_s.max(0.0);
-        if let Some(current) = &self.current {
-            if let Some(total) = current.decoder.duration_seconds() {
-                if total > 0.0 {
-                    return window.min(total / 3.0);
-                }
-            }
+        if total > 0.0 {
+            return window.min(total / 3.0);
         }
         window
+    }
+
+    /// A planned fade, kept off a half-second floor.
+    ///
+    /// Analysis of a partial file, or a grid snap onto the mix-out, can hand
+    /// the mixer a fade of a few hundred milliseconds. On a track with room
+    /// for four seconds, that figure is a cut and the floor replaces it. A
+    /// plan that already asked for a real blend is left alone, including one
+    /// that spends most of a short record — the planner chose that length.
+    fn blend_seconds(&self, plan_fade: f64, track_seconds: f64) -> f64 {
+        let planned = plan_fade.max(0.0);
+        if planned == 0.0 || planned >= 4.0 {
+            return planned;
+        }
+        if track_seconds > 0.0 && track_seconds < 12.0 {
+            return planned;
+        }
+        4.0
     }
 
     /// Starts the fade the moment the audible tail has shrunk to it — or, for
@@ -1200,32 +1810,40 @@ impl MixerState {
             return;
         }
         let fade_s = t.fade_frames as f64 / self.device_rate as f64;
-        let buffered_s =
-            self.buffered_frames.load(Ordering::Relaxed) as f64 / self.device_rate as f64;
-        // The blend ends where the *plan* says, not at the file's last byte. The
-        // planner picks that anchor — up to 12 s inside the track — and derives
-        // `bass_swap_fraction` and `vocal_overlap` from the window it defines,
-        // so arming from the file end moved the gains and both filter rides
-        // together, late, by however much the anchor is early.
-        //
-        // The audible tail is measured from the position the listener hears,
-        // which trails the decoder by the ring.
-        let end_s = if t.plan.transition_end_seconds > 0.0 {
-            t.plan.transition_end_seconds
-        } else {
-            current.position_seconds() + current.remaining_seconds().unwrap_or(f64::INFINITY)
+        // The blend starts when the *rendered* playhead crosses the plan, not
+        // when the audible tail estimate does. The audible figure adds the ring
+        // backlog, which moves with how full the device buffer is, so the same
+        // plan started on a different beat every time. The next sample this
+        // voice will emit is the one that has to land on the downbeat, and it
+        // is checked once per chunk, so the error is at most 512 frames.
+        let start_s = {
+            let end_s = self.outgoing_end_s(&t.plan, current);
+            if !end_s.is_finite() {
+                return;
+            }
+            (end_s - fade_s).max(0.0)
         };
-        let audible_tail_s = (end_s - current.position_seconds()) + buffered_s;
-        if audible_tail_s > fade_s {
+        if current.emitted_position_seconds() + 1e-4 < start_s {
             return;
         }
         self.start_fade();
     }
 
     fn start_fade(&mut self) {
-        let Some(voice) = self.incoming.take() else {
+        let Some(mut voice) = self.incoming.take() else {
             return;
         };
+        // The blend is what the handoff stretch is for, so the stage goes live
+        // here rather than at open. It holds this rate until the blend ends;
+        // the glide home starts in `finish_transition`.
+        if (voice.base_plan_rate - 1.0).abs() > 1e-4 {
+            log::info!(
+                "handoff stretch engaged: rate={:.4} ({:.0} cents, pitch preserved)",
+                voice.base_plan_rate,
+                1200.0 * (voice.base_plan_rate.ln() / 2f64.ln()).abs(),
+            );
+            voice.set_plan_rate(voice.base_plan_rate);
+        }
         let info = voice.info.clone();
         log::info!("fade start + handoff: {}", info.title);
         self.duration_ms
@@ -1271,7 +1889,16 @@ impl MixerState {
         let span = if fade_frames == 0 {
             0
         } else {
-            fade_frames.min(incoming_cap_frames).max(1)
+            let capped = fade_frames.min(incoming_cap_frames).max(1);
+            // The third-of-the-record cap is for a genuinely short song. A cap
+            // under a second, against a plan that asked for more, is a partial
+            // container duration — and using it is how a blend collapses into
+            // a half-second cut.
+            if fade_frames > self.device_rate as u64 && capped < self.device_rate as u64 {
+                fade_frames
+            } else {
+                capped
+            }
         };
         let p = if span == 0 {
             1.0
@@ -1280,10 +1907,22 @@ impl MixerState {
         };
         let plan = self.transition.as_ref().map(|t| (t.plan.clone(), t.swap));
         let swap = plan.as_ref().is_some_and(|(_, swap)| *swap);
-        // See `fade_gains`: a swap needs the linear pair, a queue advance the
-        // equal-power one. Upstream runs equal-power for both, which bumps
-        // wherever its two players happen to be aligned.
-        let (rise, fall) = fade_gains(p, swap);
+        let dj = plan.as_ref().is_some_and(|(plan, _)| {
+            !swap && plan.bed_fraction > 0.0 && matches!(
+                plan.style,
+                TransitionStyle::DjBlend | TransitionStyle::DjFilter
+            )
+        });
+        // A swap needs the linear pair. A plain crossfade needs equal-power.
+        // A DJ blend holds the outgoing record up and brings the next one in
+        // underneath. The tempo stretch is *held* here — walking it during the
+        // fade is how two matched grids drift into a flam. It glides home
+        // after the blend, on the promoted voice.
+        let (rise, fall) = if dj {
+            automix_gains(p, &plan.as_ref().unwrap().0)
+        } else {
+            fade_gains(p, swap)
+        };
         if let (Some(current), Some(incoming), Some((plan, _))) =
             (&mut self.current, &mut self.incoming, plan)
         {
@@ -1345,11 +1984,17 @@ impl MixerState {
                 if let Some(mut incoming) = self.incoming.take() {
                     incoming.gain = 1.0;
                     incoming.filter.open();
-                    // The blend is over, so the tempo stretch it was holding is
-                    // over too — upstream's `finish()` does exactly this. A swap
-                    // carries no stretch (its plan is the default), so this is a
-                    // no-op there.
-                    incoming.release_plan_stretch(self.playback_speed, self.device_rate);
+                    // Hold the matched tempo through the blend, then walk it
+                    // home. A swap has nothing to walk, and a plan with no
+                    // glide releases here so the stretch cannot outlive the mix.
+                    let glide = !swap
+                        && incoming.post_glide_seconds > 0.05
+                        && (incoming.base_plan_rate - 1.0).abs() > 1e-4;
+                    if glide {
+                        incoming.begin_tempo_glide(self.device_rate);
+                    } else {
+                        incoming.release_plan_stretch(self.playback_speed, self.device_rate);
+                    }
                     let info = incoming.info.clone();
                     self.current = Some(incoming);
                     if swap {
@@ -1392,6 +2037,9 @@ impl MixerState {
         if let Some(incoming) = &mut self.incoming {
             incoming.filter.open();
             incoming.gain = 1.0;
+            // A seek abandoned the blend. The glide is for a mix that finished,
+            // not for one that was interrupted.
+            incoming.release_plan_stretch(self.playback_speed, self.device_rate);
         }
         if let Some(mut current) = self.current.take() {
             let from_gain = current.gain;
@@ -1464,6 +2112,7 @@ pub fn run_mixer(
         current: None,
         incoming: None,
         pending_next: None,
+        warned_no_duration: false,
         transition: None,
         retiring: Vec::new(),
         playing: false,
@@ -1582,6 +2231,25 @@ fn handle_command(state: &mut MixerState, cmd: Command, ring: &mut Producer<f32>
                 state.pending_next = None;
             } else if state.current.as_ref().is_some_and(|c| c.info.source == request.source) {
                 log::debug!("queueNext ignored; already current");
+            } else if state.incoming.as_ref().is_some_and(|c| c.info.source == request.source) {
+                // The early overlap can arm before analysis finishes. Replacing
+                // it once the fade has started would replay this song after the
+                // handoff; replacing the plan while it is still waiting moves
+                // the blend to where the analysis said it should be.
+                state.upgrade_armed_plan(request);
+            } else if state
+                .transition
+                .as_ref()
+                .is_some_and(|transition| transition.phase == Phase::Arming && !transition.swap)
+            {
+                // Not audible yet. A better encode of the incoming record, or a
+                // queue change, replaces the armed voice. Doing this once the
+                // fade is sounding would cut the blend.
+                state.retarget_armed_source(request);
+            } else if state.incoming.as_ref().is_some_and(|incoming| {
+                incoming.info.title == request.title && incoming.info.artist == request.artist
+            }) {
+                log::info!("held a same-song source change; the blend is already audible");
             } else {
                 state.pending_next = Some(request);
             }
@@ -1837,7 +2505,11 @@ fn render_available(state: &mut MixerState, ring: &mut Producer<f32>) {
         let swap_fade = state.transition.as_ref().is_some_and(|t| t.swap);
         if let Some(voice) = &mut state.current {
             if state.playing {
-                let frames = voice.pull(CHUNK_FRAMES, state.device_rate);
+                let rate = state.device_rate;
+                let speed = state.playback_speed;
+                voice.drive_tempo_glide(rate, speed);
+                let frames = voice.pull(CHUNK_FRAMES, rate);
+                voice.note_glide_frames((frames.len() / 2) as u64);
                 if !frames.is_empty() {
                     audible = true;
                     produced = produced.max(frames.len());
@@ -1997,6 +2669,44 @@ mod tests {
         std::fs::write(path, bytes).unwrap();
     }
 
+    /// Clicks on one channel, silence on the other, so a mix can be split back
+    /// into the two records.
+    fn click_wav(path: &std::path::Path, seconds: f32, bpm: f64, left: bool) {
+        let rate = 44_100u32;
+        let frames = (rate as f32 * seconds) as usize;
+        let interval = (rate as f64 * 60.0 / bpm).round() as usize;
+        let burst = rate as usize * 8 / 1000;
+        let data_len = frames * 4;
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"RIFF");
+        bytes.extend_from_slice(&(36 + data_len as u32).to_le_bytes());
+        bytes.extend_from_slice(b"WAVE");
+        bytes.extend_from_slice(b"fmt ");
+        bytes.extend_from_slice(&16u32.to_le_bytes());
+        bytes.extend_from_slice(&1u16.to_le_bytes());
+        bytes.extend_from_slice(&2u16.to_le_bytes());
+        bytes.extend_from_slice(&rate.to_le_bytes());
+        bytes.extend_from_slice(&(rate * 4).to_le_bytes());
+        bytes.extend_from_slice(&4u16.to_le_bytes());
+        bytes.extend_from_slice(&16u16.to_le_bytes());
+        bytes.extend_from_slice(b"data");
+        bytes.extend_from_slice(&(data_len as u32).to_le_bytes());
+        for i in 0..frames {
+            let within = i % interval;
+            let sample = if within < burst {
+                let t = within as f32 / rate as f32;
+                let env = (-t * 500.0).exp();
+                (env * (2.0 * std::f32::consts::PI * 4000.0 * t).sin() * 0.8 * 32767.0) as i16
+            } else {
+                0
+            };
+            let (l, r) = if left { (sample, 0) } else { (0, sample) };
+            bytes.extend_from_slice(&l.to_le_bytes());
+            bytes.extend_from_slice(&r.to_le_bytes());
+        }
+        std::fs::write(path, bytes).unwrap();
+    }
+
     #[test]
     fn gapless_queue_advances_and_fires_handoff() {
         let dir = std::env::temp_dir().join("bitchord-mixer-test");
@@ -2035,6 +2745,7 @@ mod tests {
                 headers: std::collections::HashMap::new(),
                 claimed_kbps: 0,
             loudness_db: None,
+            duration_seconds: 0.0,
             },
             reply: crossbeam_channel::bounded(1).0,
         })
@@ -2049,6 +2760,7 @@ mod tests {
                 headers: std::collections::HashMap::new(),
                 claimed_kbps: 0,
             loudness_db: None,
+            duration_seconds: 0.0,
             },
         })
         .unwrap();
@@ -2135,6 +2847,7 @@ mod tests {
                 headers: std::collections::HashMap::new(),
                 claimed_kbps: 0,
             loudness_db: None,
+            duration_seconds: 0.0,
             },
             reply: crossbeam_channel::bounded(1).0,
         })
@@ -2208,6 +2921,7 @@ mod tests {
                 headers: std::collections::HashMap::new(),
                 claimed_kbps: 0,
                 loudness_db: None,
+            duration_seconds: 0.0,
             },
             reply,
         })
@@ -2274,6 +2988,431 @@ mod tests {
         assert_eq!(super::clamp_start_seconds(8.0, 0.0), 8.0);
     }
 
+    /// A plan cannot talk the decoder into starting a record a minute in.
+    ///
+    /// Regression-shaped, and deliberately redundant with the planner's own
+    /// bounds: the reason the deep cue reached the decoder at all is that every
+    /// layer trusted the one above it, so the last layer before `seek_seconds`
+    /// gets to disagree.
+    #[test]
+    fn a_planned_mix_in_cannot_reach_past_the_depth_bound() {
+        let planned = TransitionPlan {
+            cue_seconds: 45.0,
+            ..TransitionPlan::default()
+        };
+        // The shape of the original bug: a plan asking to start a minute in.
+        assert_eq!(super::bound_mix_in_depth(45.0, &planned, 210.0), 0.0);
+        assert_eq!(super::bound_mix_in_depth(48.0, &planned, 210.0), 0.0);
+        // A legal mix-in passes untouched, on either bound.
+        let legal = TransitionPlan {
+            cue_seconds: 6.0,
+            ..TransitionPlan::default()
+        };
+        assert_eq!(super::bound_mix_in_depth(6.0, &legal, 210.0), 6.0);
+        assert_eq!(super::bound_mix_in_depth(7.5, &legal, 210.0), 7.5);
+        // The fraction is a floor for short material, not a ceiling for long:
+        // eight seconds is a fifth of a one-minute clip and nothing at all in a
+        // four-minute song.
+        let eight = TransitionPlan {
+            cue_seconds: 8.0,
+            ..TransitionPlan::default()
+        };
+        assert_eq!(super::bound_mix_in_depth(8.0, &eight, 240.0), 8.0);
+        assert_eq!(super::bound_mix_in_depth(8.0, &eight, 60.0), 0.0);
+        assert_eq!(super::bound_mix_in_depth(3.5, &eight, 60.0), 3.5);
+    }
+
+    /// ...and a resume seek is none of its business.
+    ///
+    /// `start_seconds` carries two different intents: a mix-in point from the
+    /// planner, and — from `loadCurrent(startAt:)` after a cold restore — a
+    /// timestamp minutes into a track the listener was partway through. Only the
+    /// first is a mix-in, and the tell is the plan: a resume carries none.
+    #[test]
+    fn a_resume_seek_is_not_treated_as_a_mix_in() {
+        let no_plan = TransitionPlan::default();
+        assert_eq!(no_plan.cue_seconds, 0.0);
+        assert_eq!(super::bound_mix_in_depth(180.0, &no_plan, 240.0), 180.0);
+        assert_eq!(super::bound_mix_in_depth(45.0, &no_plan, 210.0), 45.0);
+        // And an unknown duration cannot be bounded, so it is passed through for
+        // the outro rule to deal with.
+        assert_eq!(super::bound_mix_in_depth(45.0, &planned_at(45.0), 0.0), 45.0);
+    }
+
+    fn planned_at(cue: f64) -> TransitionPlan {
+        TransitionPlan {
+            cue_seconds: cue,
+            ..TransitionPlan::default()
+        }
+    }
+
+    /// A queued transition must *overlap*: the incoming track has to be
+    /// audible while the outgoing one still has music left, or there is no
+    /// transition, there is a cut.
+    ///
+    /// This is the whole claim Automix makes, asserted directly rather than
+    /// inferred from gains. The handoff is the engine saying "the incoming is
+    /// audible now", so what matters at that moment is how much of the outgoing
+    /// track is still to play — if the answer is nothing, the two never
+    /// overlapped and the listener heard a song end and a song start.
+    #[test]
+    fn a_planned_transition_overlaps_rather_than_waits_for_the_end() {
+        let dir = std::env::temp_dir().join("bitchord-mixer-overlap");
+        std::fs::create_dir_all(&dir).unwrap();
+        let a = dir.join("a.wav");
+        let b = dir.join("b.wav");
+        // Eight seconds each, so there is room to be early by a real margin.
+        test_wav(&a, 8.0, 440.0);
+        test_wav(&b, 8.0, 660.0);
+
+        let events = std::sync::Arc::new(RecordedEvents::default());
+        let (tx, rx) = crossbeam_channel::unbounded::<Command>();
+        let (consumer_side, mut consumer) = rtrb::RingBuffer::<f32>::new(44_100 * 2 * 2);
+        let buffered = std::sync::Arc::new(AtomicU64::new(0));
+        let position = std::sync::Arc::new(AtomicU64::new(0));
+        let duration = std::sync::Arc::new(AtomicU64::new(0));
+        let shutdown = std::sync::Arc::new(AtomicBool::new(false));
+
+        let handle = std::thread::spawn({
+            let events = events.clone();
+            let buffered = buffered.clone();
+            let position = position.clone();
+            let duration = duration.clone();
+            let shutdown = shutdown.clone();
+            move || {
+                run_mixer(
+                    rx,
+                    consumer_side,
+                    buffered,
+                    position,
+                    duration,
+                    44_100,
+                    events,
+                    shutdown,
+                    std::sync::Arc::new(AtomicBool::new(false)),
+                    std::sync::Arc::new(AtomicBool::new(false)),
+                    std::sync::Arc::new(Mutex::new(NerdSnapshot::default())),
+                )
+            }
+        });
+
+        // Two seconds of blend ending at 6 s into an 8 s track: the handoff must
+        // land while two more seconds of the outgoing are still coming.
+        let fade = 2.0f64;
+        tx.send(Command::Load {
+            request: TrackSource {
+                source: a.display().to_string(),
+                title: "A".into(),
+                artist: String::new(),
+                start_seconds: 0.0,
+                plan: TransitionPlan::default(),
+                headers: std::collections::HashMap::new(),
+                claimed_kbps: 0,
+                loudness_db: None,
+                duration_seconds: 0.0,
+            },
+            reply: crossbeam_channel::bounded(1).0,
+        })
+        .unwrap();
+        tx.send(Command::QueueNext {
+            request: TrackSource {
+                source: b.display().to_string(),
+                title: "B".into(),
+                artist: String::new(),
+                start_seconds: 0.0,
+                plan: TransitionPlan {
+                    style: TransitionStyle::DjBlend,
+                    bass_swap: false,
+                    fade_seconds: fade,
+                    transition_end_seconds: 6.0,
+                    ..TransitionPlan::default()
+                },
+                headers: std::collections::HashMap::new(),
+                claimed_kbps: 0,
+                loudness_db: None,
+                duration_seconds: 0.0,
+            },
+        })
+        .unwrap();
+
+        let at = drain_until_handoff(
+            &mut consumer,
+            &buffered,
+            &position,
+            &events,
+            20,
+        )
+        .expect("no handoff fired");
+        assert!(
+            at <= 6.0 + 0.6,
+            "the handoff fired at {at:.2}s, past the 6 s blend anchor"
+        );
+        assert!(
+            at <= 8.0 - 0.5,
+            "the handoff fired at {at:.2}s of an 8 s track — that is a cut at the end, not a mix"
+        );
+
+        shutdown.store(true, std::sync::atomic::Ordering::Relaxed);
+        tx.send(Command::Shutdown).ok();
+        let _ = handle.join();
+    }
+
+    /// 116 BPM clicks, sped up to 120, stay on the outgoing 120 BPM grid through
+    /// the overlap, then settle back to 116 once the post-blend glide ends.
+    #[test]
+    fn a_beatmatched_blend_holds_the_grid_then_glides_home() {
+        let dir = std::env::temp_dir().join("bitchord-mixer-beats");
+        std::fs::create_dir_all(&dir).unwrap();
+        let a = dir.join("out.wav");
+        let b = dir.join("in.wav");
+        click_wav(&a, 10.0, 120.0, true);
+        click_wav(&b, 36.0, 116.0, false);
+
+        let events = std::sync::Arc::new(RecordedEvents::default());
+        let (tx, rx) = crossbeam_channel::unbounded::<Command>();
+        let (consumer_side, mut consumer) = rtrb::RingBuffer::<f32>::new(44_100 * 2);
+        let buffered = std::sync::Arc::new(AtomicU64::new(0));
+        let position = std::sync::Arc::new(AtomicU64::new(0));
+        let duration = std::sync::Arc::new(AtomicU64::new(0));
+        let shutdown = std::sync::Arc::new(AtomicBool::new(false));
+        let handle = std::thread::spawn({
+            let events = events.clone();
+            let buffered = buffered.clone();
+            let position = position.clone();
+            let duration = duration.clone();
+            let shutdown = shutdown.clone();
+            move || {
+                run_mixer(
+                    rx,
+                    consumer_side,
+                    buffered,
+                    position,
+                    duration,
+                    44_100,
+                    events,
+                    shutdown,
+                    std::sync::Arc::new(AtomicBool::new(false)),
+                    std::sync::Arc::new(AtomicBool::new(false)),
+                    std::sync::Arc::new(Mutex::new(NerdSnapshot::default())),
+                )
+            }
+        });
+
+        let rate = 44_100usize;
+        // Eight seconds of blend ending one second before the outgoing file,
+        // so the bed (before the bass swap) is long enough to compare grids.
+        let fade = 8.0;
+        let end = 9.0;
+        tx.send(Command::Load {
+            request: TrackSource {
+                source: a.display().to_string(),
+                title: "A".into(),
+                artist: String::new(),
+                start_seconds: 0.0,
+                plan: TransitionPlan::default(),
+                headers: std::collections::HashMap::new(),
+                claimed_kbps: 0,
+                loudness_db: None,
+                duration_seconds: 10.0,
+            },
+            reply: crossbeam_channel::bounded(1).0,
+        })
+        .unwrap();
+        tx.send(Command::QueueNext {
+            request: TrackSource {
+                source: b.display().to_string(),
+                title: "B".into(),
+                artist: String::new(),
+                start_seconds: 0.0,
+                plan: TransitionPlan {
+                    style: TransitionStyle::DjBlend,
+                    bass_swap: true,
+                    bass_swap_fraction: 0.6,
+                    fade_seconds: fade,
+                    transition_end_seconds: end,
+                    playback_rate: 120.0 / 116.0,
+                    bed_fraction: 0.45,
+                    bed_gain_db: -14.0,
+                    dip_depth: 0.0,
+                    dip_width: 0.05,
+                    // 32 beats of the matched 120 BPM grid.
+                    post_glide_seconds: 32.0 * 0.5,
+                    ..TransitionPlan::default()
+                },
+                headers: std::collections::HashMap::new(),
+                claimed_kbps: 0,
+                loudness_db: None,
+                duration_seconds: 36.0,
+            },
+        })
+        .unwrap();
+
+        let want = rate * 28;
+        let mut samples = Vec::with_capacity(want * 2);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+        while samples.len() / 2 < want && std::time::Instant::now() < deadline {
+            match consumer.pop() {
+                Ok(sample) => {
+                    samples.push(sample);
+                    if samples.len() % 2 == 0 {
+                        let mut current = buffered.load(Ordering::Relaxed);
+                        while current > 0 {
+                            match buffered.compare_exchange_weak(
+                                current,
+                                current - 1,
+                                Ordering::Relaxed,
+                                Ordering::Relaxed,
+                            ) {
+                                Ok(_) => break,
+                                Err(v) => current = v,
+                            }
+                        }
+                    }
+                }
+                Err(_) => std::thread::sleep(std::time::Duration::from_millis(2)),
+            }
+        }
+        shutdown.store(true, Ordering::Relaxed);
+        tx.send(Command::Shutdown).ok();
+        let _ = handle.join();
+        assert!(
+            samples.len() / 2 > rate * 27,
+            "only captured {:.1}s",
+            samples.len() as f64 / 2.0 / rate as f64
+        );
+
+        let onsets = |channel: usize, from_s: f64, until_s: f64| -> Vec<usize> {
+            let frames = samples.len() / 2;
+            let start = ((from_s * rate as f64) as usize).min(frames);
+            let end = ((until_s * rate as f64) as usize).min(frames);
+            let mut peaks = Vec::new();
+            let mut i = start.max(1);
+            while i + 1 < end {
+                let level = samples[i * 2 + channel].abs();
+                if level > 0.05
+                    && level >= samples[(i - 1) * 2 + channel].abs()
+                    && level >= samples[(i + 1) * 2 + channel].abs()
+                {
+                    peaks.push(i);
+                    i += rate / 10;
+                } else {
+                    i += 1;
+                }
+            }
+            peaks
+        };
+
+        // Fade runs 1s..9s; the bass swap is at 0.6 of that, so 1.4s..5.4s is
+        // still the bed — both records full-band, the incoming underneath.
+        let left = onsets(0, 1.4, 5.4);
+        let right = onsets(1, 1.4, 5.4);
+        assert!(left.len() >= 4, "outgoing clicks in the overlap: {}", left.len());
+        assert!(right.len() >= 4, "incoming clicks in the overlap: {}", right.len());
+        let mut worst = 0.0f64;
+        for beat in &left {
+            let nearest = right
+                .iter()
+                .map(|other| (*other as isize - *beat as isize).unsigned_abs())
+                .min()
+                .unwrap_or(usize::MAX);
+            let ms = nearest as f64 / rate as f64 * 1000.0;
+            worst = worst.max(ms);
+        }
+        assert!(
+            worst < 15.0,
+            "beats drifted by {worst:.1} ms during the blend"
+        );
+
+        // The glide is 16 s from the end of the blend (t = 9), so past t = 25
+        // the incoming record is back at its own 116 BPM.
+        let home = onsets(1, 25.4, 27.6);
+        assert!(home.len() >= 3, "not enough clicks after the glide: {}", home.len());
+        let expected = rate as f64 * 60.0 / 116.0;
+        for pair in home.windows(2) {
+            let gap = (pair[1] - pair[0]) as f64;
+            let error = (gap - expected).abs() / expected;
+            assert!(
+                error < 0.02,
+                "after the glide the spacing was {gap:.0} samples, {error:.3} off 116 BPM"
+            );
+        }
+    }
+
+    /// The engine's length for a track, and which of the two sources wins.
+    ///
+    /// The container's own figure is measured from the bytes being decoded and
+    /// is the better answer; the caller's is the only answer when the container
+    /// declares none, which is the case that decides whether a transition gets
+    /// scheduled at all.
+    #[test]
+    fn a_container_without_a_duration_falls_back_to_the_callers_figure() {
+        assert_eq!(super::known_duration(Some(210.0), 209.0), 210.0, "the container wins");
+        assert_eq!(super::known_duration(Some(0.0), 210.0), 210.0, "a zero is not a duration");
+        assert_eq!(super::known_duration(None, 210.0), 210.0, "the caller fills the gap");
+        assert_eq!(super::known_duration(None, 0.0), 0.0, "and unknown stays unknown");
+        assert_eq!(super::known_duration(None, f64::NAN), 0.0);
+        assert_eq!(super::known_duration(Some(f64::NAN), 210.0), 210.0);
+    }
+
+
+    /// The mix-out anchor is a preferred musical point near the end, distinct
+    /// from the recording's duration. That anchor schedules the fade; this
+    /// duration still limits the fade and protects the recording's tail.
+    #[test]
+    fn the_recording_duration_takes_precedence_over_its_mix_out_anchor() {
+        let dir = std::env::temp_dir().join("bitchord-mixer-anchor-duration");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("duration.wav");
+        test_wav(&path, 10.0, 440.0);
+        let request = TrackSource {
+            source: path.display().to_string(),
+            title: "A".into(),
+            artist: String::new(),
+            start_seconds: 0.0,
+            plan: TransitionPlan {
+                transition_end_seconds: 8.0,
+                outgoing_duration_seconds: 10.0,
+                fade_seconds: 1.0,
+                ..TransitionPlan::default()
+            },
+            headers: std::collections::HashMap::new(),
+            claimed_kbps: 0,
+            loudness_db: None,
+            duration_seconds: 10.0,
+        };
+        let voice = Voice::open(&request, false, 0.0, 44_100, 1.0, false, false).unwrap();
+        let state = MixerState {
+            current: Some(voice),
+            incoming: None,
+            pending_next: None,
+            warned_no_duration: false,
+            transition: None,
+            retiring: Vec::new(),
+            playing: true,
+            volume: 1.0,
+            crossfade_window_s: 4.0,
+            spatial_enabled: false,
+            head_yaw: 0.0,
+            device_rate: 44_100,
+            buffered_frames: Arc::new(AtomicU64::new(0)),
+            position_ms: Arc::new(AtomicU64::new(0)),
+            duration_ms: Arc::new(AtomicU64::new(0)),
+            events: Arc::new(RecordedEvents::default()),
+            state: crate::PlaybackState::Playing,
+            flush_ring: Arc::new(AtomicBool::new(false)),
+            bail_flush: Arc::new(AtomicBool::new(false)),
+            playback_speed: 1.0,
+            skip_silence: false,
+            eq: EqualizerProcessor::new(44_100, 2),
+            nerd: Arc::new(Mutex::new(NerdSnapshot::default())),
+            loudness_enabled: false,
+            swap_probe: SwapProbe::default(),
+        };
+        let current = state.current.as_ref().unwrap();
+        assert_eq!(state.outgoing_end_s(&request.plan, current), 8.0);
+        assert_eq!(state.effective_fade_seconds(current.known_duration.unwrap()), 10.0 / 3.0);
+    }
+
     /// Drain the ring the way the device callback would (decrementing the
     /// shared counter) for a fixed number of frames.
     fn drain_frames(consumer: &mut rtrb::Consumer<f32>, buffered: &AtomicU64, frames: usize) {
@@ -2307,12 +3446,18 @@ mod tests {
         }
     }
 
+    /// Drains until the handoff fires, returning the playhead at that moment.
+    ///
+    /// The playhead is the number a caller needs: the handoff is the engine
+    /// saying "the incoming track is audible now", so how far into the outgoing
+    /// track that happens is exactly whether there was a transition or a cut.
     fn drain_until_handoff(
         consumer: &mut rtrb::Consumer<f32>,
         buffered: &AtomicU64,
+        position: &AtomicU64,
         events: &RecordedEvents,
         seconds: u64,
-    ) {
+    ) -> Option<f64> {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(seconds);
         loop {
             while consumer.pop().is_ok() {
@@ -2329,10 +3474,16 @@ mod tests {
                     }
                 }
             }
-            if !events.handoffs.lock().unwrap().is_empty()
-                || std::time::Instant::now() > deadline
-            {
-                break;
+            if !events.handoffs.lock().unwrap().is_empty() {
+                // The mixer publishes the incoming track's playhead at handoff,
+                // which is its own cue rather than the outgoing tail — so this is
+                // the *outgoing* position only if the handoff had not been
+                // published yet. Sampled before the check on the next pass, this
+                // is close enough for a margin measured in seconds.
+                return Some(position.load(Ordering::Relaxed) as f64 / 1000.0);
+            }
+            if std::time::Instant::now() > deadline {
+                return None;
             }
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
@@ -2392,6 +3543,7 @@ mod tests {
                 headers: std::collections::HashMap::new(),
                 claimed_kbps: 0,
             loudness_db: None,
+            duration_seconds: 0.0,
             },
             reply: crossbeam_channel::bounded(1).0,
         })
@@ -2406,11 +3558,12 @@ mod tests {
                 headers: std::collections::HashMap::new(),
                 claimed_kbps: 0,
             loudness_db: None,
+            duration_seconds: 0.0,
             },
         })
         .unwrap();
 
-        drain_until_handoff(&mut consumer, &buffered, &events, 20);
+        drain_until_handoff(&mut consumer, &buffered, &position, &events, 20);
 
         let handoffs = events.handoffs.lock().unwrap().clone();
         assert_eq!(handoffs, vec!["B".to_string()], "handoff to B must fire");
@@ -2487,6 +3640,7 @@ mod tests {
             headers: std::collections::HashMap::new(),
             claimed_kbps: 0,
             loudness_db: None,
+            duration_seconds: 0.0,
         };
 
         tx.send(Command::SetCrossfadeWindow(1.0)).unwrap();
@@ -2578,24 +3732,131 @@ mod tests {
         assert!(worst_swap_db < 1e-4, "swap fade swells by {worst_swap_db} dB");
         assert!(worst_track_db < 1e-4, "track fade dips by {worst_track_db} dB");
 
-        // What the equal-power pair costs when both sides are the same signal —
-        // recorded so the branch above cannot quietly be undone.
-        let midpoint = (rise_gain(0.5) + fall_gain(0.5)) as f64;
-        let bump_db = 20.0 * midpoint.log10();
+        // What a plain equal-power pair costs when both sides are the same
+        // signal — recorded so the branch above cannot quietly be undone, and
+        // so the reason the incoming no longer uses one is written down where
+        // the arithmetic is.
+        let quarter = core::f64::consts::FRAC_PI_4;
+        let bump_db = 20.0 * (quarter.sin() + quarter.cos()).log10();
         assert!(
             (bump_db - 3.01).abs() < 0.02,
             "expected the √2 bump at the midpoint, got {bump_db} dB"
         );
     }
 
+    /// A plain crossfade is equal-power: silent at the open, unity at the
+    /// close, and level-flat the whole way. A DJ blend is a different curve.
+    #[test]
+    fn a_plain_crossfade_is_equal_power_and_starts_from_silence() {
+        let (first_rise, first_fall) = fade_gains(0.0, false);
+        let (last_rise, last_fall) = fade_gains(1.0, false);
+        assert!(first_rise.abs() < 1e-6, "a crossfade opens on silence, got {first_rise}");
+        assert!((first_fall - 1.0).abs() < 1e-6);
+        assert!((last_rise - 1.0).abs() < 1e-6);
+        assert!(last_fall.abs() < 1e-6);
+        let mut worst_db = 0.0f64;
+        for step in 0..=1000 {
+            let (rise, fall) = fade_gains(step as f64 / 1000.0, false);
+            let power = (rise as f64).powi(2) + (fall as f64).powi(2);
+            worst_db = worst_db.max(10.0 * power.log10().abs());
+        }
+        assert!(worst_db < 1e-4, "equal-power moved the level by {worst_db} dB");
+    }
+
+    /// Bed, then a rise, then the outgoing lets go. The incoming is already
+    /// audible while the outgoing is still at full level, and a one-beat dip
+    /// sits just before the swap.
+    #[test]
+    fn a_dj_blend_beds_the_incoming_track_then_swaps() {
+        let plan = TransitionPlan {
+            style: TransitionStyle::DjBlend,
+            bass_swap: true,
+            bass_swap_fraction: 0.62,
+            bed_fraction: 0.4,
+            bed_gain_db: -14.0,
+            dip_depth: 0.5,
+            dip_width: 0.08,
+            fade_seconds: 12.0,
+            ..TransitionPlan::default()
+        };
+        let bed = 10.0_f64.powf(-14.0 / 20.0) as f32;
+        let (open_rise, open_fall) = automix_gains(0.0, &plan);
+        assert!(open_rise.abs() < 1e-4, "the bed eases in from silence, got {open_rise}");
+        assert!((open_fall - 1.0).abs() < 1e-4, "the outgoing stays up, got {open_fall}");
+
+        let (bed_rise, bed_fall) = automix_gains(0.2, &plan);
+        assert!(
+            bed_rise > bed * 0.5 && bed_rise < 0.45,
+            "early in the blend the incoming is underneath, got {bed_rise}"
+        );
+        assert!((bed_fall - 1.0).abs() < 1e-4, "the outgoing is still the record");
+
+        let (late_rise, late_fall) = automix_gains(0.95, &plan);
+        assert!(late_rise > 0.95, "after the swap the incoming is the record, got {late_rise}");
+        assert!(late_fall < 0.35, "after the swap the outgoing is leaving, got {late_fall}");
+
+        // The dip is on the incoming, just before the swap, and the outgoing
+        // gain at that moment is still full. Sample a half-width either side
+        // of the notch so the comparison is the dip, not the climb into it.
+        let before = automix_gains(0.54, &plan).0;
+        let notch = automix_gains(0.58, &plan).0;
+        let after = automix_gains(0.70, &plan).0;
+        assert!(
+            notch < before * 0.85 && after > notch,
+            "expected a dip then a recovery, got {before} -> {notch} -> {after}"
+        );
+        let outgoing_at_dip = automix_gains(0.58, &plan).1;
+        assert!(
+            outgoing_at_dip > 0.75,
+            "the dip is on the incoming; the outgoing is still leaving slowly, got {outgoing_at_dip}"
+        );
+    }
+
+    /// A handoff stretch that is stepped back to unity at the end of a blend is
+    /// a pitch step, because the stretch is a resample.
+    ///
+    /// Regression-shaped: `release_plan_stretch` used to fire at the fade's end
+    /// and land the rate on 1.0 in a single frame — a 3 % stretch is 51 cents,
+    /// arriving in one sample. The glide walks there instead, so the release
+    /// finds unity already reached and changes nothing.
+    #[test]
+    fn the_handoff_tempo_glide_lands_on_unity_rather_than_stepping() {
+        let base = 1.03f64;
+        assert!(
+            (base - 1.0).abs() > 1e-4,
+            "this test is about a non-unity rate"
+        );
+        // Monotone, and strictly inside the range the whole way.
+        let mut previous = f64::INFINITY;
+        for step in 0..=1000 {
+            let p = step as f64 / 1000.0;
+            let target = glided_plan_rate(base, p);
+            assert!(
+                target <= previous + 1e-12 && target >= 1.0 - 1e-12,
+                "glide at {p} was {target}, outside (1.0, {previous}]"
+            );
+            previous = target;
+        }
+        // Exactly unity at the end, so `release_plan_stretch`'s early-out is
+        // what actually runs and there is nothing to snap.
+        assert_eq!(glided_plan_rate(base, 1.0), 1.0);
+        // A unity plan is not glided at all.
+        assert_eq!(glided_plan_rate(1.0, 0.5), 1.0);
+    }
+
     /// A beatmatched handoff stretches the incoming track so the two share a
     /// grid for the blend. That stretch must not survive the blend.
     ///
-    /// Regression: the port baked `plan_rate` in at `Voice::open` and nothing
-    /// ever cleared it, so every track that arrived through a beatmatched or
-    /// phrase-switch blend played ~3 % fast for its entire length — +51 cents,
-    /// with the published position running at the stretched rate too. Upstream
-    /// resets the player's speed in both `finish()` and `retire()`.
+    /// Regression: the port baked `plan_rate` into the voice's speed resampler
+    /// at `Voice::open` and nothing ever cleared it, so every track that
+    /// arrived through a beatmatched or phrase-switch blend played ~3 % fast for
+    /// its entire length — +51 cents, with the published position running at the
+    /// stretched rate too. Upstream resets the player's speed in both
+    /// `finish()` and `retire()`.
+    ///
+    /// The stretch is a WSOLA stage now rather than a rate change, so the
+    /// assertion is on the stage: engaged at the plan's rate while the blend
+    /// runs, gone and drained once it ends.
     #[test]
     fn a_promoted_voice_drops_the_handoff_tempo_stretch() {
         let dir = std::env::temp_dir().join("bitchord-mixer-stretch");
@@ -2616,22 +3877,51 @@ mod tests {
             headers: std::collections::HashMap::new(),
             claimed_kbps: 0,
             loudness_db: None,
+            duration_seconds: 0.0,
         };
         let mut voice = Voice::open(&request, false, 0.0, 44_100, 1.0, false, false).unwrap();
+        // The listener's own speed is untouched by the handoff — that is the
+        // point of routing the stretch through its own stage. It used to be
+        // multiplied by the plan rate, which is the bug in its other form.
         assert!(
-            (voice.effective_speed - 1.03).abs() < 1e-6,
-            "the stretch must be applied while the blend runs, got {}",
+            (voice.effective_speed - 1.0).abs() < 1e-6,
+            "the handoff must not touch the speed control, got {}",
             voice.effective_speed
         );
+        // And nothing is running yet: the stage is for a blend, and this voice
+        // has not entered one. A `Load` — a tap on the queue, a skip — carries
+        // the same plan record, and engaging here would leave the track playing
+        // 3 % slow for its whole length with nothing to release it.
+        assert!(
+            voice.stretch.is_none(),
+            "a fresh open must not engage the handoff stretch"
+        );
+        assert_eq!(voice.base_plan_rate, 1.03, "but the plan's ratio is remembered");
 
-        // Promotion is the end of the blend, and of the stretch.
+        // The blend engages it...
+        voice.set_plan_rate(voice.base_plan_rate);
+        assert!(voice.stretch.is_some());
+        assert!((voice.stretch.as_ref().unwrap().rate() - 1.03).abs() < 1e-9);
+
+        // The blend holds the rate. Walking it during the fade is the flam.
+        assert!((voice.plan_rate - 1.03).abs() < 1e-9);
+        // With no post-blend glide requested, release is immediate and arms
+        // the drain. The stage is still holding a frame; dropping it there
+        // would punch a hole. It goes on the next pull.
         voice.release_plan_stretch(1.0, 44_100);
+        assert!(
+            voice.stretch_draining,
+            "release must drain the stage rather than drop it"
+        );
         assert!(
             (voice.effective_speed - 1.0).abs() < 1e-6,
             "the stretch outlived the blend: {}",
             voice.effective_speed
         );
         assert!((voice.plan_rate - 1.0).abs() < 1e-9);
+        let _ = voice.pull(512, 44_100);
+        assert!(!voice.stretch_draining);
+        assert!(voice.stretch.is_none(), "the stretch outlived the blend");
 
         // A later user speed change must not resurrect it.
         voice.set_playback_speed(1.25, 44_100);
@@ -2640,6 +3930,59 @@ mod tests {
             "a speed change re-stacked the stretch: {}",
             voice.effective_speed
         );
+        assert!(
+            voice.stretch.is_none(),
+            "a speed change must not bring the handoff stage back"
+        );
+    }
+
+    /// Retiring the stretch must not swallow the samples it was still holding.
+    ///
+    /// The stage buffers roughly a frame of input it has not placed. Dropping it
+    /// on release would punch a ~12 ms hole in the track at the exact moment the
+    /// blend hands it over and its gain reaches unity — the worst possible place
+    /// for a discontinuity, and one no level assertion on the blend would catch
+    /// because the blend is already over.
+    #[test]
+    fn retiring_the_stretch_drains_rather_than_drops() {
+        let dir = std::env::temp_dir().join("bitchord-mixer-stretch");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("drain.wav");
+        test_wav(&path, 3.0, 440.0);
+
+        let request = TrackSource {
+            source: path.display().to_string(),
+            title: "A".into(),
+            artist: String::new(),
+            start_seconds: 0.0,
+            plan: TransitionPlan {
+                playback_rate: 1.03,
+                ..TransitionPlan::default()
+            },
+            headers: std::collections::HashMap::new(),
+            claimed_kbps: 0,
+            loudness_db: None,
+            duration_seconds: 0.0,
+        };
+        let mut voice = Voice::open(&request, false, 0.0, 44_100, 1.0, false, false).unwrap();
+        // Run the blend part of the way so the stage has something buffered.
+        for _ in 0..40 {
+            let frames = voice.pull(512, 44_100);
+            assert!(!frames.is_empty(), "the voice stopped producing audio");
+        }
+        voice.set_plan_rate(voice.base_plan_rate);
+        voice.release_plan_stretch(1.0, 44_100);
+        let before = voice.emitted_dev_frames;
+        let frames = voice.pull(512, 44_100);
+        assert!(
+            !frames.is_empty(),
+            "the drain must hand over what the stage was holding, not return nothing"
+        );
+        assert!(
+            voice.emitted_dev_frames > before,
+            "the drained samples were never emitted"
+        );
+        assert!(voice.stretch.is_none(), "the stage should be gone after the drain");
     }
 
     /// Drain `frames` and return the RMS of what came out.
@@ -2840,6 +4183,7 @@ mod tests {
                 headers: std::collections::HashMap::new(),
                 claimed_kbps: kbps,
                 loudness_db: None,
+            duration_seconds: 0.0,
             }
         }
 

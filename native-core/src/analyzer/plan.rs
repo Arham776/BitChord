@@ -4,7 +4,7 @@ use super::audio_analysis;
 use super::beat::{self, Grid, WINDOW_SECONDS};
 use super::resample;
 use super::vocal;
-use crate::mixer::{TransitionPlan, TransitionStyle};
+use crate::mixer::{TransitionPlan, TransitionStyle, MAX_DUCK_DEPTH};
 use std::sync::Arc;
 
 const MIN_BEATMATCH_CONFIDENCE: f64 = 0.55;
@@ -34,24 +34,56 @@ const MIN_DECODED_FRACTION: f64 = 0.95;
 /// Pickup inside this margin of the end is the outro, not a mix-in
 /// (upstream `incomingCuePoint`: `pickup < duration - 10`).
 const MIX_IN_END_MARGIN_SECONDS: f64 = 10.0;
+/// How deep a mix-in may reach, in seconds, in beats, and as a fraction of the
+/// incoming track.
+///
+/// A DJ enters the next record at the top of its own intro. Each bound exists
+/// for a different track:
+///
+/// * `MAX_CUE_SECONDS` is the one that normally bites — four bars is about 7 s
+///   at 140 BPM, so anything past that is a skip, not a mix-in.
+/// * `MAX_CUE_BEATS` stops a slow track turning 16 beats into half a minute,
+///   which is what the seconds bound would otherwise allow at 40 BPM.
+/// * `MAX_CUE_FRACTION` is a floor under both, for short material: 6 % of a
+///   one-minute clip is 3.6 s, and an 8 s skip there is 13 % of the record. It
+///   never binds above about 133 s, where the seconds bound takes over.
+const MAX_CUE_SECONDS: f64 = 8.0;
+const MAX_CUE_BEATS: f64 = 16.0;
+const MAX_CUE_FRACTION: f64 = 0.06;
 /// Upstream bass-swap tuning constants (TransitionPlanner.kt:351-364).
 const HANDOFF_FRACTION: f64 = 0.5;
 const DEFAULT_BASS_SWAP_FRACTION: f64 = 0.7;
 const MAX_BASS_SWAP_FRACTION: f64 = 0.85;
 const MIN_BASS_STRUCTURE_SCORE: f64 = 0.25;
 const BASS_SWAP_MAX_SECONDS: f64 = 6.0;
-/// Upstream gapless handoff length (TransitionPlanner.kt:901).
-const GAPLESS_FADE_SECONDS: f64 = 0.12;
+/// Album tracks played in order still join, they just do not get a DJ blend.
+///
+/// Upstream uses 0.12 s here (TransitionPlanner.kt:901), which is a splice.
+/// A few seconds of equal-power is the shortest ramp that still reads as one
+/// record giving way to the next.
+const GAPLESS_FADE_SECONDS: f64 = AUTO_MIN_SECONDS;
 /// Upstream `MAX_DISCARDED_MUSIC_SECONDS` — a mix-out anchor may not skip more
 /// than this much audible music.
 const MAX_DISCARDED_MUSIC_SECONDS: f64 = 12.0;
 /// Upstream `AUDIBLE_ENERGY_FRACTION` — the energy threshold that counts a
 /// point as audible when measuring skipped music.
 const AUDIBLE_ENERGY_FRACTION: f64 = 0.1;
-/// Upstream WSOLA phrase-switch constants (TransitionPlanner.kt:329-374).
+/// Upstream WSOLA phrase-switch constants (TransitionPlanner.kt:329-374),
+/// plus the long blend a confident, unclashing pair is allowed.
 const MIN_FADE_BEATS: usize = 4;
-const MAX_FADE_BEATS: usize = 16;
-const MAX_OVERLAP_SECONDS: f64 = 16.0;
+/// Upstream ceiling. A confident beat match may go further; see
+/// [`LONG_BLEND_BEATS`].
+const UPSTREAM_MAX_FADE_BEATS: usize = 16;
+const UPSTREAM_MAX_OVERLAP_SECONDS: f64 = 16.0;
+/// Apple-style long blend: up to 64 beats / 32 s when both grids are trusted
+/// and the vocal-clash loop does not shrink it. 64 beats at 120 BPM is 32 s.
+const LONG_BLEND_BEATS: usize = 64;
+const LONG_BLEND_SECONDS: f64 = 32.0;
+/// After the blend, walk the matched tempo back to the record's own over
+/// this many beats of the tempo it was matched to.
+const POST_BLEND_GLIDE_BEATS: f64 = 32.0;
+/// Incoming level while it plays underneath, before the swap.
+const BED_GAIN_DB: f64 = -14.0;
 const ARRANGEMENT_OVERLAP_BEATS: f64 = 8.0;
 const MIN_CLEARANCE_SECONDS: f64 = 5.0;
 const VOCAL_CLASH_TOLERANCE: f64 = 0.05;
@@ -77,6 +109,8 @@ struct Analysis {
     audible_start_time: f64,
     mix_in_candidates: Vec<audio_analysis::MixCuePoint>,
     mix_out_candidates: Vec<audio_analysis::MixCuePoint>,
+    /// Phrase starts, for snapping a transition onto a boundary.
+    phrase_boundaries: Vec<f64>,
     energy_curve: Vec<audio_analysis::EnergyPoint>,
     low_energy_curve: Vec<audio_analysis::EnergyPoint>,
     /// DSP per-frame vocal mask (parallel to `energy_curve`), from
@@ -142,6 +176,12 @@ mod analysis_cache {
         CACHE.get_or_init(|| Mutex::new(Cache::default()))
     }
 
+    pub(super) fn clear() {
+        let mut guard = cache().lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        guard.entries.clear();
+        guard.order.clear();
+    }
+
     /// File length is part of the key because a streamed download is appended
     /// to under a stable path: a still-growing file must produce a fresh
     /// analysis, and a finished one must keep hitting.
@@ -179,6 +219,10 @@ mod analysis_cache {
             k_norm == norm_path
         }).map(|(_, v)| v.energy_curve.clone())
     }
+}
+
+pub(super) fn clear_analysis_cache() {
+    analysis_cache::clear();
 }
 
 /// Locates the next local energy dip in the audio curve for the given source
@@ -280,6 +324,7 @@ pub fn plan_pair(
     album_sequential: bool,
     crossfade_seconds: f64,
     skip_vocals: bool,
+    tier_label: &str,
     decode: impl Fn(&str, f64, f64, bool) -> Option<(Vec<f32>, u32, f64)>,
     duration_of: impl Fn(&str) -> f64,
 ) -> TransitionPlan {
@@ -290,14 +335,23 @@ pub fn plan_pair(
     };
     // Upstream `BLOCKED_TEXT`: spoken or already-performed material is never
     // smart-mixed — fall back to a plain equal-power crossfade.
+    //
+    // Even this one carries the outgoing track's length, because a plain
+    // crossfade is still *scheduled* against the end of the outgoing track and
+    // the mixer has to know where that is.
+    let outgoing_duration = duration_of(outgoing_path);
+    let out = analyze_cached(outgoing_path, skip_vocals, &decode, outgoing_duration);
+    // Spoken or already-performed material is never smart-mixed. The fallback
+    // is still anchored on the outgoing content end, so it does not wait out
+    // the trailing silence and then cut.
     if blocked_text(outgoing_text) || blocked_text(incoming_text) {
-        return plain_fallback(fade);
+        return plain_fallback(fade, &out);
     }
-    let out = analyze_cached(outgoing_path, skip_vocals, &decode, duration_of(outgoing_path));
 
     // Upstream gapless path (TransitionPlanner.kt:893-905): an album played
-    // through in order gets a seamless 0.12 s handoff instead of a mix, unless
-    // the outgoing track has an interior energy cliff worth mixing out of.
+    // through in order skips the DJ blend, unless the outgoing track has an
+    // interior energy cliff worth mixing out of. The join itself is still a
+    // ramp — upstream's 0.12 s handoff is a cut.
     if album_sequential {
         let (anchor, _) = resolve_mix_out_anchor(&out);
         let end = if out.content_end > 0.0 {
@@ -317,6 +371,12 @@ pub fn plan_pair(
                 transition_end_seconds: 0.0,
                 cue_seconds: 0.0,
                 playback_rate: 1.0,
+                bed_fraction: 0.0,
+                bed_gain_db: 0.0,
+                dip_depth: 0.0,
+                dip_width: 0.0,
+                post_glide_seconds: 0.0,
+                outgoing_duration_seconds: outgoing_duration,
             };
         }
     }
@@ -325,14 +385,68 @@ pub fn plan_pair(
 
     // The most ambitious move: a beat-matched, harmonically-compatible pair gets
     // a WSOLA phrase-switch before the adaptive overlap (upstream `phraseSwitch`).
-    if let Some(plan) = phrase_switch(&out, &inc) {
-        return plan;
-    }
-    plan_from(&out, &inc, fade)
+    let plan = phrase_switch(&out, &inc).unwrap_or_else(|| plan_from(&out, &inc, fade));
+    log_plan(&out, &inc, &plan, tier_label);
+    plan
+}
+
+/// One line per planned transition, with the evidence that produced it.
+///
+/// The bug this exists to make diagnosable was invisible from the outside: a
+/// track that lost forty-five seconds to a mix-in sounded exactly like a track
+/// that had always been cued that way, and the mixer's `voice opened: …` line
+/// reports the symptom (a large `start`) without the cause. These are the
+/// inputs to [`incoming_cue`] and to [`assess`], so a wrong cue can be traced to
+/// the read that produced it.
+fn log_plan(outgoing: &Analysis, incoming: &Analysis, plan: &TransitionPlan, tier: &str) {
+    let grid = |a: &Analysis| {
+        format!(
+            "bpm={:.1} conf={:.2} beat={:.3} downbeats={} audible={:.1} content_end={:.1} dur={:.1} vocal_p={:.2}",
+            a.bpm,
+            a.beat_confidence,
+            a.beat_interval,
+            a.downbeats.len(),
+            a.audible_start_time,
+            a.content_end,
+            a.duration,
+            a.vocal_probability,
+        )
+    };
+    log::info!(
+        "automix plan [{}] style={:?} cue={:.2}s fade={:.2}s end={:.1}s rate={:.4} \
+         bed={:.2}@{:.0}dB dip={:.2} glide={:.1}s vocal_overlap={:.2} bass_swap={}@{:.2}",
+        tier,
+        plan.style,
+        plan.cue_seconds,
+        plan.fade_seconds,
+        plan.transition_end_seconds,
+        plan.playback_rate,
+        plan.bed_fraction,
+        plan.bed_gain_db,
+        plan.dip_depth,
+        plan.post_glide_seconds,
+        plan.vocal_overlap,
+        plan.bass_swap,
+        plan.bass_swap_fraction,
+    );
+    log::info!("automix out: {}", grid(outgoing));
+    log::info!("automix in:  {}", grid(incoming));
 }
 
 /// The plain equal-power fallback shared by the speech guard and the tier.
-fn plain_fallback(fade: f64) -> TransitionPlan {
+///
+/// Anchored on the outgoing mix-out (or its content end), never on the file's
+/// last byte — that is the silence after the song, and fading there is why a
+/// transition waited for one record to finish before the next began.
+fn plain_fallback(fade: f64, outgoing: &Analysis) -> TransitionPlan {
+    let mut end = resolve_mix_out_anchor(outgoing).0;
+    if end <= 0.0 {
+        end = if outgoing.content_end > 0.0 {
+            outgoing.content_end
+        } else {
+            outgoing.duration
+        };
+    }
     TransitionPlan {
         style: TransitionStyle::EqualPower,
         bass_swap: false,
@@ -340,9 +454,15 @@ fn plain_fallback(fade: f64) -> TransitionPlan {
         filter_sweep: 0.0,
         vocal_overlap: 0.0,
         fade_seconds: fade,
-        transition_end_seconds: 0.0,
+        transition_end_seconds: end,
         cue_seconds: 0.0,
         playback_rate: 1.0,
+        bed_fraction: 0.0,
+        bed_gain_db: 0.0,
+        dip_depth: 0.0,
+        dip_width: 0.0,
+        post_glide_seconds: 0.0,
+        outgoing_duration_seconds: outgoing.duration,
     }
 }
 
@@ -444,6 +564,7 @@ fn analyze(
             analysis.audible_start_time = audio.audible_start_time;
             analysis.mix_in_candidates = audio.mix_in_candidates;
             analysis.mix_out_candidates = audio.mix_out_candidates;
+            analysis.phrase_boundaries = audio.phrase_boundaries;
             analysis.energy_curve = audio.energy_curve;
             analysis.low_energy_curve = audio.low_energy_curve;
             analysis.vocal_activity_mask = audio.vocal_activity_mask;
@@ -459,14 +580,39 @@ fn analyze(
     // buffer just decoded, so it is a slice rather than a second decode. The
     // fallback exists only for the case where the whole-track decode failed
     // outright.
-    if let Some((mono, rate)) = whole.as_ref() {
+    //
+    // Whether the model actually ran is worth saying out loud. The graphs are a
+    // first-run download rather than a build input, so "Automix is on" and "a
+    // beat model is installed" are different states, and a plan built on the DSP
+    // estimator is a different — and noticeably worse — plan. The symptom is
+    // invisible from the outside: transitions still happen, they are just
+    // coarser, and `mix_in_candidates` in particular used to be derived here and
+    // never revisited, so a model grid could not fix it even once installed.
+    let model_grid = if let Some((mono, rate)) = whole.as_ref() {
         let head_samples = ((head_len * *rate as f64) as usize).min(mono.len());
-        if let Some(grid) = beat::track(&mono[..head_samples], *rate as f64, 0.0) {
+        beat::track(&mono[..head_samples], *rate as f64, 0.0)
+    } else if let Some((mono, rate, offset)) = decode(path, 0.0, head_len, true) {
+        beat::track(&mono, rate as f64, offset)
+    } else {
+        None
+    };
+    match model_grid {
+        Some(grid) => {
+            log::info!(
+                "automix analysis {path}: beat model grid {:.1} bpm, {} downbeats, confidence {:.2}",
+                grid.bpm,
+                grid.downbeats.len(),
+                grid.beat_confidence,
+            );
             fill_grid(&mut analysis, grid);
         }
-    } else if let Some((mono, rate, offset)) = decode(path, 0.0, head_len, true) {
-        if let Some(grid) = beat::track(&mono, rate as f64, offset) {
-            fill_grid(&mut analysis, grid);
+        None => {
+            log::info!(
+                "automix analysis {path}: no beat-model grid — DSP tempo only \
+                 ({:.1} bpm, confidence {:.2}). Transitions will be coarser; \
+                 install the Automix beat model in Settings.",
+                analysis.bpm, analysis.beat_confidence,
+            );
         }
     }
 
@@ -539,6 +685,9 @@ fn fill_grid(analysis: &mut Analysis, grid: Grid) {
     analysis.beat_confidence = grid.beat_confidence;
     analysis.downbeats = grid.downbeats;
     analysis.first_beat = grid.first_beat;
+    // The DSP phrases were built on the DSP grid. Eight downbeats is the same
+    // 32-beat phrase, on the grid that actually won.
+    analysis.phrase_boundaries = analysis.downbeats.iter().step_by(8).copied().collect();
 }
 
 fn split_stereo(interleaved: &[f32]) -> (Vec<f32>, Vec<f32>) {
@@ -893,24 +1042,18 @@ fn harmonically_compatible(left: &str, right: &str) -> bool {
 }
 
 fn plan_from(outgoing: &Analysis, incoming: &Analysis, fade: f64) -> TransitionPlan {
-    let cue = incoming_cue(incoming);
+    let entry = incoming_entry(incoming);
     // Upstream `MIN_SMART_DURATION_SECONDS`: a track too short to spend a smart
     // transition on gets a plain crossfade (TransitionPlanner.kt:880-882).
     let too_short = (outgoing.duration > 0.0 && outgoing.duration < MIN_SMART_DURATION_SECONDS)
         || (incoming.duration > 0.0 && incoming.duration < MIN_SMART_DURATION_SECONDS);
     let tier = assess(outgoing, incoming);
     if matches!(tier, Tier::Plain) || too_short {
-        return TransitionPlan {
-            style: TransitionStyle::EqualPower,
-            bass_swap: false,
-            bass_swap_fraction: 0.7,
-            filter_sweep: 0.0,
-            vocal_overlap: 0.0,
-            fade_seconds: fade,
-            transition_end_seconds: 0.0,
-            cue_seconds: cue,
-            playback_rate: 1.0,
-        };
+        let mut plan = plain_fallback(fade, outgoing);
+        // Still enter at the top of the music, not at a drop and not at the
+        // file's last byte.
+        plan.cue_seconds = entry;
+        return plan;
     }
 
     let out_bpm = outgoing.bpm;
@@ -930,10 +1073,13 @@ fn plan_from(outgoing: &Analysis, incoming: &Analysis, fade: f64) -> TransitionP
         1.0
     };
     let vocal_conflict = outgoing.vocal_probability >= 0.62 && incoming.vocal_probability >= 0.62;
-    // Upstream `adaptiveOverlap`: a longer overlap also when the two keys are
-    // far apart (a key-distance > 4 uses 16 beats even at a close tempo).
+    // A confident beat match with both voices out of the way earns the long
+    // blend. Two singers, or a weak grid, stays inside upstream's 8–16 beats.
+    let long = long_blend_allowed(outgoing, incoming) && !vocal_conflict;
     let key_distance = key_distance(&trusted_key(outgoing), &trusted_key(incoming));
-    let overlap_beats = if !vocal_conflict
+    let overlap_beats = if long {
+        LONG_BLEND_BEATS as f64
+    } else if !vocal_conflict
         && ((1.0 - ratio).abs() > 0.07 || key_distance.is_some_and(|d| d > 4))
     {
         16.0
@@ -946,24 +1092,43 @@ fn plan_from(outgoing: &Analysis, incoming: &Analysis, fade: f64) -> TransitionP
     } else {
         AUTO_MIN_SECONDS
     };
-    // `adaptiveOverlap` — the overlap length the policy proposes.
-    let overlap = (overlap_beats * beat_seconds).clamp(min_overlap, AUTO_TRANSITION_MAX_SECONDS);
+    let max_seconds = if long {
+        LONG_BLEND_SECONDS
+    } else {
+        AUTO_TRANSITION_MAX_SECONDS
+    };
+    let max_beats_cap = if long {
+        LONG_BLEND_BEATS as f64
+    } else {
+        AUTO_TRANSITION_MAX_BEATS
+    };
+    let overlap = (overlap_beats * beat_seconds).clamp(min_overlap, max_seconds);
 
-    // Upstream `maximumOverlap`: the 16-beat cap, the 40 %-of-mixEnd cap (the
-    // outgoing track's ranked mix-out anchor, from phase-1 analysis), and the
-    // 40 %-of-incoming cap (TransitionPlanner.kt:975-980).
-    let outgoing_mix_end = resolve_mix_out_anchor(outgoing).0;
-    let max_overlap = (AUTO_TRANSITION_MAX_BEATS * beat_seconds)
-        .min(AUTO_TRANSITION_MAX_SECONDS)
-        .min(outgoing_mix_end * 0.4)
+    // Where the outgoing record should be gone: its mix-out anchor, pulled
+    // forward by an arrangement overlap when that anchor is just the content
+    // end (upstream `outgoingArrangementOverlap`).
+    let (anchor, _) = resolve_mix_out_anchor(outgoing);
+    let content_end = if outgoing.content_end > 0.0 {
+        outgoing.content_end
+    } else {
+        outgoing.duration
+    };
+    let arrangement = if same_beat && (anchor - content_end).abs() < 0.05 && out_bpm > 0.0 {
+        (ARRANGEMENT_OVERLAP_BEATS * 60.0 / out_bpm).min(MAX_DISCARDED_MUSIC_SECONDS)
+    } else {
+        0.0
+    };
+    let mix_end = (anchor - arrangement).max(0.0);
+    let max_overlap = (max_beats_cap * beat_seconds)
+        .min(max_seconds)
+        .min((mix_end * 0.4).max(min_overlap))
         .min(if incoming.duration > 0.0 {
-            incoming.duration * 0.4
+            (incoming.duration * 0.4).max(min_overlap)
         } else {
-            AUTO_TRANSITION_MAX_SECONDS
-        });
+            max_seconds
+        })
+        .max(min_overlap);
 
-    // `handoffSeconds`: how long the handover itself takes, from the shared
-    // beat grid (TransitionPlanner.kt:981-987).
     let handoff_beats = if same_beat { 8.0 } else { 4.0 };
     let handoff_seconds = if out_bpm > 0.0 {
         (handoff_beats * 60.0 / out_bpm).clamp(2.0, if same_beat { 6.0 } else { 5.0 })
@@ -971,17 +1136,51 @@ fn plan_from(outgoing: &Analysis, incoming: &Analysis, fade: f64) -> TransitionP
         4.0
     };
 
-    // `desiredOverlap` / `actualOverlap` — the intro preroll is zero without
-    // phase-1 structure, so the handoff's own length is the floor that keeps
-    // the fade from finishing before the handover does (TransitionPlanner.kt:
-    // 1038-1039).
-    let desired_overlap = overlap.max(handoff_seconds * 0.42);
-    let actual_overlap = desired_overlap.clamp(handoff_seconds.min(max_overlap), max_overlap);
-    let fade_seconds = actual_overlap;
+    // The drop is the handoff, not the cue. Playback starts `overlap` earlier,
+    // and never more than eight seconds past the entry.
+    let drop = incoming_handoff(incoming, max_overlap);
+    let aligned_in = align_tempo_octave(out_bpm, in_bpm);
+    let requested_handoff = if same_beat && aligned_in > 0.0 {
+        drop + ARRANGEMENT_OVERLAP_BEATS * 60.0 / aligned_in
+    } else {
+        drop
+    };
+    let max_in_handoff = incoming.duration - MIN_CLEARANCE_SECONDS;
+    let handoff = if max_in_handoff >= drop {
+        requested_handoff.min(max_in_handoff)
+    } else {
+        drop
+    };
 
-    // Per-beat low-energy handoff placement (upstream `bassSwapFractionFor`) —
-    // only the DJ_BLEND style swaps bass, so only it needs the chosen beat.
-    let transition_start = (outgoing_mix_end - fade_seconds).max(0.0);
+    let (transition_start, fade_seconds) = if same_beat && beat_seconds > 0.0 {
+        let intro_span = handoff / playback_rate.max(0.8);
+        let total = intro_span.clamp(12.0_f64.min(max_overlap), max_overlap);
+        let target = (mix_end - total).max(0.0);
+        let earliest = (mix_end - max_overlap).max(0.0);
+        let start = aligned_transition_start(
+            outgoing,
+            target,
+            (mix_end - 0.05).max(earliest),
+            true,
+            earliest,
+        );
+        realized_window(mix_end, start, total, min_overlap)
+    } else {
+        let desired = overlap.max(handoff_seconds * 0.42);
+        let actual = desired.clamp(handoff_seconds.min(max_overlap), max_overlap);
+        let target = (mix_end - actual).max(0.0);
+        let earliest = (mix_end - max_overlap).max(0.0);
+        let start = aligned_transition_start(
+            outgoing,
+            target,
+            (mix_end - 0.05).max(earliest),
+            desired > overlap + 0.5,
+            earliest,
+        );
+        realized_window(mix_end, start, actual, min_overlap)
+    };
+    let cue = cue_for(entry, handoff, fade_seconds, playback_rate);
+
     let incoming_beat_seconds = if in_bpm > 0.0 { 60.0 / in_bpm } else { 0.5 };
     let bass_swap_fraction = if same_beat {
         bass_swap_fraction_for(
@@ -997,35 +1196,116 @@ fn plan_from(outgoing: &Analysis, incoming: &Analysis, fade: f64) -> TransitionP
     } else {
         DEFAULT_BASS_SWAP_FRACTION
     };
-
     let vocal_overlap = planned_vocal_overlap(
         outgoing,
         incoming,
         transition_start,
-        outgoing_mix_end,
+        transition_start + fade_seconds,
         cue,
         playback_rate,
+    );
+    let style = if same_beat {
+        TransitionStyle::DjBlend
+    } else {
+        TransitionStyle::DjFilter
+    };
+    let shape = mix_shape(
+        style,
+        same_beat,
+        vocal_overlap,
+        vocal_conflict,
+        fade_seconds,
+        beat_seconds,
+        bass_swap_fraction,
+        playback_rate,
+        out_bpm,
     );
 
     TransitionPlan {
         // Upstream `sameBeatBlend` gates on tempo ratio + beat confidence
         // alone — a DJ_ASSISTED pair that is tempo-close still blends, not
         // sweeps (TransitionPlanner.kt:965-967, 1073). No tier requirement.
-        style: if same_beat {
-            TransitionStyle::DjBlend
-        } else {
-            TransitionStyle::DjFilter
-        },
+        style,
         bass_swap: true,
         bass_swap_fraction,
         filter_sweep: if same_beat { 0.0 } else { FILTER_SWEEP },
         vocal_overlap,
         fade_seconds,
-        // The window every ride above was computed against.
-        transition_end_seconds: outgoing_mix_end,
+        transition_end_seconds: transition_start + fade_seconds,
         cue_seconds: cue,
         playback_rate,
+        bed_fraction: shape.bed_fraction,
+        bed_gain_db: shape.bed_gain_db,
+        dip_depth: shape.dip_depth,
+        dip_width: shape.dip_width,
+        post_glide_seconds: shape.post_glide_seconds,
+        outgoing_duration_seconds: outgoing.duration,
     }
+}
+
+struct MixShape {
+    bed_fraction: f64,
+    bed_gain_db: f64,
+    dip_depth: f64,
+    dip_width: f64,
+    post_glide_seconds: f64,
+}
+
+/// Bed, dip and post-blend glide for one planned blend. A plain crossfade
+/// gets zeros, which is how the mixer knows to stay equal-power.
+fn mix_shape(
+    style: TransitionStyle,
+    same_beat: bool,
+    vocal_overlap: f64,
+    vocal_conflict: bool,
+    fade_seconds: f64,
+    beat_seconds: f64,
+    swap_fraction: f64,
+    playback_rate: f64,
+    bpm: f64,
+) -> MixShape {
+    if !matches!(style, TransitionStyle::DjBlend | TransitionStyle::DjFilter) {
+        return MixShape {
+            bed_fraction: 0.0,
+            bed_gain_db: 0.0,
+            dip_depth: 0.0,
+            dip_width: 0.0,
+            post_glide_seconds: 0.0,
+        };
+    }
+    let clash = vocal_overlap.clamp(0.0, 1.0).max(if vocal_conflict { 0.7 } else { 0.0 });
+    let dip = if same_beat {
+        (0.28 + 0.5 * clash).clamp(0.0, MAX_DUCK_DEPTH)
+    } else {
+        (0.2 * clash).clamp(0.0, MAX_DUCK_DEPTH)
+    };
+    let rise = if fade_seconds > 0.0 && beat_seconds > 0.0 {
+        (2.0 * beat_seconds / fade_seconds).clamp(0.08, 0.3)
+    } else {
+        0.15
+    };
+    let bed = (swap_fraction - rise).clamp(0.15, 0.8);
+    let dip_width = if fade_seconds > 0.0 && beat_seconds > 0.0 {
+        (beat_seconds / fade_seconds).clamp(0.02, 0.2)
+    } else {
+        0.06
+    };
+    let post_glide_seconds = if same_beat && (playback_rate - 1.0).abs() > 1e-3 && bpm > 0.0 {
+        POST_BLEND_GLIDE_BEATS * 60.0 / bpm
+    } else {
+        0.0
+    };
+    MixShape {
+        bed_fraction: bed,
+        bed_gain_db: BED_GAIN_DB,
+        dip_depth: dip,
+        dip_width,
+        post_glide_seconds,
+    }
+}
+
+fn long_blend_allowed(outgoing: &Analysis, incoming: &Analysis) -> bool {
+    assess(outgoing, incoming) == Tier::Beatmatched
 }
 
 fn assess(outgoing: &Analysis, incoming: &Analysis) -> Tier {
@@ -1074,43 +1354,217 @@ fn normalized_tempo_ratio(current: f64, next: f64) -> f64 {
     ratio
 }
 
-fn incoming_cue(analysis: &Analysis) -> f64 {
+/// Where playback of the incoming track starts: the earliest point it makes
+/// sound, snapped to a downbeat, and bounded so a mix-in cannot skip the front
+/// of the record.
+///
+/// This is not the drop. The drop is [`incoming_handoff`]; playback begins
+/// `overlap` before that, and [`cue_for`] keeps the result within eight
+/// seconds of this entry.
+fn incoming_entry(analysis: &Analysis) -> f64 {
     let duration = analysis.duration;
-    let in_mix_in_window = |t: f64| {
-        t >= 0.0 && (duration <= 0.0 || t < duration - MIX_IN_END_MARGIN_SECONDS)
-    };
-    // Phase-1 mix-in candidates, highest score first (`main_drop` > `intro_drop`
-    // > `pickup`), matching upstream `incomingCuePoint`'s ranking.
-    let mut ranked: Vec<&audio_analysis::MixCuePoint> =
-        analysis.mix_in_candidates.iter().collect();
-    ranked.sort_by(|a, b| b.score.total_cmp(&a.score));
-    for candidate in ranked {
-        if in_mix_in_window(candidate.time) {
-            return candidate.time;
-        }
-    }
-    // No structure analysis: fall back to the beat-grid heuristic.
-    let pickup = analysis.first_beat.max(0.0);
-    if pickup > 0.0 && in_mix_in_window(pickup) {
-        if let Some(db) = analysis
+    let beat_seconds = beat_seconds_of(analysis);
+    let grid = beat_seconds > 0.0
+        && analysis
             .downbeats
             .iter()
-            .copied()
-            .find(|t| *t >= pickup && in_mix_in_window(*t))
-        {
-            return db;
-        }
-        return pickup;
+            .any(|d| d.is_finite() && *d >= 0.0);
+    if !grid {
+        // No grid, no skip. Without a beat to align to there is nothing to say
+        // how deep a mix-in should reach, and the honest answer is the top of
+        // the file: a missing analysis degrades to "play it from the start",
+        // never to "start at a drop we guessed at".
+        return 0.0;
     }
-    if analysis.downbeats.len() >= 8 {
-        let t = analysis.downbeats[8.min(analysis.downbeats.len() - 1)];
-        if in_mix_in_window(t) {
-            return t;
+
+    // The earliest music, from the phase-1 candidates (a single `pickup` at the
+    // pickup point) with the envelope's own measurement as the backstop.
+    let entry = analysis
+        .mix_in_candidates
+        .iter()
+        .filter(|c| c.time.is_finite() && c.time >= 0.0)
+        .map(|c| c.time)
+        .chain([analysis.audible_start_time].into_iter())
+        .fold(f64::INFINITY, f64::min);
+    let entry = if entry.is_finite() { entry } else { 0.0 };
+
+    // Snap forward onto the grid: entering between beats is the one thing a
+    // listener hears as "edited" rather than "mixed". Bounded to one beat past
+    // the pickup, so a grid that starts late cannot drag the entry with it.
+    let snapped = analysis
+        .downbeats
+        .iter()
+        .copied()
+        .filter(|d| d.is_finite() && *d >= entry - 1e-3 && *d <= entry + beat_seconds)
+        .min_by(|a, b| a.total_cmp(b))
+        .unwrap_or(entry);
+
+    cap_cue(snapped, entry, beat_seconds, duration)
+}
+
+/// The tests still talk about the cue. It is the entry.
+#[cfg(test)]
+fn incoming_cue(analysis: &Analysis) -> f64 {
+    incoming_entry(analysis)
+}
+
+/// A track's beat length, or 0 when there is no usable tempo. A BPM outside
+/// the analyser's own range means the read failed, and a failed read must not
+/// become a 32-beat cue.
+fn beat_seconds_of(analysis: &Analysis) -> f64 {
+    if !(MIN_BPM..=MAX_BPM).contains(&analysis.bpm) {
+        return 0.0;
+    }
+    let from_bpm = 60.0 / analysis.bpm;
+    if analysis.beat_interval.is_finite() && analysis.beat_interval > 0.0 {
+        // Trust the grid's own interval when the two agree; the two can differ
+        // by an octave after `align_tempo_octave`, and the grid is what the
+        // downbeats are actually spaced at.
+        if (analysis.beat_interval - from_bpm).abs() / from_bpm < 0.5 {
+            return analysis.beat_interval;
         }
     }
-    // A late-only grid is the outro. Starting at 0 is the unanalysed fallback,
-    // not a cue into the last bars.
-    0.0
+    from_bpm
+}
+
+/// The three bounds on a mix-in. Together they mean a listener never loses the
+/// front of a record to a transition, however long it is or however badly the
+/// analysis read.
+fn cap_cue(cue: f64, entry: f64, beat_seconds: f64, duration: f64) -> f64 {
+    let in_mix_in_window = |t: f64| {
+        t.is_finite()
+            && t >= 0.0
+            && (duration <= 0.0 || t < duration - MIX_IN_END_MARGIN_SECONDS)
+    };
+    let cue = if in_mix_in_window(cue) { cue } else { 0.0 };
+    let mut cap = MAX_CUE_SECONDS.min(MAX_CUE_BEATS * beat_seconds);
+    if duration > 0.0 {
+        // On a long set or a DJ track, a flat 8 s cap still throws away music;
+        // a fraction of the track keeps the skip proportional to the track.
+        cap = cap.min(duration * MAX_CUE_FRACTION);
+    }
+    if cue <= cap {
+        return cue;
+    }
+    // Over the cap, fall back to the pickup — which is the top of the music, and
+    // what the track would have played from anyway.
+    if entry <= cap && in_mix_in_window(entry) {
+        entry
+    } else {
+        0.0
+    }
+}
+
+/// Where the incoming arrangement arrives — the drop — if the overlap can
+/// cover the distance from the entry. Otherwise the handoff is the entry plus
+/// that overlap, which is a long intro played underneath, not a skip.
+fn incoming_handoff(analysis: &Analysis, max_overlap_s: f64) -> f64 {
+    let entry = incoming_entry(analysis);
+    let budget = max_overlap_s.max(0.0);
+    let beat = beat_seconds_of(analysis);
+    let mut ranked: Vec<&audio_analysis::MixCuePoint> = analysis
+        .mix_in_candidates
+        .iter()
+        .filter(|c| c.kind != "pickup" && c.time.is_finite() && c.time > entry + 0.25)
+        .collect();
+    ranked.sort_by(|a, b| b.score.total_cmp(&a.score));
+    if let Some(drop) = ranked.first() {
+        let snapped = if beat > 0.0 {
+            nearest_value(&analysis.downbeats, drop.time, 0.5_f64.max(beat * 2.0))
+                .unwrap_or(drop.time)
+        } else {
+            drop.time
+        };
+        if snapped >= entry && snapped - entry <= budget + 0.05 {
+            return snapped;
+        }
+    }
+    if analysis.mix_in_time.is_finite()
+        && analysis.mix_in_time > entry + 0.25
+        && analysis.mix_in_time - entry <= budget + 0.05
+    {
+        return analysis.mix_in_time;
+    }
+    entry + budget
+}
+
+/// Playback starts `overlap * rate` before the handoff, and never more than
+/// eight seconds past the entry.
+fn cue_for(entry: f64, handoff: f64, overlap: f64, rate: f64) -> f64 {
+    let rate = if rate.is_finite() && rate > 0.0 { rate } else { 1.0 };
+    let raw = if overlap.is_finite() {
+        handoff - overlap * rate
+    } else {
+        entry
+    };
+    raw.max(entry).max(0.0).min(entry + MAX_CUE_SECONDS)
+}
+
+fn timed_near_or_before(values: &[f64], target: f64, tolerance: f64, minimum: f64) -> Option<f64> {
+    values
+        .iter()
+        .copied()
+        .filter(|v| v.is_finite() && *v >= minimum && *v <= target && target - *v <= tolerance)
+        .max_by(|a, b| a.total_cmp(b))
+}
+
+fn nearest_timed(values: &[f64], target: f64, tolerance: f64, minimum: f64) -> Option<f64> {
+    values
+        .iter()
+        .copied()
+        .filter(|v| v.is_finite() && *v >= minimum && (*v - target).abs() <= tolerance)
+        .min_by(|a, b| (*a - target).abs().total_cmp(&(*b - target).abs()))
+}
+
+/// Snaps a transition start onto the outgoing grid: a phrase boundary if one
+/// is near, a downbeat otherwise (upstream `alignedTransitionStart`).
+fn aligned_transition_start(
+    analysis: &Analysis,
+    target: f64,
+    end: f64,
+    prefer_earlier: bool,
+    minimum: f64,
+) -> f64 {
+    let interval = beat_seconds_of(analysis);
+    let phrase_tolerance = 1.0_f64.max(interval * 4.0);
+    let downbeat_tolerance = 0.75_f64.max(interval * 2.0);
+    let phrase = if prefer_earlier {
+        timed_near_or_before(&analysis.phrase_boundaries, target, phrase_tolerance, minimum)
+    } else {
+        nearest_timed(&analysis.phrase_boundaries, target, phrase_tolerance, minimum)
+    };
+    let downbeat = if prefer_earlier {
+        timed_near_or_before(&analysis.downbeats, target, downbeat_tolerance, minimum)
+    } else {
+        nearest_timed(&analysis.downbeats, target, downbeat_tolerance, minimum)
+    };
+    let chosen = phrase.or(downbeat).unwrap_or(target);
+    if end < minimum {
+        return chosen.max(0.0).min(end.max(0.0));
+    }
+    chosen.clamp(minimum, end)
+}
+
+/// The blend that actually plays, after the grid snap.
+///
+/// [`aligned_transition_start`] clamps onto `mix_end - 0.05`. When the only
+/// boundary in range is the end itself, `mix_end - start` collapses, and a
+/// floor of half a second rendered that collapse as a cut. Upstream's floor
+/// is four seconds (six on a fast track). A snap that kept the blend is left
+/// alone; a snap that ate it is discarded and the planned length is restored.
+/// A tail shorter than the floor uses the tail — there is nothing else to
+/// blend across.
+fn realized_window(mix_end: f64, snapped_start: f64, desired: f64, minimum: f64) -> (f64, f64) {
+    let mix_end = mix_end.max(0.0);
+    let snapped = (mix_end - snapped_start).max(0.0);
+    let minimum = minimum.min(mix_end);
+    let fade = if snapped + 0.25 >= minimum {
+        snapped.max(minimum)
+    } else {
+        desired.max(minimum)
+    };
+    let fade = fade.min(mix_end);
+    ((mix_end - fade).max(0.0), fade)
 }
 
 /// Mean vocal activity over `start`..`end` on a track's own timeline (upstream
@@ -1267,31 +1721,6 @@ fn audible_start_of(analysis: &Analysis) -> f64 {
     }
 }
 
-/// Where the incoming track takes over: the best-ranked mix-in candidate,
-/// snapped to a downbeat (upstream `incomingMixInPoint`).
-fn incoming_mix_in_point(analysis: &Analysis) -> Option<f64> {
-    let beat_seconds = if analysis.beat_interval > 0.0 {
-        analysis.beat_interval
-    } else if analysis.bpm > 0.0 {
-        60.0 / analysis.bpm
-    } else {
-        0.0
-    };
-    let tolerance = 0.5f64.max(beat_seconds * 2.0);
-    let mut ranked: Vec<&audio_analysis::MixCuePoint> =
-        analysis.mix_in_candidates.iter().collect();
-    ranked.sort_by(|a, b| b.score.total_cmp(&a.score));
-    let target = ranked
-        .first()
-        .map(|c| c.time)
-        .or(if analysis.mix_in_time > 0.0 {
-            Some(analysis.mix_in_time)
-        } else {
-            None
-        })?;
-    nearest_value(&analysis.downbeats, target, tolerance).or(Some(target))
-}
-
 /// One pass of the vocal-clash gate (upstream `clashOver`).
 #[allow(clippy::too_many_arguments)]
 fn clash_over(
@@ -1358,7 +1787,19 @@ fn plan_wsola_transition(outgoing: &Analysis, incoming: &Analysis) -> Option<Tra
     let incoming_beat_seconds = 60.0 / incoming_bpm;
     let outgoing_beat_seconds = 60.0 / outgoing_bpm;
 
-    let incoming_drop_time = incoming_mix_in_point(incoming)?;
+    let long = long_blend_allowed(outgoing, incoming);
+    let max_seconds = if long {
+        LONG_BLEND_SECONDS
+    } else {
+        UPSTREAM_MAX_OVERLAP_SECONDS
+    };
+    let max_beats = if long {
+        LONG_BLEND_BEATS
+    } else {
+        UPSTREAM_MAX_FADE_BEATS
+    };
+    // The drop, or the furthest handoff the overlap can reach. Never the cue.
+    let incoming_drop_time = incoming_handoff(incoming, max_seconds);
 
     let content_end = if outgoing.content_end > 0.0 {
         outgoing.content_end
@@ -1379,11 +1820,11 @@ fn plan_wsola_transition(outgoing: &Analysis, incoming: &Analysis) -> Option<Tra
     let available_fade_beats =
         (incoming_drop_time - audible_start).max(0.0) / incoming_beat_seconds;
     let capped_by_overlap =
-        ((MAX_OVERLAP_SECONDS / incoming_beat_seconds).floor() as usize / 4) * 4;
+        ((max_seconds / incoming_beat_seconds).floor() as usize / 4) * 4;
     if capped_by_overlap < MIN_FADE_BEATS {
         return None;
     }
-    let mut fade_beats = MAX_FADE_BEATS
+    let mut fade_beats = max_beats
         .min(capped_by_overlap)
         .min(((available_fade_beats / 4.0).floor() as usize) * 4);
     if fade_beats < MIN_FADE_BEATS {
@@ -1423,8 +1864,9 @@ fn plan_wsola_transition(outgoing: &Analysis, incoming: &Analysis) -> Option<Tra
         return None;
     }
     let incoming_handoff_time = requested_incoming_handoff.min(max_incoming_handoff);
-    let incoming_cue_time = incoming_handoff_time - overlap_seconds;
-    if incoming_cue_time < audible_start - 0.05 {
+    let entry = incoming_entry(incoming);
+    let incoming_cue_time = cue_for(entry, incoming_handoff_time, overlap_seconds, stretch_ratio);
+    if incoming_cue_time < audible_start - 0.5 {
         return None;
     }
 
@@ -1463,16 +1905,37 @@ fn plan_wsola_transition(outgoing: &Analysis, incoming: &Analysis) -> Option<Tra
         stretch_ratio,
     );
 
+    let vocal_conflict = outgoing.vocal_probability >= 0.62 && incoming.vocal_probability >= 0.62;
+    let style = TransitionStyle::DjBlend;
+    let playback_rate = (stretch_ratio * 10_000.0).round() / 10_000.0;
+    let fade_seconds = transition_end - transition_start;
+    let shape = mix_shape(
+        style,
+        true,
+        vocal_overlap,
+        vocal_conflict,
+        fade_seconds,
+        outgoing_beat_seconds,
+        bass_swap_fraction,
+        playback_rate,
+        outgoing_bpm,
+    );
     Some(TransitionPlan {
-        style: TransitionStyle::DjBlend,
+        style,
         bass_swap: true,
         bass_swap_fraction,
         filter_sweep: 0.0,
         vocal_overlap,
-        fade_seconds: transition_end - transition_start,
+        fade_seconds,
         transition_end_seconds: transition_end,
         cue_seconds: incoming_cue_time,
-        playback_rate: (stretch_ratio * 10_000.0).round() / 10_000.0,
+        playback_rate,
+        bed_fraction: shape.bed_fraction,
+        bed_gain_db: shape.bed_gain_db,
+        dip_depth: shape.dip_depth,
+        dip_width: shape.dip_width,
+        post_glide_seconds: shape.post_glide_seconds,
+        outgoing_duration_seconds: outgoing.duration,
     })
 }
 
@@ -1528,11 +1991,18 @@ mod tests {
         assert_eq!(computed.load(Ordering::SeqCst), 3);
     }
 
+    /// A track whose music starts at `first_beat`, on a 120 BPM grid. The
+    /// pickup is reported the way the real analysis reports it — as both the
+    /// envelope's `audible_start` and the grid's `first_beat` — because the
+    /// cue is derived from whichever of them is earliest.
     fn analysis(first_beat: f64, duration: f64, downbeats: Vec<f64>) -> Analysis {
         Analysis {
             first_beat,
+            audible_start_time: first_beat,
             duration,
             downbeats,
+            bpm: 120.0,
+            beat_interval: 0.5,
             ..Analysis::default()
         }
     }
@@ -1701,6 +2171,122 @@ mod tests {
         );
     }
 
+    /// A mix-in is the top of the next record, not its drop.
+    ///
+    /// Regression: the cue used to be the highest-ranked phase-1 candidate, and
+    /// that ranking put `main_drop` — 32 beats in — above `pickup`. Worse, when
+    /// the DSP tempo read failed, `beat_interval` was 0, which sent the drop
+    /// candidate to `intro_end_time`: the first moment the track got *loud*,
+    /// capped at 48 s. That is a mix-*out* question used as a mix-in question,
+    /// and it is where "the next song starts a minute in" came from.
+    #[test]
+    fn a_mix_in_never_reaches_for_the_drop() {
+        // 120 BPM, pickup at 2 s, and a grid running the length of the track.
+        let downbeats: Vec<f64> = (0..40).map(|i| 2.0 + i as f64 * 2.0).collect();
+        let cue = incoming_cue(&analysis(2.0, 240.0, downbeats));
+        assert!(
+            (cue - 2.0).abs() < 1e-9,
+            "a beat-aligned pickup at 2 s should cue at 2 s, got {cue}"
+        );
+
+        // And with the analysis reporting its pickup through the candidate list,
+        // which is where the real value comes from.
+        let with_candidate_grid: Vec<f64> = (0..40).map(|i| 2.0 + i as f64 * 2.0).collect();
+        let mut with_candidate = analysis(2.0, 240.0, with_candidate_grid);
+        with_candidate.audible_start_time = 2.0;
+        with_candidate.mix_in_candidates = vec![audio_analysis::MixCuePoint {
+            time: 2.0,
+            score: 0.8,
+            kind: "pickup".into(),
+        }];
+        assert!((incoming_cue(&with_candidate) - 2.0).abs() < 1e-9);
+    }
+
+    /// No usable grid means the top of the file, and never a guess.
+    ///
+    /// This is the degraded path in its purest form: the analysis is empty, so
+    /// there is nothing to align to and nothing to say how deep a mix-in should
+    /// reach. A plain crossfade from 0 is right; a crossfade from 45 s is the
+    /// bug.
+    #[test]
+    fn a_mix_in_without_a_beat_grid_starts_at_the_top() {
+        // No tempo at all.
+        let mut blind = analysis(0.0, 200.0, vec![0.5, 1.0, 1.5, 2.0]);
+        blind.bpm = 0.0;
+        blind.beat_interval = 0.0;
+        assert_eq!(incoming_cue(&blind), 0.0, "no tempo must not become a deep cue");
+
+        // A tempo outside the analyser's own range means the read failed, and a
+        // failed read must not turn into a 32-beat cue either.
+        let mut absurd = analysis(0.0, 200.0, vec![0.5, 1.0, 1.5, 2.0]);
+        absurd.bpm = 12.0;
+        absurd.beat_interval = 5.0;
+        assert_eq!(incoming_cue(&absurd), 0.0, "an out-of-range tempo is not a grid");
+
+        // A tempo with no downbeats is no grid either.
+        let mut no_downbeats = analysis(0.0, 200.0, vec![]);
+        no_downbeats.audible_start_time = 1.0;
+        assert_eq!(incoming_cue(&no_downbeats), 0.0);
+    }
+
+    /// The three bounds, each of which is the one that bites in its own case.
+    #[test]
+    fn a_mix_in_is_bounded_by_seconds_beats_and_the_track() {
+        // Seconds: a pickup deep into the record is pulled back to eight.
+        let deep: Vec<f64> = (0..40).map(|i| 30.0 + i as f64 * 0.5).collect();
+        let mut slow = analysis(30.0, 240.0, deep);
+        slow.audible_start_time = 30.0;
+        let cue = incoming_cue(&slow);
+        assert!(
+            cue <= MAX_CUE_SECONDS + 1e-9,
+            "cue {cue} exceeded the {MAX_CUE_SECONDS}s cap"
+        );
+
+        // Beats: 16 beats of a 40 BPM track is 24 s, so the beat cap is the one
+        // that applies — and a failed read at 40 BPM must not become 32 beats.
+        let slow_grid: Vec<f64> = (0..200).map(|i| 1.0 + i as f64 * 1.5).collect();
+        let mut ballad = analysis(1.0, 600.0, slow_grid);
+        ballad.bpm = 40.0;
+        ballad.beat_interval = 1.5;
+        ballad.audible_start_time = 40.0;
+        let cue = incoming_cue(&ballad);
+        assert!(
+            cue <= MAX_CUE_BEATS * 1.5 + 1e-9,
+            "cue {cue} exceeded {MAX_CUE_BEATS} beats"
+        );
+
+        // Fraction: short material gets a proportionally smaller entry, because
+        // eight seconds is an eighth of a one-minute clip and nothing at all in
+        // a four-minute song.
+        let short: Vec<f64> = (0..200).map(|i| 0.2 + i as f64 * 0.5).collect();
+        let mut brief = analysis(0.2, 60.0, short);
+        brief.audible_start_time = 12.0;
+        let cue = incoming_cue(&brief);
+        assert!(
+            cue <= 60.0 * MAX_CUE_FRACTION + 1e-9,
+            "cue {cue} exceeded {MAX_CUE_FRACTION} of a one-minute track"
+        );
+    }
+
+    /// The cue lands on a beat, because entering between beats is the one thing
+    /// a listener hears as "edited" rather than "mixed".
+    #[test]
+    fn a_mix_in_lands_on_the_grid() {
+        let downbeats: Vec<f64> = (0..40).map(|i| 0.25 + i as f64 * 0.5).collect();
+        let mut track = analysis(0.25, 200.0, downbeats.clone());
+        // A pickup that falls a little after a downbeat.
+        track.audible_start_time = 1.4;
+        let cue = incoming_cue(&track);
+        assert!(
+            downbeats.iter().any(|d| (d - cue).abs() < 1e-6),
+            "cue {cue} is not on the grid"
+        );
+        assert!(
+            cue >= 1.4 && cue <= 1.4 + 0.5 + 1e-6,
+            "cue {cue} should be the first downbeat at or after the 1.4 s pickup"
+        );
+    }
+
     #[test]
     fn incoming_cue_does_not_index_into_sorted_outro_beats() {
         // The old fallback picked downbeats[8] after merging and sorting tail
@@ -1717,6 +2303,148 @@ mod tests {
     fn incoming_cue_rejects_pickup_in_the_last_ten_seconds() {
         let cue = incoming_cue(&analysis(175.0, 180.0, vec![175.0, 177.0, 179.0]));
         assert_eq!(cue, 0.0);
+    }
+
+    fn matched(first_beat: f64, duration: f64) -> Analysis {
+        let step = 0.5;
+        let downbeats: Vec<f64> = (0..((duration / step) as usize))
+            .map(|i| first_beat + i as f64 * step)
+            .filter(|t| *t < duration)
+            .collect();
+        let mut track = analysis(first_beat, duration, downbeats);
+        track.beat_confidence = 0.9;
+        track.content_end = duration;
+        track.key = "C major".into();
+        track.key_confidence = 0.9;
+        track
+    }
+
+    /// An eight-bar intro is a runway, so the phrase switch fires and the cue
+    /// stays at the top of that intro.
+    #[test]
+    fn phrase_switch_fires_on_an_eight_bar_intro_and_starts_at_the_entry() {
+        let out = matched(0.5, 200.0);
+        let mut inc = matched(0.5, 200.0);
+        // 32 beats of intro: the drop, not the cue.
+        inc.mix_in_candidates = vec![audio_analysis::MixCuePoint {
+            time: 0.5 + 32.0 * 0.5,
+            score: 0.95,
+            kind: "main_drop".into(),
+        }];
+        let plan = phrase_switch(&out, &inc).expect("an eight-bar intro should phrase-switch");
+        assert_eq!(plan.style, TransitionStyle::DjBlend);
+        let entry = incoming_entry(&inc);
+        assert!(
+            plan.cue_seconds <= entry + MAX_CUE_SECONDS + 1e-6,
+            "cue {} started more than {MAX_CUE_SECONDS}s past the entry {entry}",
+            plan.cue_seconds
+        );
+        assert!(
+            plan.cue_seconds < 0.5 + 32.0 * 0.5 - 1.0,
+            "cue {} is the drop, not the entry",
+            plan.cue_seconds
+        );
+        assert!(plan.bed_fraction > 0.0, "a phrase switch is a bed, not a crossfade");
+    }
+
+    #[test]
+    fn a_cue_is_never_more_than_eight_seconds_past_the_entry() {
+        assert!(
+            (cue_for(1.0, 80.0, 8.0, 1.0) - 9.0).abs() < 1e-9,
+            "80 - 8 = 72, which must clamp to entry + 8"
+        );
+        let out = matched(0.5, 240.0);
+        let mut inc = matched(0.5, 240.0);
+        inc.mix_in_candidates = vec![audio_analysis::MixCuePoint {
+            time: 90.0,
+            score: 0.95,
+            kind: "main_drop".into(),
+        }];
+        let plan = plan_from(&out, &inc, 8.0);
+        let entry = incoming_entry(&inc);
+        assert!(
+            plan.cue_seconds <= entry + MAX_CUE_SECONDS + 1e-6,
+            "cue {} exceeded entry {entry} + {MAX_CUE_SECONDS}s",
+            plan.cue_seconds
+        );
+    }
+
+    #[test]
+    fn a_plain_crossfade_ends_where_the_music_ends() {
+        let mut out = analysis(0.5, 200.0, vec![]);
+        out.bpm = 0.0;
+        out.beat_interval = 0.0;
+        out.content_end = 170.0;
+        let inc = analysis(0.5, 200.0, vec![]);
+        let plan = plan_from(&out, &inc, 8.0);
+        assert_eq!(plan.style, TransitionStyle::EqualPower);
+        assert!(
+            (plan.transition_end_seconds - 170.0).abs() < 1e-6,
+            "plain fade ended at {}, not the content end",
+            plan.transition_end_seconds
+        );
+        assert_eq!(plan.bed_fraction, 0.0);
+        assert_eq!(plan.dip_depth, 0.0);
+    }
+
+    /// A grid snap that lands on the mix-out used to leave `mix_end - start`
+    /// at a few dozen milliseconds, and `.max(0.5)` turned every one of those
+    /// into a half-second cut.
+    #[test]
+    fn a_snapped_start_cannot_shrink_the_blend_to_half_a_second() {
+        let (start, fade) = realized_window(180.0, 179.95, 12.0, AUTO_MIN_SECONDS);
+        assert!(
+            (fade - 12.0).abs() < 1e-6,
+            "a collapsed snap must restore the planned blend, got {fade}s"
+        );
+        assert!((start - 168.0).abs() < 1e-6, "start {start}");
+
+        let (kept_start, kept_fade) = realized_window(180.0, 168.0, 12.0, AUTO_MIN_SECONDS);
+        assert!((kept_fade - 12.0).abs() < 1e-6, "a good snap stays, got {kept_fade}");
+        assert!((kept_start - 168.0).abs() < 1e-6);
+
+        // The tail is the whole window: do not invent blend time the track
+        // does not have.
+        let (_, short) = realized_window(2.0, 1.9, 12.0, AUTO_MIN_SECONDS);
+        assert!((short - 2.0).abs() < 1e-6, "short tail {short}");
+    }
+
+    #[test]
+    fn a_clean_beatmatched_pair_blends_for_more_than_thirty_two_beats() {
+        let out = matched(0.5, 240.0);
+        let inc = matched(0.5, 240.0);
+        let plan = phrase_switch(&out, &inc).expect("a clean pair should phrase-switch");
+        let beats = plan.fade_seconds / 0.5;
+        assert!(
+            beats > 32.0,
+            "fade {:.2}s is only {beats:.0} beats; a clean pair should run long",
+            plan.fade_seconds
+        );
+    }
+
+    #[test]
+    fn a_vocal_clash_shrinks_the_long_blend() {
+        let mut out = matched(0.5, 200.0);
+        let mut inc = matched(0.5, 200.0);
+        let curve: Vec<audio_analysis::EnergyPoint> = (0..400)
+            .map(|i| audio_analysis::EnergyPoint {
+                time: i as f64 * 0.5,
+                energy: 1.0,
+            })
+            .collect();
+        let mask = vec![1.0f64; curve.len()];
+        out.energy_curve = curve.clone();
+        inc.energy_curve = curve;
+        out.vocal_activity_mask = mask.clone();
+        inc.vocal_activity_mask = mask;
+        out.vocal_probability = 0.9;
+        inc.vocal_probability = 0.9;
+        let plan = phrase_switch(&out, &inc).expect("a clash shrinks the blend, it does not refuse it");
+        let beats = plan.fade_seconds / 0.5;
+        assert!(
+            beats <= 8.0,
+            "a vocal clash left the blend at {beats:.0} beats"
+        );
     }
 
     #[test]

@@ -425,13 +425,12 @@ struct SearchView: View {
     /// Whether the field is mid-edit, so the results below are not the ones for
     /// what it now says.
     ///
-    /// Two signals, and either is enough. A non-empty suggestion list is
-    /// upstream's signal — a committed search clears the suggestions, so "there
-    /// are suggestions" and "the field is being edited" are the same statement.
-    /// The second is that the field no longer says what was searched, which
-    /// catches the edits too short to produce a suggestion list.
+    /// Only the text decides this. A suggestion list that arrives after the
+    /// search was committed used to count as "still editing", so the first tap
+    /// on a term replaced the results with another suggestion list and a second
+    /// tap was needed to see them.
     private var isEditing: Bool {
-        !term.isEmpty && (term != searchedTerm || !suggestions.isEmpty)
+        !term.isEmpty && term != searchedTerm
     }
 
     /// See [resultsColumn]. Hidden for an empty search, a failed one, and while
@@ -682,12 +681,21 @@ struct SearchView: View {
     private func scheduleSuggestions(_ value: String) {
         suggestTask?.cancel()
         let term = value.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard term.count >= 2 else { suggestions = []; return }
+        // A committed search sets the field to the term it just ran. Fetching
+        // completions for that same string puts the suggestion list back on
+        // top of the results.
+        guard term.count >= 2, term != searchedTerm else {
+            suggestions = []
+            return
+        }
         suggestTask = Task {
             try? await Task.sleep(nanoseconds: 250_000_000)
             guard !Task.isCancelled else { return }
             let list = await InnertubeSearch.shared.suggestions(term)
-            await MainActor.run { suggestions = list }
+            await MainActor.run {
+                guard !Task.isCancelled, self.term == term, term != self.searchedTerm else { return }
+                suggestions = list
+            }
         }
     }
 
@@ -738,6 +746,7 @@ struct SearchView: View {
         // is the bug a listener sees as "I searched for the right thing and got
         // the wrong thing".
         searchTask?.cancel()
+        cancelSuggestions()
         searching = true
         attempted = true
         searchError = nil

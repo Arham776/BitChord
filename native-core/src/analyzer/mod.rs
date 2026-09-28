@@ -19,8 +19,17 @@ mod tempo;
 mod vocal;
 
 pub use beat::Grid;
-pub use models::{analyzer_ready, configure};
+pub use models::analyzer_ready;
 pub use plan::{next_energy_dip, plan_pair};
+
+/// Refresh both graphs and discard analyses made with the previous model set.
+/// A track analyzed before a first-run download must get a new beat grid when
+/// the model arrives during the same listening session.
+pub fn configure(beat_path: &str, vocal_path: &str) -> bool {
+    let ready = models::configure(beat_path, vocal_path);
+    plan::clear_analysis_cache();
+    ready
+}
 
 const PI: f64 = core::f64::consts::PI;
 

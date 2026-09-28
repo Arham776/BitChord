@@ -231,13 +231,33 @@ fn codec_label(source: &SourceKind, audio: &symphonia::core::codecs::audio::Audi
 
 impl SymphoniaDecoder {
     pub fn open(source: &SourceKind, headers: &HashMap<String, String>) -> Result<Self, DecodeError> {
+        Self::open_inner(source, headers, true)
+    }
+
+    /// Like [`open`], but a download that is still appending ends at the bytes
+    /// on disk. Planning uses this. Playback uses [`open`], which waits, so a
+    /// song never stops in the middle of its own download.
+    pub fn open_available(
+        source: &SourceKind,
+        headers: &HashMap<String, String>,
+    ) -> Result<Self, DecodeError> {
+        Self::open_inner(source, headers, false)
+    }
+
+    fn open_inner(
+        source: &SourceKind,
+        headers: &HashMap<String, String>,
+        block_on_growth: bool,
+    ) -> Result<Self, DecodeError> {
         let mss: MediaSourceStream = match source {
             SourceKind::Path(path) => {
                 let boxed: Box<dyn MediaSource> = if GrowingFile::is_growing(path) {
-                    Box::new(
+                    let growing = if block_on_growth {
                         GrowingFile::open(path)
-                            .map_err(|e| DecodeError(format!("open {path}: {e}")))?,
-                    )
+                    } else {
+                        GrowingFile::open_mode(path, false)
+                    };
+                    Box::new(growing.map_err(|e| DecodeError(format!("open {path}: {e}")))?)
                 } else {
                     Box::new(
                         File::open(path).map_err(|e| DecodeError(format!("open {path}: {e}")))?,
@@ -505,6 +525,10 @@ struct GrowingFile {
     file: File,
     path: PathBuf,
     declared_len: Option<u64>,
+    /// Playback waits for bytes that have not arrived yet. Analysis must not:
+    /// a plan that blocks until `.complete` runs at the end of the song, which
+    /// is after the blend it was supposed to schedule.
+    block: bool,
 }
 
 impl GrowingFile {
@@ -514,6 +538,10 @@ impl GrowingFile {
     }
 
     fn open(path: &str) -> std::io::Result<Self> {
+        Self::open_mode(path, true)
+    }
+
+    fn open_mode(path: &str, block: bool) -> std::io::Result<Self> {
         let declared_len = std::fs::read_to_string(format!("{path}.len"))
             .ok()
             .and_then(|s| s.trim().parse().ok())
@@ -522,6 +550,7 @@ impl GrowingFile {
             file: File::open(path)?,
             path: PathBuf::from(path),
             declared_len,
+            block,
         })
     }
 
@@ -565,7 +594,7 @@ impl Read for GrowingFile {
             if n > 0 {
                 return Ok(n);
             }
-            if self.is_complete() {
+            if self.is_complete() || !self.block {
                 return Ok(0);
             }
             let len = std::fs::metadata(&self.path)?.len();
@@ -602,7 +631,14 @@ impl Seek for GrowingFile {
             ));
         }
         let target = target as u64;
-        self.wait_for_len(target)?;
+        if self.block {
+            self.wait_for_len(target)?;
+        } else if !self.is_complete() && target > on_disk {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "analysis read stopped at the bytes downloaded so far",
+            ));
+        }
         self.file.seek(SeekFrom::Start(target))
     }
 }
@@ -969,6 +1005,57 @@ mod tests {
     #[test]
     fn growing_file_waits_only_with_grow_marker() {
         assert!(!GrowingFile::is_growing("/tmp/bitchord-no-such.mp4"));
+    }
+
+    /// A still-downloading file ends where the bytes end, for analysis. The
+    /// playback opener would sit here for two minutes waiting on `.complete`.
+    #[test]
+    fn an_analysis_read_does_not_wait_for_the_rest_of_the_download() {
+        let dir = std::env::temp_dir().join("bitchord-growing-analysis");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("partial.wav");
+        let rate = 44_100u32;
+        let frames = rate as usize / 10;
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"RIFF");
+        bytes.extend_from_slice(&(36 + (frames * 4) as u32).to_le_bytes());
+        bytes.extend_from_slice(b"WAVE");
+        bytes.extend_from_slice(b"fmt ");
+        bytes.extend_from_slice(&16u32.to_le_bytes());
+        bytes.extend_from_slice(&1u16.to_le_bytes());
+        bytes.extend_from_slice(&2u16.to_le_bytes());
+        bytes.extend_from_slice(&rate.to_le_bytes());
+        bytes.extend_from_slice(&(rate * 4).to_le_bytes());
+        bytes.extend_from_slice(&4u16.to_le_bytes());
+        bytes.extend_from_slice(&16u16.to_le_bytes());
+        bytes.extend_from_slice(b"data");
+        bytes.extend_from_slice(&((frames * 4) as u32).to_le_bytes());
+        bytes.extend(std::iter::repeat(0).take(frames * 4));
+        std::fs::write(&path, bytes).unwrap();
+        let path_str = path.display().to_string();
+        std::fs::write(format!("{path_str}.grow"), b"").unwrap();
+        let _ = std::fs::remove_file(format!("{path_str}.complete"));
+
+        let started = std::time::Instant::now();
+        let mut decoder = SymphoniaDecoder::open_available(
+            &SourceKind::parse(&path_str),
+            &std::collections::HashMap::new(),
+        )
+        .unwrap();
+        let mut total = 0usize;
+        loop {
+            let chunk = decoder.read_stereo(4096).unwrap();
+            if chunk.is_empty() {
+                break;
+            }
+            total += chunk.len();
+        }
+        assert!(total > 0, "the bytes already on disk should decode");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "analysis waited {:?} for a download that is still in progress",
+            started.elapsed()
+        );
     }
 
     #[test]

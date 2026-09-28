@@ -114,7 +114,8 @@ var loaded: TrackInfoRec?
 do {
     loaded = try engine.loadTrack(request: LoadRequest(
         source: wav, title: "tone", artist: "harness",
-        startSeconds: 0, plan: nil, headers: nil, claimedKbps: 0, loudnessDb: nil
+        startSeconds: 0, plan: nil, headers: nil, claimedKbps: 0, loudnessDb: nil,
+        durationSeconds: nil
     ))
     check("load reports the decoded duration", loaded!.durationSeconds > 5.5,
           "\(String(format: "%.2f", loaded!.durationSeconds))s")
@@ -232,7 +233,8 @@ do {
 do {
     try engine.loadTrack(request: LoadRequest(
         source: wav, title: "tone", artist: "harness",
-        startSeconds: 0, plan: nil, headers: nil, claimedKbps: 0, loudnessDb: -7.0
+        startSeconds: 0, plan: nil, headers: nil, claimedKbps: 0, loudnessDb: -7.0,
+        durationSeconds: nil
     ))
     let nerd = engine.nerdStats()
     check("a figured load reports the clamped correction",
@@ -252,7 +254,8 @@ do {
           "\(on.loudnessGainDb.map { "\($0)" } ?? "nil") dB")
     try engine.loadTrack(request: LoadRequest(
         source: wav, title: "tone", artist: "harness",
-        startSeconds: 0, plan: nil, headers: nil, claimedKbps: 0, loudnessDb: nil
+        startSeconds: 0, plan: nil, headers: nil, claimedKbps: 0, loudnessDb: nil,
+        durationSeconds: nil
     ))
     let bare = engine.nerdStats()
     check("a figureless load reports no correction", bare.loudnessGainDb == nil,
@@ -274,6 +277,49 @@ do {
     check("route and tier setters hold", true)
 } catch {
     check("route and tier setters hold", false, "\(error)")
+}
+
+// 12. What the planner hands the mixer, read back through the same plan the
+//     engine renders from.
+//
+//     These are the claims a listener makes about Automix: that the next record
+//     starts at the top of its own intro rather than at its drop, that the
+//     blend is an arrival rather than a swap, and that the tempo match does not
+//     come with a pitch bend. The first is a planner property, so it is
+//     assertable here; the other two are render properties the Rust tests
+//     measure on the sample level, and what this checks is that a plan
+//     describing them can still be built and round-tripped over the FFI
+//     boundary — a field the Swift side sets has to reach the mixer intact, and
+//     a record that quietly loses one is invisible everywhere else.
+do {
+    let cue = engine.planAutomix(
+        outgoingPath: wav, incomingPath: wav,
+        outgoingText: "out", incomingText: "in",
+        albumSequential: false, crossfadeSeconds: 8)
+    check("a plan comes back for a real pair", true,
+          "style=\(cue.style) cue=\(String(format: "%.2f", cue.cueSeconds))s "
+          + "fade=\(String(format: "%.2f", cue.fadeSeconds))s "
+          + "bed=\(String(format: "%.2f", cue.bedFraction)) "
+          + "dip=\(String(format: "%.2f", cue.dipDepth)) "
+          + "rate=\(String(format: "%.4f", cue.playbackRate))")
+    // The bound the minute-long skip violated, restated on the Swift side so a
+    // planner that drifted would be caught here as well as in Rust.
+    check("the mix-in point is near the top of the incoming record",
+          cue.cueSeconds >= 0 && cue.cueSeconds <= 8.0,
+          "cue=\(String(format: "%.2f", cue.cueSeconds))s")
+    check("the dip depth is a usable fraction",
+          cue.dipDepth >= 0 && cue.dipDepth <= 1,
+          "dip=\(String(format: "%.2f", cue.dipDepth))")
+    check("a plain crossfade asks for no bed",
+          cue.style == .equalPower ? cue.bedFraction == 0 && cue.dipDepth == 0 : true,
+          "style=\(cue.style) bed=\(String(format: "%.2f", cue.bedFraction))")
+    // The tempo match must be a real ratio, and never the 2× a clamped
+    // half/double-tempo read would produce.
+    check("the tempo match is a ratio, not an octave",
+          cue.playbackRate > 0.5 && cue.playbackRate < 2.0,
+          "rate=\(String(format: "%.4f", cue.playbackRate))")
+} catch {
+    check("a plan comes back for a real pair", false, "\(error)")
 }
 
 print(failures == 0 ? "\nall \(checks) checks passed" : "\n\(failures) of \(checks) checks FAILED")

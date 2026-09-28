@@ -60,7 +60,12 @@ enum AudioSessionManager {
             let mixing = PlatformSettings.shared.getBoolean(
                 key: "mix_with_other_audio", default: true
             )
-            var options: AVAudioSession.CategoryOptions = [.allowAirPlay, .allowBluetoothA2DP]
+            // `.playback` already routes to AirPlay and Bluetooth A2DP, and
+            // iOS 27 rejects the call (OSStatus -50) if those options are set
+            // on it. `allowAirPlay` is only valid for play-and-record. A
+            // rejected category is why Now Playing then answered
+            // `internalFailure` to every claim.
+            var options: AVAudioSession.CategoryOptions = []
             if mixing {
                 options.insert(.mixWithOthers)
             }

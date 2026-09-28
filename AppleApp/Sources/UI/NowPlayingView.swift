@@ -1406,6 +1406,12 @@ struct NowPlayingView: View {
         if let tier = controller.analysisTier, !tier.isEmpty { parts.append(tier) }
         if let conf = controller.analysisConfidence { parts.append(String(format: "%.0f%% mix", conf * 100)) }
         if controller.smartMixInProgress { parts.append("Automix") }
+        // Only when the transition actually cued the track somewhere other than
+        // the top — which is now the minority of transitions, so a non-nil value
+        // is the interesting one.
+        if let cue = controller.automixCueSeconds, cue > 0.05 {
+            parts.append(String(format: "in at %@", QueueEntry.formatDuration(cue)))
+        }
         return parts.joined(separator: " · ")
     }
 }

@@ -270,6 +270,14 @@ final class PlaybackController {
     private(set) var smartTransitionWindow: TransitionWindow?
     /// True during a real Automix (not a plain equal-power fallback).
     private(set) var smartMixInProgress = false
+    /// Where in *this* track the last planned transition cued it, in seconds.
+    ///
+    /// Published so the mix-in point is visible while the track plays rather
+    /// than only in a log line. A deep value is the symptom of a planning bug
+    /// rather than a setting, and seeing it in the player is how it gets
+    /// noticed; `0` means the track started at the top, which is the ordinary
+    /// case now that the planner enters a record at the head of its own intro.
+    private(set) var automixCueSeconds: Double?
     private(set) var sleepUntil: Date?
     private(set) var sleepAfterTrack = false
     private(set) var autoplayEnabled = PlatformSettings.shared.getBoolean(key: "autoplay", default: true)
@@ -350,6 +358,9 @@ final class PlaybackController {
     /// path) is also wrong — it forgoes the cue and the arm — so the path is
     /// remembered instead.
     private var loadedSourcePath: String?
+    /// Invalidates an older source-resolution or analysis task when the queue
+    /// changes without changing the currently playing track.
+    private var queueNextRevision: UInt64 = 0
     /// Where a restored session left off, **and which track it was left on**.
     ///
     /// The id is the whole point. Held as a bare `Double?` the position was
@@ -1296,6 +1307,7 @@ final class PlaybackController {
         guard automixEnabled != enabled else { return }
         automixEnabled = enabled
         AppSettings.shared.setSmartFadeEnabled(value: enabled)
+        syncEngineQueueNext()
     }
 
     func authoriseLastFm() {
@@ -1335,6 +1347,7 @@ final class PlaybackController {
         mixFadeUntil = nil
         analysisTier = nil
         analysisConfidence = nil
+        automixCueSeconds = nil
         let wasAudible = state == .playing || (state == .paused && engineLoadedId != nil)
         let previousPath = current?.isLocal == true ? current?.source : nil
         let previousText = current?.itemText ?? ""
@@ -1359,6 +1372,11 @@ final class PlaybackController {
         widgetPublisher.publish(entry: entry, isPlaying: false,
                                 canNext: index + 1 < queue.count,
                                 canPrevious: index > 0)
+        // The next songs start fetching now, in parallel with this one, including
+        // when this load is a cold resume of the track that was playing last
+        // time. Waiting until the handoff is what made their download show up
+        // at the end of the current song.
+        warmUpcoming(around: index, generation: generation)
         if wasAudible {
             PlaybackTrackerBridge.shared.onTrackChanged(positionSeconds: Int64(outgoingPosition))
             try? engine.stop()
@@ -1413,7 +1431,13 @@ final class PlaybackController {
                     plan: plan,
                     headers: resolved.headers,
                     claimedKbps: Swift.UInt32(resolved.kbps),
-                    loudnessDb: resolved.loudnessDb
+                    loudnessDb: resolved.loudnessDb,
+                    // Not bookkeeping: the mixer schedules a transition against
+                    // the end of the outgoing track, and a container that
+                    // declares no length gives it nothing to schedule against —
+                    // the incoming is then never armed and the queue advances by
+                    // a cut. We already know the length.
+                    durationSeconds: entry.durationSeconds > 0 ? entry.durationSeconds : nil
                 ))
                 await MainActor.run { [weak self] in
                     guard let self, self.playGeneration == generation else { return }
@@ -1529,6 +1553,15 @@ final class PlaybackController {
             )
         }
         let videoId = String(entry.source.dropFirst(3))
+        if let growing = streamGate.lock.withLock({ streamGate.growing[videoId] }),
+           FileManager.default.fileExists(atPath: growing) {
+            return ResolveOutcome(
+                source: ResolvedSource(
+                    source: growing, headers: [:], kbps: 0, origin: .cache
+                ),
+                leftover: nil
+            )
+        }
         // A track the listener has reverted is held on YouTube's own upload, so
         // there is nothing to look for: a substitute found here would be the
         // exact thing they rejected. This has to be checked *before* the lookup
@@ -1797,11 +1830,74 @@ final class PlaybackController {
         let lossless: Bool?
     }
 
+    /// Fetches the next track and the one after it into the stream cache
+    /// without queueing either. The blend's own `syncEngineQueueNext` then
+    /// finds the file already on disk.
+    ///
+    /// A cold resume takes this path too. It does not cancel a blend that is
+    /// already running: that only exists once a track is loaded, and a resume
+    /// from a killed process has no engine yet. Unpausing a track the engine
+    /// still holds does not come through here.
+    private func warmUpcoming(around index: Int, generation: UInt64) {
+        guard repeatMode != .one else { return }
+        let ahead = (1...2).compactMap { offset -> QueueEntry? in
+            let at = index + offset
+            guard queue.indices.contains(at) else { return nil }
+            return queue[at]
+        }
+        guard !ahead.isEmpty else { return }
+        let prefs = ResolvePrefs.current()
+        for entry in ahead {
+            let id = entry.id
+            Task.detached(priority: .userInitiated) { [weak self] in
+                let stillQueued = await MainActor.run { [weak self] in
+                    guard let self else { return false }
+                    return self.playGeneration == generation && self.queue.contains { $0.id == id }
+                }
+                guard stillQueued else { return }
+                _ = try? await Self.resolveSource(entry, prefs: prefs)
+            }
+        }
+    }
+
+    private final class StreamGate: @unchecked Sendable {
+        let lock = NSLock()
+        var tasks: [String: Task<String, Error>] = [:]
+        /// Path of a download that has its first bytes, set before the
+        /// downloader's continuation resumes so a second resolve cannot miss it.
+        var growing: [String: String] = [:]
+    }
+
+    private static let streamGate = StreamGate()
+
     /// Starts playback as soon as the first range is on disk — up to a megabyte,
     /// or half that for a client that caps lower. Remaining ranges keep
     /// appending; [StreamFileCache] is filled when the last one lands so a
     /// re-tap does not fetch again.
     private static func streamViaKtor(
+        videoId: String, url: String, headers: [String: String]
+    ) async throws -> String {
+        let task: Task<String, Error> = streamGate.lock.withLock {
+            if let existing = streamGate.tasks[videoId] { return existing }
+            let created = Task { try await streamViaKtorOnce(videoId: videoId, url: url, headers: headers) }
+            streamGate.tasks[videoId] = created
+            return created
+        }
+        do {
+            let path = try await task.value
+            streamGate.lock.withLock {
+                if streamGate.tasks[videoId] != nil { streamGate.tasks[videoId] = nil }
+            }
+            return path
+        } catch {
+            streamGate.lock.withLock {
+                if streamGate.tasks[videoId] != nil { streamGate.tasks[videoId] = nil }
+            }
+            throw error
+        }
+    }
+
+    private static func streamViaKtorOnce(
         videoId: String, url: String, headers: [String: String]
     ) async throws -> String {
         try await withCheckedThrowingContinuation { continuation in
@@ -1816,6 +1912,8 @@ final class PlaybackController {
                     guard !resumed else { return }
                     resumed = true
                     if let path {
+                        streamGate.lock.withLock { streamGate.growing[videoId] = path }
+                        Task { await StreamFileCache.shared.noteGrowing(videoId: videoId, path: path) }
                         continuation.resume(returning: path)
                     } else {
                         continuation.resume(throwing: InnertubeStreamResolver.StreamError(
@@ -1827,6 +1925,8 @@ final class PlaybackController {
                         Task { await StreamFileCache.shared.store(videoId, path: path) }
                     } else if let message {
                         print("[Playback] stream tail failed for \(videoId): \(message)")
+                        streamGate.lock.withLock { streamGate.growing[videoId] = nil }
+                        Task { await StreamFileCache.shared.dropGrowing(videoId: videoId) }
                     }
                 }
             )
@@ -1868,23 +1968,10 @@ final class PlaybackController {
                                 canNext: playingIndex + 1 < queue.count,
                                 canPrevious: index > 0)
         lookForBetterCopy(entry, codec: info.codec, kbps: info.kbps)
-        // Don't steal googlevideo bandwidth from the track that just started
-        // — wait until its file is fully on disk (or a few seconds) before
-        // prefetching the next one. Upstream's AudioCache also never reads
-        // the currently playing entry.
-        let generation = playGeneration
-        let currentId = entry.id
-        Task { [weak self] in
-            for _ in 0..<40 {
-                guard let self, self.playGeneration == generation else { return }
-                if await StreamFileCache.shared.path(for: currentId) != nil { break }
-                try? await Task.sleep(nanoseconds: 200_000_000)
-            }
-            await MainActor.run { [weak self] in
-                guard let self, self.playGeneration == generation else { return }
-                self.syncEngineQueueNext()
-            }
-        }
+        // The incoming source must be ready before the outgoing tail begins.
+        // Waiting for the current download here made prefetch start up to eight
+        // seconds late, then full analysis delayed queueing it even further.
+        syncEngineQueueNext()
     }
 
     private func loadDidFail(entry: QueueEntry, error: Error) {
@@ -1892,24 +1979,41 @@ final class PlaybackController {
         state = .stopped
     }
 
+    /// A streamed download is finished once `.complete` lands, or when it was
+    /// never a stream. `.grow` without `.complete` means bytes are still arriving
+    /// and a plan made now is only as good as the audio on disk.
+    private nonisolated static func fileSettled(_ path: String) -> Bool {
+        let files = FileManager.default
+        if files.fileExists(atPath: path + ".complete") { return true }
+        if files.fileExists(atPath: path + ".grow") { return false }
+        return true
+    }
+
     /// Keeps the engine's pending-next pointing at the following queue entry
     /// so gapless/crossfade arming works (spec §3.1). Repeat-one must not
     /// arm the next song — the current track should seek to 0 at EOS.
     private func syncEngineQueueNext() {
+        queueNextRevision &+= 1
+        let revision = queueNextRevision
         if repeatMode == .one {
             try? engine.queueNext(request: LoadRequest(
                 source: "", title: "", artist: "", startSeconds: 0, plan: nil,
-                headers: [:], claimedKbps: 0, loudnessDb: nil
+                headers: [:], claimedKbps: 0, loudnessDb: nil, durationSeconds: nil
             ))
             return
         }
         guard playingIndex + 1 < queue.count || (repeatMode == .all && queue.count > 1),
               let next = nextEntry else {
+            try? engine.queueNext(request: LoadRequest(
+                source: "", title: "", artist: "", startSeconds: 0, plan: nil,
+                headers: [:], claimedKbps: 0, loudnessDb: nil, durationSeconds: nil
+            ))
             maybeAutoplay()
             return
         }
         let generation = playGeneration
         let nextId = next.id
+        let outgoingId = current?.id
         let engine = self.engine
         let automix = automixEnabled
         // The *file* the engine opened, not `current.source` — which for a
@@ -1920,28 +2024,86 @@ final class PlaybackController {
         // symptom was a plausible-looking cue sitting on top of a plain 12 s
         // crossfade — which was every transition on normal streaming playback.
         let currentSource = loadedSourcePath ?? ""
+        let outgoingDuration = duration
         let currentText = current?.itemText ?? ""
         let nextText = next.itemText
         let albumSequential = !shuffleEnabled && (current?.sameAlbum(as: next) ?? false)
         let prefs = ResolvePrefs.current()
-        Task.detached(priority: .utility) {
+        warmUpcoming(around: playingIndex, generation: generation)
+        // `.utility` is deferrable. The scheduler was holding this until the
+        // song was nearly over, so the next download — and the plan that waits
+        // on it — started after the blend should already have been playing.
+        Task.detached(priority: .userInitiated) {
             do {
                 let outcome = try await Self.resolveSource(next, prefs: prefs)
                 let stillCurrent = await MainActor.run { [weak self] in
                     guard let self else { return false }
                     return self.playGeneration == generation
                         && self.nextEntry?.id == nextId
+                        && self.current?.id == outgoingId
+                        && self.queueNextRevision == revision
                 }
                 guard stillCurrent else { return }
                 await MainActor.run { [weak self] in
                     self?.noteResolved(next, outcome: outcome, prefs: prefs)
+                    // The better copy has to be in hand before the blend arms.
+                    // Waiting until this track becomes current means the upgrade
+                    // arrives during the ramp and cuts it.
+                    self?.lookForBetterCopy(
+                        next,
+                        codec: outcome.source.format.codec ?? "",
+                        kbps: Swift.UInt32(outcome.source.kbps)
+                    )
                 }
+                let stillQueueTarget = await MainActor.run { [weak self] in
+                    guard let self else { return false }
+                    return self.playGeneration == generation
+                        && self.nextEntry?.id == nextId
+                        && self.current?.id == outgoingId
+                        && self.queueNextRevision == revision
+                }
+                guard stillQueueTarget else { return }
                 let resolved = outcome.source
-                var plan: TransitionPlanRec?
-                var start = 0.0
-                if automix, !currentSource.isEmpty {
-                    let fade = Double(PlatformSettings.shared.getInt(key: "crossfade_seconds", default: 0))
-                    plan = engine.planAutomix(
+                let declaredDuration = next.durationSeconds > 0 ? next.durationSeconds : nil
+                let safetyFade = albumSequential ? 4.0 : min(
+                    8.0,
+                    outgoingDuration > 0 ? outgoingDuration / 3 : 8.0,
+                    next.durationSeconds > 0 ? next.durationSeconds / 3 : 8.0
+                )
+                // Queue a real overlap as soon as the source is resolved. Beat
+                // and vocal analysis can take seconds and must not be on the
+                // critical path to hearing the next record under this one.
+                let safetyPlan: TransitionPlanRec? = automix ? TransitionPlanRec(
+                    style: .equalPower, bassSwap: false, bassSwapFraction: 0.7,
+                    filterSweep: 0, vocalOverlap: 0, fadeSeconds: safetyFade,
+                    transitionEndSeconds: 0, cueSeconds: 0, playbackRate: 1,
+                    bedFraction: 0, bedGainDb: 0, dipDepth: 0, dipWidth: 0,
+                    postGlideSeconds: 0, outgoingDurationSeconds: outgoingDuration
+                ) : nil
+                try engine.queueNext(request: LoadRequest(
+                    source: resolved.source, title: next.title, artist: next.artist,
+                    startSeconds: 0, plan: safetyPlan, headers: resolved.headers,
+                    claimedKbps: Swift.UInt32(resolved.kbps),
+                    loudnessDb: resolved.loudnessDb, durationSeconds: declaredDuration
+                ))
+                if automix {
+                    NSLog("[BitChord] automix queued %@ with an immediate %.1fs overlap", next.title, safetyPlan?.fadeSeconds ?? 0)
+                }
+                guard automix, !currentSource.isEmpty else { return }
+                let fade = Double(PlatformSettings.shared.getInt(key: "crossfade_seconds", default: 0))
+                // Plan from whatever is already downloaded, then again as the
+                // files grow. Waiting for both downloads to finish is what put
+                // the real blend at the last second of the song.
+                for attempt in 0..<12 {
+                    let stillPlanning = await MainActor.run { [weak self] in
+                        guard let self else { return false }
+                        return self.playGeneration == generation
+                            && self.nextEntry?.id == nextId
+                            && self.current?.id == outgoingId
+                            && self.queueNextRevision == revision
+                    }
+                    guard stillPlanning else { return }
+                    let plan = engine.planAutomix(
                         outgoingPath: currentSource,
                         incomingPath: resolved.source,
                         outgoingText: currentText,
@@ -1949,22 +2111,38 @@ final class PlaybackController {
                         albumSequential: albumSequential,
                         crossfadeSeconds: fade
                     )
-                    start = plan?.cueSeconds ?? 0
-                }
-                try engine.queueNext(request: LoadRequest(
-                    source: resolved.source,
-                    title: next.title,
-                    artist: next.artist,
-                    startSeconds: start,
-                    plan: plan,
-                    headers: resolved.headers,
-                    claimedKbps: Swift.UInt32(resolved.kbps),
-                    loudnessDb: resolved.loudnessDb
-                ))
-                if let plan {
+                    try engine.queueNext(request: LoadRequest(
+                        source: resolved.source,
+                        title: next.title,
+                        artist: next.artist,
+                        startSeconds: plan.cueSeconds,
+                        plan: plan,
+                        headers: resolved.headers,
+                        claimedKbps: Swift.UInt32(resolved.kbps),
+                        loudnessDb: resolved.loudnessDb,
+                        // Not bookkeeping: the mixer schedules a transition against
+                        // the end of the outgoing track, and a container that
+                        // declares no length gives it nothing to schedule against —
+                        // the incoming is then never armed and the queue advances by
+                        // a cut. We already know the length.
+                        durationSeconds: declaredDuration
+                    ))
+                    NSLog(
+                        "[BitChord] automix plan %d for %@: %@, cue %.2fs, fade %.2fs, end %.1fs",
+                        attempt, next.title, String(describing: plan.style),
+                        plan.cueSeconds, plan.fadeSeconds, plan.transitionEndSeconds
+                    )
                     await MainActor.run { [weak self] in
-                        self?.adoptAutomixPlan(plan)
+                        guard let self, self.queueNextRevision == revision else { return }
+                        self.adoptAutomixPlan(plan)
                     }
+                    let settled = Self.fileSettled(currentSource) && Self.fileSettled(resolved.source)
+                    if settled { return }
+                    let position = engine.positionSeconds()
+                    let remaining = outgoingDuration - position
+                    let lead = max(plan.fadeSeconds, safetyFade) + 8
+                    if outgoingDuration > 0, remaining < lead { return }
+                    try await Task.sleep(nanoseconds: 2_000_000_000)
                 }
             } catch {
                 // Prefetch failure is non-fatal; the next tap/natural end re-resolves.
@@ -2248,6 +2426,11 @@ final class PlaybackController {
         if let mixFadeUntil, Date() >= mixFadeUntil {
             self.mixFadeUntil = nil
             smartMixInProgress = false
+            // An upgrade that arrived during the ramp was shelved so it would
+            // not cut the blend. The new song is on its own now.
+            if let entry = current, QualityUpgrade.shelvedFor(entry.id) != nil {
+                lookForBetterCopy(entry, codec: "", kbps: nerd?.kbps ?? 0)
+            }
         }
     }
 
@@ -2575,22 +2758,125 @@ final class PlaybackController {
             }
             defer {
                 Task { @MainActor [weak self] in
-                    guard let self, self.current?.id == mediaId else { return }
-                    self.racingLossless = QualityUpgrade.isRacing(mediaId)
+                    guard let self else { return }
                     if self.upgradeFor == mediaId { self.upgradeFor = nil }
+                    if self.current?.id == mediaId {
+                        self.racingLossless = QualityUpgrade.isRacing(mediaId)
+                    }
                     QualityUpgrade.onRaceEnd(mediaId)
                 }
             }
-            let still = await MainActor.run { [weak self] in
-                guard let self else { return false }
-                return self.playGeneration == generation && self.current?.id == mediaId
+            let moment = await MainActor.run { [weak self] () -> String in
+                guard let self, self.playGeneration == generation else { return "gone" }
+                if self.current?.id == mediaId { return "current" }
+                if self.nextEntry?.id == mediaId { return "next" }
+                return "gone"
             }
-            guard still, let better else { return }
-            await self?.performSwap(
-                mediaId: mediaId, stream: better, entry: entry,
-                generation: generation, engine: eng, log: log
+            guard let better else { return }
+            switch moment {
+            case "current":
+                await self?.performSwap(
+                    mediaId: mediaId, stream: better, entry: entry,
+                    generation: generation, engine: eng, log: log
+                )
+            case "next":
+                await self?.installUpgradedIncoming(
+                    mediaId: mediaId, stream: better, entry: entry,
+                    generation: generation, engine: eng, log: log
+                )
+            default:
+                QualityUpgrade.shelve(mediaId, stream: better)
+                log.record("upgrade proved but the queue moved on; shelved", about: mediaId)
+            }
+        }
+    }
+
+    nonisolated private func installUpgradedIncoming(
+        mediaId: String,
+        stream: QualityUpgrade.Candidate,
+        entry: QueueEntry,
+        generation: UInt64,
+        engine: PlayerEngine,
+        log: PlaybackDebugLog
+    ) async {
+        let path: String?
+        if stream.url.hasPrefix("/") || stream.url.hasPrefix("file:") {
+            let local = stream.url.hasPrefix("file:")
+                ? (URL(string: stream.url)?.path ?? stream.url)
+                : stream.url
+            path = FileManager.default.fileExists(atPath: local) ? local : nil
+        } else {
+            path = try? await Self.streamViaKtor(
+                videoId: "\(mediaId)#\(QualityUpgrade.upgraded)",
+                url: stream.url,
+                headers: stream.headers
             )
         }
+        guard let path else {
+            QualityUpgrade.forget(mediaId)
+            log.record("upgrade audition failed", about: mediaId)
+            return
+        }
+        let context = await MainActor.run { () -> (String, String, String, Bool)? in
+            guard self.playGeneration == generation, self.nextEntry?.id == mediaId else { return nil }
+            let outgoing = self.loadedSourcePath ?? ""
+            guard !outgoing.isEmpty else { return nil }
+            let album = !self.shuffleEnabled && (self.current?.sameAlbum(as: entry) ?? false)
+            return (outgoing, self.current?.itemText ?? "", entry.itemText, album)
+        }
+        guard let (outgoing, outgoingText, incomingText, album) = context else {
+            let nowPlaying = await MainActor.run {
+                self.playGeneration == generation && self.current?.id == mediaId
+            }
+            if nowPlaying {
+                var local = stream
+                local.url = path
+                await performSwap(
+                    mediaId: mediaId, stream: local, entry: entry,
+                    generation: generation, engine: engine, log: log
+                )
+            } else {
+                var local = stream
+                local.url = path
+                QualityUpgrade.shelve(mediaId, stream: local)
+                log.record("upgrade proved but the queue moved on; shelved", about: mediaId)
+            }
+            return
+        }
+        let fade = Double(PlatformSettings.shared.getInt(key: "crossfade_seconds", default: 0))
+        let plan = engine.planAutomix(
+            outgoingPath: outgoing,
+            incomingPath: path,
+            outgoingText: outgoingText,
+            incomingText: incomingText,
+            albumSequential: album,
+            crossfadeSeconds: fade
+        )
+        do {
+            try engine.queueNext(request: LoadRequest(
+                source: path,
+                title: entry.title,
+                artist: entry.artist,
+                startSeconds: plan.cueSeconds,
+                plan: plan,
+                headers: stream.headers,
+                claimedKbps: Swift.UInt32(stream.format.kbps ?? 0),
+                loudnessDb: nil,
+                durationSeconds: entry.durationSeconds > 0 ? entry.durationSeconds : nil
+            ))
+        } catch {
+            var local = stream
+            local.url = path
+            QualityUpgrade.shelve(mediaId, stream: local)
+            log.record("upgrade could not join the blend", about: mediaId)
+            return
+        }
+        await MainActor.run { [weak self] in
+            guard let self, self.playGeneration == generation, self.nextEntry?.id == mediaId else { return }
+            self.adoptAutomixPlan(plan)
+        }
+        QualityUpgrade.unshelve(mediaId)
+        log.record("upgrade joined the blend as \(stream.format.summary)", about: mediaId)
     }
 
     nonisolated private func performSwap(
@@ -2601,25 +2887,28 @@ final class PlaybackController {
         engine: PlayerEngine,
         log: PlaybackDebugLog
     ) async {
-        let snapshot = await MainActor.run { () -> (Double, Double, Bool)? in
+        let snapshot = await MainActor.run { () -> (Double, Double, Bool, Double)? in
             guard self.playGeneration == generation, self.current?.id == mediaId else { return nil }
-            return (self.position, self.duration, self.smartMixInProgress)
+            let planned = self.pendingAutomixPlan?.fadeSeconds ?? 0
+            // No plan yet still means a blend is coming. Eight seconds is the
+            // plain-crossfade floor, and a swap inside that window is the cut.
+            let fade = self.automixEnabled ? max(planned, 8) : planned
+            return (self.position, self.duration, self.smartMixInProgress, fade)
         }
-        guard let (pos, dur, mixing) = snapshot else {
+        guard let (pos, dur, mixing, fade) = snapshot else {
             QualityUpgrade.shelve(mediaId, stream: stream)
             log.record("upgrade proved but the queue moved on; shelved", about: mediaId)
             return
         }
-        if dur > 0, dur - pos < QualityUpgrade.minRemaining {
+        let horizon = max(QualityUpgrade.minRemaining, fade + 6)
+        if mixing || (dur > 0 && dur - pos < horizon) {
+            QualityUpgrade.shelve(mediaId, stream: stream)
             log.record(
-                "upgrade abandoned: only \(Int((dur - pos) * 1000))ms of the track left",
+                mixing
+                    ? "upgrade shelved: a crossfade was still running"
+                    : "upgrade held: the blend starts inside \(Int(horizon))s",
                 about: mediaId
             )
-            return
-        }
-        if mixing {
-            QualityUpgrade.shelve(mediaId, stream: stream)
-            log.record("upgrade shelved: a crossfade was still running", about: mediaId)
             return
         }
         QualityUpgrade.force(mediaId, stream: stream)
@@ -2702,7 +2991,11 @@ final class PlaybackController {
                     // Same recording, new file: the figure belongs to the track,
                     // not the URL, so the upgrade keeps the current correction
                     // instead of dropping to unity mid-song.
-                    loudnessDb: loudnessDb
+                    loudnessDb: loudnessDb,
+                    // And the same for its length — a swap continues a track
+                    // that is already playing, so the current entry's figure is
+                    // the right one.
+                    durationSeconds: entry.durationSeconds > 0 ? entry.durationSeconds : nil
                 ),
                 crossfadeSeconds: QualityUpgrade.swapCrossfadeSeconds
             )
@@ -2762,6 +3055,7 @@ final class PlaybackController {
     private func adoptAutomixPlan(_ plan: TransitionPlanRec) {
         pendingAutomixPlan = plan
         analysisTier = Self.tierName(plan)
+        automixCueSeconds = plan.cueSeconds
         publishSmartWindow()
         // The audit's per-transition NSLog lived here. It did its job — it is
         // how the `yt:` identifier bug was caught, and how the anchor was
@@ -2800,12 +3094,25 @@ final class PlaybackController {
         pendingAutomixPlan = nil
     }
 
+    /// Whether this plan is a real transition rather than the no-analysis
+    /// fallback.
+    ///
+    /// Was `cueSeconds > 0.05 || |playbackRate − 1| > 0.01`, which was a proxy
+    /// for "the planner found something". It stopped being one: a mix-in at the
+    /// top of the record is now the *correct* answer, so a well-planned
+    /// transition can legitimately arrive with a cue of zero and no tempo
+    /// stretch — and this read that as "no mix" and dropped the transition
+    /// marker and the label, for a transition that was about to be rendered.
+    ///
+    /// The style used to be the only signal, which left a plain crossfade —
+    /// the one a partial analysis actually plays — invisible to the upgrade
+    /// guard. Any ramp of a second or more is a transition the quality swap
+    /// must not cut across.
     private static func isRealMix(_ plan: TransitionPlanRec) -> Bool {
         switch plan.style {
         case .djBlend, .djFilter: return true
-        default: break
+        case .equalPower, .gapless: return plan.fadeSeconds >= 1
         }
-        return plan.cueSeconds > 0.05 || abs(plan.playbackRate - 1) > 0.01
     }
 
     private static func tierName(_ plan: TransitionPlanRec) -> String {

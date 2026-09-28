@@ -31,6 +31,14 @@ final class NowPlayingController {
             let model = ModernNowPlaying()
             model.delegate = self
             modern = model
+            // The session publishes metadata. This is what delivers the
+            // commands the lock screen and the island send back. Returning
+            // before it left a session with nothing listening.
+            DispatchQueue.main.async {
+                UIApplication.shared.beginReceivingRemoteControlEvents()
+            }
+            // Apple's rule for iOS 27: do not also publish this playback
+            // through MPRemoteCommandCenter. The commands live on the session.
             return
         }
         DispatchQueue.main.async {
@@ -252,6 +260,11 @@ private final class ModernNowPlaying: MediaSessionRepresentable {
     var artworkURL: String?
     private var session: MediaSession<ModernNowPlaying>?
     private var primaryRequestInFlight = false
+    /// `internalFailure` retried every two seconds flooded the log and the
+    /// system. One failure holds the next ask off; a success clears it.
+    private var nextClaimAt = Date.distantPast
+    private var reportedClaimFailure = false
+    private var otherAudioWasPlaying = false
 
     var content: (any MediaContentRepresentable)? {
         guard !title.isEmpty else { return nil }
@@ -309,31 +322,75 @@ private final class ModernNowPlaying: MediaSessionRepresentable {
         self.artworkURL = thumbnailUrl
         self.rate = isPlaying
             ? Double(PlatformSettings.shared.getFloat(key: "playback_speed", default: 1)) : 0
-        if isPlaying { requestPrimaryIfPossible() }
+        if isPlaying { claimNowPlaying(reason: "playback") }
     }
 
     func requestPrimaryIfPossible() {
-        guard UIApplication.shared.applicationState == .active,
-              !primaryRequestInFlight else { return }
+        nextClaimAt = .distantPast
+        reportedClaimFailure = false
+        claimNowPlaying(reason: "foreground")
+    }
+
+    func reclaimAfterOtherAudioStops() {
+        let other = AVAudioSession.sharedInstance().isOtherAudioPlaying
+        let justStopped = otherAudioWasPlaying && !other
+        otherAudioWasPlaying = other
+        guard justStopped else { return }
+        guard rate > 0, session?.isSystemPrimary != true else { return }
+        // The other app has gone. Ask even if BitChord is not the frontmost
+        // app — the lock screen is exactly where this has to land.
+        nextClaimAt = .distantPast
+        claimNowPlaying(reason: "other audio stopped", allowInBackground: true)
+    }
+
+    /// Publish the session and ask for the system slot.
+    ///
+    /// iOS 27 has two steps, and skipping the first is why nothing appeared.
+    /// The session has to become *this app's* primary before it can become the
+    /// system's, which is the lock screen, the island and Control Center.
+    /// Mixing with another app means that second step is refused while they
+    /// hold it. It is asked again when this app is in front, and when theirs
+    /// stops.
+    private func claimNowPlaying(reason: String, allowInBackground: Bool = false) {
+        guard !title.isEmpty else { return }
         if session == nil { session = MediaSession(self) }
         guard let session else { return }
+        let foreground = UIApplication.shared.applicationState == .active
+        guard foreground || allowInBackground else { return }
+        guard !primaryRequestInFlight else { return }
         guard !session.isSystemPrimary else { return }
+        guard Date() >= nextClaimAt else { return }
         primaryRequestInFlight = true
         Task { @MainActor in
             defer { primaryRequestInFlight = false }
+            if !session.isApplicationPrimary {
+                do {
+                    try await session.requestToBecomeApplicationPrimary()
+                } catch {
+                    self.noteClaimFailure("app-session", reason: reason, error: error)
+                    return
+                }
+            }
+            let inFront = UIApplication.shared.applicationState == .active
+            let alone = !AVAudioSession.sharedInstance().isOtherAudioPlaying
+            guard inFront || alone else { return }
+            guard !session.isSystemPrimary else { return }
             do {
                 try await session.requestToBecomeSystemPrimary()
+                self.reportedClaimFailure = false
+                self.nextClaimAt = .distantPast
+                NSLog("[BitChord] Now Playing is the system session (\(reason))")
             } catch {
-                NSLog("[BitChord] Now Playing primary request failed: \(error)")
+                self.noteClaimFailure("system", reason: reason, error: error)
             }
         }
     }
 
-    func reclaimAfterOtherAudioStops() {
-        guard rate > 0,
-              session?.isSystemPrimary != true,
-              !AVAudioSession.sharedInstance().isOtherAudioPlaying else { return }
-        requestPrimaryIfPossible()
+    private func noteClaimFailure(_ step: String, reason: String, error: Error) {
+        nextClaimAt = Date().addingTimeInterval(30)
+        guard !reportedClaimFailure else { return }
+        reportedClaimFailure = true
+        NSLog("[BitChord] Now Playing \(step) request failed (\(reason)): \(error)")
     }
 }
 #endif

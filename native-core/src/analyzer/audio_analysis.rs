@@ -63,6 +63,7 @@ pub(crate) struct AudioAnalysis {
     pub(crate) vocal_activity_mask: Vec<f64>,
     pub(crate) mix_in_candidates: Vec<MixCuePoint>,
     pub(crate) mix_out_candidates: Vec<MixCuePoint>,
+    pub(crate) phrase_boundaries: Vec<f64>,
 }
 
 fn clamp(value: f64, minimum: f64, maximum: f64) -> f64 {
@@ -602,6 +603,7 @@ fn build_structure(envelope: &EnvelopeResult, result: &mut AudioAnalysis) {
     }
     phrase_boundaries.sort_by(|a, b| a.total_cmp(b));
     phrase_boundaries.dedup_by(|a, b| (*a - *b).abs() < 0.05);
+    result.phrase_boundaries = phrase_boundaries;
 
     let eight_bar_target = if result.beat_interval > 0.0 {
         phrase_start + result.beat_interval * 32.0
@@ -630,6 +632,17 @@ fn build_structure(envelope: &EnvelopeResult, result: &mut AudioAnalysis) {
         1.0,
     );
 
+    // Where the track starts, and where its arrangement arrives.
+    //
+    // `pickup` is the entry: the first sound. `intro_drop` and `main_drop` are
+    // handoff candidates — the point the outgoing track should be gone by, not
+    // the point playback starts. The planner accepts a drop only when the
+    // overlap can cover the distance from the entry, so a drop can never skip
+    // the listener a minute into the next record.
+    //
+    // `main_drop` is emitted only from a real beat grid. The old fallback, when
+    // `beat_interval` was 0, used `intro_end_time` (the first loud window,
+    // capped at 48 s). That is a mix-out question used as a mix-in question.
     result.mix_in_candidates.push(MixCuePoint {
         time: result.audible_start_time,
         score: 0.8,
@@ -642,18 +655,19 @@ fn build_structure(envelope: &EnvelopeResult, result: &mut AudioAnalysis) {
             kind: "intro_drop".into(),
         });
     }
-    let drop_cue = if result.beat_interval > 0.0 {
-        phrase_start + result.beat_interval * 32.0
-    } else {
-        result.intro_end_time
-    };
-    if drop_cue > result.mix_in_time + 0.5 && drop_cue < envelope.content_end * 0.4 {
-        let aligned_drop = downbeat_at_or_before(&result.downbeats, drop_cue, drop_cue);
-        result.mix_in_candidates.push(MixCuePoint {
-            time: aligned_drop,
-            score: 0.95,
-            kind: "main_drop".into(),
-        });
+    let has_grid = result.beat_interval > 0.0
+        && (40.0..=220.0).contains(&result.bpm)
+        && !result.downbeats.is_empty();
+    if has_grid {
+        let drop_cue = phrase_start + result.beat_interval * 32.0;
+        if drop_cue > result.mix_in_time + 0.5 && drop_cue < envelope.content_end * 0.4 {
+            let aligned_drop = downbeat_at_or_before(&result.downbeats, drop_cue, drop_cue);
+            result.mix_in_candidates.push(MixCuePoint {
+                time: aligned_drop,
+                score: 0.95,
+                kind: "main_drop".into(),
+            });
+        }
     }
 
     if result.mix_out_time > 0.0 && result.mix_out_time < envelope.content_end - 1.0 {

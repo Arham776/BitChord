@@ -18,14 +18,24 @@ actor StreamFileCache {
 
     func path(for videoId: String) -> String? {
         if let path = inFlight[videoId], FileManager.default.fileExists(atPath: path) {
-            let complete = FileManager.default.fileExists(atPath: path + ".complete")
-            let dest = cachedURL(for: videoId)
-            if dest.path == path || complete { return path }
+            return path
         }
         let dest = cachedURL(for: videoId)
         guard FileManager.default.fileExists(atPath: dest.path) else { return nil }
         DiskCache.touch(dest)
         return dest.path
+    }
+
+    /// The download has its first bytes. Later resolves of the same track must
+    /// join this file instead of starting a second fetch at the handoff.
+    func noteGrowing(videoId: String, path: String) {
+        inFlight[videoId] = path
+    }
+
+    /// The download failed before it finished. Drop the pointer so the next
+    /// resolve fetches again. The bytes already handed to a player stay put.
+    func dropGrowing(videoId: String) {
+        inFlight.removeValue(forKey: videoId)
     }
 
     func store(_ videoId: String, path: String) {
