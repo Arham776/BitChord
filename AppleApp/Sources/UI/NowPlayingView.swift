@@ -1404,6 +1404,7 @@ struct NowPlayingView: View {
             parts.append(String(format: "%+.1f dB", gain))
         }
         if let tier = controller.analysisTier, !tier.isEmpty { parts.append(tier) }
+        if let sources = controller.analysisSources, !sources.isEmpty { parts.append(sources) }
         if let conf = controller.analysisConfidence { parts.append(String(format: "%.0f%% mix", conf * 100)) }
         if controller.smartMixInProgress { parts.append("Automix") }
         // Only when the transition actually cued the track somewhere other than

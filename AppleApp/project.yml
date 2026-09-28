@@ -37,6 +37,8 @@ targets:
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.example.bitchord
+        # Resolve Music Understanding on OS 27+; leave Automix on Rust MIR below that.
+        OTHER_LDFLAGS: "$(inherited) -weak_framework MusicUnderstanding"
     sources:
       - path: Sources
         excludes:
@@ -61,6 +63,8 @@ targets:
       - sdk: AVKit.framework
       - sdk: AVFoundation.framework
       - sdk: CoreMotion.framework
+      - sdk: MusicUnderstanding.framework
+        weak: true
     info:
       path: BitChord-Info.plist
       properties:

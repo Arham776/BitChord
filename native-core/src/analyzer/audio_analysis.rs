@@ -61,9 +61,19 @@ pub(crate) struct AudioAnalysis {
     pub(crate) energy_curve: Vec<EnergyPoint>,
     pub(crate) low_energy_curve: Vec<EnergyPoint>,
     pub(crate) vocal_activity_mask: Vec<f64>,
+    /// Percussive / high-band activity parallel to `energy_curve` (0…1).
+    pub(crate) drum_activity_mask: Vec<f64>,
+    /// Low-band / bass activity parallel to `energy_curve` (0…1).
+    pub(crate) bass_activity_mask: Vec<f64>,
+    /// Perceived pace (energy × novelty), parallel to `energy_curve` (0…1).
+    pub(crate) pace_curve: Vec<EnergyPoint>,
     pub(crate) mix_in_candidates: Vec<MixCuePoint>,
     pub(crate) mix_out_candidates: Vec<MixCuePoint>,
     pub(crate) phrase_boundaries: Vec<f64>,
+    /// Coarser section starts (novelty peaks on the downbeat grid).
+    pub(crate) section_boundaries: Vec<f64>,
+    /// Mid-level segment starts between phrase and section.
+    pub(crate) segment_boundaries: Vec<f64>,
 }
 
 fn clamp(value: f64, minimum: f64, maximum: f64) -> f64 {
@@ -391,6 +401,7 @@ fn analyze_key_and_timbre(
     result: &mut AudioAnalysis,
     low_frames: &mut Vec<EnergyPoint>,
     vocal_frames: &mut Vec<EnergyPoint>,
+    high_frames: &mut Vec<EnergyPoint>,
 ) {
     const FRAME_SIZE: usize = 4096;
     let hop_size = (sample_rate * 0.65).max(FRAME_SIZE as f64) as usize;
@@ -469,13 +480,18 @@ fn analyze_key_and_timbre(
             low_energy += frame_low;
             vocal_energy += frame_vocal;
             high_energy += frame_high;
+            let mid_time = (start + FRAME_SIZE / 2) as f64 / sample_rate;
             low_frames.push(EnergyPoint {
-                time: (start + FRAME_SIZE / 2) as f64 / sample_rate,
+                time: mid_time,
                 energy: frame_low,
             });
             vocal_frames.push(EnergyPoint {
-                time: (start + FRAME_SIZE / 2) as f64 / sample_rate,
+                time: mid_time,
                 energy: vocal_probability_from(frame_low, frame_vocal, frame_high, frame_flatness),
+            });
+            high_frames.push(EnergyPoint {
+                time: mid_time,
+                energy: frame_high,
             });
             chroma_weight += (frame_chroma * rms).max(1e-9);
             accepted_frames += 1;
@@ -605,6 +621,22 @@ fn build_structure(envelope: &EnvelopeResult, result: &mut AudioAnalysis) {
     phrase_boundaries.dedup_by(|a, b| (*a - *b).abs() < 0.05);
     result.phrase_boundaries = phrase_boundaries;
 
+    // Hierarchical structure: novelty on the envelope → sections (coarse) and
+    // segments (mid). Snapped to downbeats when a grid exists — switch-point
+    // literature prefers bar-aligned boundaries over arbitrary seconds.
+    let (sections, segments) = novelty_boundaries(envelope, result);
+    result.section_boundaries = sections;
+    result.segment_boundaries = segments;
+    for &time in &result.section_boundaries {
+        if time > result.intro_end_time + 1.0 && time < envelope.content_end - 4.0 {
+            result.mix_out_candidates.push(MixCuePoint {
+                time,
+                score: 0.88,
+                kind: "section_boundary".into(),
+            });
+        }
+    }
+
     let eight_bar_target = if result.beat_interval > 0.0 {
         phrase_start + result.beat_interval * 32.0
     } else {
@@ -689,6 +721,90 @@ fn build_structure(envelope: &EnvelopeResult, result: &mut AudioAnalysis) {
     });
 }
 
+/// Energy novelty peaks → section / segment starts on the downbeat grid.
+fn novelty_boundaries(envelope: &EnvelopeResult, result: &AudioAnalysis) -> (Vec<f64>, Vec<f64>) {
+    let levels = &envelope.levels;
+    if levels.len() < 8 {
+        return (Vec::new(), Vec::new());
+    }
+    let mut novelty = vec![0.0f64; levels.len()];
+    for index in 1..levels.len() {
+        novelty[index] = (levels[index] - levels[index - 1]).abs();
+    }
+    // Smooth a little so single-window spikes do not invent sections.
+    let mut smooth = novelty.clone();
+    for index in 1..novelty.len().saturating_sub(1) {
+        smooth[index] = (novelty[index - 1] + novelty[index] + novelty[index + 1]) / 3.0;
+    }
+    let peak_threshold = percentile(&smooth, 0.85).max(envelope.reference * 0.08);
+    let min_section_gap = if result.beat_interval > 0.0 {
+        (result.beat_interval * 32.0).max(8.0)
+    } else {
+        12.0
+    };
+    let min_segment_gap = (min_section_gap * 0.5).max(4.0);
+
+    let mut raw_peaks = Vec::new();
+    for index in 2..smooth.len().saturating_sub(2) {
+        if smooth[index] < peak_threshold {
+            continue;
+        }
+        if smooth[index] >= smooth[index - 1] && smooth[index] >= smooth[index + 1] {
+            let time = index as f64 * envelope.window_seconds;
+            if time > envelope.audible_start + 2.0 && time < envelope.content_end - 2.0 {
+                raw_peaks.push((time, smooth[index]));
+            }
+        }
+    }
+    raw_peaks.sort_by(|a, b| b.1.total_cmp(&a.1));
+
+    let snap = |time: f64| -> f64 {
+        if result.downbeats.is_empty() {
+            return time;
+        }
+        result
+            .downbeats
+            .iter()
+            .copied()
+            .min_by(|a, b| (a - time).abs().total_cmp(&(b - time).abs()))
+            .unwrap_or(time)
+    };
+
+    let mut sections = Vec::new();
+    for &(time, _) in &raw_peaks {
+        let snapped = snap(time);
+        if sections
+            .iter()
+            .all(|existing: &f64| (existing - snapped).abs() >= min_section_gap)
+        {
+            sections.push(snapped);
+        }
+        if sections.len() >= 12 {
+            break;
+        }
+    }
+    sections.sort_by(|a, b| a.total_cmp(b));
+
+    let mut segments = Vec::new();
+    for &(time, _) in &raw_peaks {
+        let snapped = snap(time);
+        if sections.iter().any(|s| (s - snapped).abs() < 0.5) {
+            continue;
+        }
+        if segments
+            .iter()
+            .all(|existing: &f64| (existing - snapped).abs() >= min_segment_gap)
+        {
+            segments.push(snapped);
+        }
+        if segments.len() >= 24 {
+            break;
+        }
+    }
+    segments.sort_by(|a, b| a.total_cmp(b));
+    (sections, segments)
+}
+
 /// Orchestrates the envelope, tempo, level, spectral, and structure stages.
 pub(crate) fn analyze_audio(
     samples: &[f32],
@@ -764,6 +880,7 @@ pub(crate) fn analyze_audio(
 
     let mut low_frames = Vec::new();
     let mut vocal_frames = Vec::new();
+    let mut high_frames = Vec::new();
     analyze_key_and_timbre(
         samples,
         sample_rate,
@@ -772,11 +889,15 @@ pub(crate) fn analyze_audio(
         &mut result,
         &mut low_frames,
         &mut vocal_frames,
+        &mut high_frames,
     );
 
     let low_values: Vec<f64> = low_frames.iter().map(|f| f.energy).collect();
     let low_reference = percentile(&low_values, 0.85);
+    let high_values: Vec<f64> = high_frames.iter().map(|f| f.energy).collect();
+    let high_reference = percentile(&high_values, 0.85);
     let mut low_cursor = 0usize;
+    let mut high_cursor = 0usize;
     for point in &result.energy_curve {
         while low_cursor + 1 < low_frames.len()
             && (low_frames[low_cursor + 1].time - point.time).abs()
@@ -784,15 +905,28 @@ pub(crate) fn analyze_audio(
         {
             low_cursor += 1;
         }
-        let energy = if low_frames.is_empty() || point.energy <= 0.1 || low_reference <= 1e-9 {
+        while high_cursor + 1 < high_frames.len()
+            && (high_frames[high_cursor + 1].time - point.time).abs()
+                < (high_frames[high_cursor].time - point.time).abs()
+        {
+            high_cursor += 1;
+        }
+        let bass = if low_frames.is_empty() || point.energy <= 0.1 || low_reference <= 1e-9 {
             0.0
         } else {
             clamp(low_frames[low_cursor].energy / low_reference, 0.0, 1.5)
         };
         result.low_energy_curve.push(EnergyPoint {
             time: point.time,
-            energy,
+            energy: bass,
         });
+        result.bass_activity_mask.push(bass.min(1.0));
+        let drums = if high_frames.is_empty() || point.energy <= 0.1 || high_reference <= 1e-9 {
+            0.0
+        } else {
+            clamp(high_frames[high_cursor].energy / high_reference, 0.0, 1.0)
+        };
+        result.drum_activity_mask.push(drums);
     }
 
     let mut frame_cursor = 0usize;
@@ -813,6 +947,23 @@ pub(crate) fn analyze_audio(
             0.0,
             1.0,
         ));
+    }
+
+    // Pace ≈ local energy × absolute energy change (novelty). Used by the
+    // sequencer and long-blend policy as an Apple Music Understanding stand-in.
+    for index in 0..result.energy_curve.len() {
+        let energy = result.energy_curve[index].energy;
+        let prev = if index == 0 {
+            energy
+        } else {
+            result.energy_curve[index - 1].energy
+        };
+        let novelty = (energy - prev).abs();
+        let pace = clamp(energy * 0.65 + novelty * 1.4, 0.0, 1.0);
+        result.pace_curve.push(EnergyPoint {
+            time: result.energy_curve[index].time,
+            energy: pace,
+        });
     }
 
     build_structure(&envelope, &mut result);
@@ -847,6 +998,14 @@ mod tests {
             "audible_start {} outside 0.5..2.0",
             result.audible_start_time
         );
+        assert!(
+            result.content_end_time > silence_before + tone_seconds - 0.75,
+            "content_end {} too early",
+            result.content_end_time
+        );
+        assert_eq!(result.pace_curve.len(), result.energy_curve.len());
+        assert_eq!(result.bass_activity_mask.len(), result.energy_curve.len());
+        assert_eq!(result.drum_activity_mask.len(), result.energy_curve.len());
         // Content ends where the trailing silence begins, not at file end.
         let expected_end = silence_before + tone_seconds;
         assert!(
@@ -855,8 +1014,45 @@ mod tests {
             result.content_end_time,
             expected_end
         );
-        // The energy curve is non-empty and bounded.
         assert!(!result.energy_curve.is_empty());
         assert!(result.energy_curve.iter().all(|p| p.energy >= 0.0 && p.energy <= 1.5));
+    }
+
+    #[test]
+    fn novelty_finds_section_candidates_on_an_energy_step() {
+        let rate = 11_025.0;
+        let total = 48.0;
+        let samples_len = (total * rate) as usize;
+        let mut samples = vec![0.0f32; samples_len];
+        // Soft bed for the whole file so audible_start/content_end stay at the
+        // edges; interior amplitude jumps produce novelty peaks that survive
+        // the +2s / −2s margin around those edges.
+        for index in 0..samples_len {
+            let t = index as f64 / rate;
+            let amp = if (12.0..28.0).contains(&t) {
+                0.7
+            } else if (28.0..40.0).contains(&t) {
+                0.25
+            } else {
+                0.08
+            };
+            samples[index] = (2.0 * PI * 220.0 * t).sin() as f32 * amp;
+        }
+        let result = analyze_audio(&samples, rate, total);
+        assert!(
+            !result.section_boundaries.is_empty() || !result.segment_boundaries.is_empty(),
+            "expected novelty boundaries on a stepped envelope; sections={:?} segments={:?} mix_out={:?}",
+            result.section_boundaries,
+            result.segment_boundaries,
+            result.mix_out_candidates.iter().map(|c| &c.kind).collect::<Vec<_>>(),
+        );
+        assert!(
+            result.mix_out_candidates.iter().any(|c| {
+                c.kind == "section_boundary"
+                    || c.kind == "energy_cliff"
+                    || c.kind == "outro_start"
+            }),
+            "mix-out candidates should include structure or energy cues"
+        );
     }
 }

@@ -11,7 +11,14 @@ const MIN_BEATMATCH_CONFIDENCE: f64 = 0.55;
 const MIN_DJ_CONFIDENCE: f64 = 0.2;
 const MIN_BPM: f64 = 40.0;
 const MAX_BPM: f64 = 220.0;
+/// How far a Beatmatched pair may drift from unity and still stretch.
+///
+/// Apple AutoMix's documented failure mode is comic warps (reviewers report
+/// ~0.75×–1.5×). Beatmatched stretch stays inside this band; DjAssisted never
+/// stretches at all — it rides filters instead.
 const MAX_STRETCH_DEVIATION: f64 = 0.04;
+/// Alias used at call sites that stretch an incoming track onto the outgoing.
+const MAX_BEATMATCH_STRETCH: f64 = MAX_STRETCH_DEVIATION;
 const VOCAL_ACTIVE_THRESHOLD: f64 = 0.6;
 const FILTER_SWEEP: f64 = 1.0;
 const AUTO_TRANSITION_MAX_BEATS: f64 = 16.0;
@@ -111,12 +118,17 @@ struct Analysis {
     mix_out_candidates: Vec<audio_analysis::MixCuePoint>,
     /// Phrase starts, for snapping a transition onto a boundary.
     phrase_boundaries: Vec<f64>,
+    section_boundaries: Vec<f64>,
+    segment_boundaries: Vec<f64>,
     energy_curve: Vec<audio_analysis::EnergyPoint>,
     low_energy_curve: Vec<audio_analysis::EnergyPoint>,
+    pace_curve: Vec<audio_analysis::EnergyPoint>,
     /// DSP per-frame vocal mask (parallel to `energy_curve`), from
     /// `AnalyzeKeyAndTimbre`. Drives `vocalActivityBetween` /
     /// `simultaneousVocalFraction`.
     vocal_activity_mask: Vec<f64>,
+    drum_activity_mask: Vec<f64>,
+    bass_activity_mask: Vec<f64>,
     /// The full beat grid, for downbeat snapping.
     beats: Vec<f64>,
     vocal_mask: Vec<f32>,
@@ -124,9 +136,12 @@ struct Analysis {
     /// Whole-track DSP vocal heuristic (`AnalyzeKeyAndTimbre`), not the model
     /// mask mean.
     vocal_probability: f64,
+    /// Where the strongest analysis for this track came from.
+    /// `music_understanding` | `beat_this` | `dsp` | `disk_cache`.
+    analysis_source: String,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Tier {
     Beatmatched,
     DjAssisted,
@@ -211,6 +226,24 @@ mod analysis_cache {
         analysis
     }
 
+    pub(super) fn invalidate(path: &str) {
+        let norm = path.strip_prefix("file://").unwrap_or(path);
+        let mut guard = cache().lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let doomed: Vec<Key> = guard
+            .entries
+            .keys()
+            .filter(|(p, _, _)| {
+                let p_norm = p.strip_prefix("file://").unwrap_or(p);
+                p_norm == norm
+            })
+            .cloned()
+            .collect();
+        for key in doomed {
+            guard.entries.remove(&key);
+            guard.order.retain(|k| k != &key);
+        }
+    }
+
     pub(super) fn get_cached_energy_curve(path: &str) -> Option<Vec<super::audio_analysis::EnergyPoint>> {
         let norm_path = path.strip_prefix("file://").unwrap_or(path);
         let guard = cache().lock().unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -223,6 +256,194 @@ mod analysis_cache {
 
 pub(super) fn clear_analysis_cache() {
     analysis_cache::clear();
+    overlays::clear();
+}
+
+/// External analysis overlay (Music Understanding, disk cache, …) merged onto
+/// the DSP/ONNX result after `analyze` finishes. Rhythm/key/structure from a
+/// stronger source win; envelope/energy from DSP stay unless the overlay
+/// supplies replacements.
+#[derive(Clone, Debug, Default)]
+pub struct AnalysisOverlay {
+    pub bpm: Option<f64>,
+    pub beat_confidence: Option<f64>,
+    pub beat_interval: Option<f64>,
+    pub beats: Option<Vec<f64>>,
+    pub downbeats: Option<Vec<f64>>,
+    pub key: Option<String>,
+    pub key_confidence: Option<f64>,
+    pub phrase_boundaries: Option<Vec<f64>>,
+    pub vocal_probability: Option<f64>,
+    pub content_end: Option<f64>,
+    pub audible_start: Option<f64>,
+    pub outro_start: Option<f64>,
+    pub mix_in_time: Option<f64>,
+    /// `music_understanding` | `disk_cache` | …
+    pub source: String,
+}
+
+mod overlays {
+    use super::AnalysisOverlay;
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+
+    fn map() -> &'static Mutex<HashMap<String, AnalysisOverlay>> {
+        static MAP: OnceLock<Mutex<HashMap<String, AnalysisOverlay>>> = OnceLock::new();
+        MAP.get_or_init(|| Mutex::new(HashMap::new()))
+    }
+
+    pub(super) fn clear() {
+        map().lock().unwrap_or_else(|p| p.into_inner()).clear();
+    }
+
+    pub(super) fn put(path: &str, overlay: AnalysisOverlay) {
+        let key = path.strip_prefix("file://").unwrap_or(path).to_string();
+        map()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(key, overlay);
+    }
+
+    pub(super) fn get(path: &str) -> Option<AnalysisOverlay> {
+        let key = path.strip_prefix("file://").unwrap_or(path);
+        map()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(key)
+            .cloned()
+    }
+}
+
+/// Register an external analysis overlay for `path`. The next `plan_pair`
+/// analysis of that file merges it on top of DSP/ONNX results. Returns true
+/// when stored.
+pub fn seed_analysis_overlay(path: &str, overlay: AnalysisOverlay) -> bool {
+    if path.is_empty() {
+        return false;
+    }
+    // Drop any cached analysis so the next plan re-runs with the overlay.
+    analysis_cache::invalidate(path);
+    overlays::put(path, overlay);
+    true
+}
+
+/// Sources used by the most recent `plan_pair` (outgoing, incoming).
+pub fn last_analysis_sources() -> (String, String) {
+    last_sources::get()
+}
+
+mod last_sources {
+    use std::sync::{Mutex, OnceLock};
+
+    fn pair() -> &'static Mutex<(String, String)> {
+        static PAIR: OnceLock<Mutex<(String, String)>> = OnceLock::new();
+        PAIR.get_or_init(|| Mutex::new((String::new(), String::new())))
+    }
+
+    pub(super) fn set(outgoing: &str, incoming: &str) {
+        let out = if outgoing.is_empty() {
+            "dsp"
+        } else {
+            outgoing
+        };
+        let inc = if incoming.is_empty() {
+            "dsp"
+        } else {
+            incoming
+        };
+        *pair().lock().unwrap_or_else(|p| p.into_inner()) = (out.into(), inc.into());
+    }
+
+    pub(super) fn get() -> (String, String) {
+        pair().lock().unwrap_or_else(|p| p.into_inner()).clone()
+    }
+}
+
+fn apply_overlay(analysis: &mut Analysis, overlay: &AnalysisOverlay) {
+    // Prefer Beat This / DSP tempo when MU reports a clear half/double of an
+    // already-trusted grid (common with electronic tracks). Key/structure from
+    // MU still apply.
+    let trust_existing_tempo = analysis.beat_confidence >= 0.55
+        && !analysis.downbeats.is_empty()
+        && analysis.bpm > 0.0;
+    let overlay_bpm = overlay.bpm.filter(|b| *b > 0.0);
+    let tempo_octave = overlay_bpm.is_some_and(|bpm| {
+        let ratio = bpm / analysis.bpm;
+        (ratio - 2.0).abs() < 0.12 || (ratio - 0.5).abs() < 0.06
+            || (ratio - 3.0).abs() < 0.15 || (ratio - 1.0 / 3.0).abs() < 0.05
+    });
+    let accept_overlay_tempo = !(trust_existing_tempo && tempo_octave);
+
+    if accept_overlay_tempo {
+        if let Some(bpm) = overlay_bpm {
+            analysis.bpm = bpm;
+        }
+        if let Some(c) = overlay.beat_confidence {
+            analysis.beat_confidence = c.clamp(0.0, 1.0);
+        }
+        if let Some(interval) = overlay.beat_interval.filter(|i| *i > 0.0) {
+            analysis.beat_interval = interval;
+        } else if analysis.bpm > 0.0 {
+            analysis.beat_interval = 60.0 / analysis.bpm;
+        }
+        if let Some(beats) = overlay.beats.as_ref().filter(|b| b.len() >= 2) {
+            analysis.beats = beats.clone();
+            analysis.first_beat = beats[0];
+        }
+        if let Some(downbeats) = overlay.downbeats.as_ref().filter(|d| !d.is_empty()) {
+            analysis.downbeats = downbeats.clone();
+        }
+    } else if let Some(bpm) = overlay_bpm {
+        log::info!(
+            "automix overlay: keeping {:.1} bpm grid; ignoring MU tempo {:.1} (octave)",
+            analysis.bpm,
+            bpm
+        );
+    }
+    if let Some(key) = overlay.key.as_ref().filter(|k| !k.is_empty()) {
+        analysis.key = key.clone();
+    }
+    if let Some(c) = overlay.key_confidence {
+        analysis.key_confidence = c.clamp(0.0, 1.0);
+    }
+    if let Some(phrases) = overlay.phrase_boundaries.as_ref().filter(|p| !p.is_empty()) {
+        analysis.phrase_boundaries = phrases.clone();
+        // Treat phrase overlays as section hints when MU provides hierarchy as phrases.
+        if analysis.section_boundaries.is_empty() {
+            analysis.section_boundaries = phrases.clone();
+        }
+    }
+    if let Some(v) = overlay.vocal_probability {
+        analysis.vocal_probability = v.clamp(0.0, 1.0);
+    }
+    if let Some(end) = overlay.content_end.filter(|e| *e > 0.0) {
+        analysis.content_end = end;
+    }
+    if let Some(start) = overlay.audible_start.filter(|s| s.is_finite() && *s >= 0.0) {
+        analysis.audible_start_time = start;
+    }
+    if let Some(outro) = overlay.outro_start.filter(|s| *s > 0.0) {
+        analysis.outro_start = outro;
+    }
+    if let Some(mix_in) = overlay.mix_in_time.filter(|s| *s > 0.0) {
+        analysis.mix_in_time = mix_in;
+    }
+    if !overlay.source.is_empty() {
+        // Keep a blended label when we refused the MU tempo but took structure.
+        if !accept_overlay_tempo && analysis.analysis_source == "beat_this" {
+            analysis.analysis_source = "beat_this+music_understanding".into();
+        } else {
+            analysis.analysis_source = overlay.source.clone();
+        }
+        log::info!(
+            "automix overlay [{}]: bpm={:.1} conf={:.2} key={} phrases={}",
+            analysis.analysis_source,
+            analysis.bpm,
+            analysis.beat_confidence,
+            analysis.key,
+            analysis.phrase_boundaries.len()
+        );
+    }
 }
 
 /// Locates the next local energy dip in the audio curve for the given source
@@ -429,8 +650,25 @@ fn log_plan(outgoing: &Analysis, incoming: &Analysis, plan: &TransitionPlan, tie
         plan.bass_swap,
         plan.bass_swap_fraction,
     );
-    log::info!("automix out: {}", grid(outgoing));
-    log::info!("automix in:  {}", grid(incoming));
+    log::info!(
+        "automix out [{}]: {}",
+        if outgoing.analysis_source.is_empty() {
+            "dsp"
+        } else {
+            &outgoing.analysis_source
+        },
+        grid(outgoing)
+    );
+    log::info!(
+        "automix in [{}]: {}",
+        if incoming.analysis_source.is_empty() {
+            "dsp"
+        } else {
+            &incoming.analysis_source
+        },
+        grid(incoming)
+    );
+    last_sources::set(&outgoing.analysis_source, &incoming.analysis_source);
 }
 
 /// The plain equal-power fallback shared by the speech guard and the tier.
@@ -565,11 +803,17 @@ fn analyze(
             analysis.mix_in_candidates = audio.mix_in_candidates;
             analysis.mix_out_candidates = audio.mix_out_candidates;
             analysis.phrase_boundaries = audio.phrase_boundaries;
+            analysis.section_boundaries = audio.section_boundaries;
+            analysis.segment_boundaries = audio.segment_boundaries;
             analysis.energy_curve = audio.energy_curve;
             analysis.low_energy_curve = audio.low_energy_curve;
+            analysis.pace_curve = audio.pace_curve;
             analysis.vocal_activity_mask = audio.vocal_activity_mask;
+            analysis.drum_activity_mask = audio.drum_activity_mask;
+            analysis.bass_activity_mask = audio.bass_activity_mask;
             analysis.beats = audio.beats;
             analysis.vocal_probability = audio.vocal_probability;
+            analysis.analysis_source = "dsp".into();
             }
             whole = Some((mono, rate));
         }
@@ -588,9 +832,11 @@ fn analyze(
     // invisible from the outside: transitions still happen, they are just
     // coarser, and `mix_in_candidates` in particular used to be derived here and
     // never revisited, so a model grid could not fix it even once installed.
+    // Beat This! over the whole decoded buffer when we have it. The head-only
+    // window left mix-out anchors on a DSP grid while intros looked great —
+    // Apple AutoMix's quality lives at the *end* of the outgoing track.
     let model_grid = if let Some((mono, rate)) = whole.as_ref() {
-        let head_samples = ((head_len * *rate as f64) as usize).min(mono.len());
-        beat::track(&mono[..head_samples], *rate as f64, 0.0)
+        beat::track(mono, *rate as f64, 0.0)
     } else if let Some((mono, rate, offset)) = decode(path, 0.0, head_len, true) {
         beat::track(&mono, rate as f64, offset)
     } else {
@@ -627,6 +873,9 @@ fn analyze(
         // the DSP heuristic, so where it exists it overrides the DSP mask on the
         // energy-curve grid.
         merge_open_unmix_mask(&mut analysis);
+    }
+    if let Some(overlay) = overlays::get(path) {
+        apply_overlay(&mut analysis, &overlay);
     }
     analysis
 }
@@ -685,9 +934,13 @@ fn fill_grid(analysis: &mut Analysis, grid: Grid) {
     analysis.beat_confidence = grid.beat_confidence;
     analysis.downbeats = grid.downbeats;
     analysis.first_beat = grid.first_beat;
+    analysis.beats = grid.beats;
     // The DSP phrases were built on the DSP grid. Eight downbeats is the same
     // 32-beat phrase, on the grid that actually won.
     analysis.phrase_boundaries = analysis.downbeats.iter().step_by(8).copied().collect();
+    if analysis.analysis_source.is_empty() || analysis.analysis_source == "dsp" {
+        analysis.analysis_source = "beat_this".into();
+    }
 }
 
 fn split_stereo(interleaved: &[f32]) -> (Vec<f32>, Vec<f32>) {
@@ -836,10 +1089,41 @@ fn bass_swap_fraction_for(
             outgoing_at,
             outgoing_window,
         );
-        if incoming_change.is_none() && outgoing_change.is_none() {
+        // Instrument-activity proxy: prefer the beat where outgoing bass falls
+        // and incoming bass rises (Music Understanding–style activity masks).
+        let out_bass_before = mask_activity_between(
+            &outgoing.bass_activity_mask,
+            &outgoing.energy_curve,
+            outgoing_at - outgoing_window,
+            outgoing_at,
+        );
+        let out_bass_after = mask_activity_between(
+            &outgoing.bass_activity_mask,
+            &outgoing.energy_curve,
+            outgoing_at,
+            outgoing_at + outgoing_window,
+        );
+        let in_bass_before = mask_activity_between(
+            &incoming.bass_activity_mask,
+            &incoming.energy_curve,
+            incoming_at - incoming_window,
+            incoming_at,
+        );
+        let in_bass_after = mask_activity_between(
+            &incoming.bass_activity_mask,
+            &incoming.energy_curve,
+            incoming_at,
+            incoming_at + incoming_window,
+        );
+        let bass_handoff = match (out_bass_before, out_bass_after, in_bass_before, in_bass_after) {
+            (Some(ob), Some(oa), Some(ib), Some(ia)) => (ob - oa) + (ia - ib),
+            _ => 0.0,
+        };
+        if incoming_change.is_none() && outgoing_change.is_none() && bass_handoff.abs() < 0.05 {
             continue;
         }
-        let score = incoming_change.unwrap_or(0.0) - outgoing_change.unwrap_or(0.0);
+        let score =
+            incoming_change.unwrap_or(0.0) - outgoing_change.unwrap_or(0.0) + bass_handoff * 0.35;
         let candidate = (*beat, score);
         strongest = Some(match strongest {
             None => candidate,
@@ -877,6 +1161,7 @@ fn mix_out_type_score(kind: &str) -> f64 {
     match kind {
         "energy_cliff" | "interior_mix_out" => 0.95,
         "outro_start" => 0.9,
+        "section_boundary" => 0.88,
         "content_end" => 0.75,
         _ => 0.0,
     }
@@ -924,6 +1209,63 @@ fn audible_seconds_between(
     Some(audible)
 }
 
+/// Mean of a parallel activity mask over `start`..`end` (same grid as energy).
+fn mask_activity_between(mask: &[f64], curve: &[audio_analysis::EnergyPoint], start: f64, end: f64) -> Option<f64> {
+    if mask.is_empty() || mask.len() != curve.len() || end <= start {
+        return None;
+    }
+    let mut sum = 0.0;
+    let mut count = 0usize;
+    for index in 0..mask.len() {
+        let time = curve[index].time;
+        if !time.is_finite() || time < start || time > end {
+            continue;
+        }
+        let value = mask[index];
+        if !value.is_finite() {
+            continue;
+        }
+        sum += value;
+        count += 1;
+    }
+    if count > 0 {
+        Some(sum / count as f64)
+    } else {
+        None
+    }
+}
+
+/// Bonus when pace drops across a candidate mix-out (structure + novelty cue).
+fn pace_drop_bonus(analysis: &Analysis, time: f64) -> f64 {
+    if analysis.pace_curve.len() < 4 {
+        return 0.0;
+    }
+    let before = analysis
+        .pace_curve
+        .iter()
+        .filter(|p| p.time >= time - 4.0 && p.time < time)
+        .map(|p| p.energy)
+        .collect::<Vec<_>>();
+    let after = analysis
+        .pace_curve
+        .iter()
+        .filter(|p| p.time >= time && p.time <= time + 4.0)
+        .map(|p| p.energy)
+        .collect::<Vec<_>>();
+    if before.is_empty() || after.is_empty() {
+        return 0.0;
+    }
+    let mean = |vals: &[f64]| vals.iter().sum::<f64>() / vals.len() as f64;
+    let drop = mean(&before) - mean(&after);
+    if drop > 0.08 {
+        0.06
+    } else if drop > 0.03 {
+        0.03
+    } else {
+        0.0
+    }
+}
+
 /// Where the outgoing track's transition ends: the best-ranked mix-out
 /// candidate inside the discarded-music budget, or the content end. Returns
 /// `(time, discarded_music_seconds)` (upstream `resolveMixOutAnchor`).
@@ -952,7 +1294,9 @@ fn resolve_mix_out_anchor(outgoing: &Analysis) -> (f64, f64) {
         if discarded > MAX_DISCARDED_MUSIC_SECONDS {
             continue;
         }
-        let rank_score = candidate.score + mix_out_type_score(&candidate.kind);
+        let rank_score = candidate.score
+            + mix_out_type_score(&candidate.kind)
+            + pace_drop_bonus(outgoing, candidate.time);
         best = Some(match best {
             None => (rank_score, candidate.time, discarded),
             Some((score, time, discarded_seconds)) => {
@@ -1061,14 +1405,12 @@ fn plan_from(outgoing: &Analysis, incoming: &Analysis, fade: f64) -> TransitionP
     let ratio = normalized_tempo_ratio(out_bpm, in_bpm);
     let same_beat = (1.0 - ratio).abs() <= 0.05
         && (outgoing.beat_confidence >= 0.2 || incoming.beat_confidence >= 0.2);
-    // Upstream phrase-switch: a beat-matched, harmonically-compatible pair is
-    // stretched to the outgoing tempo unclamped (the 0.9–1.1 band is only the
-    // adaptive-overlap fallback). The mixer's effective clamp is 0.5–2.0.
-    let harmonic = harmonically_compatible(&trusted_key(outgoing), &trusted_key(incoming));
-    let playback_rate = if same_beat && harmonic {
-        ((1.0 / ratio).clamp(0.5, 2.0) * 10_000.0).round() / 10_000.0
-    } else if (0.9..=1.1).contains(&ratio) {
-        ((1.0 / ratio).clamp(0.9, 1.1) * 10_000.0).round() / 10_000.0
+    // Only Beatmatched may stretch, and only inside MAX_BEATMATCH_STRETCH.
+    // DjAssisted used to warp up to ±10% on the 0.9–1.1 band — that is the
+    // Apple failure mode (tempo morph that draws attention to itself). A weak
+    // grid keeps unity rate and lets the filter ride mask the gap instead.
+    let playback_rate = if matches!(tier, Tier::Beatmatched) {
+        transparent_playback_rate(out_bpm, in_bpm, MAX_BEATMATCH_STRETCH).unwrap_or(1.0)
     } else {
         1.0
     };
@@ -1119,7 +1461,7 @@ fn plan_from(outgoing: &Analysis, incoming: &Analysis, fade: f64) -> TransitionP
         0.0
     };
     let mix_end = (anchor - arrangement).max(0.0);
-    let max_overlap = (max_beats_cap * beat_seconds)
+    let mut max_overlap = (max_beats_cap * beat_seconds)
         .min(max_seconds)
         .min((mix_end * 0.4).max(min_overlap))
         .min(if incoming.duration > 0.0 {
@@ -1128,6 +1470,12 @@ fn plan_from(outgoing: &Analysis, incoming: &Analysis, fade: f64) -> TransitionP
             max_seconds
         })
         .max(min_overlap);
+    // Mixxx Auto DJ: fade length ≈ min(usable outro, usable intro) when both
+    // sections are known. Caps the overlap before handoff math so the cue and
+    // the fade agree.
+    if let Some(cap) = section_fade_cap(outgoing, incoming) {
+        max_overlap = max_overlap.min(cap.max(min_overlap));
+    }
 
     let handoff_beats = if same_beat { 8.0 } else { 4.0 };
     let handoff_seconds = if out_bpm > 0.0 {
@@ -1152,7 +1500,13 @@ fn plan_from(outgoing: &Analysis, incoming: &Analysis, fade: f64) -> TransitionP
         drop
     };
 
-    let (transition_start, fade_seconds) = if same_beat && beat_seconds > 0.0 {
+    // A Beatmatched pair with a transparent stretch earns DjBlend. Anything
+    // else — DjAssisted, far tempo, refused stretch — rides filters so the
+    // ear never hears a chipmunk or a slow-mo vocal.
+    let beatmatched_blend =
+        matches!(tier, Tier::Beatmatched) && same_beat && (playback_rate - 1.0).abs() <= MAX_BEATMATCH_STRETCH + 1e-6;
+
+    let (transition_start, fade_seconds) = if beatmatched_blend && beat_seconds > 0.0 {
         let intro_span = handoff / playback_rate.max(0.8);
         let total = intro_span.clamp(12.0_f64.min(max_overlap), max_overlap);
         let target = (mix_end - total).max(0.0);
@@ -1182,7 +1536,7 @@ fn plan_from(outgoing: &Analysis, incoming: &Analysis, fade: f64) -> TransitionP
     let cue = cue_for(entry, handoff, fade_seconds, playback_rate);
 
     let incoming_beat_seconds = if in_bpm > 0.0 { 60.0 / in_bpm } else { 0.5 };
-    let bass_swap_fraction = if same_beat {
+    let bass_swap_fraction = if beatmatched_blend {
         bass_swap_fraction_for(
             outgoing,
             incoming,
@@ -1204,14 +1558,14 @@ fn plan_from(outgoing: &Analysis, incoming: &Analysis, fade: f64) -> TransitionP
         cue,
         playback_rate,
     );
-    let style = if same_beat {
+    let style = if beatmatched_blend {
         TransitionStyle::DjBlend
     } else {
         TransitionStyle::DjFilter
     };
     let shape = mix_shape(
         style,
-        same_beat,
+        beatmatched_blend,
         vocal_overlap,
         vocal_conflict,
         fade_seconds,
@@ -1222,9 +1576,8 @@ fn plan_from(outgoing: &Analysis, incoming: &Analysis, fade: f64) -> TransitionP
     );
 
     TransitionPlan {
-        // Upstream `sameBeatBlend` gates on tempo ratio + beat confidence
-        // alone — a DJ_ASSISTED pair that is tempo-close still blends, not
-        // sweeps (TransitionPlanner.kt:965-967, 1073). No tier requirement.
+        // Beatmatched + transparent stretch → DjBlend. DjAssisted used to
+        // blend on tempo proximity alone; that stretched weak grids. Filter.
         style,
         bass_swap: true,
         bass_swap_fraction,
@@ -1338,6 +1691,55 @@ fn align_tempo_octave(outgoing_bpm: f64, incoming_bpm: f64) -> f64 {
         aligned *= 2.0;
     }
     aligned
+}
+
+/// Rate that brings the incoming tempo onto the outgoing one, or `None` when
+/// the stretch would be audible. Octave-aligned first.
+fn transparent_playback_rate(
+    outgoing_bpm: f64,
+    incoming_bpm: f64,
+    max_deviation: f64,
+) -> Option<f64> {
+    if outgoing_bpm <= 0.0 || incoming_bpm <= 0.0 || max_deviation < 0.0 {
+        return None;
+    }
+    let aligned = align_tempo_octave(outgoing_bpm, incoming_bpm);
+    let rate = outgoing_bpm / aligned;
+    if (rate - 1.0).abs() <= max_deviation {
+        Some(((rate * 10_000.0).round()) / 10_000.0)
+    } else {
+        None
+    }
+}
+
+/// Mixxx-style fade cap: min(outro length, intro length) when both sections
+/// look real. `None` means "no useful section lengths — leave the beat math".
+fn section_fade_cap(outgoing: &Analysis, incoming: &Analysis) -> Option<f64> {
+    let content_end = if outgoing.content_end > 0.0 {
+        outgoing.content_end
+    } else {
+        outgoing.duration
+    };
+    let outro_len = if outgoing.outro_start > 0.0 && content_end > outgoing.outro_start + 1.0 {
+        content_end - outgoing.outro_start
+    } else {
+        return None;
+    };
+    let audible = if incoming.audible_start_time.is_finite() && incoming.audible_start_time >= 0.0 {
+        incoming.audible_start_time
+    } else {
+        0.0
+    };
+    let intro_end = if incoming.mix_in_time > audible + 1.0 {
+        incoming.mix_in_time
+    } else {
+        return None;
+    };
+    let intro_len = intro_end - audible;
+    if outro_len < 2.0 || intro_len < 2.0 {
+        return None;
+    }
+    Some(outro_len.min(intro_len))
 }
 
 fn normalized_tempo_ratio(current: f64, next: f64) -> f64 {
@@ -1776,7 +2178,10 @@ fn plan_wsola_transition(outgoing: &Analysis, incoming: &Analysis) -> Option<Tra
         return None;
     }
     let incoming_bpm = align_tempo_octave(outgoing_bpm, incoming.bpm);
-    let stretch_ratio = outgoing_bpm / incoming_bpm;
+    // Refuse the phrase-switch rather than warp past the transparent band —
+    // the adaptive-overlap path will offer a filtered handoff instead.
+    let stretch_ratio =
+        transparent_playback_rate(outgoing_bpm, incoming.bpm, MAX_BEATMATCH_STRETCH)?;
 
     let outgoing_length = outgoing.duration;
     let incoming_length = incoming.duration;
@@ -1907,7 +2312,7 @@ fn plan_wsola_transition(outgoing: &Analysis, incoming: &Analysis) -> Option<Tra
 
     let vocal_conflict = outgoing.vocal_probability >= 0.62 && incoming.vocal_probability >= 0.62;
     let style = TransitionStyle::DjBlend;
-    let playback_rate = (stretch_ratio * 10_000.0).round() / 10_000.0;
+    let playback_rate = stretch_ratio;
     let fade_seconds = transition_end - transition_start;
     let shape = mix_shape(
         style,
@@ -2056,6 +2461,89 @@ mod tests {
         inc.bpm = 120.0;
         inc.beat_confidence = 0.8;
         assert!(phrase_switch(&out, &inc).is_none());
+    }
+
+    #[test]
+    fn transparent_playback_rate_refuses_apple_style_warps() {
+        // 120 → 90 is a 25% stretch after octave alignment fails to help.
+        assert!(transparent_playback_rate(120.0, 90.0, MAX_BEATMATCH_STRETCH).is_none());
+        // 120 → 122 is ~1.67% — transparent.
+        let rate = transparent_playback_rate(120.0, 122.0, MAX_BEATMATCH_STRETCH).unwrap();
+        assert!((rate - 120.0 / 122.0).abs() < 1e-4, "rate {rate}");
+        // Octave cousins: 60 against 120 aligns to unity.
+        let octave = transparent_playback_rate(120.0, 60.0, MAX_BEATMATCH_STRETCH).unwrap();
+        assert!((octave - 1.0).abs() < 1e-4, "octave {octave}");
+    }
+
+    #[test]
+    fn dj_assisted_near_tempo_does_not_stretch() {
+        // Same tempo neighbourhood, weak grids → DjAssisted. Must keep unity
+        // rate and ride filters rather than warp (Apple's failure mode).
+        let mut out = matched(0.5, 200.0);
+        out.beat_confidence = 0.4; // below MIN_BEATMATCH_CONFIDENCE (0.55)
+        let mut inc = matched(0.5, 200.0);
+        inc.bpm = 126.0; // 5% fast — inside the old ±10% assisted band
+        inc.beat_interval = 60.0 / 126.0;
+        inc.beat_confidence = 0.4;
+        assert_eq!(assess(&out, &inc), Tier::DjAssisted);
+        let plan = plan_from(&out, &inc, 8.0);
+        assert!(
+            (plan.playback_rate - 1.0).abs() < 1e-9,
+            "DjAssisted stretched to {}",
+            plan.playback_rate
+        );
+        assert_eq!(plan.style, TransitionStyle::DjFilter);
+        let smooth = super::super::smoothness::score_plan(&plan);
+        assert!(!smooth.forced_stretch);
+    }
+
+    #[test]
+    fn section_fade_cap_takes_the_shorter_section() {
+        let mut out = matched(0.5, 200.0);
+        out.outro_start = 170.0;
+        out.content_end = 180.0; // 10 s outro
+        let mut inc = matched(0.5, 200.0);
+        inc.audible_start_time = 0.5;
+        inc.mix_in_time = 6.5; // 6 s intro
+        let cap = section_fade_cap(&out, &inc).expect("both sections known");
+        assert!((cap - 6.0).abs() < 1e-9, "cap {cap}");
+    }
+
+    #[test]
+    fn overlay_skips_half_tempo_when_beat_this_grid_is_trusted() {
+        let mut analysis = matched(0.5, 200.0);
+        analysis.bpm = 148.7;
+        analysis.beat_interval = 60.0 / 148.7;
+        analysis.beat_confidence = 0.75;
+        analysis.downbeats = vec![0.0, 1.615, 3.23];
+        analysis.analysis_source = "beat_this".into();
+        analysis.key = "C minor".into();
+        apply_overlay(
+            &mut analysis,
+            &AnalysisOverlay {
+                bpm: Some(74.5),
+                beat_confidence: Some(0.85),
+                beat_interval: Some(60.0 / 74.5),
+                beats: None,
+                downbeats: Some(vec![0.0, 3.23]),
+                key: Some("C minor".into()),
+                key_confidence: Some(0.8),
+                phrase_boundaries: Some(vec![8.0, 16.0]),
+                vocal_probability: None,
+                content_end: None,
+                audible_start: None,
+                outro_start: None,
+                mix_in_time: None,
+                source: "music_understanding".into(),
+            },
+        );
+        assert!(
+            (analysis.bpm - 148.7).abs() < 0.01,
+            "kept Beat This tempo, got {}",
+            analysis.bpm
+        );
+        assert_eq!(analysis.phrase_boundaries, vec![8.0, 16.0]);
+        assert!(analysis.analysis_source.contains("music_understanding"));
     }
 
     #[test]

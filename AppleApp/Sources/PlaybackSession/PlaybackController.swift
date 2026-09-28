@@ -210,10 +210,12 @@ final class PlaybackController {
     var isPlaying: Bool { state == .playing }
     var isBuffering: Bool { state == .buffering }
     var canPlayPrevious: Bool {
-        playingIndex > 0 || (repeatMode == .all && queue.count > 1)
+        playingIndex > 0 || (repeatMode == .all && !queue.isEmpty)
     }
     var canPlayNext: Bool {
-        playingIndex + 1 < queue.count || (repeatMode == .all && !queue.isEmpty)
+        playingIndex + 1 < queue.count
+            || (repeatMode == .all && !queue.isEmpty)
+            || (repeatMode == .one && automixEnabled && current != nil)
     }
 
     /// Upstream ExoPlayer `REPEAT_MODE_OFF / ALL / ONE`.
@@ -223,6 +225,12 @@ final class PlaybackController {
 
     private(set) var repeatMode: RepeatMode = .off
     private(set) var shuffleEnabled = false
+    /// AutoPlay tail removed while repeat-all is on, put back when it ends —
+    /// upstream `repeatAllStash`. Taken once per stretch of ALL so OFF→ALL→ONE
+    /// does not overwrite a full stash with the empty tail the first step left.
+    private var repeatAllStash: [QueueEntry] = []
+    /// `id` of the track that was current when [repeatAllStash] was taken.
+    private var repeatAllStashSeed: String?
     private(set) var lyrics: [LyricLineDto] = []
     /// Empty when lyrics came from the file itself (EmbeddedLyrics).
     private(set) var lyricsSourceLabel: String?
@@ -262,8 +270,12 @@ final class PlaybackController {
     private(set) var nerd: NerdStatsRec?
     /// True while a lossless/module lookup is still running for the playing track
     /// (upstream `NerdStats.racingLossless`).
-    private(set) var racingLossless = false    /// Automix analysis tier for stats-for-nerds: `beatmatched`, `dj`, or `plain`.
+    private(set) var racingLossless = false
+    /// Automix analysis tier for stats-for-nerds: `beatmatched`, `dj`, or `plain`.
     private(set) var analysisTier: String?
+    /// Analysis backends for the last planned pair: outgoing / incoming
+    /// (`music_understanding`, `beat_this`, `dsp`, `disk_cache`).
+    private(set) var analysisSources: String?
     /// Beat-grid confidence when native-core exposes it. Nil until then.
     private(set) var analysisConfidence: Double?
     /// Marker on the progress bar while a planned Automix window is known.
@@ -683,6 +695,8 @@ final class PlaybackController {
         unshuffledQueue = nil
         shuffleEnabled = false
         restoredStart = nil
+        repeatAllStash = []
+        repeatAllStashSeed = nil
         persistSession()
         startEngineIfNeeded()
         loadCurrent(index)
@@ -811,6 +825,8 @@ final class PlaybackController {
         repeatMode = snap.repeatMode
         shuffleEnabled = snap.shuffleEnabled
         volume = snap.volume
+        repeatAllStash = []
+        repeatAllStashSeed = nil
         rememberRestoredStart(snap.position, of: current?.id)
         engineLoadedId = nil
         loadedSourcePath = nil
@@ -1039,13 +1055,28 @@ final class PlaybackController {
     }
 
     func cycleRepeat() {
-        switch repeatMode {
-        case .off: repeatMode = .all
-        case .all: repeatMode = .one
-        case .one: repeatMode = .off
+        let previous = repeatMode
+        let next: RepeatMode
+        switch previous {
+        case .off: next = .all
+        case .all: next = .one
+        case .one: next = .off
         }
+        // Repeat-all loops the queue as it stands; AutoPlay's endless supply of
+        // new tracks is the opposite, so they come out first (upstream
+        // onRepeatModeChanged / stashAutoplayTracks). Leaving ALL — including
+        // the step ALL→ONE — puts them back when the seed track is still current.
+        if next == .all {
+            stashAutoplayTracks()
+        } else if previous == .all {
+            restoreAutoplayTracks()
+        }
+        repeatMode = next
         persistSession()
         syncEngineQueueNext()
+        if next != .all {
+            maybeAutoplay()
+        }
     }
 
     func toggleShuffle() {
@@ -1296,7 +1327,14 @@ final class PlaybackController {
     func toggleAutoplay() {
         autoplayEnabled.toggle()
         AppSettings.shared.setAutoplay(value: autoplayEnabled)
-        if autoplayEnabled { maybeAutoplay() }
+        if !autoplayEnabled {
+            // Upstream clears the stash when AutoPlay is switched off mid-loop
+            // so ending ALL later does not resurrect dropped suggestions.
+            repeatAllStash = []
+            repeatAllStashSeed = nil
+        } else if repeatMode != .all {
+            maybeAutoplay()
+        }
     }
 
     func toggleAutomix() {
@@ -1347,6 +1385,7 @@ final class PlaybackController {
         mixFadeUntil = nil
         analysisTier = nil
         analysisConfidence = nil
+        analysisSources = nil
         automixCueSeconds = nil
         let wasAudible = state == .playing || (state == .paused && engineLoadedId != nil)
         let previousPath = current?.isLocal == true ? current?.source : nil
@@ -1839,11 +1878,20 @@ final class PlaybackController {
     /// from a killed process has no engine yet. Unpausing a track the engine
     /// still holds does not come through here.
     private func warmUpcoming(around index: Int, generation: UInt64) {
-        guard repeatMode != .one else { return }
-        let ahead = (1...2).compactMap { offset -> QueueEntry? in
-            let at = index + offset
-            guard queue.indices.contains(at) else { return nil }
-            return queue[at]
+        // Repeat-one never arms a different next track into the engine, but the
+        // song after the loop still has to be measured while the loop runs —
+        // otherwise turning repeat off starts a cold whole-track decode with
+        // seconds left (upstream requestAnalysisAround). Automix self-mix only
+        // needs the current file, which is already loaded.
+        let ahead: [QueueEntry]
+        if repeatMode == .one {
+            ahead = (index + 1 < queue.count) ? [queue[index + 1]] : []
+        } else {
+            ahead = (1...2).compactMap { offset -> QueueEntry? in
+                let at = index + offset
+                guard queue.indices.contains(at) else { return nil }
+                return queue[at]
+            }
         }
         guard !ahead.isEmpty else { return }
         let prefs = ResolvePrefs.current()
@@ -1990,20 +2038,24 @@ final class PlaybackController {
     }
 
     /// Keeps the engine's pending-next pointing at the following queue entry
-    /// so gapless/crossfade arming works (spec §3.1). Repeat-one must not
-    /// arm the next song — the current track should seek to 0 at EOS.
+    /// so gapless/crossfade arming works (spec §3.1). Repeat-one without Automix
+    /// must not arm the next song — the current track seeks to 0 at EOS.
+    /// Repeat-one *with* Automix arms a self-mix into the same track.
     private func syncEngineQueueNext() {
         queueNextRevision &+= 1
         let revision = queueNextRevision
-        if repeatMode == .one {
+        let generation = playGeneration
+        // Upstream still measures the following track while a non-Automix
+        // repeat-one loop runs, so leaving the loop is not a cold start.
+        warmUpcoming(around: playingIndex, generation: generation)
+        if repeatMode == .one && !automixEnabled {
             try? engine.queueNext(request: LoadRequest(
                 source: "", title: "", artist: "", startSeconds: 0, plan: nil,
                 headers: [:], claimedKbps: 0, loudnessDb: nil, durationSeconds: nil
             ))
             return
         }
-        guard playingIndex + 1 < queue.count || (repeatMode == .all && queue.count > 1),
-              let next = nextEntry else {
+        guard let next = nextEntry else {
             try? engine.queueNext(request: LoadRequest(
                 source: "", title: "", artist: "", startSeconds: 0, plan: nil,
                 headers: [:], claimedKbps: 0, loudnessDb: nil, durationSeconds: nil
@@ -2011,9 +2063,9 @@ final class PlaybackController {
             maybeAutoplay()
             return
         }
-        let generation = playGeneration
         let nextId = next.id
         let outgoingId = current?.id
+        let selfMix = repeatMode == .one || nextId == outgoingId
         let engine = self.engine
         let automix = automixEnabled
         // The *file* the engine opened, not `current.source` — which for a
@@ -2027,9 +2079,9 @@ final class PlaybackController {
         let outgoingDuration = duration
         let currentText = current?.itemText ?? ""
         let nextText = next.itemText
-        let albumSequential = !shuffleEnabled && (current?.sameAlbum(as: next) ?? false)
+        // A self-mix is never an album gapless splice — force a real blend.
+        let albumSequential = !selfMix && !shuffleEnabled && (current?.sameAlbum(as: next) ?? false)
         let prefs = ResolvePrefs.current()
-        warmUpcoming(around: playingIndex, generation: generation)
         // `.utility` is deferrable. The scheduler was holding this until the
         // song was nearly over, so the next download — and the plan that waits
         // on it — started after the blend should already have been playing.
@@ -2048,12 +2100,15 @@ final class PlaybackController {
                     self?.noteResolved(next, outcome: outcome, prefs: prefs)
                     // The better copy has to be in hand before the blend arms.
                     // Waiting until this track becomes current means the upgrade
-                    // arrives during the ramp and cuts it.
-                    self?.lookForBetterCopy(
-                        next,
-                        codec: outcome.source.format.codec ?? "",
-                        kbps: Swift.UInt32(outcome.source.kbps)
-                    )
+                    // arrives during the ramp and cuts it. Skip for self-mix —
+                    // the playing file is already the one being upgraded in place.
+                    if !selfMix {
+                        self?.lookForBetterCopy(
+                            next,
+                            codec: outcome.source.format.codec ?? "",
+                            kbps: Swift.UInt32(outcome.source.kbps)
+                        )
+                    }
                 }
                 let stillQueueTarget = await MainActor.run { [weak self] in
                     guard let self else { return false }
@@ -2087,7 +2142,12 @@ final class PlaybackController {
                     loudnessDb: resolved.loudnessDb, durationSeconds: declaredDuration
                 ))
                 if automix {
-                    NSLog("[BitChord] automix queued %@ with an immediate %.1fs overlap", next.title, safetyPlan?.fadeSeconds ?? 0)
+                    NSLog(
+                        "[BitChord] automix queued %@%@ with an immediate %.1fs overlap",
+                        next.title,
+                        selfMix ? " (self-mix)" : "",
+                        safetyPlan?.fadeSeconds ?? 0
+                    )
                 }
                 guard automix, !currentSource.isEmpty else { return }
                 let fade = Double(PlatformSettings.shared.getInt(key: "crossfade_seconds", default: 0))
@@ -2103,6 +2163,25 @@ final class PlaybackController {
                             && self.queueNextRevision == revision
                     }
                     guard stillPlanning else { return }
+                    // Music Understanding (OS 27+): seed rhythm/key/structure
+                    // overlays once per pair before the first plan. Sequential
+                    // so we never run two Metal sessions at once (background
+                    // GPU asserts abort the process).
+                    if attempt == 0, MusicUnderstandingAnalyzer.isAvailable {
+                        let outOk = await MusicUnderstandingAnalyzer.analyzeAndSeed(
+                            filePath: currentSource
+                        )
+                        let inOk = await MusicUnderstandingAnalyzer.analyzeAndSeed(
+                            filePath: resolved.source
+                        )
+                        if outOk || inOk {
+                            NSLog(
+                                "[BitChord] Music Understanding overlay out=%@ in=%@",
+                                outOk ? "yes" : "no",
+                                inOk ? "yes" : "no"
+                            )
+                        }
+                    }
                     let plan = engine.planAutomix(
                         outgoingPath: currentSource,
                         incomingPath: resolved.source,
@@ -2128,8 +2207,9 @@ final class PlaybackController {
                         durationSeconds: declaredDuration
                     ))
                     NSLog(
-                        "[BitChord] automix plan %d for %@: %@, cue %.2fs, fade %.2fs, end %.1fs",
-                        attempt, next.title, String(describing: plan.style),
+                        "[BitChord] automix plan %d for %@%@: %@, cue %.2fs, fade %.2fs, end %.1fs",
+                        attempt, next.title, selfMix ? " (self-mix)" : "",
+                        String(describing: plan.style),
                         plan.cueSeconds, plan.fadeSeconds, plan.transitionEndSeconds
                     )
                     await MainActor.run { [weak self] in
@@ -2167,8 +2247,11 @@ final class PlaybackController {
     }
 
     fileprivate func handleHandoff(_ info: TrackInfoRec) {
-        // The engine flipped to the incoming track: move the queue pointer.
-        if playingIndex + 1 < queue.count {
+        // The engine flipped to the incoming track. Repeat-one with Automix is
+        // a self-mix: stay on the same queue item. Repeat-all wrap lands on 0.
+        if repeatMode == .one {
+            // Same song again — count the lap like upstream REASON_REPEAT.
+        } else if playingIndex + 1 < queue.count {
             playingIndex += 1
         } else if repeatMode == .all, !queue.isEmpty {
             playingIndex = 0
@@ -2176,13 +2259,16 @@ final class PlaybackController {
             return
         }
         let outgoingPosition = position
+        let sameSong = current?.id == queue[playingIndex].id
         current = queue[playingIndex]
         duration = info.durationSeconds
         position = 0
         if let entry = current {
-            refreshArtwork(entry)
-            fetchLyrics(for: entry)
-            fetchCanvas(for: entry)
+            if !sameSong {
+                refreshArtwork(entry)
+                fetchLyrics(for: entry)
+                fetchCanvas(for: entry)
+            }
             nerd = engine.nerdStats()
             racingLossless = QualityUpgrade.isRacing(entry.id)
             scrobbleArmed = false
@@ -2230,9 +2316,10 @@ final class PlaybackController {
         }
         switch repeatMode {
         case .one:
-            seek(to: 0)
-            try? engine.play()
-            state = .playing
+            // Automix self-mix should have handed off before EOS. A natural end
+            // here means the blend never armed — reopen rather than sit stopped
+            // (the previous seek-after-EOF path left the decoder finished).
+            restartCurrentAfterNaturalEnd()
         case .all:
             next()
         case .off:
@@ -2243,6 +2330,17 @@ final class PlaybackController {
                 await AudioSessionManager.deactivate()
             }
         }
+    }
+
+    /// Reopen the current queue item after a natural end. Seeking a finished
+    /// voice after the mixer has drained often fails to produce audio again;
+    /// a fresh load is what actually loops without Automix.
+    private func restartCurrentAfterNaturalEnd() {
+        guard queue.indices.contains(playingIndex) else { return }
+        let index = playingIndex
+        scrobbleArmed = false
+        scrobbleSent = false
+        loadCurrent(index)
     }
 
     fileprivate func handleDuration(_ seconds: Double) {
@@ -2285,8 +2383,15 @@ final class PlaybackController {
     }
 
     private var nextEntry: QueueEntry? {
+        if repeatMode == .one {
+            // Automix: blend the track into itself. Without Automix there is no
+            // engine next — EOS reopens the same item.
+            return automixEnabled ? current : nil
+        }
         if playingIndex + 1 < queue.count { return queue[playingIndex + 1] }
-        if repeatMode == .all, queue.count > 1 { return queue[0] }
+        // Including a one-item queue: Media3 wrap under REPEAT_ALL points next
+        // at the same index, which is how a single track on repeat-all self-mixes.
+        if repeatMode == .all, !queue.isEmpty { return queue[0] }
         return nil
     }
 
@@ -2550,6 +2655,7 @@ final class PlaybackController {
 
     private func maybeAutoplay(force: Bool = false) {
         guard autoplayEnabled,
+              repeatMode != .all,
               let current, current.source.hasPrefix("yt:") else { return }
         let remaining = queue.count - playingIndex - 1
         if !force, remaining >= 6 { return }
@@ -2558,6 +2664,8 @@ final class PlaybackController {
         AutoPlayBridge.shared.related(videoId: videoId, callback: AutoPlayAdapter { [weak self] json, _ in
             Task { @MainActor in
                 guard let self, let json else { return }
+                // Repeat-all may have been switched on while the request was out.
+                guard self.autoplayEnabled, self.repeatMode != .all else { return }
                 let existing = (try? JSONEncoder().encode(self.queue.map { $0.asSongJSON() }))
                     .flatMap { String(data: $0, encoding: .utf8) } ?? "[]"
                 let extraJson = QueueBuilderBridge.shared.extendJson(
@@ -2575,9 +2683,121 @@ final class PlaybackController {
                 }
                 let known = Set(self.queue.map(\.id))
                 self.queue.append(contentsOf: extras.filter { !known.contains($0.id) })
+                await self.reorderAutoplayTailForAutomix()
                 self.syncEngineQueueNext()
             }
         })
+    }
+
+    /// When Smart Sequencing is on, rank the Autoplay tail against the current
+    /// track using local cache paths and bring the best mixable candidate next.
+    private func reorderAutoplayTailForAutomix() async {
+        guard automixEnabled,
+              PlatformSettings.shared.getBoolean(key: "automix_smart_sequence", default: true),
+              let current
+        else { return }
+        let start = autoplaySectionStart
+        guard start < queue.count else { return }
+        let window = Array(queue[start..<min(queue.count, start + 12)])
+        guard window.count >= 2 else { return }
+
+        var paths: [String] = []
+        var texts: [String] = []
+        var indices: [Int] = []
+        for (offset, entry) in window.enumerated() {
+            let videoId: String?
+            if entry.source.hasPrefix("yt:") {
+                videoId = String(entry.source.dropFirst(3))
+            } else if entry.isLocal {
+                videoId = nil
+            } else {
+                videoId = nil
+            }
+            let path: String?
+            if entry.isLocal, !entry.source.isEmpty, FileManager.default.fileExists(atPath: entry.source) {
+                path = entry.source
+            } else if let videoId {
+                path = await StreamFileCache.shared.path(for: videoId)
+            } else {
+                path = nil
+            }
+            guard let path, FileManager.default.fileExists(atPath: path) else { continue }
+            paths.append(path)
+            texts.append(entry.itemText)
+            indices.append(start + offset)
+        }
+        guard paths.count >= 2,
+              let currentPath = loadedSourcePath,
+              FileManager.default.fileExists(atPath: currentPath)
+        else { return }
+
+        let fade = Double(PlatformSettings.shared.getInt(key: "crossfade_seconds", default: 0))
+        let skipVocals = automixPerformanceMode == "EFFICIENT"
+        let ranked = rankAutomixCandidates(
+            currentPath: currentPath,
+            candidatePaths: paths,
+            currentText: current.itemText,
+            candidateTexts: texts,
+            crossfadeSeconds: fade,
+            skipVocals: skipVocals
+        )
+        guard let bestLocal = ranked.first.map(Int.init),
+              bestLocal >= 0,
+              bestLocal < indices.count
+        else { return }
+        let bestQueueIndex = indices[bestLocal]
+        guard bestQueueIndex != start else { return }
+
+        var next = queue
+        let best = next.remove(at: bestQueueIndex)
+        next.insert(best, at: start)
+        queue = next
+        NSLog(
+            "[BitChord] smart sequencing moved %@ ahead in Autoplay tail (rank %u)",
+            best.title,
+            ranked.first ?? 0
+        )
+    }
+
+    /// Clears AutoPlay's tail for the duration of repeat-all, keeping it to put back.
+    private func stashAutoplayTracks() {
+        if !repeatAllStash.isEmpty { return }
+        let seed = current?.id
+        var kept: [QueueEntry] = []
+        var dropped: [QueueEntry] = []
+        for (i, entry) in queue.enumerated() {
+            // Never pull the playing item or anything before it out of the loop.
+            if i <= playingIndex || !entry.fromAutoplay {
+                kept.append(entry)
+            } else {
+                dropped.append(entry)
+            }
+        }
+        guard !dropped.isEmpty else { return }
+        queue = kept
+        if let original = unshuffledQueue {
+            let droppedIds = Set(dropped.map(\.id))
+            unshuffledQueue = original.filter { !droppedIds.contains($0.id) }
+        }
+        repeatAllStash = dropped
+        repeatAllStashSeed = seed
+        persistSession()
+    }
+
+    /// Puts the stashed AutoPlay tracks back when repeat-all ends.
+    private func restoreAutoplayTracks() {
+        let stashed = repeatAllStash
+        let seed = repeatAllStashSeed
+        repeatAllStash = []
+        repeatAllStashSeed = nil
+        guard !stashed.isEmpty, autoplayEnabled else { return }
+        guard current?.id == seed else { return }
+        let present = Set(queue.map(\.id))
+        let restored = stashed.filter { !present.contains($0.id) }
+        guard !restored.isEmpty else { return }
+        queue.append(contentsOf: restored)
+        unshuffledQueue?.append(contentsOf: restored)
+        persistSession()
     }
 
     private struct SongDTO: Codable {
@@ -3054,13 +3274,20 @@ final class PlaybackController {
 
     private func adoptAutomixPlan(_ plan: TransitionPlanRec) {
         pendingAutomixPlan = plan
-        analysisTier = Self.tierName(plan)
+        let rateNote = abs(plan.playbackRate - 1) > 0.001
+            ? String(format: " @%.3fx", plan.playbackRate)
+            : ""
+        analysisTier = Self.tierName(plan) + rateNote
+        let sources = lastAutomixAnalysisSources()
+        if sources.count >= 2 {
+            analysisSources = "\(sources[0]) → \(sources[1])"
+        } else if let only = sources.first, !only.isEmpty {
+            analysisSources = only
+        } else {
+            analysisSources = nil
+        }
         automixCueSeconds = plan.cueSeconds
         publishSmartWindow()
-        // The audit's per-transition NSLog lived here. It did its job — it is
-        // how the `yt:` identifier bug was caught, and how the anchor was
-        // confirmed reaching the mixer — and the tier it printed is on the
-        // player already. The engine logs the plan it actually renders.
     }
 
     private func publishSmartWindow() {

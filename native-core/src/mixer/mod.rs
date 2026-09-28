@@ -2230,7 +2230,20 @@ fn handle_command(state: &mut MixerState, cmd: Command, ring: &mut Producer<f32>
             if request.source.is_empty() {
                 state.pending_next = None;
             } else if state.current.as_ref().is_some_and(|c| c.info.source == request.source) {
-                log::debug!("queueNext ignored; already current");
+                // Same path as the playing voice is normally a duplicate and is
+                // dropped. A planned fade is the repeat-one / single-item
+                // repeat-all self-mix: open a second reader on the same file and
+                // blend the track into itself.
+                if request.plan.fade_seconds > 0.0 {
+                    log::info!(
+                        "queued self-mix for {} fade={:.1}s",
+                        request.title,
+                        request.plan.fade_seconds
+                    );
+                    state.pending_next = Some(request);
+                } else {
+                    log::debug!("queueNext ignored; already current");
+                }
             } else if state.incoming.as_ref().is_some_and(|c| c.info.source == request.source) {
                 // The early overlap can arm before analysis finishes. Replacing
                 // it once the fade has started would replay this song after the
@@ -2794,6 +2807,117 @@ mod tests {
 
         let handoffs = events.handoffs.lock().unwrap().clone();
         assert_eq!(handoffs, vec!["B".to_string()], "handoff to B must fire");
+
+        shutdown.store(true, Ordering::Relaxed);
+        let _ = handle.join();
+    }
+
+    /// Repeat-one / single-item repeat-all with Automix: the same file must be
+    /// accepted as pending-next when it carries a fade, so the track can blend
+    /// into itself instead of stopping at EOS.
+    #[test]
+    fn a_planned_self_mix_is_accepted_and_hands_off() {
+        let dir = std::env::temp_dir().join("bitchord-mixer-self-mix");
+        std::fs::create_dir_all(&dir).unwrap();
+        let a = dir.join("loop.wav");
+        test_wav(&a, 3.0, 440.0);
+
+        let events = std::sync::Arc::new(RecordedEvents::default());
+        let (tx, rx) = crossbeam_channel::unbounded::<Command>();
+        let (consumer_side, mut consumer) = rtrb::RingBuffer::<f32>::new(44_100 * 2 * 4);
+        let buffered = std::sync::Arc::new(AtomicU64::new(0));
+        let position = std::sync::Arc::new(AtomicU64::new(0));
+        let duration = std::sync::Arc::new(AtomicU64::new(0));
+        let shutdown = std::sync::Arc::new(AtomicBool::new(false));
+
+        let handle = std::thread::spawn({
+            let events = events.clone();
+            let buffered = buffered.clone();
+            let position = position.clone();
+            let duration = duration.clone();
+            let shutdown = shutdown.clone();
+            move || {
+                run_mixer(
+                    rx,
+                    consumer_side,
+                    buffered,
+                    position,
+                    duration,
+                    44_100,
+                    events,
+                    shutdown,
+                    std::sync::Arc::new(AtomicBool::new(false)),
+                    std::sync::Arc::new(AtomicBool::new(false)),
+                    std::sync::Arc::new(Mutex::new(NerdSnapshot::default())),
+                )
+            }
+        });
+
+        let path = a.display().to_string();
+        tx.send(Command::Load {
+            request: TrackSource {
+                source: path.clone(),
+                title: "Loop".into(),
+                artist: String::new(),
+                start_seconds: 0.0,
+                plan: TransitionPlan::default(),
+                headers: std::collections::HashMap::new(),
+                claimed_kbps: 0,
+                loudness_db: None,
+                duration_seconds: 3.0,
+            },
+            reply: crossbeam_channel::bounded(1).0,
+        })
+        .unwrap();
+        tx.send(Command::QueueNext {
+            request: TrackSource {
+                source: path,
+                title: "Loop".into(),
+                artist: String::new(),
+                start_seconds: 0.0,
+                plan: TransitionPlan {
+                    fade_seconds: 1.0,
+                    ..TransitionPlan::default()
+                },
+                headers: std::collections::HashMap::new(),
+                claimed_kbps: 0,
+                loudness_db: None,
+                duration_seconds: 3.0,
+            },
+        })
+        .unwrap();
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        loop {
+            while let Ok(_) = consumer.pop() {
+                let mut current = buffered.load(Ordering::Relaxed);
+                while current > 0 {
+                    match buffered.compare_exchange_weak(
+                        current,
+                        current - 1,
+                        Ordering::Relaxed,
+                        Ordering::Relaxed,
+                    ) {
+                        Ok(_) => break,
+                        Err(v) => current = v,
+                    }
+                }
+            }
+            let handoffs = events.handoffs.lock().unwrap();
+            if !handoffs.is_empty() || std::time::Instant::now() > deadline {
+                break;
+            }
+            drop(handoffs);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+
+        let handoffs = events.handoffs.lock().unwrap().clone();
+        let ended = events.ended.lock().unwrap().clone();
+        assert_eq!(
+            handoffs,
+            vec!["Loop".to_string()],
+            "self-mix must hand off into the same title, not drain: ended={ended:?}"
+        );
 
         shutdown.store(true, Ordering::Relaxed);
         let _ = handle.join();

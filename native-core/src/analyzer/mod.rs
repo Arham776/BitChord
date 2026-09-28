@@ -15,12 +15,18 @@ mod audio_analysis;
 mod beat;
 mod models;
 mod plan;
+mod sequencer;
+mod smoothness;
 mod tempo;
 mod vocal;
 
 pub use beat::Grid;
 pub use models::analyzer_ready;
-pub use plan::{next_energy_dip, plan_pair};
+pub use plan::{
+    last_analysis_sources, next_energy_dip, plan_pair, seed_analysis_overlay, AnalysisOverlay,
+};
+pub use sequencer::{rank_candidate_indices, rank_candidates, CandidateScore};
+pub use smoothness::{score_plan, SmoothnessReport};
 
 /// Refresh both graphs and discard analyses made with the previous model set.
 /// A track analyzed before a first-run download must get a new beat grid when

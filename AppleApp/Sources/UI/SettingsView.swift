@@ -19,6 +19,7 @@ struct SettingsView: View {
     @State private var crossfade = Int(PlatformSettings.shared.getInt(key: "crossfade_seconds", default: 0))
     @State private var spatial = PlatformSettings.shared.getBoolean(key: "spatial_audio", default: false)
     @State private var automix = PlatformSettings.shared.getBoolean(key: "smart_fade_enabled", default: false)
+    @State private var automixSequence = PlatformSettings.shared.getBoolean(key: "automix_smart_sequence", default: true)
     @State private var skipSilence = PlatformSettings.shared.getBoolean(key: "skip_silence", default: false)
     @State private var wifiQuality = PlatformSettings.shared.getString(key: "audio_quality_wifi", default: "LOSSLESS")
     @State private var cellQuality = PlatformSettings.shared.getString(key: "audio_quality_cellular", default: "LOSSLESS")
@@ -135,6 +136,7 @@ struct SettingsView: View {
             spatial: $spatial,
             mixWithOtherAudio: $mixWithOtherAudio,
             automix: $automix,
+            automixSequence: $automixSequence,
             automixPerf: $automixPerf,
             skipSilence: $skipSilence,
             playbackSpeed: $playbackSpeed,
@@ -267,7 +269,8 @@ struct SettingsView: View {
                 return ["crossfade", "gapless", "automix", "autoplay", "skip silence",
                         "playback speed", "speed", "spatial audio", "fade", "sounds",
                         "equalizer", "eq", "volume", "sleep timer", "queue", "repeat",
-                        "shuffle", "scrobble", "automix performance", "cpu", "threads",
+                        "shuffle", "scrobble", "smart sequencing", "sequencing",
+                        "automix performance", "cpu", "threads",
                         "automix models", "models", "model", "onnx", "beat", "downbeat",
                         "vocal", "download models",
                         "battery", "prefer music only", "music video"]
@@ -592,6 +595,14 @@ struct SettingsView: View {
                     : "Times and blends transitions automatically, no slider needed.",
                 isOn: $automix
             )
+            if automix {
+                SettingsToggleLine(
+                    glyph: .automix,
+                    title: "Smart Sequencing",
+                    subtitle: "Reorder Autoplay and shuffle-pool tails for tempo/key fit. Never touches your curated queue or albums.",
+                    isOn: $automixSequence
+                )
+            }
             NavigationLink {
                 AutomixPerformancePage(selection: $automixPerf)
             } label: {
@@ -2145,6 +2156,7 @@ private struct SettingsPlaybackPersist: ViewModifier {
     @Binding var spatial: Bool
     @Binding var mixWithOtherAudio: Bool
     @Binding var automix: Bool
+    @Binding var automixSequence: Bool
     @Binding var automixPerf: String
     @Binding var skipSilence: Bool
     @Binding var playbackSpeed: Double
@@ -2170,6 +2182,9 @@ private struct SettingsPlaybackPersist: ViewModifier {
                 AppSettings.shared.setSmartFadeEnabled(value: value)
                 controller.setAutomixEnabled(value)
                 if value { onAutomixEnabled() }
+            }
+            .onChange(of: automixSequence) { _, value in
+                PlatformSettings.shared.putBoolean(key: "automix_smart_sequence", value: value)
             }
             .onChange(of: automixPerf) { _, value in
                 controller.setAutomixPerformanceMode(value)

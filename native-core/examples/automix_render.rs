@@ -1,12 +1,13 @@
-//! Offline audition of one Automix transition.
-//!
-//! Plans the pair the way the player does, runs that plan through the real
-//! mixer, and writes a WAV of the blend (plus the tempo glide after it) so a
-//! transition can be heard without the app.
+//! Offline audition / scoring of Automix transitions.
 //!
 //! ```text
 //! cargo run --example automix_render -- <outgoing> <incoming> <out.wav>
+//! cargo run --example automix_render -- --score-only <outgoing> <incoming>
+//! cargo run --example automix_render -- --score-dir <fixtures_dir>
 //! ```
+//!
+//! `--score-dir` expects pairs named `NN-out.*` / `NN-in.*` (same stem prefix)
+//! and prints a Smoothness Index line per pair without rendering audio.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -105,6 +106,7 @@ fn write_wav(path: &Path, interleaved: &[f32], rate: u32) {
 }
 
 fn print_plan(plan: &TransitionPlan) {
+    let smooth = native_core::analyzer::score_plan(plan);
     println!(
         "style={:?} cue={:.2}s fade={:.2}s end={:.2}s rate={:.4} bed={:.2}@{:.1}dB dip={:.2}x{:.2} glide={:.1}s swap={}@{:.2} vocal={:.2}",
         plan.style,
@@ -121,24 +123,22 @@ fn print_plan(plan: &TransitionPlan) {
         plan.bass_swap_fraction,
         plan.vocal_overlap,
     );
+    println!(
+        "smoothness={:.3} stretch_cost={:.3} style_bonus={:.3} forced_stretch={}",
+        smooth.score, smooth.stretch_cost, smooth.style_bonus, smooth.forced_stretch
+    );
+    if smooth.forced_stretch {
+        eprintln!(
+            "warning: playback_rate {:.4} exceeds the transparent ±4% band — planner should refuse this",
+            plan.playback_rate
+        );
+    }
 }
 
-fn main() {
-    env_logger::init();
-    let mut args = std::env::args().skip(1);
-    let outgoing = args.next();
-    let incoming = args.next();
-    let output = args.next();
-    let (Some(outgoing), Some(incoming), Some(output)) = (outgoing, incoming, output) else {
-        eprintln!("usage: automix_render <outgoing> <incoming> <out.wav>");
-        std::process::exit(2);
-    };
-
-    let out_duration = file_duration(&outgoing);
-    let in_duration = file_duration(&incoming);
-    let plan = native_core::analyzer::plan_pair(
-        &outgoing,
-        &incoming,
+fn plan_for(outgoing: &str, incoming: &str) -> TransitionPlan {
+    native_core::analyzer::plan_pair(
+        outgoing,
+        incoming,
         "",
         "",
         false,
@@ -147,7 +147,125 @@ fn main() {
         "render",
         decode_window,
         file_duration,
+    )
+}
+
+fn score_pair(outgoing: &str, incoming: &str, label: &str) {
+    let plan = plan_for(outgoing, incoming);
+    let smooth = native_core::analyzer::score_plan(&plan);
+    let (out_src, in_src) = native_core::analyzer::last_analysis_sources();
+    println!(
+        "{label}\tstyle={:?}\trate={:.4}\tsmooth={:.3}\tforced={}\tout_src={}\tin_src={}",
+        plan.style,
+        plan.playback_rate,
+        smooth.score,
+        smooth.forced_stretch,
+        out_src,
+        in_src
     );
+    if smooth.forced_stretch {
+        eprintln!("{label}: FAIL forced_stretch rate={}", plan.playback_rate);
+    }
+}
+
+fn pair_prefix(path: &Path) -> Option<String> {
+    let name = path.file_stem()?.to_str()?;
+    name.strip_suffix("-out")
+        .or_else(|| name.strip_suffix("-in"))
+        .map(str::to_string)
+}
+
+fn score_dir(dir: &Path) {
+    let mut entries: Vec<_> = std::fs::read_dir(dir)
+        .unwrap_or_else(|e| panic!("read {dir:?}: {e}"))
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| p.is_file())
+        .collect();
+    entries.sort();
+    let mut outs = std::collections::BTreeMap::new();
+    let mut ins = std::collections::BTreeMap::new();
+    for path in &entries {
+        let Some(prefix) = pair_prefix(path) else {
+            continue;
+        };
+        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        if name.contains("-out.") {
+            outs.insert(prefix, path.clone());
+        } else if name.contains("-in.") {
+            ins.insert(prefix, path.clone());
+        }
+    }
+    let mut pairs = Vec::new();
+    for (prefix, out) in &outs {
+        if let Some(incoming) = ins.get(prefix) {
+            pairs.push((prefix.clone(), out.clone(), incoming.clone()));
+        }
+    }
+    if pairs.is_empty() {
+        eprintln!(
+            "score-dir expects matching *-out.* / *-in.* pairs; found {} out, {} in",
+            outs.len(),
+            ins.len()
+        );
+        std::process::exit(2);
+    }
+    let mut failures = 0usize;
+    for (label, out, incoming) in &pairs {
+        let plan = plan_for(&out.to_string_lossy(), &incoming.to_string_lossy());
+        let smooth = native_core::analyzer::score_plan(&plan);
+        let (out_src, in_src) = native_core::analyzer::last_analysis_sources();
+        println!(
+            "{label}\tstyle={:?}\trate={:.4}\tsmooth={:.3}\tforced={}\tout_src={}\tin_src={}",
+            plan.style,
+            plan.playback_rate,
+            smooth.score,
+            smooth.forced_stretch,
+            out_src,
+            in_src
+        );
+        if smooth.forced_stretch {
+            failures += 1;
+        }
+    }
+    if failures > 0 {
+        std::process::exit(1);
+    }
+}
+
+fn main() {
+    env_logger::init();
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.first().map(String::as_str) == Some("--score-only") {
+        if args.len() < 3 {
+            eprintln!("usage: automix_render --score-only <outgoing> <incoming>");
+            std::process::exit(2);
+        }
+        score_pair(&args[1], &args[2], "pair");
+        return;
+    }
+    if args.first().map(String::as_str) == Some("--score-dir") {
+        if args.len() < 2 {
+            eprintln!("usage: automix_render --score-dir <fixtures_dir>");
+            std::process::exit(2);
+        }
+        score_dir(Path::new(&args[1]));
+        return;
+    }
+
+    let outgoing = args.first().cloned();
+    let incoming = args.get(1).cloned();
+    let output = args.get(2).cloned();
+    let (Some(outgoing), Some(incoming), Some(output)) = (outgoing, incoming, output) else {
+        eprintln!("usage: automix_render <outgoing> <incoming> <out.wav>");
+        eprintln!("       automix_render --score-only <outgoing> <incoming>");
+        eprintln!("       automix_render --score-dir <fixtures_dir>");
+        std::process::exit(2);
+    };
+
+    let out_duration = file_duration(&outgoing);
+    let in_duration = file_duration(&incoming);
+    let plan = plan_for(&outgoing, &incoming);
     print_plan(&plan);
 
     let fade = plan.fade_seconds.max(0.5);

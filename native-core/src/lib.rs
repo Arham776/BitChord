@@ -1610,6 +1610,90 @@ pub fn next_energy_dip(source: String, position_seconds: f64) -> Option<f64> {
 }
 
 /// Load Automix ONNX graphs. Paths are bundle-resolved by Swift; empty unloads.
+#[derive(uniffi::Record, Debug, Clone, Default)]
+pub struct AutomixAnalysisOverlayRec {
+    pub bpm: Option<f64>,
+    pub beat_confidence: Option<f64>,
+    pub beat_interval: Option<f64>,
+    pub beats: Option<Vec<f64>>,
+    pub downbeats: Option<Vec<f64>>,
+    pub key: Option<String>,
+    pub key_confidence: Option<f64>,
+    pub phrase_boundaries: Option<Vec<f64>>,
+    pub vocal_probability: Option<f64>,
+    pub content_end: Option<f64>,
+    pub audible_start: Option<f64>,
+    pub outro_start: Option<f64>,
+    pub mix_in_time: Option<f64>,
+    /// `music_understanding` | `disk_cache` | …
+    pub source: String,
+}
+
+/// Seed an external analysis overlay (e.g. Music Understanding) for `path`.
+/// The next Automix plan for that file merges the overlay onto DSP/ONNX results.
+#[uniffi::export]
+pub fn seed_automix_analysis(path: String, overlay: AutomixAnalysisOverlayRec) -> bool {
+    analyzer::seed_analysis_overlay(
+        &path,
+        analyzer::AnalysisOverlay {
+            bpm: overlay.bpm,
+            beat_confidence: overlay.beat_confidence,
+            beat_interval: overlay.beat_interval,
+            beats: overlay.beats,
+            downbeats: overlay.downbeats,
+            key: overlay.key,
+            key_confidence: overlay.key_confidence,
+            phrase_boundaries: overlay.phrase_boundaries,
+            vocal_probability: overlay.vocal_probability,
+            content_end: overlay.content_end,
+            audible_start: overlay.audible_start,
+            outro_start: overlay.outro_start,
+            mix_in_time: overlay.mix_in_time,
+            source: overlay.source,
+        },
+    )
+}
+
+/// Sources used by the most recent Automix plan: `(outgoing, incoming)`.
+/// Values are `music_understanding`, `beat_this`, `dsp`, or `disk_cache`.
+#[uniffi::export]
+pub fn last_automix_analysis_sources() -> Vec<String> {
+    let (out, inc) = analyzer::last_analysis_sources();
+    vec![out, inc]
+}
+
+/// Rank Autoplay/shuffle candidates for mixing after `current_path`.
+/// Returns candidate indices in preferred order (best first).
+#[uniffi::export]
+pub fn rank_automix_candidates(
+    current_path: String,
+    candidate_paths: Vec<String>,
+    current_text: String,
+    candidate_texts: Vec<String>,
+    crossfade_seconds: f64,
+    skip_vocals: bool,
+) -> Vec<u32> {
+    analyzer::rank_candidate_indices(
+        &current_path,
+        &candidate_paths,
+        &current_text,
+        &candidate_texts,
+        crossfade_seconds,
+        skip_vocals,
+        |path, start, dur, mono| {
+            decode_region_impl(path, start, dur, mono)
+                .ok()
+                .map(|r| (r.samples, r.sample_rate, r.start_seconds))
+        },
+        |path| {
+            metadata::read_track_metadata(path)
+                .map(|m| m.duration_seconds)
+                .unwrap_or(0.0)
+        },
+    )
+}
+
+/// Load Automix ONNX graphs. Paths are bundle-resolved by Swift; empty unloads.
 #[uniffi::export]
 pub fn configure_analyzer(beat_model_path: String, vocal_model_path: String) -> bool {
     analyzer::configure(&beat_model_path, &vocal_model_path)
