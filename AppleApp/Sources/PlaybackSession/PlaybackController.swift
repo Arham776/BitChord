@@ -413,6 +413,9 @@ final class PlaybackController {
     /// Incremented on every user-initiated load so in-flight resolves/downloads
     /// from a previous tap cannot `loadTrack`/`queueNext` into the new song.
     private var playGeneration: UInt64 = 0
+    /// Serializes the last synchronous engine setup/load step and drops any
+    /// request whose generation was superseded while it resolved or probed.
+    @ObservationIgnored private let loadSubmissionGate = PlaybackLoadSubmissionGate()
     /// Invalidates an in-flight audio-session reactivation when another
     /// transport command arrives before it finishes.
     private var resumeGeneration: UInt64 = 0
@@ -1457,6 +1460,7 @@ final class PlaybackController {
         }
         playGeneration += 1
         let generation = playGeneration
+        loadSubmissionGate.advance(to: generation)
         upgradeFor = nil
         racingLossless = false
         smartMixInProgress = false
@@ -1505,6 +1509,7 @@ final class PlaybackController {
             try? engine.stop()
         }
         let engine = self.engine
+        let loadSubmissionGate = self.loadSubmissionGate
         let automix = automixEnabled
         let prefs = ResolvePrefs.current()
         let resume = startAt ?? 0
@@ -1543,6 +1548,10 @@ final class PlaybackController {
                     )
                     start = plan?.cueSeconds ?? 0
                 }
+                let currentAfterPlanning = await MainActor.run { [weak self] in
+                    self?.playGeneration == generation
+                }
+                guard currentAfterPlanning else { return }
                 // Inspect the resolved source before loading it so the output
                 // can request its native clock family (44.1 or 48 kHz) and, on
                 // eligible macOS routes, open an exact integer stream before
@@ -1552,6 +1561,10 @@ final class PlaybackController {
                     source: resolved.source,
                     headers: resolved.headers
                 )
+                let currentAfterProbe = await MainActor.run { [weak self] in
+                    self?.playGeneration == generation
+                }
+                guard currentAfterProbe else { return }
                 let matchRate = PlatformSettings.shared.getBoolean(
                     key: "match_source_sample_rate", default: true
                 )
@@ -1560,21 +1573,11 @@ final class PlaybackController {
                         ? sourceFormat.map { Double($0.sampleRate) }
                         : nil
                 )
-                do {
-                    try engine.prepareTrackOutput(
-                        sourceRate: sourceFormat?.sampleRate ?? 0,
-                        sourceChannels: sourceFormat?.channels ?? 0,
-                        sourceBitDepth: sourceFormat?.bitDepth ?? 0,
-                        codec: sourceFormat?.codec ?? "",
-                        losslessPcm: sourceFormat?.losslessPcm ?? false,
-                        matchSourceRate: matchRate,
-                        sessionRate: sessionFormat?.rate,
-                        sessionChannels: sessionFormat?.channels
-                    )
-                } catch {
-                    NSLog("[BitChord] track output preparation failed; continuing with current output: \(error)")
+                let currentAfterActivation = await MainActor.run { [weak self] in
+                    self?.playGeneration == generation
                 }
-                let info = try engine.loadTrack(request: LoadRequest(
+                guard currentAfterActivation else { return }
+                let loadRequest = LoadRequest(
                     source: resolved.source,
                     title: entry.title,
                     artist: entry.artist,
@@ -1589,7 +1592,28 @@ final class PlaybackController {
                     // the incoming is then never armed and the queue advances by
                     // a cut. We already know the length.
                     durationSeconds: entry.durationSeconds > 0 ? entry.durationSeconds : nil
-                ))
+                )
+                // Engine setup and the command submission share one serial
+                // lane. If another selection arrives after this request passes
+                // the gate, its load is submitted after this one; if it arrives
+                // first, this older generation is discarded here.
+                guard let info = try loadSubmissionGate.performIfCurrent(generation: generation, {
+                    do {
+                        try engine.prepareTrackOutput(
+                            sourceRate: sourceFormat?.sampleRate ?? 0,
+                            sourceChannels: sourceFormat?.channels ?? 0,
+                            sourceBitDepth: sourceFormat?.bitDepth ?? 0,
+                            codec: sourceFormat?.codec ?? "",
+                            losslessPcm: sourceFormat?.losslessPcm ?? false,
+                            matchSourceRate: matchRate,
+                            sessionRate: sessionFormat?.rate,
+                            sessionChannels: sessionFormat?.channels
+                        )
+                    } catch {
+                        NSLog("[BitChord] track output preparation failed; continuing with current output: \(error)")
+                    }
+                    return try engine.loadTrack(request: loadRequest)
+                }) else { return }
                 await MainActor.run { [weak self] in
                     guard let self, self.playGeneration == generation else { return }
                     self.currentLoudnessDb = resolved.loudnessDb
@@ -1653,6 +1677,59 @@ final class PlaybackController {
     private struct ResolveOutcome: Sendable {
         let source: ResolvedSource
         let leftover: Task<QualityUpgrade.Candidate?, Never>?
+    }
+
+    /// Completes as soon as either source yields a usable stream. A task group
+    /// waits for every child when its scope exits, even after cancellation, so
+    /// it must not own the two independent lookups in this first-audio race.
+    private actor FirstUsableSourceRace {
+        enum Winner: Sendable {
+            case substitute(QualityUpgrade.Candidate)
+            case youtube(ResolvedSource)
+            case none
+        }
+
+        private var result: Winner?
+        private var lookupFinished = false
+        private var fallbackFinished = false
+        private var continuation: CheckedContinuation<Winner, Never>?
+
+        func wait() async -> Winner {
+            await withCheckedContinuation { continuation in
+                if let result {
+                    continuation.resume(returning: result)
+                } else {
+                    self.continuation = continuation
+                }
+            }
+        }
+
+        func finishLookup(_ candidate: QualityUpgrade.Candidate?) {
+            guard result == nil else { return }
+            if let candidate {
+                finish(.substitute(candidate))
+            } else {
+                lookupFinished = true
+                if fallbackFinished { finish(.none) }
+            }
+        }
+
+        func finishFallback(_ source: ResolvedSource?) {
+            guard result == nil else { return }
+            if let source {
+                finish(.youtube(source))
+            } else {
+                fallbackFinished = true
+                if lookupFinished { finish(.none) }
+            }
+        }
+
+        private func finish(_ winner: Winner) {
+            guard result == nil else { return }
+            result = winner
+            continuation?.resume(returning: winner)
+            continuation = nil
+        }
     }
 
     private struct ResolvePrefs: Sendable {
@@ -1776,62 +1853,28 @@ final class PlaybackController {
             throw InnertubeStreamResolver.StreamError(message: "No stream")
         }
 
-        enum Leg { case lookup(QualityUpgrade.Candidate?); case fallback(ResolvedSource?) }
+        let race = FirstUsableSourceRace()
+        _ = Task { await race.finishLookup(await lookup.value) }
+        _ = Task { await race.finishFallback(await fallback.value) }
 
-        // `withTaskGroup` is non-throwing in Swift 6 — collect, then throw outside.
-        let outcome = await withTaskGroup(of: Leg.self) { group in
-            group.addTask { .lookup(await lookup.value) }
-            group.addTask { .fallback(await fallback.value) }
-            var lookupDone: QualityUpgrade.Candidate??
-            var fallbackDone: ResolvedSource??
-            var outcome: ResolveOutcome?
-            for await leg in group {
-                switch leg {
-                case .lookup(let stream):
-                    lookupDone = .some(stream)
-                    if let stream {
-                        fallback.cancel()
-                        let src = ResolvedSource(
-                            source: stream.url, headers: stream.headers,
-                            kbps: stream.format.kbps ?? 0,
-                            lossless: stream.format.lossless,
-                            durationSec: stream.durationSec,
-                            origin: .substitute
-                        )
-                        outcome = ResolveOutcome(source: src, leftover: nil)
-                        group.cancelAll()
-                    } else if case .some(let yt) = fallbackDone {
-                        if let yt {
-                            outcome = ResolveOutcome(source: yt, leftover: nil)
-                        }
-                        group.cancelAll()
-                    }
-                case .fallback(let yt):
-                    fallbackDone = .some(yt)
-                    if let yt {
-                        let leftover = lookupDone == nil ? lookup : nil
-                        outcome = ResolveOutcome(source: yt, leftover: leftover)
-                        group.cancelAll()
-                    } else if case .some(let late) = lookupDone {
-                        if let late {
-                            let src = ResolvedSource(
-                                source: late.url, headers: late.headers,
-                                kbps: late.format.kbps ?? 0,
-                                lossless: late.format.lossless,
-                                durationSec: late.durationSec,
-                                origin: .substitute
-                            )
-                            outcome = ResolveOutcome(source: src, leftover: nil)
-                        }
-                        group.cancelAll()
-                    }
-                }
-                if outcome != nil { break }
-            }
-            return outcome
+        switch await race.wait() {
+        case .substitute(let stream):
+            fallback.cancel()
+            let source = ResolvedSource(
+                source: stream.url, headers: stream.headers,
+                kbps: stream.format.kbps ?? 0,
+                lossless: stream.format.lossless,
+                durationSec: stream.durationSec,
+                origin: .substitute
+            )
+            return ResolveOutcome(source: source, leftover: nil)
+        case .youtube(let source):
+            // Preserve the slower substitute lookup for the in-playback quality
+            // upgrade path instead of making it delay the first audible sample.
+            return ResolveOutcome(source: source, leftover: lookup)
+        case .none:
+            throw InnertubeStreamResolver.StreamError(message: "No stream")
         }
-        if let outcome { return outcome }
-        throw InnertubeStreamResolver.StreamError(message: "No stream")
     }
 
     /// Innertube URL + growing local file, the path that starts playback earliest.
@@ -2148,6 +2191,7 @@ final class PlaybackController {
     private func loadDidFail(entry: QueueEntry, error: Error) {
         lastError = "Couldn't play “\(entry.title)” — \(error)"
         state = .stopped
+        nowPlaying.endActivity()
     }
 
     /// A streamed download is finished once `.complete` lands, or when it was
@@ -2362,7 +2406,11 @@ final class PlaybackController {
     }
 
     fileprivate func handleState(_ newState: PlaybackState) {
-        if newState == .stopped && state == .buffering { return }
+        // A load callback can arrive from the outgoing voice after the listener
+        // has already selected another track. Its load result is discarded by
+        // the generation gate; don't let its state callback relabel the new
+        // selection as playing while that selection is still buffering.
+        if state == .buffering && (newState == .playing || newState == .stopped) { return }
         state = newState
         if let current {
             nowPlaying.update(
@@ -2374,6 +2422,9 @@ final class PlaybackController {
         }
         widgetPublisher.publish(entry: current, isPlaying: newState == .playing,
                                 canNext: canPlayNext, canPrevious: canPlayPrevious)
+        if newState == .stopped {
+            nowPlaying.endActivity()
+        }
         if newState == .paused { persistSession() }
     }
 
@@ -2458,6 +2509,7 @@ final class PlaybackController {
             state = .stopped
             position = 0
             nowPlaying.updateRate(0.0, position: 0)
+            nowPlaying.endActivity()
             Task.detached(priority: .utility) {
                 await AudioSessionManager.deactivate()
             }
@@ -3658,6 +3710,31 @@ final class PlaybackController {
                     thumbnailUrl: entry.thumbnailUrl, isPlaying: self.isPlaying
                 )
             }
+        }
+    }
+}
+
+/// Ensures the engine never receives an older load command after a newer one.
+/// Resolving and probing stay concurrent; only the synchronous output setup and
+/// load submission are serialized, and stale generations are discarded there.
+private final class PlaybackLoadSubmissionGate: @unchecked Sendable {
+    private let submissionQueue = DispatchQueue(label: "com.example.bitchord.load-submission")
+    private let lock = NSLock()
+    private var latestGeneration: UInt64 = 0
+
+    func advance(to generation: UInt64) {
+        lock.lock()
+        latestGeneration = generation
+        lock.unlock()
+    }
+
+    func performIfCurrent<T>(generation: UInt64, _ operation: () throws -> T) rethrows -> T? {
+        try submissionQueue.sync {
+            lock.lock()
+            let isCurrent = latestGeneration == generation
+            lock.unlock()
+            guard isCurrent else { return nil }
+            return try operation()
         }
     }
 }

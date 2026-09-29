@@ -23,6 +23,7 @@ final class NowPlayingController {
     private var handlers: [Any] = []
 #if os(iOS)
     private var modern: AnyObject?
+    private let liveActivity = NowPlayingActivityController()
 #endif
 
     init() {
@@ -92,6 +93,18 @@ final class NowPlayingController {
                 artworkData: Data?, thumbnailUrl: String?, isPlaying: Bool,
                 position: Double? = nil) {
 #if os(iOS)
+        liveActivity.update(
+            title: title,
+            artist: artist,
+            duration: duration,
+            artworkData: artworkData,
+            thumbnailURL: thumbnailUrl,
+            isPlaying: isPlaying,
+            position: position,
+            rate: isPlaying
+                ? Double(PlatformSettings.shared.getFloat(key: "playback_speed", default: 1))
+                : 0
+        )
         if #available(iOS 27, *), let model = modern as? ModernNowPlaying {
             model.update(title: title, artist: artist, duration: duration,
                          artworkData: artworkData, thumbnailUrl: thumbnailUrl,
@@ -130,6 +143,7 @@ final class NowPlayingController {
 
     func update(position: Double) {
 #if os(iOS)
+        liveActivity.updatePosition(position)
         if #available(iOS 27, *), let model = modern as? ModernNowPlaying {
             model.position = position
             return
@@ -143,6 +157,7 @@ final class NowPlayingController {
 
     func updateRate(_ rate: Double, position: Double? = nil) {
 #if os(iOS)
+        liveActivity.updateRate(rate, position: position)
         if #available(iOS 27, *), let model = modern as? ModernNowPlaying {
             model.rate = rate
             if let position { model.position = position }
@@ -171,6 +186,7 @@ final class NowPlayingController {
 
     func requestPrimaryIfPossible() {
 #if os(iOS)
+        liveActivity.requestIfPossible()
         if #available(iOS 27, *), let model = modern as? ModernNowPlaying {
             model.requestPrimaryIfPossible()
         }
@@ -178,13 +194,19 @@ final class NowPlayingController {
     }
 
     /// A foreground music session can regain the system slot after the other
-    /// app finishes. The system does not deliver this event to background apps,
-    /// so playback's existing timer checks while BitChord is visible.
+    /// app finishes. Background checks only record the transition; the system
+    /// slot request is made from the foreground lifecycle callback.
     func reclaimAfterOtherAudioStops() {
 #if os(iOS)
         if #available(iOS 27, *), let model = modern as? ModernNowPlaying {
             model.reclaimAfterOtherAudioStops()
         }
+#endif
+    }
+
+    func endActivity() {
+#if os(iOS)
+        liveActivity.end()
 #endif
     }
 
@@ -336,11 +358,13 @@ private final class ModernNowPlaying: MediaSessionRepresentable {
         let justStopped = otherAudioWasPlaying && !other
         otherAudioWasPlaying = other
         guard justStopped else { return }
+        // iOS only promotes a system-primary session while its app is in the
+        // foreground. The scene activation path retries if audio stopped while
+        // BitChord was backgrounded.
+        guard UIApplication.shared.applicationState == .active else { return }
         guard rate > 0, session?.isSystemPrimary != true else { return }
-        // The other app has gone. Ask even if BitChord is not the frontmost
-        // app — the lock screen is exactly where this has to land.
         nextClaimAt = .distantPast
-        claimNowPlaying(reason: "other audio stopped", allowInBackground: true)
+        claimNowPlaying(reason: "other audio stopped")
     }
 
     /// Publish the session and ask for the system slot.
@@ -348,15 +372,15 @@ private final class ModernNowPlaying: MediaSessionRepresentable {
     /// iOS 27 has two steps, and skipping the first is why nothing appeared.
     /// The session has to become *this app's* primary before it can become the
     /// system's, which is the lock screen, the island and Control Center.
-    /// Mixing with another app means that second step is refused while they
-    /// hold it. It is asked again when this app is in front, and when theirs
-    /// stops.
-    private func claimNowPlaying(reason: String, allowInBackground: Bool = false) {
+    /// This system-slot request is independent of the audio session's
+    /// `.mixWithOthers` setting, which remains enabled while playback is active.
+    /// Promotion is retried on foreground return and after competing audio
+    /// stops while BitChord is foregrounded.
+    private func claimNowPlaying(reason: String) {
         guard !title.isEmpty else { return }
         if session == nil { session = MediaSession(self) }
         guard let session else { return }
-        let foreground = UIApplication.shared.applicationState == .active
-        guard foreground || allowInBackground else { return }
+        guard UIApplication.shared.applicationState == .active else { return }
         guard !primaryRequestInFlight else { return }
         guard !session.isSystemPrimary else { return }
         guard Date() >= nextClaimAt else { return }
@@ -371,9 +395,7 @@ private final class ModernNowPlaying: MediaSessionRepresentable {
                     return
                 }
             }
-            let inFront = UIApplication.shared.applicationState == .active
-            let alone = !AVAudioSession.sharedInstance().isOtherAudioPlaying
-            guard inFront || alone else { return }
+            guard UIApplication.shared.applicationState == .active else { return }
             guard !session.isSystemPrimary else { return }
             do {
                 try await session.requestToBecomeSystemPrimary()

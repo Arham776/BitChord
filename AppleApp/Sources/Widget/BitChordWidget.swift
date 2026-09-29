@@ -1,6 +1,9 @@
 import SwiftUI
 import WidgetKit
 import AppIntents
+#if os(iOS)
+import ActivityKit
+#endif
 
 // The §9 widget, snapshot-driven per the parity contract: ready-to-play
 // state with no position, prev/next availability dimmed not removed, dark
@@ -173,8 +176,167 @@ struct BitChordMediaWidget: Widget {
 struct BitChordWidgetBundle: WidgetBundle {
     var body: some Widget {
         BitChordMediaWidget()
+#if os(iOS)
+        BitChordNowPlayingLiveActivity()
+#endif
     }
 }
+
+#if os(iOS)
+@available(iOSApplicationExtension 16.1, *)
+struct BitChordNowPlayingLiveActivity: Widget {
+    var body: some WidgetConfiguration {
+        ActivityConfiguration(for: NowPlayingActivityAttributes.self) { context in
+            NowPlayingActivityLockScreen(state: context.state)
+                .activityBackgroundTint(Color(red: 0.09, green: 0.08, blue: 0.12))
+                .activitySystemActionForegroundColor(.white)
+                .widgetURL(URL(string: "bitchord://open-player"))
+        } dynamicIsland: { context in
+            DynamicIsland {
+                DynamicIslandExpandedRegion(.leading) {
+                    LiveActivityArtwork(path: context.state.artworkPath)
+                        .frame(width: 42, height: 42)
+                        .clipShape(.rect(cornerRadius: 8, style: .continuous))
+                }
+                DynamicIslandExpandedRegion(.center) {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(context.state.title)
+                            .font(.caption.weight(.semibold))
+                            .lineLimit(1)
+                        Text(context.state.artist)
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                    }
+                }
+                DynamicIslandExpandedRegion(.trailing) {
+                    Button(intent: WidgetTransportIntent(command: "toggle")) {
+                        Image(systemName: context.state.isPlaying ? "pause.fill" : "play.fill")
+                            .font(.title3.weight(.semibold))
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel(context.state.isPlaying ? "Pause" : "Play")
+                }
+                DynamicIslandExpandedRegion(.bottom) {
+                    HStack(spacing: 22) {
+                        Button(intent: WidgetTransportIntent(command: "previous")) {
+                            Image(systemName: "backward.fill")
+                        }
+                        .buttonStyle(.plain)
+                        LiveActivityProgress(state: context.state)
+                        Button(intent: WidgetTransportIntent(command: "next")) {
+                            Image(systemName: "forward.fill")
+                        }
+                        .buttonStyle(.plain)
+                    }
+                    .font(.title3)
+                    .tint(.white)
+                }
+            } compactLeading: {
+                LiveActivityArtwork(path: context.state.artworkPath)
+                    .frame(width: 18, height: 18)
+                    .clipShape(.circle)
+            } compactTrailing: {
+                Image(systemName: context.state.isPlaying ? "waveform" : "play.fill")
+                    .font(.caption.weight(.semibold))
+            } minimal: {
+                Image(systemName: "music.note")
+            }
+            .widgetURL(URL(string: "bitchord://open-player"))
+            .keylineTint(.accentColor)
+        }
+    }
+}
+
+@available(iOSApplicationExtension 16.1, *)
+private struct NowPlayingActivityLockScreen: View {
+    let state: NowPlayingActivityAttributes.ContentState
+
+    var body: some View {
+        HStack(spacing: 12) {
+            LiveActivityArtwork(path: state.artworkPath)
+                .frame(width: 58, height: 58)
+                .clipShape(.rect(cornerRadius: 9, style: .continuous))
+            VStack(alignment: .leading, spacing: 5) {
+                Text(state.title)
+                    .font(.headline)
+                    .lineLimit(1)
+                Text(state.artist)
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                LiveActivityProgress(state: state)
+            }
+            Spacer(minLength: 4)
+            HStack(spacing: 15) {
+                Button(intent: WidgetTransportIntent(command: "previous")) {
+                    Image(systemName: "backward.fill")
+                }
+                .accessibilityLabel("Previous")
+                Button(intent: WidgetTransportIntent(command: "toggle")) {
+                    Image(systemName: state.isPlaying ? "pause.fill" : "play.fill")
+                }
+                .accessibilityLabel(state.isPlaying ? "Pause" : "Play")
+                Button(intent: WidgetTransportIntent(command: "next")) {
+                    Image(systemName: "forward.fill")
+                }
+                .accessibilityLabel("Next")
+            }
+            .buttonStyle(.plain)
+            .font(.title3)
+            .tint(.white)
+        }
+        .padding(.vertical, 8)
+        .padding(.horizontal, 4)
+        .foregroundStyle(.white)
+    }
+}
+
+@available(iOSApplicationExtension 16.1, *)
+private struct LiveActivityProgress: View {
+    let state: NowPlayingActivityAttributes.ContentState
+
+    var body: some View {
+        Group {
+            if let interval = state.progressInterval {
+                ProgressView(timerInterval: interval, countsDown: false)
+            } else {
+                ProgressView(value: state.duration > 0 ? state.displayedPosition / state.duration : 0)
+            }
+        }
+        .progressViewStyle(.linear)
+        .tint(.white)
+        .accessibilityLabel("Playback progress")
+    }
+}
+
+@available(iOSApplicationExtension 16.1, *)
+private struct LiveActivityArtwork: View {
+    let path: String?
+
+    var body: some View {
+        if let path,
+           let data = try? Data(contentsOf: URL(fileURLWithPath: path)),
+           let image = UIImage(data: data) {
+            Image(uiImage: image)
+                .resizable()
+                .scaledToFill()
+        } else {
+            ZStack {
+                LinearGradient(
+                    colors: [Color(red: 0.20, green: 0.16, blue: 0.27),
+                             Color(red: 0.07, green: 0.06, blue: 0.10)],
+                    startPoint: .topLeading,
+                    endPoint: .bottomTrailing
+                )
+                Image(systemName: "music.note")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.white.opacity(0.75))
+            }
+        }
+    }
+}
+#endif
 
 struct WidgetTransportIntent: AppIntent {
     static var title: LocalizedStringResource = "BitChord Transport"
