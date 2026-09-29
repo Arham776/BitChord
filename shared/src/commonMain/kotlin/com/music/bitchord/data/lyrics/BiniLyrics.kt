@@ -70,7 +70,49 @@ object BiniLyrics {
         val body = lyricsGet(BASE, query = query) ?: return null
         val response = runCatching { lyricsJson.decodeFromString(Response.serializer(), body) }
             .getOrNull() ?: return null
-        return response.results?.firstOrNull()
+        val candidates = response.results.orEmpty()
+        if (!isrc.isNullOrBlank()) {
+            // When the caller already has a recording identifier, do not let a
+            // search result for a neighbouring edit replace it. If the service
+            // drops the ID from its result, only accept the fallback when its
+            // title, artist and duration still identify the requested recording.
+            return selectHitForIsrc(candidates, isrc, title, artist, durationMs)
+        }
+        return selectHit(candidates, title, artist, durationMs)
+    }
+
+    internal fun selectHitForIsrc(
+        candidates: List<Hit>,
+        isrc: String,
+        title: String,
+        artist: String,
+        durationMs: Long,
+    ): Hit? = candidates.firstOrNull { it.isrc.equals(isrc.trim(), ignoreCase = true) }
+        ?: selectHit(candidates.filter { it.isrc.isNullOrBlank() }, title, artist, durationMs)
+
+    /** Select by recording identity before its ISRC is shared with other providers. */
+    internal fun selectHit(
+        candidates: List<Hit>,
+        title: String,
+        artist: String,
+        durationMs: Long,
+    ): Hit? = candidates.mapNotNull { candidate ->
+        val score = LyricsMatching.candidateScore(
+            wantedTitle = title,
+            wantedArtist = artist,
+            wantedDurationMs = durationMs,
+            candidateTitle = candidate.trackName,
+            candidateArtist = candidate.artistName,
+            candidateDurationMs = candidate.duration.toDurationMs(),
+            requireArtist = true,
+        ) ?: return@mapNotNull null
+        candidate to score
+    }.maxByOrNull { it.second }?.first
+
+    private fun Int?.toDurationMs(): Long = when {
+        this == null || this <= 0 -> 0L
+        this < 10_000 -> this.toLong() * 1000L
+        else -> this.toLong()
     }
 
     /** The document a search already found, fetched and parsed. */

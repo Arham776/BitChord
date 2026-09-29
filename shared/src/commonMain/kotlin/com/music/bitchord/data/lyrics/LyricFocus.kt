@@ -52,15 +52,15 @@ object LyricFocus {
         // sung" that answers "one of them" for a transcript with no times is a
         // trap for every caller rather than for one.
         if (!isSynced(lines)) return emptyList()
-        val latest = lines.indexOfLast { it.timeMs <= positionMs }
+        val latest = lines.indexOfLast { lineStartMs(it) <= positionMs }
         if (latest < 0) return emptyList()
         return (0..latest).filter { index ->
             val line = lines[index]
-            index == latest || (
+            !line.isGap && (index == latest || (
                 !line.isGap &&
                     (line.hasKnownEnd || line.background?.hasKnownEnd == true) &&
-                    line.timeMs <= positionMs && positionMs < line.endMs
-                )
+                    lineStartMs(line) <= positionMs && positionMs < line.endMs
+                ))
         }
     }
 
@@ -76,10 +76,10 @@ object LyricFocus {
      * few seconds in is every track that opens on an intro.
      */
     fun scrollLead(lines: List<LyricLineDto>, positionMs: Long): Long {
-        val current = lines.indexOfLast { it.timeMs <= positionMs }
+        val current = lines.indexOfLast { lineStartMs(it) <= positionMs }
         if (current < 0) return SCROLL_LEAD_MIN_MS
         val next = lines.getOrNull(current + 1) ?: return SCROLL_LEAD_MIN_MS
-        val gap = next.timeMs - lines[current].endMs
+        val gap = lineStartMs(next) - lines[current].endMs
         return gap.coerceIn(SCROLL_LEAD_MIN_MS, SCROLL_LEAD_MAX_MS)
     }
 
@@ -94,9 +94,23 @@ object LyricFocus {
         val active = activeRows(lines, positionMs)
         if (active.isNotEmpty()) return active.first()
         if (!isSynced(lines)) return -1
-        return lines.indexOfLast { it.timeMs <= positionMs + scrollLead(lines, positionMs) }
+        return lines.indexOfLast { !it.isGap && lineStartMs(it) <= positionMs + scrollLead(lines, positionMs) }
     }
 
-    /** Whether any line carries a real timestamp, as opposed to a plain transcript. */
-    fun isSynced(lines: List<LyricLineDto>): Boolean = lines.any { it.timeMs > 0L }
+    /** Whether any line or word carries a real timestamp, rather than a transcript. */
+    fun isSynced(lines: List<LyricLineDto>): Boolean = lines.any { line ->
+        line.timeMs > 0L || line.words.any { it.startMs > 0L || it.endMs > 0L } ||
+            line.background?.let { background ->
+                background.timeMs > 0L || background.words.any { it.startMs > 0L || it.endMs > 0L }
+            } == true
+    }
+
+    /** A missing line stamp falls back to the first word's timestamp. */
+    private fun lineStartMs(line: LyricLineDto): Long = if (line.timeMs == 0L) {
+        line.words.minOfOrNull { it.startMs }
+            ?: line.background?.words?.minOfOrNull { it.startMs }
+            ?: line.timeMs
+    } else {
+        line.timeMs
+    }
 }

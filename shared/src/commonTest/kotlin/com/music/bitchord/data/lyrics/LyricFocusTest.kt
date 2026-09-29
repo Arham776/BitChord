@@ -123,7 +123,25 @@ class LyricFocusTest {
         // An instrumental stretch is a bare timestamp with no words. It must not
         // take the highlight.
         val lines = listOf(line(1_000, "words"), line(5_000, ""))
-        assertEquals(listOf(1), LyricFocus.activeRows(lines, 6_000))
+        assertEquals(emptyList(), LyricFocus.activeRows(lines, 6_000))
+    }
+
+    @Test
+    fun a_current_instrumental_gap_does_not_highlight_a_music_note() {
+        val lines = listOf(line(1_000, "words", sungUntilMs = 2_000), line(5_000, ""))
+        assertEquals(emptyList(), LyricFocus.activeRows(lines, 6_000))
+    }
+
+    @Test
+    fun word_timestamps_make_a_zero_stamped_line_synced_and_active() {
+        val lines = listOf(
+            line(0, "hello", words = listOf(word(1_000, 1_500, "hello"))),
+            line(0, "world", words = listOf(word(2_000, 2_500, "world"))),
+        )
+        assertTrue(LyricFocus.isSynced(lines))
+        assertEquals(emptyList(), LyricFocus.activeRows(lines, 500))
+        assertEquals(listOf(0), LyricFocus.activeRows(lines, 1_200))
+        assertEquals(listOf(1), LyricFocus.activeRows(lines, 2_200))
     }
 
     @Test

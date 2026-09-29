@@ -7,9 +7,9 @@ package com.music.bitchord.data.lyrics
  * app has is YouTube's, which is not the name anyone catalogued. "Dracula (feat.
  * JENNIE)" is filed by Apple, LRCLIB and everyone else as "Dracula", and asked
  * for verbatim it misses all of them — which is exactly how a track ends up
- * answered by whichever source happened to clean the title on its own
- * ([PaxSenix] was the only one that did) regardless of the order the user put
- * their sources in.
+ * answered by whichever source happened to clean the title on its own. The
+ * repository now cleans once for every provider, including a leading artist
+ * credit on upload-style titles.
  *
  * ## What is taken off, and what is deliberately left on
  *
@@ -23,13 +23,50 @@ package com.music.bitchord.data.lyrics
  * rather than merely missing. A miss is recoverable; the wrong words scrolling in
  * time with the right song is not.
  */
-internal fun String.forLyricsSearch(): String {
+internal fun String.forLyricsSearch(artist: String? = null): String {
     var name = this
     CREDITS.forEach { pattern -> name = pattern.replace(name, " ") }
-    return name.replace(WHITESPACE, " ").trim().trimEnd(',', '-', '\u2013', '\u2014').trim()
+    name = name.replace(WHITESPACE, " ").trim().trimEnd(',', '-', '\u2013', '\u2014').trim()
         // A title that was *only* packaging is no title at all; better to ask
         // with what we were given than with nothing.
         .ifBlank { trim() }
+
+    // YouTube audio uploads often put the artist in the title itself, sometimes
+    // without a dash: "AIKA & NAHREEL FORTY (AUDIO) FT AZAWI". Providers index
+    // that recording under just "Forty". Remove a leading artist credit when
+    // the artist metadata confirms it; otherwise this upload wrapper makes every
+    // exact-title lookup miss.
+    val cleanedArtist = artist?.artistForLyricsSearch()
+    val credits = cleanedArtist?.split(ARTIST_PREFIX_SEPARATOR)
+        ?.map { it.trim() }
+        ?.filter { it.isNotEmpty() }
+        .orEmpty()
+    val prefixCandidates = buildList {
+        cleanedArtist?.takeIf { it.isNotBlank() }?.let(::add)
+        for (count in 1..credits.size) {
+            val prefix = credits.take(count)
+            add(prefix.joinToString(" & "))
+            add(prefix.joinToString(" "))
+        }
+    }.distinct().sortedByDescending { it.length }
+
+    for (prefix in prefixCandidates) {
+        if (name.length <= prefix.length || !name.regionMatches(0, prefix, 0, prefix.length, ignoreCase = true)) {
+            continue
+        }
+        val boundary = name[prefix.length]
+        val separatedByPunctuation = boundary in TITLE_PREFIX_SEPARATORS
+        // A multiword artist followed by whitespace is the common no-dash
+        // upload style. Do not strip a one-word artist from a real title such as
+        // "Aika Song" merely because the same word names the performer.
+        val separatedByWords = boundary.isWhitespace() && prefix.any { it.isWhitespace() }
+        if (!separatedByPunctuation && !separatedByWords) continue
+        val remainder = name.substring(prefix.length).trimStart()
+            .trimStart('-', '\u2013', '\u2014', ':', '|', '\u00b7')
+            .trim()
+        if (remainder.isNotEmpty()) return remainder
+    }
+    return name
 }
 
 /**
@@ -54,6 +91,10 @@ internal fun String.isUsableLyricsQuery(): Boolean = isNotBlank() && length >= M
 private const val MIN_QUERY = 1
 
 private val WHITESPACE = Regex("""\s+""")
+private val ARTIST_PREFIX_SEPARATOR = Regex(
+    """(?i)\s*(?:,|&|;|feat(?:uring)?\.?|ft\.?|with|x|·)\s*""",
+)
+private val TITLE_PREFIX_SEPARATORS = setOf('-', '\u2013', '\u2014', ':', '|', '\u00b7')
 
 /**
  * Brackets, in both widths.

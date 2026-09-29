@@ -49,7 +49,17 @@ object Unison {
         // "I have never heard of that", and treating it as an error would put a
         // failed lookup in the log for every track it does not have.
         if (response.success != true) return@withContext null
-        linesOf(response.data ?: return@withContext null)
+        val entry = response.data ?: return@withContext null
+        if (LyricsMatching.candidateScore(
+                wantedTitle = title,
+                wantedArtist = artist,
+                wantedDurationMs = durationMs,
+                candidateTitle = entry.song,
+                candidateArtist = entry.artist,
+                requireArtist = true,
+            ) == null
+        ) return@withContext null
+        linesOf(entry)
     }
 
     /** The three shapes, told apart by what the entry says it is. */

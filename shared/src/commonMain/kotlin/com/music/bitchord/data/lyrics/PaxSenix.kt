@@ -35,7 +35,6 @@ object PaxSenix {
     private const val API = "https://api.paxsenix.org"
     private const val MINIMUM_MATCH_SCORE = 10
     private const val APPLE_SEARCH = "https://amp-api.music.apple.com/v1/catalog/us/search"
-    private const val DURATION_TOLERANCE_SECONDS = 10
 
     private val tokenMutex = Mutex()
     @kotlin.concurrent.Volatile private var cachedToken: String? = null
@@ -63,7 +62,10 @@ object PaxSenix {
         album: String? = null,
     ): List<LyricLineDto>? {
         val seconds = (durationMs / 1000).toInt()
-        val query = listOfNotNull(title.cleaned(), artist.cleaned().takeIf { it.isNotBlank() })
+        val query = listOfNotNull(
+            title.forLyricsSearch(),
+            artist.artistForLyricsSearch().takeIf { it.isNotBlank() },
+        )
             .joinToString(" ")
         val results = search(query) ?: return null
         // The floor is the whole point and this path did not have it.
@@ -77,11 +79,17 @@ object PaxSenix {
         // was never going to succeed, which is exactly the unfamiliar and
         // non-Latin catalogue.
         val best = results
-            .filter { track ->
-                val trackSeconds = track.durationSeconds
-                seconds <= 0 || trackSeconds == null || abs(trackSeconds - seconds) <= DURATION_TOLERANCE_SECONDS
+            .mapNotNull { track ->
+                val score = LyricsMatching.candidateScore(
+                    wantedTitle = title,
+                    wantedArtist = artist,
+                    wantedDurationMs = durationMs,
+                    candidateTitle = track.attributes.name,
+                    candidateArtist = track.attributes.artistName,
+                    candidateDurationMs = track.attributes.durationInMillis ?: 0L,
+                ) ?: return@mapNotNull null
+                track to score
             }
-            .map { it to score(it, title, artist) }
             .filter { it.second >= MINIMUM_MATCH_SCORE }
             .maxByOrNull { it.second }
             ?.first
@@ -89,30 +97,6 @@ object PaxSenix {
 
         return fetchLyrics(best.id)
     }
-
-    private fun score(track: AppleTrack, title: String, artist: String): Double {
-        val name = track.attributes.name.trim().lowercase()
-        val targetTitle = title.trim().lowercase()
-        val artistName = track.attributes.artistName.trim().lowercase()
-        val targetArtist = artist.trim().lowercase()
-        var score = 0.0
-        score += when {
-            name == targetTitle -> 80.0
-            name.contains(targetTitle) || targetTitle.contains(name) -> 40.0
-            else -> 0.0
-        }
-        if (artistName.contains(targetArtist) || targetArtist.contains(artistName)) score += 40.0
-        return score
-    }
-
-    private fun String.cleaned(): String = replace(
-        Regex(
-            """\s*[(\[](official|video|audio|lyrics?|visualizer|hd|hq|4k|remaster\w*|live|version|""" +
-                """feat\.?|ft\.?)[^)\]]*[)\]]""",
-            RegexOption.IGNORE_CASE,
-        ),
-        "",
-    ).trim()
 
     private suspend fun search(query: String): List<AppleTrack>? {
         val token = getToken() ?: return null
@@ -168,9 +152,7 @@ object PaxSenix {
     private data class Songs(val data: List<AppleTrack> = emptyList())
 
     @Serializable
-    private data class AppleTrack(val id: String, val attributes: Attributes) {
-        val durationSeconds: Int? get() = attributes.durationInMillis?.let { (it / 1000).toInt() }
-    }
+    private data class AppleTrack(val id: String, val attributes: Attributes)
 
     @Serializable
     private data class Attributes(
@@ -270,7 +252,9 @@ object PaxSenix {
         val candidates = mutableListOf<Candidate>()
         root.collectCandidates(candidates)
         return candidates
-            .map { it to it.score(title, artist, durationMs) }
+            .mapNotNull { candidate ->
+                candidate.score(title, artist, durationMs)?.let { candidate to it }
+            }
             .maxByOrNull { it.second }
             ?.takeIf { it.second >= MINIMUM_MATCH_SCORE }
             ?.first
@@ -298,7 +282,7 @@ object PaxSenix {
         return documents.mapNotNull { document ->
             val lines = parseResponse(document.toString()) ?: return@mapNotNull null
             val metadataScore = (document as? JsonObject)
-                ?.lyricCandidateScore(title, artist, durationMs) ?: 0
+                ?.lyricCandidateScore(title, artist, durationMs) ?: return@mapNotNull null
             ParsedDocument(lines, metadataScore, durationDistance(lines, durationMs))
         }.maxWithOrNull(
             compareBy<ParsedDocument> { it.metadataScore }
@@ -320,7 +304,7 @@ object PaxSenix {
         title: String,
         artist: String,
         durationMs: Long,
-    ): Int {
+    ): Int? {
         val details = this["attributes"] as? JsonObject ?: this
         return Candidate(
             id = details.firstString(ID_KEYS).orEmpty(),
@@ -458,24 +442,14 @@ object PaxSenix {
         wantedTitle: String,
         wantedArtist: String,
         wantedDuration: Long,
-    ): Int {
-        var score = textScore(title, wantedTitle, 20, 10) +
-            textScore(artist, wantedArtist, 15, 5)
-        if (wantedDuration > 0 && durationMs > 0) score += when {
-            abs(durationMs - wantedDuration) < 3_000 -> 10
-            abs(durationMs - wantedDuration) < 10_000 -> 5
-            else -> 0
-        }
-        return score
-    }
-
-    private fun textScore(candidate: String, wanted: String, exact: Int, partial: Int): Int = when {
-        candidate.isBlank() || wanted.isBlank() -> 0
-        candidate.equals(wanted, ignoreCase = true) -> exact
-        candidate.contains(wanted, ignoreCase = true) ||
-            wanted.contains(candidate, ignoreCase = true) -> partial
-        else -> 0
-    }
+    ): Int? = LyricsMatching.candidateScore(
+        wantedTitle = wantedTitle,
+        wantedArtist = wantedArtist,
+        wantedDurationMs = wantedDuration,
+        candidateTitle = title,
+        candidateArtist = artist,
+        candidateDurationMs = durationMs,
+    )
 
     private suspend fun apiBody(path: String, query: Map<String, String>): String? =
         if (!hasApiKey) null

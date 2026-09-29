@@ -9,7 +9,6 @@ import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.JsonElement
 import kotlin.io.encoding.Base64
 import kotlin.io.encoding.ExperimentalEncodingApi
-import kotlin.math.abs
 
 /**
  * Line-synced lyrics from Musixmatch's own web client API.
@@ -49,32 +48,22 @@ object Musixmatch {
 
     private suspend fun bestTrack(title: String, artist: String, seconds: Int): Track? {
         val tracks = searchTrack(title, artist) ?: return null
-        return tracks.maxByOrNull { score(it, title, artist, seconds) }
+        val durationMs = seconds.toLong() * 1000L
+        return tracks.mapNotNull { track ->
+            score(track, title, artist, durationMs)?.let { track to it }
+        }.maxByOrNull { it.second }?.first
     }
 
-    private fun score(track: Track, title: String, artist: String, seconds: Int): Double {
-        var score = 0.0
-        val name = track.trackName.trim().lowercase()
-        val targetTitle = title.trim().lowercase()
-        score += when {
-            name == targetTitle -> 80.0
-            name.contains(targetTitle) || targetTitle.contains(name) -> 40.0
-            else -> 0.0
-        }
-        if (track.artistName.trim().lowercase().contains(artist.trim().lowercase())) {
-            score += 40.0
-        }
-        track.trackLength?.let { length ->
-            val diff = abs(length - seconds)
-            score += when {
-                diff <= 2 -> 30.0
-                diff <= 5 -> 15.0
-                diff <= 10 -> 5.0
-                else -> -20.0
-            }
-        }
-        return score
-    }
+    private fun score(track: Track, title: String, artist: String, durationMs: Long): Int? =
+        LyricsMatching.candidateScore(
+            wantedTitle = title,
+            wantedArtist = artist,
+            wantedDurationMs = durationMs,
+            candidateTitle = track.trackName,
+            candidateArtist = track.artistName,
+            candidateDurationMs = track.trackLength?.toLong()?.times(1000L) ?: 0L,
+            requireArtist = true,
+        )
 
     private suspend fun searchTrack(title: String, artist: String): List<Track>? {
         val response = signedGet { token ->

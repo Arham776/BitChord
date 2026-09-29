@@ -220,7 +220,7 @@ struct LyricsSourcesSheet: View {
     @State private var order = LyricsSourceNames.normalizeList(
         PlatformSettings.shared.getString(key: "lyrics_source_order", default: LyricsSourceNames.defaultEnabled)
     )
-    @State private var syllableSync = PlatformSettings.shared.getBoolean(key: "prioritize_syllable_sync", default: false)
+    @State private var syllableSync = PlatformSettings.shared.getBoolean(key: "prioritize_syllable_sync", default: true)
     @State private var paxSenixKey = PlatformSettings.shared.getSecret(key: "paxsenix_api_key") ?? ""
 
     /// Re-run the lookup for the track that is playing.

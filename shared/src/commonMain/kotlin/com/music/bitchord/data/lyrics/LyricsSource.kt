@@ -87,30 +87,6 @@ enum class LyricsSource(
         detail = "Matched on the video, so never the wrong edit",
         wordSynced = true,
     ),
-    /**
-     * YouTube's own transcript for the video being played.
-     *
-     * Asked about a video id rather than a name, so it cannot be wrong about which
-     * song this is — and that is worth more than its timing, which is only
-     * line-stamped. It also covers the long tail nobody has uploaded lyrics for,
-     * which is most of a catalogue nobody has written lyrics for.
-     */
-    YOUTUBE_TRANSCRIPT(
-        label = "YouTube Transcript",
-        detail = "YouTube's own captions for this video, line by line",
-        wordSynced = false,
-    ),
-    /**
-     * The Lyrics tab on YouTube Music.
-     *
-     * Unsynced and therefore last among the video-matched sources: it is
-     * authoritative about the words and no use at all for when they are said.
-     */
-    YOUTUBE_MUSIC(
-        label = "YouTube Music",
-        detail = "YouTube Music's own lyrics, with no timing",
-        wordSynced = false,
-    ),
     KUGOU(
         label = "KuGou",
         detail = "Whole lines, strong outside the English catalogue",
@@ -135,6 +111,29 @@ enum class LyricsSource(
         label = "Unison",
         detail = "Community submissions; can be word synced, line synced or plain",
         wordSynced = true,
+    ),
+    /**
+     * YouTube's own transcript for the video being played.
+     *
+     * It is tied to the playing video, but captions can be approximate and are
+     * not authored lyric sheets. Keep catalogue lyric providers ahead of it so
+     * rough captions do not displace better synced or reviewed lyrics.
+     */
+    YOUTUBE_TRANSCRIPT(
+        label = "YouTube Transcript",
+        detail = "YouTube's own captions for this video, line by line",
+        wordSynced = false,
+    ),
+    /**
+     * The Lyrics tab on YouTube Music.
+     *
+     * Unsynced and therefore last among the video-matched sources: it is
+     * authoritative about the words and no use at all for when they are said.
+     */
+    YOUTUBE_MUSIC(
+        label = "YouTube Music",
+        detail = "YouTube Music's own lyrics, with no timing",
+        wordSynced = false,
     ),
     /**
      * A community database scraped from its web pages, with no API at all.

@@ -13,8 +13,9 @@ import kotlinx.coroutines.withTimeoutOrNull
 
 /**
  * Where the player gets its lyrics. Every enabled source is asked at the same
- * time; answers are taken in [order] so a lower-priority source finishing first
- * never preempts one still pending ahead of it.
+ * time; answers follow [order] rather than whichever request happens to finish
+ * first. When a YouTube video id is available, exact-video sources take
+ * precedence over title-matched catalogues.
  *
  * ## Matching on the recording
  *
@@ -33,6 +34,12 @@ import kotlinx.coroutines.withTimeoutOrNull
  * can skip it entirely: its own tags name the recording, which is what the
  * `isrc` parameter is for.
  *
+ * If the playing item has a YouTube video id, sources keyed to that exact video
+ * are considered before title-matched catalogs. A timed transcript for the
+ * actual video beats fuzzy lyrics for a nearby version. If the exact-video
+ * source has only plain text, another provider's timing is borrowed only when
+ * its words substantially agree with that text.
+ *
  * Only run when the user has [LyricsSource.BINI_LYRICS] enabled. It is a request
  * to a third party like any other, and a source somebody has turned off is a
  * source this app does not contact — not even for something it would only use to
@@ -40,9 +47,10 @@ import kotlinx.coroutines.withTimeoutOrNull
  *
  * ## Ordering inside the race
  *
- * A word-timed answer wins outright. Failing that, a line-timed one is taken
- * from the highest-priority source that had it — better a whole line lighting up
- * in sync than the right animation on lyrics that don't exist.
+ * A word-timed answer wins within its identity tier. A timed transcript from the
+ * exact playing video takes precedence over title-matched timing; with no timed
+ * exact-video answer, catalog timings are only used when they agree with any
+ * exact-video lyric text.
  */
 object LyricsRepository {
 
@@ -57,11 +65,10 @@ object LyricsRepository {
      * after everything named, in [LyricsSource]'s own order.
      *
      * [prioritizeSyllableSync] decides what happens once *something* has come
-     * back: off, the highest-priority source's own answer is taken as-is,
-     * word-synced or not — priority is priority, and second-guessing it with more
-     * network calls after it has already answered is not what "first" was supposed
-     * to mean. On, a merely line-synced answer is kept only as a fallback, and the
-     * search keeps going through the rest of [order] for a word-synced one.
+     * back: off, the first source's answer is taken as-is, word-synced or not. On,
+     * an exact-video transcript is preferred over fuzzy catalog matches, and a
+     * merely line-synced answer is kept as a fallback while the search checks for
+     * word timings that agree with the exact text.
      */
     suspend fun lyrics(
         videoId: String,
@@ -71,7 +78,7 @@ object LyricsRepository {
         album: String? = null,
         sources: Set<LyricsSource> = LyricsSource.entries.toSet(),
         order: List<LyricsSource> = LyricsSource.entries,
-        prioritizeSyllableSync: Boolean = false,
+        prioritizeSyllableSync: Boolean = true,
         isrc: String? = null,
         /** Called from the provider job itself, including for lazily-started ones. */
         onSourceStarted: ((LyricsSource) -> Unit)? = null,
@@ -83,14 +90,15 @@ object LyricsRepository {
         /** Lets callers turn a cancelled race loser back into "not fetched". */
         onSourceCancelled: ((LyricsSource) -> Unit)? = null,
     ): Result? = coroutineScope {
-        val sequence = order.filter { it in sources } +
+        val configuredSequence = order.filter { it in sources } +
             LyricsSource.entries.filter { it in sources && it !in order }
+        val sequence = identityAwareOrder(configuredSequence, videoId)
 
         // Every source but [SimpMusicLyrics] is asked for a name, and YouTube's is
         // not the name anyone catalogued. Cleaned once, here, rather than by
         // whichever source thought to do it for itself — which is how the answer
         // ended up depending on which provider happened to be enabled.
-        val searchTitle = title.forLyricsSearch()
+        val searchTitle = title.forLyricsSearch(artist)
         val searchArtist = artist.artistForLyricsSearch()
 
         // Settled before anyone is asked for words, so every source that can name
@@ -114,7 +122,15 @@ object LyricsRepository {
                     val found = fetch(
                         source, videoId, searchTitle, searchArtist, durationMs, album,
                         recording, hit,
-                    )?.let { result(source, it) }
+                    )?.let { rawLines ->
+                        val lines = LyricsMatching.normalize(rawLines.withBackgroundVocals())
+                        lines.takeIf { LyricsMatching.hasPlausibleDuration(it, durationMs) }
+                            ?.let { Result(source, it) }
+                            ?: run {
+                                DebugLog.d("${source.name} returned an implausible lyric timeline; ignoring it")
+                                null
+                            }
+                    }
                     onSourceResult?.invoke(source, found)
                     found
                 } catch (cancelled: CancellationException) {
@@ -129,16 +145,57 @@ object LyricsRepository {
         }
 
         try {
-            var lineSynced: Result? = null
-            for ((source, job) in racing) {
-                val found = runCatching { job.await() }.getOrNull() ?: continue
-                if (found.lines.any { it.isWordSynced }) return@coroutineScope found
-                if (!prioritizeSyllableSync && found.lines.any { it.timeMs > 0 }) {
+            if (!prioritizeSyllableSync) {
+                for ((_, job) in racing) {
+                    val found = runCatching { job.await() }.getOrNull() ?: continue
                     return@coroutineScope found
                 }
-                if (lineSynced == null) lineSynced = found
+                return@coroutineScope null
             }
-            lineSynced
+
+            val exactVideoSources = racing.filter { (source, _) -> source in VIDEO_ID_SOURCES }
+            val catalogSources = racing.filterNot { (source, _) -> source in VIDEO_ID_SOURCES }
+            var exactVideoLineSynced: Result? = null
+            var exactVideoUnsynced: Result? = null
+            for ((_, job) in exactVideoSources) {
+                val found = runCatching { job.await() }.getOrNull() ?: continue
+                if (found.lines.any { it.isWordSynced }) return@coroutineScope found
+                if (found.lines.any(::hasAnyTiming)) {
+                    if (exactVideoLineSynced == null) exactVideoLineSynced = found
+                } else if (exactVideoUnsynced == null) {
+                    exactVideoUnsynced = found
+                }
+            }
+
+            // A timestamped transcript for the exact playing video is stronger
+            // evidence than a word-timed fuzzy catalogue match for a nearby cut.
+            exactVideoLineSynced?.let { return@coroutineScope it }
+
+            var catalogTimedFallback: Result? = null
+            var catalogUnsyncedFallback: Result? = null
+            for ((_, job) in catalogSources) {
+                val found = runCatching { job.await() }.getOrNull() ?: continue
+                if (found.lines.any { it.isWordSynced }) {
+                    val exactText = exactVideoUnsynced
+                    if (exactText != null && !LyricsMatching.documentsAgree(exactText.lines, found.lines)) {
+                        DebugLog.d("ignoring title-matched timed lyrics: words disagree with exact-video lyrics")
+                        continue
+                    }
+                    return@coroutineScope found
+                }
+                if (found.lines.any(::hasAnyTiming)) {
+                    val exactText = exactVideoUnsynced
+                    if (catalogTimedFallback == null &&
+                        (exactText == null || LyricsMatching.documentsAgree(exactText.lines, found.lines))
+                    ) {
+                        catalogTimedFallback = found
+                    }
+                } else if (catalogUnsyncedFallback == null) {
+                    catalogUnsyncedFallback = found
+                }
+            }
+
+            catalogTimedFallback ?: exactVideoUnsynced ?: catalogUnsyncedFallback
         } finally {
             // Whoever lost the race is no longer worth waiting on, and
             // `coroutineScope` will not return while they are still running.
@@ -181,6 +238,21 @@ object LyricsRepository {
         LyricsSource.GENIUS -> Genius.lyrics(title, artist)
     }
 
+    private fun hasAnyTiming(line: LyricLineDto): Boolean =
+        line.timeMs > 0L || line.words.any { it.startMs > 0L || it.endMs > 0L } ||
+            line.background?.let(::hasAnyTiming) == true
+
+    internal fun identityAwareOrder(sequence: List<LyricsSource>, videoId: String): List<LyricsSource> {
+        if (!isVideoId(videoId)) return sequence
+        return sequence.filter { it in VIDEO_ID_SOURCES } + sequence.filterNot { it in VIDEO_ID_SOURCES }
+    }
+
+    private val VIDEO_ID_SOURCES = setOf(
+        LyricsSource.SIMP_MUSIC,
+        LyricsSource.YOUTUBE_TRANSCRIPT,
+        LyricsSource.YOUTUBE_MUSIC,
+    )
+
     /**
      * Whichever source won, its lines get the same last pass: the answering
      * vocal split off the lead so it can be drawn under it. Done here rather than
@@ -188,9 +260,6 @@ object LyricsRepository {
      * [TtmlLyrics] knows it structurally — [withBackgroundVocals] leaves that
      * one's own split alone.
      */
-    private fun result(source: LyricsSource, lines: List<LyricLineDto>) =
-        Result(source, lines.withBackgroundVocals())
-
     /**
      * Longest the lookup will wait to find out which recording this is.
      *

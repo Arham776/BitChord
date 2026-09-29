@@ -44,6 +44,30 @@ class LyricsQueryTest {
         assertEquals("Ordinary", "Ordinary (Official)".forLyricsSearch())
     }
 
+    @Test
+    fun `artist-prefixed YouTube audio titles reduce to the catalog title`() {
+        assertEquals(
+            "FORTY",
+            "AIKA & NAHREEL FORTY (AUDIO) FT AZAWI".forLyricsSearch("Aika & Nahreel, Azawi"),
+        )
+        assertEquals(
+            "Forty",
+            "Aika & Nahreel - Forty (Official Audio) ft. Azawi".forLyricsSearch("Aika & Nahreel, Azawi"),
+        )
+        // A one-word artist at the start is ambiguous without upload punctuation.
+        assertEquals("Aika Song", "Aika Song".forLyricsSearch("Aika"))
+    }
+
+    @Test
+    fun `featured artists in a YouTube title do not pollute Swalla lookup`() {
+        assertEquals(
+            "Swalla",
+            "Swalla (feat. Nicki Minaj & Ty Dolla \$ign)".forLyricsSearch(
+                "Jason Derulo, Nicki Minaj, Ty Dolla \$ign",
+            ),
+        )
+    }
+
     // ---- What must survive -------------------------------------------------
 
     @Test
