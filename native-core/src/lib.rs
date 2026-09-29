@@ -246,6 +246,17 @@ pub struct TrackMetadata {
     pub artwork: Vec<u8>,
 }
 
+/// PCM properties discovered before playback. The app uses the source rate to
+/// request the matching DAC clock before the first sample is rendered.
+#[derive(uniffi::Record, Debug, Clone)]
+pub struct AudioSourceFormatRec {
+    pub codec: String,
+    pub sample_rate: u32,
+    pub bit_depth: u32,
+    pub channels: u32,
+    pub lossless_pcm: bool,
+}
+
 #[derive(uniffi::Record, Debug, Clone)]
 pub struct MelSpectrogramResult {
     pub frames: u64,
@@ -379,6 +390,16 @@ pub struct PlayerEngine {
     /// Requested PCM word length (0 = PCM_16, 1 = FLOAT_32). Read when a
     /// stream is (re)built; changing it rebuilds the unit.
     pcm_mode: Arc<AtomicU32>,
+    /// Encoding negotiated with the current output device, separate from the
+    /// setting request so the pipeline readout reports what was opened.
+    active_pcm_mode: Arc<AtomicU32>,
+    /// Exact integer depth requested for the current track, or zero when the
+    /// ordinary mixed output path is in use.
+    bit_perfect_depth: Arc<AtomicU32>,
+    /// Exact integer depth opened by the callback, or zero when inactive.
+    active_bit_perfect_depth: Arc<AtomicU32>,
+    bit_perfect_enabled: AtomicBool,
+    bit_perfect_reason: Arc<Mutex<String>>,
     /// Prefer a USB audio device over the system default (upstream
     /// `preferUsbDac`). Advisory on iOS, where the session owns the route;
     /// a real device choice on macOS.
@@ -485,6 +506,11 @@ pub struct OutputDeviceRec {
     /// Word length the unit was actually opened as (`PCM_16` = int16 stream,
     /// `FLOAT_32` = float). The setting is the request; this is the answer.
     pub sample_format: String,
+    /// True only while an eligible lossless track uses exact-rate integer
+    /// output, CoreAudio exclusive access, and the mixer bypass path.
+    pub bit_perfect_active: bool,
+    /// Why the requested bit-perfect path is inactive for this track/route.
+    pub bit_perfect_reason: String,
 }
 
 /// Monotonic output counters for a device playback trace. Compare deltas while
@@ -529,6 +555,11 @@ impl PlayerEngine {
             device_name: Arc::new(Mutex::new(String::new())),
             nerd: Arc::new(Mutex::new(mixer::NerdSnapshot::default())),
             pcm_mode: Arc::new(AtomicU32::new(if cfg!(target_os = "ios") { 1 } else { 0 })),
+            active_pcm_mode: Arc::new(AtomicU32::new(if cfg!(target_os = "ios") { 1 } else { 0 })),
+            bit_perfect_depth: Arc::new(AtomicU32::new(0)),
+            active_bit_perfect_depth: Arc::new(AtomicU32::new(0)),
+            bit_perfect_enabled: AtomicBool::new(false),
+            bit_perfect_reason: Arc::new(Mutex::new("Bit-perfect output is off".into())),
             prefer_usb: Arc::new(AtomicBool::new(false)),
             loudness_enabled: Arc::new(AtomicBool::new(true)),
             automix_tier: Arc::new(Mutex::new(AutomixTier::Balanced)),
@@ -566,19 +597,20 @@ impl PlayerEngine {
         if let Some(c) = channels.filter(|c| *c > 0) {
             self.requested_channels.store(c, Ordering::Relaxed);
         }
-        let supported = match device.default_output_config() {
-            Ok(config) => config,
-            Err(e) => {
+        let selected = match choose_format(
+            &device,
+            self.requested_rate.load(Ordering::Relaxed),
+            self.requested_channels.load(Ordering::Relaxed),
+            self.pcm_mode.load(Ordering::Relaxed) == 0,
+        ) {
+            Ok(selected) => selected,
+            Err(error) => {
                 self.started.store(false, Ordering::Release);
-                return Err(EngineError::StreamInit(e.to_string()));
+                return Err(error);
             }
         };
-        let (sample_rate, channels) = choose_format(
-            &self.requested_rate,
-            &self.requested_channels,
-            supported.sample_rate(),
-            supported.channels() as usize,
-        );
+        let sample_rate = selected.sample_rate;
+        let channels = selected.channels;
         self.output_rate.store(sample_rate, Ordering::Relaxed);
         self.output_channels.store(channels as u32, Ordering::Relaxed);
         // The device's own name, because "no sound" is otherwise indistinguishable
@@ -650,13 +682,28 @@ impl PlayerEngine {
             bail_flush: self.bail_flush.clone(),
             output_paused: self.output_paused.clone(),
             pcm_mode: self.pcm_mode.clone(),
+            active_pcm_mode: self.active_pcm_mode.clone(),
+            bit_perfect_depth: self.bit_perfect_depth.clone(),
+            active_bit_perfect_depth: self.active_bit_perfect_depth.clone(),
+            bit_perfect_reason: self.bit_perfect_reason.clone(),
             prefer_usb: self.prefer_usb.clone(),
         };
-        let pcm16 = self.pcm_mode.load(Ordering::Relaxed) == 0;
-        let stream = open_output_stream(&device, sample_rate, channels, pcm16, consumer, &control)?;
+        let stream = open_output_stream(
+            &device,
+            sample_rate,
+            channels,
+            selected.pcm16,
+            selected.bit_perfect_depth,
+            consumer,
+            &control,
+        )?;
         stream
             .play()
             .map_err(|e| EngineError::StreamInit(e.to_string()))?;
+        self.active_pcm_mode
+            .store(if selected.pcm16 { 0 } else { 1 }, Ordering::Relaxed);
+        self.active_bit_perfect_depth
+            .store(selected.bit_perfect_depth, Ordering::Relaxed);
         *self.stream.lock().unwrap() = Some(stream);
         *self.control.lock().unwrap() = Some(control);
         Ok(())
@@ -674,6 +721,151 @@ impl PlayerEngine {
             Ok(Err(e)) => Err(EngineError::LoadFailed(e)),
             Err(_) => Err(EngineError::LoadFailed("load timed out".into())),
         }
+    }
+
+    /// Probes a source before playback so the platform can request its DAC
+    /// clock before the first audible buffer. No decoded audio is retained.
+    pub fn probe_audio_source(
+        &self,
+        source: String,
+        headers: Option<std::collections::HashMap<String, String>>,
+    ) -> Result<AudioSourceFormatRec, EngineError> {
+        let kind = decode::SourceKind::parse(&source);
+        let decoder = decode::SymphoniaDecoder::open(&kind, &headers.unwrap_or_default())
+            .map_err(|e| EngineError::LoadFailed(e.to_string()))?;
+        let codec = decoder.codec().to_string();
+        Ok(AudioSourceFormatRec {
+            lossless_pcm: is_lossless_pcm_codec(&codec),
+            codec,
+            sample_rate: decoder.sample_rate(),
+            bit_depth: decoder.bit_depth(),
+            channels: decoder.channels() as u32,
+        })
+    }
+
+    /// Opts in to the macOS exclusive integer-output path. It becomes active
+    /// only after `prepare_track_output` verifies the actual track and route.
+    pub fn set_bit_perfect_enabled(&self, enabled: bool) -> Result<(), EngineError> {
+        self.bit_perfect_enabled.store(enabled, Ordering::Relaxed);
+        if enabled {
+            *self.bit_perfect_reason.lock().unwrap() =
+                "Waiting for a supported lossless stereo track".into();
+            return Ok(());
+        }
+        self.bit_perfect_depth.store(0, Ordering::Relaxed);
+        self.active_bit_perfect_depth.store(0, Ordering::Relaxed);
+        *self.bit_perfect_reason.lock().unwrap() = "Bit-perfect output is off".into();
+        release_output_exclusive();
+        self.send(Command::SetBitPerfect(false))?;
+        if let Some(control) = self.control.lock().unwrap().clone() {
+            control.request_rebuild(true);
+        }
+        Ok(())
+    }
+
+    /// Selects the per-track DAC clock and, when requested and supported,
+    /// opens the source-depth integer stream before the mixer loads that track.
+    pub fn prepare_track_output(
+        &self,
+        source_rate: u32,
+        source_channels: u32,
+        source_bit_depth: u32,
+        codec: String,
+        lossless_pcm: bool,
+        match_source_rate: bool,
+        session_rate: Option<f64>,
+        session_channels: Option<u32>,
+    ) -> Result<(), EngineError> {
+        let control = self.control.lock().unwrap().clone().ok_or(EngineError::NotStarted)?;
+        let session_rate = session_rate.filter(|rate| rate.is_finite() && *rate > 0.0)
+            .map(|rate| rate.round() as u32).unwrap_or(0);
+        let session_channels = session_channels.filter(|channels| *channels > 0).unwrap_or(2);
+        let target_rate = if cfg!(target_os = "macos") {
+            if match_source_rate { source_rate } else { self.output_rate.load(Ordering::Relaxed) }
+        } else if session_rate > 0 {
+            session_rate
+        } else {
+            self.output_rate.load(Ordering::Relaxed)
+        };
+        let target_channels = if cfg!(target_os = "macos") { 2 } else { session_channels };
+        let requested = self.bit_perfect_enabled.load(Ordering::Relaxed);
+        let eligible = requested
+            && cfg!(target_os = "macos")
+            && match_source_rate
+            && lossless_pcm
+            && is_lossless_pcm_codec(&codec)
+            && matches!(source_bit_depth, 16 | 24)
+            && source_channels == 2
+            && source_rate > 0
+            && target_rate == source_rate;
+        let old_pause = self.output_paused.swap(true, Ordering::AcqRel);
+        self.send(Command::SetBitPerfect(false))?;
+        self.bit_perfect_depth.store(0, Ordering::Relaxed);
+        self.active_bit_perfect_depth.store(0, Ordering::Relaxed);
+        self.requested_rate.store(target_rate, Ordering::Relaxed);
+        self.requested_channels.store(target_channels, Ordering::Relaxed);
+
+        let mut bit_perfect_reason = if !requested {
+            "Bit-perfect output is off".to_string()
+        } else if !cfg!(target_os = "macos") {
+            "This iOS audio route only exposes the system float output path".to_string()
+        } else if !lossless_pcm || !is_lossless_pcm_codec(&codec) {
+            "The source is lossy or has no exact integer PCM representation".to_string()
+        } else if source_channels != 2 {
+            "Bit-perfect output currently requires a stereo source".to_string()
+        } else if !matches!(source_bit_depth, 16 | 24) {
+            "Bit-perfect output supports 16-bit and 24-bit integer PCM".to_string()
+        } else if !match_source_rate || target_rate != source_rate {
+            "Enable source sample-rate matching to use bit-perfect output".to_string()
+        } else {
+            "The output device did not grant exclusive access".to_string()
+        };
+
+        let mut try_bit_perfect = false;
+        if eligible {
+            let device = self.device_name.lock().unwrap().clone();
+            match acquire_output_exclusive(&device) {
+                Ok(()) => {
+                    self.bit_perfect_depth.store(source_bit_depth, Ordering::Relaxed);
+                    try_bit_perfect = true;
+                    bit_perfect_reason.clear();
+                }
+                Err(error) => {
+                    bit_perfect_reason = format!("Exclusive output unavailable: {error}");
+                    release_output_exclusive();
+                }
+            }
+        } else {
+            release_output_exclusive();
+        }
+
+        let result = control.rebuild(true);
+        if result.is_err() && try_bit_perfect {
+            // A route can advertise a rate yet reject the requested integer
+            // client format. Reopen the ordinary stream and keep playback.
+            self.bit_perfect_depth.store(0, Ordering::Relaxed);
+            release_output_exclusive();
+            bit_perfect_reason = "The route rejected the source-depth integer format".into();
+            let _ = control.rebuild(true);
+        } else if let Err(error) = result {
+            self.output_paused.store(old_pause, Ordering::Release);
+            return Err(error);
+        }
+
+        let active_depth = self.active_bit_perfect_depth.load(Ordering::Relaxed);
+        if try_bit_perfect && active_depth != source_bit_depth {
+            bit_perfect_reason = "The route could not open the exact source format".into();
+            release_output_exclusive();
+        }
+        let active = try_bit_perfect && active_depth == source_bit_depth;
+        *self.bit_perfect_reason.lock().unwrap() = if active {
+            "Exclusive integer PCM; DSP and system mixing bypassed".into()
+        } else {
+            bit_perfect_reason
+        };
+        self.send(Command::SetBitPerfect(active))?;
+        self.output_paused.store(old_pause, Ordering::Release);
+        Ok(())
     }
 
     /// Replaces the playing source with a better one for the same recording,
@@ -747,7 +939,12 @@ impl PlayerEngine {
     /// What the output is, for the audio pipeline panel. Reports `started:
     /// false` before the first stream is built rather than inventing a device.
     pub fn output_device(&self) -> OutputDeviceRec {
-        let format = if self.pcm_mode.load(Ordering::Relaxed) == 0 && !cfg!(target_os = "ios") {
+        let bit_perfect_depth = self.active_bit_perfect_depth.load(Ordering::Relaxed);
+        let format = if bit_perfect_depth == 16 {
+            "PCM_16"
+        } else if bit_perfect_depth == 24 {
+            "PCM_24"
+        } else if self.active_pcm_mode.load(Ordering::Relaxed) == 0 {
             "PCM_16"
         } else {
             "FLOAT_32"
@@ -759,6 +956,8 @@ impl PlayerEngine {
             started: self.started.load(Ordering::Relaxed)
                 && self.output_rate.load(Ordering::Relaxed) > 0,
             sample_format: format.to_string(),
+            bit_perfect_active: bit_perfect_depth > 0,
+            bit_perfect_reason: self.bit_perfect_reason.lock().unwrap().clone(),
         }
     }
 
@@ -934,6 +1133,20 @@ impl PlayerEngine {
         decode_region_impl(&source, start_seconds, duration_seconds, mono).ok()
     }
 
+    /// Analysis decode using the same request headers as playback. The caller
+    /// runs this off the render and UI threads; `open_available` deliberately
+    /// returns the bytes that have arrived so far for growing stream files.
+    pub fn decode_region_with_headers(
+        &self,
+        source: String,
+        start_seconds: f64,
+        duration_seconds: f64,
+        mono: bool,
+        headers: std::collections::HashMap<String, String>,
+    ) -> Option<DecodedRegion> {
+        decode_region_impl_with_headers(&source, start_seconds, duration_seconds, mono, &headers).ok()
+    }
+
     /// `ComputeBeatSpectrogram` over pre-resampled 22.05 kHz input.
     pub fn mel_spectrogram(&self, samples: Vec<f32>, sample_rate: f64) -> MelSpectrogramResult {
         let BeatSpectrogram { frames, values } =
@@ -956,10 +1169,11 @@ impl PlayerEngine {
         analyzer::analyzer_ready()
     }
 
-    /// Plan an Automix transition from two local files (Beat This! + open-unmix
-    /// when models are configured, energy/tempo otherwise). `outgoing_text` /
-    /// `incoming_text` are the "title artist album" strings the speech/live
-    /// guard reads.
+    /// Plan an Automix transition from two audio sources (Beat This! +
+    /// open-unmix when models are configured, energy/tempo otherwise).
+    /// Duration and request-header hints let the planner analyze remote streams
+    /// with the same context as playback instead of degrading them to a plain
+    /// crossfade because local tag probing cannot inspect a URL.
     pub fn plan_automix(
         &self,
         outgoing_path: String,
@@ -968,8 +1182,14 @@ impl PlayerEngine {
         incoming_text: String,
         album_sequential: bool,
         crossfade_seconds: f64,
+        outgoing_duration_seconds: f64,
+        incoming_duration_seconds: f64,
+        outgoing_headers: Option<std::collections::HashMap<String, String>>,
+        incoming_headers: Option<std::collections::HashMap<String, String>>,
     ) -> TransitionPlanRec {
         let tier = *self.automix_tier.lock().unwrap();
+        let outgoing_headers = outgoing_headers.unwrap_or_default();
+        let incoming_headers = incoming_headers.unwrap_or_default();
         plan_automix_impl_with_tier(
             &outgoing_path,
             &incoming_path,
@@ -977,6 +1197,10 @@ impl PlayerEngine {
             &incoming_text,
             album_sequential,
             crossfade_seconds,
+            outgoing_duration_seconds,
+            incoming_duration_seconds,
+            &outgoing_headers,
+            &incoming_headers,
             tier,
         )
     }
@@ -1013,6 +1237,10 @@ struct OutputControl {
     bail_flush: Arc<AtomicBool>,
     output_paused: Arc<AtomicBool>,
     pcm_mode: Arc<AtomicU32>,
+    active_pcm_mode: Arc<AtomicU32>,
+    bit_perfect_depth: Arc<AtomicU32>,
+    active_bit_perfect_depth: Arc<AtomicU32>,
+    bit_perfect_reason: Arc<Mutex<String>>,
     prefer_usb: Arc<AtomicBool>,
 }
 
@@ -1113,20 +1341,51 @@ impl OutputControl {
         // without the name check the comparison below would keep the old
         // stream on the old device.
         let device_changed = device.to_string() != *self.device_name.lock().unwrap();
-        let supported = device
-            .default_output_config()
-            .map_err(|e| EngineError::StreamInit(e.to_string()))?;
-        // The same resolution `PlayerEngine::start` applies, so a rebuild after
-        // a route change cannot land on a different format than the first start.
-        let (rate, channels) = choose_format(
-            &self.requested_rate,
-            &self.requested_channels,
-            supported.sample_rate(),
-            supported.channels() as usize,
-        );
+        // Reopen a track's exact integer source format only if this route can
+        // keep its clock and stereo layout. Other routes fall back to the
+        // normal device format and source-rate conversion.
+        let requested_rate = self.requested_rate.load(Ordering::Relaxed);
+        let requested_channels = self.requested_channels.load(Ordering::Relaxed);
+        let prefer_pcm16 = self.pcm_mode.load(Ordering::Relaxed) == 0;
+        let requested_bp_depth = self.bit_perfect_depth.load(Ordering::Relaxed);
+        let mut selected = if requested_bp_depth > 0 {
+            match choose_bitperfect_format(
+                &device, requested_rate, requested_channels, requested_bp_depth,
+            )? {
+                Some(format) => format,
+                None => choose_format(
+                    &device, requested_rate, requested_channels, prefer_pcm16,
+                )?,
+            }
+        } else {
+            choose_format(&device, requested_rate, requested_channels, prefer_pcm16)?
+        };
+        let mut bitperfect_fallback_reason = None;
+        if requested_bp_depth > 0 && selected.bit_perfect_depth == 0 {
+            bitperfect_fallback_reason = Some(
+                "This route cannot open the exact source sample rate and stereo format".to_string(),
+            );
+        }
+        if selected.bit_perfect_depth > 0 {
+            if let Err(error) = acquire_output_exclusive(&device.to_string()) {
+                bitperfect_fallback_reason = Some(format!("Exclusive output unavailable: {error}"));
+                selected = choose_format(
+                    &device, requested_rate, requested_channels, prefer_pcm16,
+                )?;
+            }
+        }
+        let mut rate = selected.sample_rate;
+        let mut channels = selected.channels;
         let prev_rate = self.output_rate.load(Ordering::Relaxed);
         let prev_ch = self.output_channels.load(Ordering::Relaxed);
-        if !force && !device_changed && rate == prev_rate && channels as u32 == prev_ch
+        let prev_pcm16 = self.active_pcm_mode.load(Ordering::Relaxed) == 0;
+        let prev_bit_perfect_depth = self.active_bit_perfect_depth.load(Ordering::Relaxed);
+        if !force
+            && !device_changed
+            && rate == prev_rate
+            && channels as u32 == prev_ch
+            && selected.pcm16 == prev_pcm16
+            && selected.bit_perfect_depth == prev_bit_perfect_depth
             && self.stream.lock().unwrap().is_some()
         {
             log::info!("output still {rate} Hz / {channels} ch — keeping stream");
@@ -1134,7 +1393,7 @@ impl OutputControl {
         }
 
         let cap = (rate.max(192_000) as usize) * 2 * 2;
-        let (producer, consumer) = rtrb::RingBuffer::<f32>::new(cap);
+        let (mut producer, consumer) = rtrb::RingBuffer::<f32>::new(cap);
 
         // Prove the replacement before giving anything up. Opening it first
         // means a failed attempt — a route still settling, the session not yet
@@ -1147,14 +1406,59 @@ impl OutputControl {
         // The new stream starts against an empty ring and simply outputs
         // silence until it is switched in below; the old one keeps playing real
         // audio throughout.
-        let stream = open_output_stream(
+        let initial_stream = open_output_stream(
             &device,
             rate,
             channels,
-            self.pcm_mode.load(Ordering::Relaxed) == 0,
+            selected.pcm16,
+            selected.bit_perfect_depth,
             consumer,
             self,
-        )?;
+        );
+        let mut stream = match initial_stream {
+            Ok(stream) => stream,
+            Err(_error) if selected.bit_perfect_depth > 0 => {
+                bitperfect_fallback_reason = Some(
+                    "The route rejected the source-depth integer stream".to_string(),
+                );
+                release_output_exclusive();
+                selected = choose_format(
+                    &device, requested_rate, requested_channels, prefer_pcm16,
+                )?;
+                rate = selected.sample_rate;
+                channels = selected.channels;
+                let (fallback_producer, consumer) = rtrb::RingBuffer::<f32>::new(cap);
+                producer = fallback_producer;
+                // Keep the exact source-rate request even when integer packing
+                // fails; this still switches the DAC clock without claiming
+                // bit-perfect delivery.
+                open_output_stream(
+                    &device, selected.sample_rate, selected.channels,
+                    selected.pcm16, 0, consumer, self,
+                )?
+            }
+            Err(error) => return Err(error),
+        };
+        if selected.bit_perfect_depth > 0
+            && !output_physical_format_matches(
+                &device.to_string(), rate, channels as u32, selected.bit_perfect_depth,
+            )
+        {
+            bitperfect_fallback_reason = Some(
+                "CoreAudio did not retain the exact integer hardware format".to_string(),
+            );
+            release_output_exclusive();
+            selected = choose_format(
+                &device, requested_rate, requested_channels, prefer_pcm16,
+            )?;
+            rate = selected.sample_rate;
+            channels = selected.channels;
+            let (fallback_producer, consumer) = rtrb::RingBuffer::<f32>::new(cap);
+            producer = fallback_producer;
+            stream = open_output_stream(
+                &device, rate, channels, selected.pcm16, 0, consumer, self,
+            )?;
+        }
         stream
             .play()
             .map_err(|e| EngineError::StreamInit(e.to_string()))?;
@@ -1173,12 +1477,22 @@ impl OutputControl {
             self.output_paused.store(user_paused, Ordering::Release);
             return Err(EngineError::NotStarted);
         }
+        if selected.bit_perfect_depth == 0 && prev_bit_perfect_depth > 0 {
+            let _ = self.commands.send(Command::SetBitPerfect(false));
+        }
         // Hand the new stream in and drop the old one, whose device has gone.
         let previous = self.stream.lock().unwrap().replace(stream);
         drop(previous);
         self.output_paused.store(user_paused, Ordering::Release);
         self.output_rate.store(rate, Ordering::Relaxed);
         self.output_channels.store(channels as u32, Ordering::Relaxed);
+        self.active_pcm_mode
+            .store(if selected.pcm16 { 0 } else { 1 }, Ordering::Relaxed);
+        self.active_bit_perfect_depth
+            .store(selected.bit_perfect_depth, Ordering::Relaxed);
+        if let Some(reason) = bitperfect_fallback_reason {
+            *self.bit_perfect_reason.lock().unwrap() = reason;
+        }
         // A rebuild after a route change is a *different* device, so the name
         // is re-read here rather than left as the one the first start found.
         *self.device_name.lock().unwrap() = device.to_string();
@@ -1225,21 +1539,504 @@ fn pick_output_device(host: &cpal::Host, prefer_usb: bool) -> Option<cpal::Devic
     }
 }
 
+fn is_lossless_pcm_codec(codec: &str) -> bool {
+    matches!(codec, "FLAC" | "ALAC" | "PCM" | "PCM Float")
+}
+
+#[cfg(target_os = "macos")]
+mod macos_exclusive {
+    use std::ffi::c_void;
+    use std::ptr::{null, NonNull};
+    use std::sync::{Mutex, OnceLock};
+
+    use objc2_core_audio::{
+        AudioObjectGetPropertyData, AudioObjectGetPropertyDataSize,
+        AudioObjectPropertyAddress, AudioObjectSetPropertyData,
+        AudioStreamRangedDescription,
+        kAudioDevicePropertyHogMode, kAudioDevicePropertyStreamConfiguration,
+        kAudioHardwarePropertyDevices, kAudioObjectPropertyElementMain, kAudioObjectPropertyName,
+        kAudioObjectPropertyScopeOutput, kAudioStreamPropertyAvailablePhysicalFormats,
+        kAudioStreamPropertyPhysicalFormat,
+        kAudioObjectPropertyScopeGlobal, kAudioObjectSystemObject, AudioObjectID,
+    };
+    use objc2_core_audio_types::{
+        AudioStreamBasicDescription, kAudioFormatFlagIsFloat,
+        kAudioFormatFlagIsPacked, kAudioFormatFlagIsSignedInteger, kAudioFormatLinearPCM,
+    };
+    use objc2_core_foundation::{CFString, CFRetained};
+
+    static HOGGED_DEVICE: OnceLock<Mutex<Option<AudioObjectID>>> = OnceLock::new();
+
+    fn hogged_device() -> &'static Mutex<Option<AudioObjectID>> {
+        HOGGED_DEVICE.get_or_init(|| Mutex::new(None))
+    }
+
+    fn status_message(status: i32) -> String {
+        format!("CoreAudio OSStatus {status}")
+    }
+
+    fn property_address(selector: u32) -> AudioObjectPropertyAddress {
+        AudioObjectPropertyAddress {
+            mSelector: selector,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain,
+        }
+    }
+
+    fn output_device_ids() -> Result<Vec<AudioObjectID>, String> {
+        let mut address = property_address(kAudioHardwarePropertyDevices);
+        let mut data_size = 0u32;
+        let status = unsafe {
+            AudioObjectGetPropertyDataSize(
+                kAudioObjectSystemObject as u32,
+                NonNull::from(&mut address), 0, null(), NonNull::from(&mut data_size),
+            )
+        };
+        if status != 0 { return Err(status_message(status)); }
+        if data_size == 0 { return Err("CoreAudio reports no devices".into()); }
+        let mut ids = vec![0u32; data_size as usize / std::mem::size_of::<AudioObjectID>()];
+        let status = unsafe {
+            AudioObjectGetPropertyData(
+                kAudioObjectSystemObject as u32,
+                NonNull::from(&mut address), 0, null(), NonNull::from(&mut data_size),
+                NonNull::new(ids.as_mut_ptr().cast::<c_void>()).unwrap(),
+            )
+        };
+        if status != 0 { return Err(status_message(status)); }
+        Ok(ids)
+    }
+
+    fn has_output_stream(device: AudioObjectID) -> bool {
+        let mut address = AudioObjectPropertyAddress {
+            mSelector: kAudioDevicePropertyStreamConfiguration,
+            mScope: kAudioObjectPropertyScopeOutput,
+            mElement: kAudioObjectPropertyElementMain,
+        };
+        let mut data_size = 0u32;
+        let status = unsafe {
+            AudioObjectGetPropertyDataSize(
+                device,
+                NonNull::from(&mut address), 0, null(), NonNull::from(&mut data_size),
+            )
+        };
+        if status != 0 || data_size < std::mem::size_of::<u32>() as u32 {
+            return false;
+        }
+        let word_count = data_size.div_ceil(std::mem::size_of::<u32>() as u32) as usize;
+        let mut words = vec![0u32; word_count];
+        let status = unsafe {
+            AudioObjectGetPropertyData(
+                device,
+                NonNull::from(&mut address), 0, null(), NonNull::from(&mut data_size),
+                NonNull::new(words.as_mut_ptr().cast::<c_void>()).unwrap(),
+            )
+        };
+        status == 0 && words.first().is_some_and(|count| *count > 0)
+    }
+
+    fn device_name(device: AudioObjectID) -> Option<String> {
+        let mut address = property_address(kAudioObjectPropertyName);
+        let mut value: *const CFString = std::ptr::null();
+        let mut data_size = std::mem::size_of::<*const CFString>() as u32;
+        let status = unsafe {
+            AudioObjectGetPropertyData(
+                device,
+                NonNull::from(&mut address), 0, null(), NonNull::from(&mut data_size),
+                NonNull::new((&mut value as *mut *const CFString).cast::<c_void>())?,
+            )
+        };
+        if status != 0 { return None; }
+        let ptr = NonNull::new(value.cast_mut())?;
+        // CoreAudio returns the property as a borrowed CFStringRef. Retain it
+        // for the short conversion so the Rust wrapper owns its lifetime.
+        let string = unsafe { CFRetained::retain(ptr) };
+        Some(string.to_string())
+    }
+
+    fn resolve_device(target: &str) -> Result<AudioObjectID, String> {
+        let ids = output_device_ids()?;
+        let mut exact = Vec::new();
+        let mut fuzzy = Vec::new();
+        for id in ids {
+            if !has_output_stream(id) { continue; }
+            let Some(name) = device_name(id) else { continue; };
+            if name == target {
+                exact.push(id);
+                continue;
+            }
+            if name.to_lowercase().contains(&target.to_lowercase())
+                || target.to_lowercase().contains(&name.to_lowercase())
+            {
+                fuzzy.push(id);
+            }
+        }
+        let matches = if exact.is_empty() { &fuzzy } else { &exact };
+        match matches.as_slice() {
+            [device] => Ok(*device),
+            [] => Err(format!("could not match output device ‘{target}’ in CoreAudio")),
+            _ => Err(format!("output device name ‘{target}’ is ambiguous in CoreAudio")),
+        }
+    }
+
+    fn physical_formats(device: AudioObjectID) -> Result<Vec<AudioStreamRangedDescription>, String> {
+        let mut address = AudioObjectPropertyAddress {
+            mSelector: kAudioStreamPropertyAvailablePhysicalFormats,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain,
+        };
+        let mut data_size = 0u32;
+        let status = unsafe {
+            AudioObjectGetPropertyDataSize(
+                device,
+                NonNull::from(&mut address), 0, null(), NonNull::from(&mut data_size),
+            )
+        };
+        if status != 0 { return Err(status_message(status)); }
+        let count = data_size as usize / std::mem::size_of::<AudioStreamRangedDescription>();
+        if count == 0 { return Ok(Vec::new()); }
+        let mut formats = Vec::<AudioStreamRangedDescription>::with_capacity(count);
+        let status = unsafe {
+            AudioObjectGetPropertyData(
+                device,
+                NonNull::from(&mut address), 0, null(), NonNull::from(&mut data_size),
+                NonNull::new(formats.as_mut_ptr().cast::<c_void>()).unwrap(),
+            )
+        };
+        if status != 0 { return Err(status_message(status)); }
+        let filled_bytes = data_size as usize;
+        let entry_size = std::mem::size_of::<AudioStreamRangedDescription>();
+        if filled_bytes > count * entry_size || filled_bytes % entry_size != 0 {
+            return Err("CoreAudio returned an invalid physical-format list size".into());
+        }
+        unsafe { formats.set_len(filled_bytes / entry_size); }
+        Ok(formats)
+    }
+
+    fn is_exact_integer_format(
+        format: &AudioStreamBasicDescription,
+        rate: u32,
+        channels: u32,
+        depth: u32,
+    ) -> bool {
+        format.mFormatID == kAudioFormatLinearPCM
+            && format.mSampleRate == rate as f64
+            && format.mChannelsPerFrame == channels
+            && format.mBitsPerChannel == depth
+            && format.mFormatFlags & kAudioFormatFlagIsSignedInteger != 0
+            && format.mFormatFlags & kAudioFormatFlagIsFloat == 0
+            && format.mFormatFlags & kAudioFormatFlagIsPacked != 0
+    }
+
+    pub fn supports_integer_format(target: &str, rate: u32, channels: u32, depth: u32) -> bool {
+        let Ok(device) = resolve_device(target) else { return false; };
+        physical_formats(device).is_ok_and(|formats| {
+            formats.into_iter().any(|entry| {
+                let format = entry.mFormat;
+                let range = entry.mSampleRateRange;
+                format.mFormatID == kAudioFormatLinearPCM
+                    && format.mChannelsPerFrame == channels
+                    && format.mBitsPerChannel == depth
+                    && format.mFormatFlags & kAudioFormatFlagIsSignedInteger != 0
+                    && format.mFormatFlags & kAudioFormatFlagIsFloat == 0
+                    && format.mFormatFlags & kAudioFormatFlagIsPacked != 0
+                    && (format.mSampleRate == rate as f64
+                        || (range.mMinimum <= rate as f64 && rate as f64 <= range.mMaximum))
+            })
+        })
+    }
+
+    pub fn current_integer_format_matches(
+        target: &str, rate: u32, channels: u32, depth: u32,
+    ) -> bool {
+        let Ok(device) = resolve_device(target) else { return false; };
+        let mut address = AudioObjectPropertyAddress {
+            mSelector: kAudioStreamPropertyPhysicalFormat,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain,
+        };
+        let mut format = AudioStreamBasicDescription {
+            mSampleRate: 0.0,
+            mFormatID: 0,
+            mFormatFlags: 0,
+            mBytesPerPacket: 0,
+            mFramesPerPacket: 0,
+            mBytesPerFrame: 0,
+            mChannelsPerFrame: 0,
+            mBitsPerChannel: 0,
+            mReserved: 0,
+        };
+        let mut data_size = std::mem::size_of::<AudioStreamBasicDescription>() as u32;
+        let status = unsafe {
+            AudioObjectGetPropertyData(
+                device,
+                NonNull::from(&mut address), 0, null(), NonNull::from(&mut data_size),
+                NonNull::from(&mut format).cast::<c_void>(),
+            )
+        };
+        status == 0 && is_exact_integer_format(&format, rate, channels, depth)
+    }
+
+    fn current_owner(device: AudioObjectID) -> Result<i32, String> {
+        let mut address = property_address(kAudioDevicePropertyHogMode);
+        let mut owner = -1i32;
+        let mut data_size = std::mem::size_of::<i32>() as u32;
+        let status = unsafe {
+            AudioObjectGetPropertyData(
+                device,
+                NonNull::from(&mut address), 0, null(), NonNull::from(&mut data_size),
+                NonNull::from(&mut owner).cast(),
+            )
+        };
+        if status != 0 { return Err(status_message(status)); }
+        Ok(owner)
+    }
+
+    fn set_hog(device: AudioObjectID, value: &mut i32) -> Result<(), String> {
+        let mut address = property_address(kAudioDevicePropertyHogMode);
+        let status = unsafe {
+            AudioObjectSetPropertyData(
+                device,
+                NonNull::from(&mut address), 0, null(),
+                std::mem::size_of::<i32>() as u32,
+                NonNull::from(value).cast::<c_void>(),
+            )
+        };
+        if status != 0 { return Err(status_message(status)); }
+        Ok(())
+    }
+
+    pub fn acquire(target: &str) -> Result<(), String> {
+        let device = resolve_device(target)?;
+        if *hogged_device().lock().unwrap() == Some(device) {
+            return Ok(());
+        }
+        release();
+        let process = unsafe { libc::getpid() };
+        let owner = current_owner(device)?;
+        if owner == process {
+            *hogged_device().lock().unwrap() = Some(device);
+            return Ok(());
+        }
+        if owner != -1 {
+            return Err("another process currently owns the output device".into());
+        }
+        let mut requested = process;
+        set_hog(device, &mut requested)?;
+        if requested != process || current_owner(device)? != process {
+            return Err("CoreAudio did not grant exclusive access".into());
+        }
+        *hogged_device().lock().unwrap() = Some(device);
+        Ok(())
+    }
+
+    pub fn release() {
+        let Some(device) = hogged_device().lock().unwrap().take() else { return; };
+        let process = unsafe { libc::getpid() };
+        if current_owner(device).ok() == Some(process) {
+            let mut release = -1;
+            let _ = set_hog(device, &mut release);
+        }
+    }
+}
+
+fn acquire_output_exclusive(device_name: &str) -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    { macos_exclusive::acquire(device_name) }
+    #[cfg(not(target_os = "macos"))]
+    { let _ = device_name; Err("exclusive output is unavailable on this platform".into()) }
+}
+
+fn release_output_exclusive() {
+    #[cfg(target_os = "macos")]
+    macos_exclusive::release();
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct OutputFormat {
+    sample_rate: u32,
+    channels: usize,
+    pcm16: bool,
+    bit_perfect_depth: u32,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct OutputRange {
+    min_rate: u32,
+    max_rate: u32,
+    channels: usize,
+    pcm16: bool,
+}
+
+/// Chooses a stream format the selected device says it supports. A platform
+/// rate is a preference, not proof the USB DAC or current route accepts it.
 fn choose_format(
-    requested_rate: &AtomicU32,
-    requested_channels: &AtomicU32,
-    device_rate: u32,
-    device_channels: usize,
-) -> (u32, usize) {
-    let rate = match requested_rate.load(Ordering::Relaxed) {
-        0 => device_rate,
-        r => r,
+    device: &cpal::Device,
+    requested_rate: u32,
+    requested_channels: u32,
+    prefer_pcm16: bool,
+) -> Result<OutputFormat, EngineError> {
+    let default = device
+        .default_output_config()
+        .map_err(|e| EngineError::StreamInit(e.to_string()))?;
+    let default_rate = default.sample_rate();
+    let default_channels = default.channels() as usize;
+    let prefer_pcm16 = prefer_pcm16 && !cfg!(target_os = "ios");
+
+    let mut ranges: Vec<OutputRange> = device
+        .supported_output_configs()
+        .ok()
+        .into_iter()
+        .flatten()
+        .filter_map(|range| {
+            let pcm16 = match range.sample_format() {
+                cpal::SampleFormat::I16 => true,
+                cpal::SampleFormat::F32 => false,
+                _ => return None,
+            };
+            if cfg!(target_os = "ios") && pcm16 {
+                return None;
+            }
+            Some(OutputRange {
+                min_rate: range.min_sample_rate(),
+                max_rate: range.max_sample_rate(),
+                channels: range.channels() as usize,
+                pcm16,
+            })
+        })
+        .collect();
+
+    // Some backends expose only a default config. That config is a valid
+    // fallback, but it does not authorize arbitrary requested rates/channels.
+    if ranges.is_empty() {
+        let pcm16 = match default.sample_format() {
+            cpal::SampleFormat::I16 => true,
+            cpal::SampleFormat::F32 => false,
+            format => {
+                return Err(EngineError::StreamInit(format!(
+                    "unsupported default output sample format: {format:?}"
+                )))
+            }
+        };
+        if cfg!(target_os = "ios") && pcm16 {
+            return Err(EngineError::StreamInit(
+                "iOS output device does not expose float32 audio".into(),
+            ));
+        }
+        ranges.push(OutputRange {
+            min_rate: default_rate,
+            max_rate: default_rate,
+            channels: default_channels,
+            pcm16,
+        });
+    }
+
+    select_supported_format(
+        &ranges,
+        requested_rate,
+        requested_channels as usize,
+        default_rate,
+        default_channels,
+        prefer_pcm16,
+    )
+    .ok_or_else(|| {
+        EngineError::StreamInit(
+            "output device has no supported float32 or int16 configuration".into(),
+        )
+    })
+}
+
+fn select_supported_format(
+    ranges: &[OutputRange],
+    requested_rate: u32,
+    requested_channels: usize,
+    default_rate: u32,
+    default_channels: usize,
+    prefer_pcm16: bool,
+) -> Option<OutputFormat> {
+    let desired_rate = if requested_rate > 0 {
+        requested_rate
+    } else {
+        default_rate.max(1)
     };
-    let channels = match requested_channels.load(Ordering::Relaxed) {
-        0 => device_channels,
-        c => c as usize,
+    let desired_channels = if requested_channels > 0 {
+        requested_channels
+    } else {
+        default_channels.max(1)
     };
-    (rate.max(1), channels.max(1))
+
+    ranges
+        .iter()
+        .filter_map(|range| {
+            if range.min_rate == 0 || range.min_rate > range.max_rate || range.channels == 0 {
+                return None;
+            }
+            let rate = if (range.min_rate..=range.max_rate).contains(&desired_rate) {
+                desired_rate
+            } else if (range.min_rate..=range.max_rate).contains(&default_rate) {
+                default_rate
+            } else {
+                desired_rate.clamp(range.min_rate, range.max_rate)
+            };
+            Some((
+                (
+                    range.channels == desired_channels,
+                    rate == desired_rate,
+                    range.channels == default_channels,
+                    rate == default_rate,
+                    range.pcm16 == prefer_pcm16,
+                ),
+                OutputFormat {
+                    sample_rate: rate,
+                    channels: range.channels,
+                    pcm16: range.pcm16,
+                    bit_perfect_depth: 0,
+                },
+            ))
+        })
+        .max_by_key(|(score, _)| *score)
+        .map(|(_, format)| format)
+}
+
+/// Builds an integer output configuration only when the route can open at
+/// precisely the decoded source rate and stereo channel layout. CoreAudio's
+/// macOS backend performs the physical stream-format/nominal-rate request when
+/// this stream is opened; all other cases fall back to the ordinary mixer.
+fn choose_bitperfect_format(
+    device: &cpal::Device,
+    requested_rate: u32,
+    requested_channels: u32,
+    source_depth: u32,
+) -> Result<Option<OutputFormat>, EngineError> {
+    #[cfg(target_os = "macos")]
+    {
+        if !matches!(source_depth, 16 | 24)
+            || requested_rate == 0
+            || requested_channels != 2
+            || !macos_exclusive::supports_integer_format(
+                &device.to_string(), requested_rate, requested_channels, source_depth,
+            )
+        {
+            return Ok(None);
+        }
+        Ok(Some(OutputFormat {
+            sample_rate: requested_rate,
+            channels: requested_channels as usize,
+            pcm16: source_depth == 16,
+            bit_perfect_depth: source_depth,
+        }))
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (device, requested_rate, requested_channels, source_depth);
+        Ok(None)
+    }
+}
+
+fn output_physical_format_matches(device_name: &str, rate: u32, channels: u32, depth: u32) -> bool {
+    #[cfg(target_os = "macos")]
+    { macos_exclusive::current_integer_format_matches(device_name, rate, channels, depth) }
+    #[cfg(not(target_os = "macos"))]
+    { let _ = (device_name, rate, channels, depth); false }
 }
 
 fn open_output_stream(
@@ -1247,6 +2044,7 @@ fn open_output_stream(
     sample_rate: u32,
     channels: usize,
     pcm16: bool,
+    bit_perfect_depth: u32,
     mut consumer: rtrb::Consumer<f32>,
     control: &OutputControl,
 ) -> Result<cpal::Stream, EngineError> {
@@ -1263,6 +2061,46 @@ fn open_output_stream(
     let bail_flush = control.bail_flush.clone();
     let paused = control.output_paused.clone();
     let err_ctrl = control.clone();
+    if bit_perfect_depth == 16 {
+        let mut scratch = Vec::<f32>::new();
+        return device
+            .build_output_stream(
+                config,
+                move |data: &mut [i16], _| {
+                    if scratch.len() < data.len() { scratch.resize(data.len(), 0.0); }
+                    render_bitperfect(
+                        &mut consumer, &buffered, &callback_underruns, &output_peak,
+                        &flush_ring, &bail_flush, &paused, &mut scratch[..data.len()],
+                    );
+                    for (out, sample) in data.iter_mut().zip(&scratch) {
+                        *out = exact_f32_to_i16(*sample);
+                    }
+                },
+                move |err| err_ctrl.on_stream_error(err),
+                None,
+            )
+            .map_err(|e| EngineError::StreamInit(e.to_string()));
+    }
+    if bit_perfect_depth == 24 {
+        let mut scratch = Vec::<f32>::new();
+        return device
+            .build_output_stream(
+                config,
+                move |data: &mut [cpal::I24], _| {
+                    if scratch.len() < data.len() { scratch.resize(data.len(), 0.0); }
+                    render_bitperfect(
+                        &mut consumer, &buffered, &callback_underruns, &output_peak,
+                        &flush_ring, &bail_flush, &paused, &mut scratch[..data.len()],
+                    );
+                    for (out, sample) in data.iter_mut().zip(&scratch) {
+                        *out = cpal::I24::new_unchecked(exact_f32_to_i24(*sample));
+                    }
+                },
+                move |err| err_ctrl.on_stream_error(err),
+                None,
+            )
+            .map_err(|e| EngineError::StreamInit(e.to_string()));
+    }
     // PCM_16 opens the unit as int16: the ring stays f32 throughout (mix, EQ
     // and volume all run in float, exactly as upstream's processors run before
     // the sink's conversion) and quantization happens once, at the boundary.
@@ -1360,6 +2198,65 @@ fn clamp16_from_float(f: f32) -> i16 {
         return i16::MAX;
     }
     (scaled + 0.5).floor() as i16
+}
+
+/// Exact inverse of Symphonia's signed PCM normalization for integer formats
+/// up to 24 bits. Eligible samples are integer-derived f32 values, so scaling
+/// by the matching power of two recovers the original codeword without
+/// rounding or dither.
+fn exact_f32_to_i16(sample: f32) -> i16 {
+    if sample <= -1.0 { return i16::MIN; }
+    if sample >= 1.0 { return i16::MAX; }
+    (sample * 32768.0) as i16
+}
+
+fn exact_f32_to_i24(sample: f32) -> i32 {
+    if sample <= -1.0 { return -(1 << 23); }
+    if sample >= 1.0 { return (1 << 23) - 1; }
+    (sample * 8_388_608.0) as i32
+}
+
+/// Direct ring drain used only by the integer bit-perfect stream. No volume,
+/// fade, remapping, or other sample arithmetic happens here.
+fn render_bitperfect(
+    consumer: &mut rtrb::Consumer<f32>,
+    buffered: &Arc<AtomicU64>,
+    callback_underruns: &Arc<AtomicU64>,
+    output_peak: &Arc<AtomicU32>,
+    flush_ring: &Arc<AtomicBool>,
+    bail_flush: &Arc<AtomicBool>,
+    paused: &Arc<AtomicBool>,
+    data: &mut [f32],
+) {
+    if flush_ring.swap(false, Ordering::AcqRel) || bail_flush.swap(false, Ordering::AcqRel) {
+        while consumer.pop().is_ok() {}
+        buffered.store(0, Ordering::Relaxed);
+    }
+    if paused.load(Ordering::Acquire) {
+        data.fill(0.0);
+        output_peak.store(0.0f32.to_bits(), Ordering::Relaxed);
+        return;
+    }
+    let mut underflowed = false;
+    let mut peak = 0.0f32;
+    for sample in data.iter_mut() {
+        *sample = match consumer.pop() {
+            Ok(value) => value,
+            Err(_) => { underflowed = true; 0.0 }
+        };
+        peak = peak.max(sample.abs());
+    }
+    output_peak.store(peak.to_bits(), Ordering::Relaxed);
+    if underflowed { callback_underruns.fetch_add(1, Ordering::Relaxed); }
+    let consumed = (data.len() / 2) as u64;
+    let mut current = buffered.load(Ordering::Relaxed);
+    while current > 0 {
+        let next = current.saturating_sub(consumed);
+        match buffered.compare_exchange_weak(current, next, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => break,
+            Err(observed) => current = observed,
+        }
+    }
 }
 
 #[derive(Default)]
@@ -1534,9 +2431,14 @@ fn plan_automix_impl_with_tier(
     incoming_text: &str,
     album_sequential: bool,
     crossfade_seconds: f64,
+    outgoing_duration_seconds: f64,
+    incoming_duration_seconds: f64,
+    outgoing_headers: &std::collections::HashMap<String, String>,
+    incoming_headers: &std::collections::HashMap<String, String>,
     tier: AutomixTier,
 ) -> TransitionPlanRec {
     let skip_vocals = !tier.runs_vocal_model();
+    let empty_headers = std::collections::HashMap::new();
     if skip_vocals {
         log::info!("automix: EFFICIENT tier — beat grid + energy, vocal model skipped");
     }
@@ -1547,17 +2449,45 @@ fn plan_automix_impl_with_tier(
         incoming_text,
         album_sequential,
         crossfade_seconds,
+        outgoing_duration_seconds,
+        incoming_duration_seconds,
         skip_vocals,
         tier.name(),
         |path, start, dur, mono| {
-            decode_region_impl(path, start, dur, mono)
+            let headers = if path == outgoing {
+                outgoing_headers
+            } else if path == incoming {
+                incoming_headers
+            } else {
+                &empty_headers
+            };
+            decode_region_impl_with_headers(path, start, dur, mono, headers)
                 .ok()
                 .map(|r| (r.samples, r.sample_rate, r.start_seconds))
         },
         |path| {
-            metadata::read_track_metadata(path)
+            let tagged_duration = metadata::read_track_metadata(path)
                 .map(|m| m.duration_seconds)
-                .unwrap_or(0.0)
+                .filter(|duration| duration.is_finite() && *duration > 0.0)
+                .unwrap_or(0.0);
+            if tagged_duration > 0.0 {
+                return tagged_duration;
+            }
+            let headers = if path == outgoing {
+                outgoing_headers
+            } else if path == incoming {
+                incoming_headers
+            } else {
+                &empty_headers
+            };
+            decode::SymphoniaDecoder::open_available(
+                &decode::SourceKind::parse(path),
+                headers,
+            )
+            .ok()
+            .and_then(|decoder| decoder.duration_seconds())
+            .filter(|duration| duration.is_finite() && *duration > 0.0)
+            .unwrap_or(0.0)
         },
     );
     TransitionPlanRec {
@@ -1711,11 +2641,26 @@ fn decode_region_impl(
     duration_seconds: f64,
     mono: bool,
 ) -> Result<DecodedRegion, String> {
+    decode_region_impl_with_headers(
+        source,
+        start_seconds,
+        duration_seconds,
+        mono,
+        &std::collections::HashMap::new(),
+    )
+}
+
+fn decode_region_impl_with_headers(
+    source: &str,
+    start_seconds: f64,
+    duration_seconds: f64,
+    mono: bool,
+    headers: &std::collections::HashMap<String, String>,
+) -> Result<DecodedRegion, String> {
     let kind = decode::SourceKind::parse(source);
-    let empty_headers = std::collections::HashMap::new();
     // Analysis must not wait out a download. Playback still does: a plan that
     // blocks until the file is complete is a plan that arrives after the blend.
-    let mut decoder = decode::SymphoniaDecoder::open_available(&kind, &empty_headers)
+    let mut decoder = decode::SymphoniaDecoder::open_available(&kind, headers)
         .map_err(|e| e.to_string())?;
     if start_seconds > 0.0 {
         decoder.seek_seconds(start_seconds).map_err(|e| e.to_string())?;
@@ -1751,57 +2696,126 @@ fn decode_region_impl(
 
 #[cfg(test)]
 mod tests {
-    use super::choose_format;
-    use std::sync::atomic::AtomicU32;
+    use super::{
+        exact_f32_to_i16, exact_f32_to_i24, is_lossless_pcm_codec,
+        select_supported_format, OutputFormat, OutputRange,
+    };
 
-    fn pick(rate: u32, channels: u32, dev_rate: u32, dev_channels: usize) -> (u32, usize) {
-        choose_format(&AtomicU32::new(rate), &AtomicU32::new(channels), dev_rate, dev_channels)
+    fn range(min_rate: u32, max_rate: u32, channels: usize, pcm16: bool) -> OutputRange {
+        OutputRange {
+            min_rate,
+            max_rate,
+            channels,
+            pcm16,
+        }
     }
 
     #[test]
-    fn no_hint_takes_cpals_figures() {
-        assert_eq!(pick(0, 0, 48_000, 2), (48_000, 2));
+    fn no_hint_uses_the_device_default_rate_and_channels() {
+        assert_eq!(
+            select_supported_format(&[range(44_100, 192_000, 2, false)], 0, 0, 48_000, 2, false),
+            Some(OutputFormat {
+                sample_rate: 48_000,
+                channels: 2,
+                pcm16: false,
+                bit_perfect_depth: 0,
+            })
+        );
     }
 
     #[test]
-    fn a_platform_hint_overrides_cpals_figures() {
-        // The iOS case: the session says 44.1 kHz, cpal's RemoteIO unit says
-        // 48 kHz, and the session is the one that owns the hardware.
-        assert_eq!(pick(44_100, 2, 48_000, 2), (44_100, 2));
+    fn an_exact_platform_rate_is_used_when_the_device_supports_it() {
+        assert_eq!(
+            select_supported_format(
+                &[range(44_100, 192_000, 2, false)],
+                44_100,
+                2,
+                48_000,
+                2,
+                false
+            ),
+            Some(OutputFormat {
+                sample_rate: 44_100,
+                channels: 2,
+                pcm16: false,
+                bit_perfect_depth: 0,
+            })
+        );
     }
 
     #[test]
-    fn a_mono_hint_is_honoured_rather_than_read_as_unset() {
-        // Zero is the only "no opinion" marker. One is a real configuration,
-        // and discarding it would hand the unit two channels for a session that
-        // believes it has one.
-        assert_eq!(pick(48_000, 1, 48_000, 2), (48_000, 1));
+    fn unsupported_requested_rate_falls_back_to_device_rate() {
+        assert_eq!(
+            select_supported_format(
+                &[range(44_100, 48_000, 2, false)],
+                192_000,
+                2,
+                48_000,
+                2,
+                false
+            ),
+            Some(OutputFormat {
+                sample_rate: 48_000,
+                channels: 2,
+                pcm16: false,
+                bit_perfect_depth: 0,
+            })
+        );
     }
 
     #[test]
-    fn hints_are_resolved_independently() {
-        assert_eq!(pick(44_100, 0, 48_000, 6), (44_100, 6));
-        assert_eq!(pick(0, 1, 48_000, 6), (48_000, 1));
+    fn unsupported_requested_encoding_falls_back_to_float() {
+        assert_eq!(
+            select_supported_format(
+                &[range(44_100, 48_000, 2, false)],
+                48_000,
+                2,
+                48_000,
+                2,
+                true
+            ),
+            Some(OutputFormat {
+                sample_rate: 48_000,
+                channels: 2,
+                pcm16: false,
+                bit_perfect_depth: 0,
+            })
+        );
     }
 
     #[test]
-    fn a_zero_device_figure_is_never_handed_to_cpal() {
-        // Nothing should reach the unit as 0 Hz or 0 channels, whatever the
-        // source of the zero. A hint of 0 means "no opinion" and falls through
-        // to the device; a device that also reports 0 is floored at 1 rather
-        // than passed on.
-        assert_eq!(choose_format(
-            &AtomicU32::new(0),
-            &AtomicU32::new(0),
-            0,
-            0
-        ), (1, 1));
-        assert_eq!(choose_format(
-            &AtomicU32::new(48_000),
-            &AtomicU32::new(2),
-            0,
-            0
-        ), (48_000, 2));
+    fn empty_device_capabilities_have_no_candidate() {
+        assert_eq!(
+            select_supported_format(&[], 48_000, 2, 48_000, 2, false),
+            None
+        );
+    }
+
+    #[test]
+    fn integer_pcm_survives_the_float_ring_and_integer_pack_exactly() {
+        for value in i16::MIN..=i16::MAX {
+            let normalized = value as f32 / 32_768.0;
+            assert_eq!(exact_f32_to_i16(normalized), value);
+        }
+        for value in (-(1 << 23)..(1 << 23)).step_by(257) {
+            let normalized = value as f32 / 8_388_608.0;
+            assert_eq!(exact_f32_to_i24(normalized), value);
+        }
+        assert_eq!(exact_f32_to_i24(-1.0), -(1 << 23));
+        assert_eq!(exact_f32_to_i24(1.0), (1 << 23) - 1);
+    }
+
+    #[test]
+    fn bitperfect_eligibility_rejects_lossy_codecs() {
+        assert!(is_lossless_pcm_codec("FLAC"));
+        assert!(is_lossless_pcm_codec("ALAC"));
+        assert!(is_lossless_pcm_codec("PCM"));
+        assert!(is_lossless_pcm_codec("PCM Float"));
+        assert!(!is_lossless_pcm_codec("AAC"));
+        assert!(!is_lossless_pcm_codec("Opus"));
+        assert!(!is_lossless_pcm_codec("MP3"));
+        assert!(!is_lossless_pcm_codec("AIFF"));
+        assert!(!is_lossless_pcm_codec("G.711"));
     }
 
     #[test]
@@ -1822,14 +2836,14 @@ mod tests {
     }
 
     #[test]
-    fn loudness_correction_matches_upstream_clamps() {
+    fn loudness_correction_does_not_boost_without_peak_metadata() {
         use super::mixer::loudness_gain;
-        // Upstream: gainMb = round(-loudnessDb * 100) clamped to [-1500, 300].
-        // A track 7 dB hot asks for -(-7) = ... precisely: gain = -loudnessDb
-        // = +7 dB, clamped to +3 dB → 10^(3/20) ≈ 1.4125.
+        // loudnessDb does not include a true-peak ceiling, so positive gain can
+        // push a mastered source over 0 dBFS. Keep normalization attenuation
+        // while refusing that unsafe boost.
         let (gain, db) = loudness_gain(Some(-7.0), true);
-        assert_eq!(db, Some(3.0));
-        assert!((gain - 1.4125375).abs() < 1e-5);
+        assert_eq!(db, Some(0.0));
+        assert_eq!(gain, 1.0);
         // A track 20 dB quiet asks for -20 dB, clamped to -15 dB.
         let (gain, db) = loudness_gain(Some(20.0), true);
         assert_eq!(db, Some(-15.0));
@@ -1839,6 +2853,30 @@ mod tests {
         assert_eq!(loudness_gain(Some(-7.0), false), (1.0, None));
         assert_eq!(loudness_gain(None, true), (1.0, None));
         assert_eq!(loudness_gain(Some(f64::NAN), true), (1.0, None));
+    }
+
+    #[test]
+    fn bitperfect_output_callback_copies_samples_without_app_gain() {
+        use super::render_bitperfect;
+        use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+        use std::sync::Arc;
+
+        let source = [-0.75f32, 0.5, -0.125, 0.25];
+        let (mut producer, mut consumer) = rtrb::RingBuffer::<f32>::new(8);
+        for sample in source { producer.push(sample).unwrap(); }
+        let buffered = Arc::new(AtomicU64::new(2));
+        let underruns = Arc::new(AtomicU64::new(0));
+        let peak = Arc::new(AtomicU32::new(0));
+        let flush = Arc::new(AtomicBool::new(false));
+        let bail = Arc::new(AtomicBool::new(false));
+        let paused = Arc::new(AtomicBool::new(false));
+        let mut output = [0.0f32; 4];
+        render_bitperfect(
+            &mut consumer, &buffered, &underruns, &peak, &flush, &bail, &paused, &mut output,
+        );
+        assert_eq!(output, source);
+        assert_eq!(buffered.load(Ordering::Relaxed), 0);
+        assert_eq!(underruns.load(Ordering::Relaxed), 0);
     }
 
     #[test]

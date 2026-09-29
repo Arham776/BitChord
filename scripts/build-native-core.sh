@@ -6,6 +6,8 @@
 # The framework bundle is named NativeCoreFFI (not NativeCore) because a
 # `framework module` in a modulemap must match its bundle name, and the
 # generated Swift imports the FFI module `NativeCoreFFI`.
+# Building native-core also builds bundled libopus; install CMake and put it on
+# PATH before running this script.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"

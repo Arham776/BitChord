@@ -295,7 +295,9 @@ do {
     let cue = engine.planAutomix(
         outgoingPath: wav, incomingPath: wav,
         outgoingText: "out", incomingText: "in",
-        albumSequential: false, crossfadeSeconds: 8)
+        albumSequential: false, crossfadeSeconds: 8,
+        outgoingDurationSeconds: 0, incomingDurationSeconds: 0,
+        outgoingHeaders: [:], incomingHeaders: [:])
     check("a plan comes back for a real pair", true,
           "style=\(cue.style) cue=\(String(format: "%.2f", cue.cueSeconds))s "
           + "fade=\(String(format: "%.2f", cue.fadeSeconds))s "

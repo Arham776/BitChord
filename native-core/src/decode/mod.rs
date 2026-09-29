@@ -10,10 +10,9 @@
 //! reads wait at EOF until `.complete` appears. symphonia only requires a
 //! `MediaSource`, so the same decoder drives both.
 //!
-//! Milestone-4 gate note (spec §3.4): symphonia 0.6 ships no Opus codec. The
-//! app mirrors upstream's `pickAac`/`isM4a` preference so streamed playback
-//! targets AAC/MP4 renditions; FLAC/MP3/ALAC/Vorbis/PCM/AIFF are covered
-//! natively. Opus-in-WebM is the documented residual gap.
+//! Symphonia 0.6.1 has no bundled Opus decoder, so the one missing codec is
+//! supplied by the libopus adapter. This lets configured sources serve WebM and
+//! Ogg Opus directly instead of forcing an AAC fallback.
 
 pub mod resampler;
 
@@ -27,7 +26,9 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use symphonia::core::audio::{Audio, Channels, GenericAudioBufferRef, Position};
+use symphonia::core::codecs::audio::well_known::CODEC_ID_OPUS;
 use symphonia::core::codecs::audio::{AudioDecoder, AudioDecoderOptions};
+use symphonia::core::codecs::registry::RegisterableAudioDecoder;
 use symphonia::core::codecs::CodecParameters;
 use symphonia::core::errors::Error as SymphoniaError;
 use symphonia::core::formats::probe::Hint;
@@ -84,8 +85,12 @@ impl std::error::Error for DecodeError {}
 fn open_audio_decoder(
     audio: &symphonia::core::codecs::audio::AudioCodecParameters,
 ) -> Result<Box<dyn AudioDecoder>, DecodeError> {
-    let codecs = symphonia::default::get_codecs();
     let opts = AudioDecoderOptions::default();
+    if audio.codec == CODEC_ID_OPUS {
+        return symphonia_adapter_libopus::OpusDecoder::try_registry_new(audio, &opts)
+            .map_err(|e| DecodeError(format!("Opus decoder: {e}")));
+    }
+    let codecs = symphonia::default::get_codecs();
     // Per decode, and a decode is now a routine event, so this is `debug`.
     // The one-line summary (`opened …: codec=… rate=… duration=…`) stays at
     // `info`, where it describes the result rather than the attempt.
@@ -106,9 +111,7 @@ fn open_audio_decoder(
     // land itag 140. Silence is worse; the resolver still prefers AAC-LC.
     let rate = audio.sample_rate.unwrap_or(44_100);
     if is_he_aac(audio) {
-        log::warn!(
-            "HE-AAC/SBR at {rate} Hz — decoding LC core only (no reconstructed highs)"
-        );
+        log::warn!("HE-AAC/SBR at {rate} Hz — decoding LC core only (no reconstructed highs)");
     }
     let mut stripped = audio.clone();
     stripped.extra_data = Some(lc_stereo_asc(rate).into());
@@ -196,7 +199,74 @@ fn lc_stereo_asc(sample_rate: u32) -> [u8; 2] {
     [(bits >> 8) as u8, bits as u8]
 }
 
-fn codec_label(source: &SourceKind, audio: &symphonia::core::codecs::audio::AudioCodecParameters) -> String {
+fn codec_label(
+    source: &SourceKind,
+    audio: &symphonia::core::codecs::audio::AudioCodecParameters,
+) -> String {
+    use symphonia::core::codecs::audio::well_known::*;
+
+    // The codec id is authoritative. In particular, ALAC is commonly stored
+    // in an .m4a container, so extension-first detection mislabeled lossless
+    // Apple Lossless files as AAC and prevented the exact-PCM route from ever
+    // qualifying them.
+    if audio.codec == CODEC_ID_FLAC {
+        return "FLAC".into();
+    }
+    if audio.codec == CODEC_ID_ALAC {
+        return "ALAC".into();
+    }
+    if matches!(
+        audio.codec,
+        CODEC_ID_PCM_S32LE
+            | CODEC_ID_PCM_S32LE_PLANAR
+            | CODEC_ID_PCM_S32BE
+            | CODEC_ID_PCM_S32BE_PLANAR
+            | CODEC_ID_PCM_S24LE
+            | CODEC_ID_PCM_S24LE_PLANAR
+            | CODEC_ID_PCM_S24BE
+            | CODEC_ID_PCM_S24BE_PLANAR
+            | CODEC_ID_PCM_S16LE
+            | CODEC_ID_PCM_S16LE_PLANAR
+            | CODEC_ID_PCM_S16BE
+            | CODEC_ID_PCM_S16BE_PLANAR
+            | CODEC_ID_PCM_S8
+            | CODEC_ID_PCM_S8_PLANAR
+            | CODEC_ID_PCM_U32LE
+            | CODEC_ID_PCM_U32LE_PLANAR
+            | CODEC_ID_PCM_U32BE
+            | CODEC_ID_PCM_U32BE_PLANAR
+            | CODEC_ID_PCM_U24LE
+            | CODEC_ID_PCM_U24LE_PLANAR
+            | CODEC_ID_PCM_U24BE
+            | CODEC_ID_PCM_U24BE_PLANAR
+            | CODEC_ID_PCM_U16LE
+            | CODEC_ID_PCM_U16LE_PLANAR
+            | CODEC_ID_PCM_U16BE
+            | CODEC_ID_PCM_U16BE_PLANAR
+            | CODEC_ID_PCM_U8
+            | CODEC_ID_PCM_U8_PLANAR
+    ) {
+        return "PCM".into();
+    }
+    if matches!(
+        audio.codec,
+        CODEC_ID_PCM_F32LE
+            | CODEC_ID_PCM_F32LE_PLANAR
+            | CODEC_ID_PCM_F32BE
+            | CODEC_ID_PCM_F32BE_PLANAR
+            | CODEC_ID_PCM_F64LE
+            | CODEC_ID_PCM_F64LE_PLANAR
+            | CODEC_ID_PCM_F64BE
+            | CODEC_ID_PCM_F64BE_PLANAR
+    ) {
+        return "PCM Float".into();
+    }
+    if audio.codec == CODEC_ID_PCM_ALAW {
+        return "G.711 A-law".into();
+    }
+    if audio.codec == CODEC_ID_PCM_MULAW {
+        return "G.711 μ-law".into();
+    }
     let from_path = match source {
         SourceKind::Path(p) => std::path::Path::new(p)
             .extension()
@@ -215,7 +285,7 @@ fn codec_label(source: &SourceKind, audio: &symphonia::core::codecs::audio::Audi
         Some("alac") => return "ALAC".into(),
         Some("mp3") => return "MP3".into(),
         Some("ogg" | "oga") => return "Vorbis".into(),
-        Some("wav") => return "PCM".into(),
+        Some("wav") => return "WAVE".into(),
         Some("aiff" | "aif") => return "AIFF".into(),
         Some("opus" | "webm") => return "Opus".into(),
         Some("m4a" | "aac" | "mp4") => {
@@ -230,7 +300,10 @@ fn codec_label(source: &SourceKind, audio: &symphonia::core::codecs::audio::Audi
 }
 
 impl SymphoniaDecoder {
-    pub fn open(source: &SourceKind, headers: &HashMap<String, String>) -> Result<Self, DecodeError> {
+    pub fn open(
+        source: &SourceKind,
+        headers: &HashMap<String, String>,
+    ) -> Result<Self, DecodeError> {
         Self::open_inner(source, headers, true)
     }
 
@@ -274,14 +347,22 @@ impl SymphoniaDecoder {
 
         let mut hint = Hint::new();
         if let SourceKind::Path(path) = source {
-            if let Some(ext) = std::path::Path::new(path).extension().and_then(|e| e.to_str()) {
+            if let Some(ext) = std::path::Path::new(path)
+                .extension()
+                .and_then(|e| e.to_str())
+            {
                 hint.with_extension(ext);
             }
         }
 
         let probe = symphonia::default::get_probe();
         let format = probe
-            .probe(&hint, mss, FormatOptions::default(), MetadataOptions::default())
+            .probe(
+                &hint,
+                mss,
+                FormatOptions::default(),
+                MetadataOptions::default(),
+            )
             .map_err(|e| DecodeError(format!("probe: {e}")))?;
 
         let track = format
@@ -309,13 +390,22 @@ impl SymphoniaDecoder {
         let sample_rate = audio
             .sample_rate
             .ok_or_else(|| DecodeError("no sample rate".into()))?;
-        let channels = audio.channels.as_ref().map(|c| c.count()).unwrap_or(2).max(1);
+        let channels = audio
+            .channels
+            .as_ref()
+            .map(|c| c.count())
+            .unwrap_or(2)
+            .max(1);
         // ISO-MP4 often has mdhd timescale ≠ sample rate (muxed itag 18), so
         // `num_frames` is left unset. Use the container duration + timebase.
         let duration_secs = match (track.time_base, track.duration) {
             (Some(tb), Some(dur)) => {
                 let secs = tb.calc_duration_saturating(dur).as_secs_f64();
-                if secs > 0.0 { Some(secs) } else { None }
+                if secs > 0.0 {
+                    Some(secs)
+                } else {
+                    None
+                }
             }
             _ => track
                 .num_frames
@@ -325,7 +415,14 @@ impl SymphoniaDecoder {
 
         let decoder = open_audio_decoder(&audio)?;
         let codec = codec_label(source, &audio);
-        let bit_depth = 16;
+        // Only report source bit depth for codecs with a meaningful integer PCM
+        // precision. Lossy codecs decode to float, which is not their encoded
+        // source depth and must not be presented as one.
+        let bit_depth = if matches!(codec.as_str(), "FLAC" | "ALAC" | "PCM" | "PCM Float") {
+            audio.bits_per_sample.unwrap_or(0)
+        } else {
+            0
+        };
 
         let label = match source {
             SourceKind::Path(p) => p.rsplit('/').next().unwrap_or(p),
@@ -387,7 +484,10 @@ impl SymphoniaDecoder {
     pub fn seek_seconds(&mut self, seconds: f64) -> Result<(), DecodeError> {
         let time = Time::try_from_secs_f64(seconds.max(0.0))
             .ok_or_else(|| DecodeError("bad seek time".into()))?;
-        let to = SeekTo::Time { time, track_id: Some(self.track_id) };
+        let to = SeekTo::Time {
+            time,
+            track_id: Some(self.track_id),
+        };
         match self.format.seek(SeekMode::Accurate, to) {
             Ok(seeked_to) => {
                 self.decoder.reset();
@@ -611,7 +711,10 @@ impl Read for GrowingFile {
 impl Seek for GrowingFile {
     fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
         let current = self.file.stream_position()?;
-        let on_disk = std::fs::metadata(&self.path).ok().map(|m| m.len()).unwrap_or(current);
+        let on_disk = std::fs::metadata(&self.path)
+            .ok()
+            .map(|m| m.len())
+            .unwrap_or(current);
         let end = if self.is_complete() {
             on_disk
         } else {
@@ -650,7 +753,10 @@ impl MediaSource for GrowingFile {
 
     fn byte_len(&self) -> Option<u64> {
         if self.is_complete() {
-            return std::fs::metadata(&self.path).ok().map(|m| m.len()).or(self.declared_len);
+            return std::fs::metadata(&self.path)
+                .ok()
+                .map(|m| m.len())
+                .or(self.declared_len);
         }
         // Unknown length until the last range lands — sequential probe of the
         // first megabyte (moov) is enough to start, and Read waits for more.
@@ -786,7 +892,13 @@ impl HttpMediaSource {
 /// networks 403 a first range larger than that).
 const HTTP_CHUNK: u64 = 1 * 1024 * 1024;
 
-fn fetch_loop(url: String, headers: HashMap<String, String>, state: Arc<FetchState>, from: u64, generation: u64) {
+fn fetch_loop(
+    url: String,
+    headers: HashMap<String, String>,
+    state: Arc<FetchState>,
+    from: u64,
+    generation: u64,
+) {
     let result = (|| -> Result<(), String> {
         let mut pos = from;
         loop {
@@ -826,8 +938,9 @@ fn fetch_loop(url: String, headers: HashMap<String, String>, state: Arc<FetchSta
                                 buf.total_len = Some(total);
                             }
                         }
-                    } else if let Some(len) =
-                        response.header("content-length").and_then(|l| l.parse::<u64>().ok())
+                    } else if let Some(len) = response
+                        .header("content-length")
+                        .and_then(|l| l.parse::<u64>().ok())
                     {
                         buf.total_len = Some(pos + len);
                     }
@@ -999,7 +1112,24 @@ mod tests {
             SourceKind::parse("http://example.com/a.webm"),
             SourceKind::Url(_)
         ));
-        assert!(matches!(SourceKind::parse("/tmp/a.flac"), SourceKind::Path(_)));
+        assert!(matches!(
+            SourceKind::parse("/tmp/a.flac"),
+            SourceKind::Path(_)
+        ));
+    }
+
+    #[test]
+    fn opus_uses_the_bundled_libopus_decoder() {
+        let mut audio = symphonia::core::codecs::audio::AudioCodecParameters::new();
+        audio
+            .for_codec(CODEC_ID_OPUS)
+            .with_sample_rate(48_000)
+            .with_channels(Channels::from(Position::FRONT_LEFT | Position::FRONT_RIGHT));
+
+        assert!(
+            open_audio_decoder(&audio).is_ok(),
+            "the Opus branch must construct the bundled decoder",
+        );
     }
 
     #[test]

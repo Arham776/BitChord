@@ -198,6 +198,9 @@ pub enum Command {
     /// afterwards. A refusal arrives as an error event instead.
     Seek { seconds: f64 },
     SetVolume(f32),
+    /// Enables the unprocessed single-voice path. The output stream is
+    /// separately rebuilt to a matching integer format before this is sent.
+    SetBitPerfect(bool),
     SetCrossfadeWindow(f64),
     SetSpatial(bool),
     SetHeadYaw(f32),
@@ -545,6 +548,8 @@ struct Voice {
     /// figure, no correction). The master switch lives on the mixer state, so
     /// this is the measurement only.
     loudness_db: Option<f64>,
+    /// Bypass all source/device resampling and voice DSP when rates match.
+    bit_perfect: bool,
 }
 
 impl Voice {
@@ -658,6 +663,7 @@ impl Voice {
             glide_done_frames: 0,
             known_duration: (duration > 0.0).then_some(duration),
             loudness_db: request.loudness_db,
+            bit_perfect: false,
         })
     }
 
@@ -844,6 +850,9 @@ impl Voice {
     /// returns more than asked: decoded batches overshooting the request are
     /// stashed in `pending_dev` and served on later calls.
     fn pull(&mut self, frames: usize, device_rate: u32) -> Vec<f32> {
+        if self.bit_perfect && device_rate == self.info.sample_rate {
+            return self.pull_bitperfect(frames);
+        }
         let want = (frames * 2).max(2);
         let mut out: Vec<f32> = Vec::with_capacity(want);
 
@@ -994,6 +1003,28 @@ impl Voice {
         }
         out
     }
+
+    /// Reads source frames directly. This branch is only used for stereo
+    /// lossless PCM with the DAC clock set to the source rate; it deliberately
+    /// avoids the resamplers, silence scan, spatial stage, and transition filter.
+    fn pull_bitperfect(&mut self, frames: usize) -> Vec<f32> {
+        if self.finished { return Vec::new(); }
+        match self.decoder.read_stereo(frames) {
+            Ok(samples) => {
+                if samples.is_empty() {
+                    self.finished = true;
+                } else {
+                    self.emitted_dev_frames += (samples.len() / 2) as u64;
+                }
+                samples
+            }
+            Err(error) => {
+                log::warn!("bit-perfect source read failed: {error}");
+                self.finished = true;
+                Vec::new()
+            }
+        }
+    }
 }
 
 /// Media3 `DEFAULT_SILENCE_THRESHOLD_LEVEL` (1024 of int16 full scale).
@@ -1007,13 +1038,15 @@ const MAX_SILENCE_KEEP_SECS: f64 = 2.0;
 /// sliver is faded to −20 dB rather than true digital silence.
 const MIN_VOLUME_TO_KEEP: f32 = 0.1;
 
-/// Upstream `PlaybackService.MIN/MAX_LOUDNESS_GAIN_MB`: the enhancer's target
-/// gain is the track's loudness figure negated, clamped to −15 dB … +3 dB.
-/// A figure is a measurement of *this* track, so the correction can only ever
-/// be its inverse; the clamp is what stops a bad figure from pinning the
-/// output.
+/// Upstream permits a +3 dB enhancer boost, but this engine has no true-peak
+/// measurement for the source. Keep the safe attenuation range and avoid
+/// boosting already mastered streams into the hard-clipping boundary.
 pub const MIN_LOUDNESS_GAIN_DB: f64 = -15.0;
-pub const MAX_LOUDNESS_GAIN_DB: f64 = 3.0;
+pub const MAX_LOUDNESS_GAIN_DB: f64 = 0.0;
+/// Float samples must stay in range before the output callback. The previous
+/// final `clamp` hard-cut any overs above 0 dBFS before they reached either
+/// float or integer output.
+const MIX_PEAK_CEILING: f32 = 1.0;
 
 /// The loudness correction for one voice: linear gain plus the applied dB for
 /// the readout. `(1.0, None)` whenever there is nothing to correct with — the
@@ -1027,6 +1060,24 @@ pub fn loudness_gain(loudness_db: Option<f64>, enabled: bool) -> (f32, Option<f3
             (10f64.powf(gain_db / 20.0) as f32, Some(gain_db as f32))
         }
         _ => (1.0, None),
+    }
+}
+
+/// A transparent-until-needed block peak guard for the mixed signal. It applies
+/// one linear gain to the already-rendered chunk, preserving its waveform while
+/// keeping normalization, EQ and overlapping voices from being hard-clipped at
+/// the output boundary. Samples below the ceiling are returned unchanged.
+fn mix_peak_guard_gain(samples: &[f32]) -> f32 {
+    let peak = samples
+        .iter()
+        .copied()
+        .filter(|sample| sample.is_finite())
+        .map(f32::abs)
+        .fold(0.0f32, f32::max);
+    if peak > MIX_PEAK_CEILING {
+        MIX_PEAK_CEILING / peak
+    } else {
+        1.0
     }
 }
 
@@ -1195,6 +1246,7 @@ struct MixerState {
     transition: Option<TransitionState>,
     retiring: Vec<RetiringVoice>,
     playing: bool,
+    bit_perfect: bool,
     volume: f32,
     crossfade_window_s: f64,
     spatial_enabled: bool,
@@ -1351,7 +1403,11 @@ impl MixerState {
         self.pending_next = None;
         self.retiring.clear();
         self.current = None;
-        self.bail_flush.store(true, Ordering::Release);
+        if self.bit_perfect {
+            self.flush_ring.store(true, Ordering::Release);
+        } else {
+            self.bail_flush.store(true, Ordering::Release);
+        }
     }
 
     /// Gapless: the current track ended and the next file is already queued.
@@ -1536,13 +1592,21 @@ impl MixerState {
     /// has a figure in hand whether or not the decoder that will play the track
     /// was able to work one out.
     fn outgoing_end_s(&self, plan: &TransitionPlan, current: &Voice) -> f64 {
-        if plan.transition_end_seconds > 0.0 {
-            return plan.transition_end_seconds;
+        let analyzed_end = (plan.transition_end_seconds.is_finite()
+            && plan.transition_end_seconds > 0.0)
+            .then_some(plan.transition_end_seconds);
+        let decoded_end = current
+            .known_duration
+            .filter(|duration| duration.is_finite() && *duration > 0.0);
+        if let Some(end) = analyzed_end {
+            // A stale or inaccurate analysis anchor must never schedule the
+            // blend past the audio the decoder can actually produce.
+            return decoded_end.map_or(end, |duration| end.min(duration));
         }
-        if current.known_duration.is_some() {
-            return current.known_duration.unwrap_or(0.0);
+        if let Some(duration) = decoded_end {
+            return duration;
         }
-        if plan.outgoing_duration_seconds > 0.0 {
+        if plan.outgoing_duration_seconds.is_finite() && plan.outgoing_duration_seconds > 0.0 {
             return plan.outgoing_duration_seconds;
         }
         current.position_seconds() + current.remaining_seconds().unwrap_or(f64::INFINITY)
@@ -1937,7 +2001,15 @@ impl MixerState {
                 ride_filters(p, &plan, &mut current.filter, &mut incoming.filter);
             }
         }
-        p >= 1.0 || self.current.as_ref().is_some_and(|c| c.finished)
+        // The outgoing decoder can hit EOF before a late/stale plan reaches
+        // its end. That must not finish the transition: doing so promotes the
+        // incoming voice at its current gain and makes the outgoing song sound
+        // like it was cut mid-fade. Let the incoming ramp reach unity; only
+        // abandon it early if the incoming source itself is fully drained.
+        let incoming_drained = self.incoming.as_ref().is_some_and(|voice| {
+            voice.finished && voice.pending_dev_cursor >= voice.pending_dev.len()
+        });
+        p >= 1.0 || incoming_drained
     }
 
     fn finish_transition(&mut self) {
@@ -2116,6 +2188,7 @@ pub fn run_mixer(
         transition: None,
         retiring: Vec::new(),
         playing: false,
+        bit_perfect: false,
         volume: 1.0,
         crossfade_window_s: 0.0,
         spatial_enabled: false,
@@ -2178,7 +2251,12 @@ fn handle_command(state: &mut MixerState, cmd: Command, ring: &mut Producer<f32>
                 state.skip_silence,
                 true,
             ) {
-                Ok(voice) => {
+                Ok(mut voice) => {
+                    voice.bit_perfect = state.bit_perfect
+                        && crate::is_lossless_pcm_codec(&voice.info.codec)
+                        && voice.info.sample_rate == state.device_rate
+                        && matches!(voice.info.bit_depth, 16 | 24)
+                        && voice.info.channels == 2;
                     let info = voice.info.clone();
                     let duration = voice.info.duration_seconds;
                     let (_, gain_db) = loudness_gain(voice.loudness_db, state.loudness_enabled);
@@ -2227,6 +2305,7 @@ fn handle_command(state: &mut MixerState, cmd: Command, ring: &mut Producer<f32>
             }
         }
         Command::QueueNext { request } => {
+            if state.bit_perfect { return; }
             if request.source.is_empty() {
                 state.pending_next = None;
             } else if state.current.as_ref().is_some_and(|c| c.info.source == request.source) {
@@ -2315,6 +2394,20 @@ fn handle_command(state: &mut MixerState, cmd: Command, ring: &mut Producer<f32>
             }
         }
         Command::SetVolume(v) => state.volume = v.clamp(0.0, 1.0),
+        Command::SetBitPerfect(enabled) => {
+            state.bit_perfect = enabled;
+            if enabled {
+                state.transition = None;
+                state.incoming = None;
+                state.pending_next = None;
+                state.retiring.clear();
+                state.bail_flush.store(false, Ordering::Release);
+                state.flush_ring.store(true, Ordering::Release);
+            }
+            if let Some(current) = &mut state.current {
+                current.bit_perfect = enabled;
+            }
+        }
         Command::SetCrossfadeWindow(s) => state.crossfade_window_s = s.max(0.0),
         Command::SetSpatial(enabled) => {
             state.spatial_enabled = enabled;
@@ -2441,6 +2534,10 @@ fn handle_command(state: &mut MixerState, cmd: Command, ring: &mut Producer<f32>
 
 /// Renders while the ring has room for a chunk.
 fn render_available(state: &mut MixerState, ring: &mut Producer<f32>) {
+    if state.bit_perfect {
+        render_bitperfect_available(state, ring);
+        return;
+    }
     let chunk_samples = CHUNK_FRAMES * 2;
     loop {
         // Maintenance, evaluated per chunk rather than once per top-up.
@@ -2586,12 +2683,16 @@ fn render_available(state: &mut MixerState, ring: &mut Producer<f32>) {
             }
         }
 
-        // Push interleaved, clamped — only what the voices actually rendered.
+        // Push only rendered audio. Guard the post-EQ mix with one linear
+        // chunk gain before the final safety clamp, so an overlap cannot turn
+        // over-range peaks into flat-topped distortion.
         let mut pushed = 0;
         if produced > 0 {
             state.eq.process(&mut scratch[..produced]);
+            let safety_gain = mix_peak_guard_gain(&scratch[..produced]);
             for s in scratch.into_iter().take(produced) {
-                if ring.push(s.clamp(-1.0, 1.0)).is_ok() {
+                let guarded = if s.is_finite() { s * safety_gain } else { 0.0 };
+                if ring.push(guarded.clamp(-MIX_PEAK_CEILING, MIX_PEAK_CEILING)).is_ok() {
                     pushed += 1;
                 } else {
                     break;
@@ -2607,11 +2708,71 @@ fn render_available(state: &mut MixerState, ring: &mut Producer<f32>) {
     }
 }
 
+/// Direct one-voice render for the qualified integer output path. It avoids
+/// gain multiplication, EQ, fades, clamping, and crossfade scheduling so the
+/// decoded PCM reaches the integer output packer unchanged.
+fn render_bitperfect_available(state: &mut MixerState, ring: &mut Producer<f32>) {
+    let chunk_samples = CHUNK_FRAMES * 2;
+    while ring.slots() >= chunk_samples {
+        if !state.playing { break; }
+        let frames = match &mut state.current {
+            Some(voice) if voice.bit_perfect && voice.info.sample_rate == state.device_rate => {
+                voice.pull(CHUNK_FRAMES, state.device_rate)
+            }
+            Some(_) => {
+                // A route changed underneath an active direct stream. Do not
+                // lie about the clock match; drop back to the resampling path.
+                state.bit_perfect = false;
+                return render_available(state, ring);
+            }
+            None => Vec::new(),
+        };
+        if frames.is_empty() {
+            let exhausted = state.current.as_ref().is_none_or(|voice| voice.finished);
+            if exhausted && state.buffered_frames.load(Ordering::Relaxed) == 0 {
+                state.playing = false;
+                state.set_state(crate::PlaybackState::Stopped);
+                state.events.track_ended(crate::TrackEndReason::Natural);
+            }
+            break;
+        }
+        state.publish_audible_position();
+        let mut pushed = 0u64;
+        for sample in frames {
+            if ring.push(sample).is_ok() {
+                pushed += 1;
+            } else {
+                break;
+            }
+        }
+        state.buffered_frames.fetch_add(pushed / 2, Ordering::Relaxed);
+        if pushed < chunk_samples as u64 { break; }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicBool, AtomicU64};
     use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn mix_peak_guard_scales_only_overrange_chunks() {
+        let clean = [0.7, -0.5, 0.1];
+        assert_eq!(mix_peak_guard_gain(&clean), 1.0);
+
+        let over = [1.2, -1.1, 0.4];
+        let gain = mix_peak_guard_gain(&over);
+        assert!(gain < 1.0);
+        assert!((over[0] * gain - MIX_PEAK_CEILING).abs() < 1e-6);
+        assert!(over.iter().all(|sample| (*sample * gain).abs() <= MIX_PEAK_CEILING));
+    }
+
+    #[test]
+    fn mix_peak_guard_ignores_non_finite_values_when_finding_peak() {
+        let gain = mix_peak_guard_gain(&[0.2, f32::INFINITY, f32::NAN]);
+        assert_eq!(gain, 1.0);
+    }
 
     #[derive(Default)]
     struct RecordedEvents {
@@ -3513,6 +3674,7 @@ mod tests {
             transition: None,
             retiring: Vec::new(),
             playing: true,
+            bit_perfect: false,
             volume: 1.0,
             crossfade_window_s: 4.0,
             spatial_enabled: false,
@@ -3534,7 +3696,86 @@ mod tests {
         };
         let current = state.current.as_ref().unwrap();
         assert_eq!(state.outgoing_end_s(&request.plan, current), 8.0);
+        let late_anchor = TransitionPlan {
+            transition_end_seconds: 12.0,
+            ..request.plan.clone()
+        };
+        assert_eq!(state.outgoing_end_s(&late_anchor, current), 10.0);
         assert_eq!(state.effective_fade_seconds(current.known_duration.unwrap()), 10.0 / 3.0);
+    }
+
+    #[test]
+    fn outgoing_eof_does_not_finish_an_incoming_fade_early() {
+        let dir = std::env::temp_dir().join("bitchord-mixer-outgoing-eof");
+        std::fs::create_dir_all(&dir).unwrap();
+        let a = dir.join("outgoing.wav");
+        let b = dir.join("incoming.wav");
+        test_wav(&a, 8.0, 440.0);
+        test_wav(&b, 8.0, 660.0);
+
+        let request = |path: &std::path::Path, title: &str| TrackSource {
+            source: path.display().to_string(),
+            title: title.into(),
+            artist: String::new(),
+            start_seconds: 0.0,
+            plan: TransitionPlan::default(),
+            headers: std::collections::HashMap::new(),
+            claimed_kbps: 0,
+            loudness_db: None,
+            duration_seconds: 8.0,
+        };
+        let mut current = Voice::open(&request(&a, "A"), false, 0.0, 44_100, 1.0, false, false)
+            .unwrap();
+        current.finished = true;
+        let mut incoming = Voice::open(&request(&b, "B"), false, 0.0, 44_100, 1.0, false, false)
+            .unwrap();
+        incoming.emitted_dev_frames = 2 * 44_100;
+
+        let mut state = MixerState {
+            current: Some(current),
+            incoming: Some(incoming),
+            pending_next: None,
+            warned_no_duration: false,
+            transition: Some(TransitionState {
+                phase: Phase::Fading,
+                fade_frames: 4 * 44_100,
+                handed_off: true,
+                plan: TransitionPlan::default(),
+                arm_deadline: Instant::now(),
+                swap: false,
+            }),
+            retiring: Vec::new(),
+            playing: true,
+            bit_perfect: false,
+            volume: 1.0,
+            crossfade_window_s: 4.0,
+            spatial_enabled: false,
+            head_yaw: 0.0,
+            device_rate: 44_100,
+            buffered_frames: Arc::new(AtomicU64::new(0)),
+            position_ms: Arc::new(AtomicU64::new(0)),
+            duration_ms: Arc::new(AtomicU64::new(0)),
+            events: Arc::new(RecordedEvents::default()),
+            state: crate::PlaybackState::Playing,
+            flush_ring: Arc::new(AtomicBool::new(false)),
+            bail_flush: Arc::new(AtomicBool::new(false)),
+            playback_speed: 1.0,
+            skip_silence: false,
+            eq: EqualizerProcessor::new(44_100, 2),
+            nerd: Arc::new(Mutex::new(NerdSnapshot::default())),
+            loudness_enabled: false,
+            swap_probe: SwapProbe::default(),
+        };
+
+        assert!(
+            !state.drive_fade(),
+            "outgoing EOF must not promote the incoming track before the fade completes"
+        );
+        let incoming_gain = state.incoming.as_ref().unwrap().gain;
+        assert!(incoming_gain > 0.0 && incoming_gain < 1.0);
+
+        state.incoming.as_mut().unwrap().emitted_dev_frames = 4 * 44_100;
+        assert!(state.drive_fade(), "the fade completes at its planned duration");
     }
 
     /// Drain the ring the way the device callback would (decrementing the

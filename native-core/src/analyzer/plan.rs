@@ -162,7 +162,8 @@ enum Tier {
 ///
 /// The plan itself is *not* cached: it also depends on the crossfade setting,
 /// the caller's text and the album flag, all of which are cheap to re-apply.
-/// Only the analysis — the expensive, purely file-derived half — is kept.
+/// Only the analysis — the expensive, file-derived half plus its duration
+/// hint — is kept.
 ///
 /// The compute runs under the lock on purpose. Two callers asking for the same
 /// track is the common case, and serialising means the second one waits and
@@ -176,7 +177,7 @@ mod analysis_cache {
     /// less than holding it. Each entry is tens to hundreds of kilobytes.
     const CAPACITY: usize = 6;
 
-    type Key = (String, u64, bool);
+    type Key = (String, u64, u64, bool);
 
     #[derive(Default)]
     struct Cache {
@@ -198,8 +199,9 @@ mod analysis_cache {
     }
 
     /// File length is part of the key because a streamed download is appended
-    /// to under a stable path: a still-growing file must produce a fresh
-    /// analysis, and a finished one must keep hitting.
+    /// to under a stable path. Duration is part too: URL sources can start with
+    /// no usable duration and acquire one from the playback/catalogue metadata
+    /// later, which changes whether whole-track analysis can run.
     fn len_of(path: &str) -> u64 {
         std::fs::metadata(path).map(|m| m.len()).unwrap_or(0)
     }
@@ -207,9 +209,10 @@ mod analysis_cache {
     pub(super) fn get_or_compute(
         path: &str,
         skip_vocals: bool,
+        duration: f64,
         compute: impl FnOnce() -> Analysis,
     ) -> Arc<Analysis> {
-        let key: Key = (path.to_string(), len_of(path), skip_vocals);
+        let key: Key = (path.to_string(), len_of(path), duration.to_bits(), skip_vocals);
         // A panic while analysing must not poison the cache for the session.
         let mut guard = cache().lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         if let Some(hit) = guard.entries.get(&key) {
@@ -232,7 +235,7 @@ mod analysis_cache {
         let doomed: Vec<Key> = guard
             .entries
             .keys()
-            .filter(|(p, _, _)| {
+            .filter(|(p, _, _, _)| {
                 let p_norm = p.strip_prefix("file://").unwrap_or(p);
                 p_norm == norm
             })
@@ -247,10 +250,14 @@ mod analysis_cache {
     pub(super) fn get_cached_energy_curve(path: &str) -> Option<Vec<super::audio_analysis::EnergyPoint>> {
         let norm_path = path.strip_prefix("file://").unwrap_or(path);
         let guard = cache().lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        guard.entries.iter().find(|(k, _)| {
-            let k_norm = k.0.strip_prefix("file://").unwrap_or(&k.0);
-            k_norm == norm_path
-        }).map(|(_, v)| v.energy_curve.clone())
+        guard.order.iter().rev().find_map(|key| {
+            let key_path = key.0.strip_prefix("file://").unwrap_or(&key.0);
+            if key_path == norm_path {
+                guard.entries.get(key).map(|analysis| analysis.energy_curve.clone())
+            } else {
+                None
+            }
+        })
     }
 }
 
@@ -534,7 +541,9 @@ fn analyze_cached(
              skipped, so this pair can only plan a plain crossfade (not a readable audio file?)"
         );
     }
-    analysis_cache::get_or_compute(path, skip_vocals, || analyze(path, skip_vocals, decode, duration))
+    analysis_cache::get_or_compute(path, skip_vocals, duration, || {
+        analyze(path, skip_vocals, decode, duration)
+    })
 }
 
 pub fn plan_pair(
@@ -544,6 +553,8 @@ pub fn plan_pair(
     incoming_text: &str,
     album_sequential: bool,
     crossfade_seconds: f64,
+    outgoing_duration_hint: f64,
+    incoming_duration_hint: f64,
     skip_vocals: bool,
     tier_label: &str,
     decode: impl Fn(&str, f64, f64, bool) -> Option<(Vec<f32>, u32, f64)>,
@@ -560,7 +571,14 @@ pub fn plan_pair(
     // Even this one carries the outgoing track's length, because a plain
     // crossfade is still *scheduled* against the end of the outgoing track and
     // the mixer has to know where that is.
-    let outgoing_duration = duration_of(outgoing_path);
+    let hinted_duration = |hint: f64, path: &str| {
+        if hint.is_finite() && hint > 0.0 {
+            hint
+        } else {
+            duration_of(path)
+        }
+    };
+    let outgoing_duration = hinted_duration(outgoing_duration_hint, outgoing_path);
     let out = analyze_cached(outgoing_path, skip_vocals, &decode, outgoing_duration);
     // Spoken or already-performed material is never smart-mixed. The fallback
     // is still anchored on the outgoing content end, so it does not wait out
@@ -602,7 +620,8 @@ pub fn plan_pair(
         }
     }
 
-    let inc = analyze_cached(incoming_path, skip_vocals, &decode, duration_of(incoming_path));
+    let incoming_duration = hinted_duration(incoming_duration_hint, incoming_path);
+    let inc = analyze_cached(incoming_path, skip_vocals, &decode, incoming_duration);
 
     // The most ambitious move: a beat-matched, harmonically-compatible pair gets
     // a WSOLA phrase-switch before the adaptive overlap (upstream `phraseSwitch`).
@@ -767,7 +786,11 @@ fn analyze(
             } else {
                 0.0
             };
-            if decoded_seconds < duration * MIN_DECODED_FRACTION {
+            let duration_shortfall = (duration - decoded_seconds).max(0.0);
+            let tolerated_shortfall = (duration * 0.005).max(0.3);
+            if decoded_seconds < duration * MIN_DECODED_FRACTION
+                || duration_shortfall > tolerated_shortfall
+            {
                 // Upstream refuses a short whole-track decode outright rather
                 // than publishing it (`TrackAnalyzer.structure`). An analysis
                 // that stops where the bytes ran out is indistinguishable,
@@ -789,33 +812,36 @@ fn analyze(
                     duration,
                 );
                 analysis.bpm = audio.bpm;
-            analysis.beat_interval = audio.beat_interval;
-            analysis.beat_confidence = audio.beat_confidence;
-            analysis.downbeats = audio.downbeats;
-            analysis.first_beat = audio.first_beat;
-            analysis.key = audio.key;
-            analysis.key_confidence = audio.key_confidence;
-            analysis.content_end = audio.content_end_time;
-            analysis.outro_start = audio.outro_start_time;
-            analysis.mix_out_time = audio.mix_out_time;
-            analysis.mix_in_time = audio.mix_in_time;
-            analysis.audible_start_time = audio.audible_start_time;
-            analysis.mix_in_candidates = audio.mix_in_candidates;
-            analysis.mix_out_candidates = audio.mix_out_candidates;
-            analysis.phrase_boundaries = audio.phrase_boundaries;
-            analysis.section_boundaries = audio.section_boundaries;
-            analysis.segment_boundaries = audio.segment_boundaries;
-            analysis.energy_curve = audio.energy_curve;
-            analysis.low_energy_curve = audio.low_energy_curve;
-            analysis.pace_curve = audio.pace_curve;
-            analysis.vocal_activity_mask = audio.vocal_activity_mask;
-            analysis.drum_activity_mask = audio.drum_activity_mask;
-            analysis.bass_activity_mask = audio.bass_activity_mask;
-            analysis.beats = audio.beats;
-            analysis.vocal_probability = audio.vocal_probability;
-            analysis.analysis_source = "dsp".into();
+                analysis.beat_interval = audio.beat_interval;
+                analysis.beat_confidence = audio.beat_confidence;
+                analysis.downbeats = audio.downbeats;
+                analysis.first_beat = audio.first_beat;
+                analysis.key = audio.key;
+                analysis.key_confidence = audio.key_confidence;
+                analysis.content_end = audio.content_end_time;
+                analysis.outro_start = audio.outro_start_time;
+                analysis.mix_out_time = audio.mix_out_time;
+                analysis.mix_in_time = audio.mix_in_time;
+                analysis.audible_start_time = audio.audible_start_time;
+                analysis.mix_in_candidates = audio.mix_in_candidates;
+                analysis.mix_out_candidates = audio.mix_out_candidates;
+                analysis.phrase_boundaries = audio.phrase_boundaries;
+                analysis.section_boundaries = audio.section_boundaries;
+                analysis.segment_boundaries = audio.segment_boundaries;
+                analysis.energy_curve = audio.energy_curve;
+                analysis.low_energy_curve = audio.low_energy_curve;
+                analysis.pace_curve = audio.pace_curve;
+                analysis.vocal_activity_mask = audio.vocal_activity_mask;
+                analysis.drum_activity_mask = audio.drum_activity_mask;
+                analysis.bass_activity_mask = audio.bass_activity_mask;
+                analysis.beats = audio.beats;
+                analysis.vocal_probability = audio.vocal_probability;
+                analysis.analysis_source = "dsp".into();
+                // Only an accepted whole-track decode may feed the later beat
+                // model pass. Keeping a refused partial buffer here made the
+                // missing bytes look like trailing silence to the planner.
+                whole = Some((mono, rate));
             }
-            whole = Some((mono, rate));
         }
     }
 
@@ -2376,24 +2402,31 @@ mod tests {
             Analysis::default()
         };
 
-        let first = analysis_cache::get_or_compute(&key, false, &mut compute);
-        let second = analysis_cache::get_or_compute(&key, false, &mut compute);
+        let first = analysis_cache::get_or_compute(&key, false, 90.0, &mut compute);
+        let second = analysis_cache::get_or_compute(&key, false, 90.0, &mut compute);
         assert_eq!(computed.load(Ordering::SeqCst), 1, "a repeat must be a hit");
         assert!(Arc::ptr_eq(&first, &second), "a hit returns the same analysis");
+
+        let _ = analysis_cache::get_or_compute(&key, false, 91.0, &mut compute);
+        assert_eq!(
+            computed.load(Ordering::SeqCst),
+            2,
+            "a newly learned duration must not reuse an unknown-duration analysis"
+        );
 
         // The same path with more bytes is a different file as far as planning
         // is concerned.
         std::fs::write(&path, vec![0u8; 2048]).unwrap();
-        let _ = analysis_cache::get_or_compute(&key, false, &mut compute);
+        let _ = analysis_cache::get_or_compute(&key, false, 90.0, &mut compute);
         assert_eq!(
             computed.load(Ordering::SeqCst),
-            2,
+            3,
             "a grown file must be analysed again, not served from the cache"
         );
 
         // The vocal-model switch is part of the identity too.
-        let _ = analysis_cache::get_or_compute(&key, true, &mut compute);
-        assert_eq!(computed.load(Ordering::SeqCst), 3);
+        let _ = analysis_cache::get_or_compute(&key, true, 90.0, &mut compute);
+        assert_eq!(computed.load(Ordering::SeqCst), 4);
     }
 
     /// A track whose music starts at `first_beat`, on a 120 BPM grid. The
@@ -2410,6 +2443,47 @@ mod tests {
             beat_interval: 0.5,
             ..Analysis::default()
         }
+    }
+
+    #[test]
+    fn partial_whole_track_decode_is_not_published_as_a_silent_tail() {
+        let rate = audio_analysis::ANALYSIS_RATE as u32;
+        // 96% is above the broad coverage ratio but still leaves 0.4 s of a
+        // short track undecoded; it must not be interpreted as terminal silence.
+        let partial = vec![0.2f32; rate as usize * 96 / 10];
+        let analyzed = analyze("growing-source", true, &|_, _, _, _| {
+            Some((partial.clone(), rate, 0.0))
+        }, 10.0);
+
+        assert_eq!(analyzed.duration, 10.0);
+        assert_eq!(analyzed.content_end, 0.0);
+        assert!(analyzed.analysis_source.is_empty());
+    }
+
+    #[test]
+    fn supplied_stream_duration_beats_local_tag_probe_fallback() {
+        let outgoing = "https://audio.example.test/outgoing.m4a";
+        let incoming = "https://audio.example.test/incoming.m4a";
+        let plan = plan_pair(
+            outgoing,
+            incoming,
+            "spoken podcast episode",
+            "",
+            false,
+            8.0,
+            83.0,
+            91.0,
+            true,
+            "test",
+            |_, _, _, _| None,
+            |_| 0.0,
+        );
+
+        // The caller knows the stream's duration even though a local tag probe
+        // cannot open its URL. Keeping that duration anchors the safety fade
+        // and lets non-blocked stream pairs run whole-track analysis.
+        assert_eq!(plan.outgoing_duration_seconds, 83.0);
+        assert_eq!(plan.transition_end_seconds, 83.0);
     }
 
     #[test]

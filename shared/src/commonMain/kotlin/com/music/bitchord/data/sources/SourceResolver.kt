@@ -134,8 +134,12 @@ object SourceResolver {
         }
 
         if (pinned != null) {
-            attempt(pinned) { pinned.stream(trackId, request) }
-                ?.let { return it.copy(sourceConfigId = pinned.configId) }
+            val pinnedStream = attempt(pinned) { pinned.stream(trackId, request) }
+            if (pinnedStream != null) {
+                if (!rejectUnsupportedNativeStream(pinned, pinnedStream, target.title)) {
+                    return pinnedStream.copy(sourceConfigId = pinned.configId)
+                }
+            }
         }
 
         // Last resort. A track whose own source is down is still a track the user
@@ -780,6 +784,7 @@ object SourceResolver {
                 sourceConfigId = source.configId,
             )
             val served = stream.format
+            if (rejectUnsupportedNativeStream(source, stream, match.title)) continue
             if (!wantsLossless || served.isLossless == true || served.isDolbyAtmos || served.statesNothingLossy) {
                 DebugLog.d(
                     "${source.displayName} matched '${match.title}' by '${match.artist}' " +
@@ -798,6 +803,20 @@ object SourceResolver {
             settleFor = betterOf(settleFor, stream.copy(belowRequest = true))
         }
         return settleFor
+    }
+
+    /** Rejects a known unsupported codec before it can become the chosen stream. */
+    private fun rejectUnsupportedNativeStream(
+        source: MusicSource,
+        stream: SourceStream,
+        title: String,
+    ): Boolean {
+        if (!stream.format.isKnownUnsupportedByNativeDecoder) return false
+        DebugLog.d(
+            "${source.displayName} offered ${stream.format.summary} for '$title', " +
+                "which the native decoder cannot play; trying another source",
+        )
+        return true
     }
 
     /**

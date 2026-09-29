@@ -43,6 +43,8 @@ pub fn rank_candidates(
             text,
             false,
             crossfade_seconds,
+            0.0,
+            0.0,
             skip_vocals,
             "sequencer",
             decode,

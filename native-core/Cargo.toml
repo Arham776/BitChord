@@ -23,16 +23,16 @@ uniffi = "0.32"
 log = "0.4"
 env_logger = "0.11"
 
-# §3.1 Decoder — enabled after the milestone-4 format-coverage spike. Feature
-# list mirrors the container/codec matrix the spec calls out: FLAC, MP3,
-# AAC/M4A, ALAC, Vorbis, PCM/WAV, AIFF. Milestone-4 gate result (§3.4):
-# symphonia 0.6 ships no Opus codec; the app mirrors upstream's own
-# `pickAac`/`isM4a` preference so playback targets AAC/MP4 renditions, and
-# Opus-in-WebM decode is the documented residual gap (libopus bindings if a
-# source only ever offers Opus).
+# §3.1 Decoder — Symphonia handles AAC/M4A, FLAC, MP3, ALAC, Vorbis,
+# PCM/WAV and AIFF; the libopus adapter below extends it to Opus streams.
 symphonia = { version = "0.6.1", default-features = false, features = [
   "flac", "mp3", "aac", "alac", "vorbis", "pcm", "wav", "ogg", "isomp4", "mkv", "aiff",
 ] }
+# Symphonia 0.6.1 has no Opus decoder yet. This adapter uses the reference
+# libopus implementation and registers only the missing codec in our decode path.
+# Its bundled C library is built with CMake; adapter: MIT/Apache-2.0, libopus:
+# BSD-3-Clause Opus license.
+symphonia-adapter-libopus = { version = "0.3", features = ["bundled"] }
 
 # §3.1 audio output — CoreAudio backend on Apple.
 cpal = "0.18"
@@ -74,3 +74,12 @@ rten-tensor = "0.26"
 # target-specific dependency instead.
 [target.'cfg(target_vendor = "apple")'.dependencies]
 libc = "0.2"
+
+# macOS CoreAudio's public HAL API is used for the short-lived exclusive
+# (hog-mode) lease required by the opt-in bit-perfect path. These types are not
+# available on iOS, where AVAudioSession owns routing and the output stream is
+# float32 only.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2-core-audio = { version = "0.3.2", default-features = false, features = ["AudioHardware", "objc2-core-audio-types"] }
+objc2-core-audio-types = { version = "0.3.2", default-features = false, features = ["CoreAudioBaseTypes"] }
+objc2-core-foundation = { version = "0.3.2", default-features = false, features = ["std", "CFString"] }

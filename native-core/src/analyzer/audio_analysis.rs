@@ -231,8 +231,12 @@ fn analyze_envelope(samples: &[f32], sample_rate: f64, duration: f64) -> Envelop
     }
 
     result.content_end = duration;
-    let silence_threshold = (0.0015f64)
-        .max((result.threshold * 0.25).min(result.reference * 0.04));
+    // Lossy encoders and old masters can leave a quiet noise floor after the
+    // music. The old quarter-threshold / 4%-of-reference gate treated that
+    // residual as content, so AutoMix used the container end and played the
+    // silent tail. Keep the gate tied to the track's own level, with a modest
+    // absolute floor, and require a sustained terminal run below it.
+    let silence_threshold = 0.0015f64.max((result.threshold * 0.45).min(result.reference * 0.06));
     let mut quiet_start = result.levels.len();
     while quiet_start > 0 && result.levels[quiet_start - 1] < silence_threshold {
         quiet_start -= 1;
@@ -1016,6 +1020,28 @@ mod tests {
         );
         assert!(!result.energy_curve.is_empty());
         assert!(result.energy_curve.iter().all(|p| p.energy >= 0.0 && p.energy <= 1.5));
+    }
+
+    #[test]
+    fn envelope_trims_a_quiet_residual_tail_above_the_absolute_floor() {
+        let rate = 11_025.0;
+        let music_end = 5.0;
+        let duration = 8.0;
+        let mut samples = Vec::with_capacity((duration * rate) as usize);
+        for index in 0..(duration * rate) as usize {
+            let time = index as f64 / rate;
+            let amplitude = if time < music_end { 0.5 } else { 0.02 };
+            samples.push((2.0 * PI * 440.0 * time).sin() as f32 * amplitude);
+        }
+
+        let result = analyze_audio(&samples, rate, duration);
+
+        assert!(
+            (music_end - 0.25..=music_end + 0.25).contains(&result.content_end_time),
+            "content_end {} should trim the low-level encoded tail near {}s",
+            result.content_end_time,
+            music_end
+        );
     }
 
     #[test]

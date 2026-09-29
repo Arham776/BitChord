@@ -37,6 +37,35 @@ data class StreamFormat(
     val sampleRateHz: Int? = null,
     val bitDepth: Int? = null,
 ) {
+    /** Codec names from providers range from short labels to MIME types. */
+    private val normalizedCodec: String?
+        get() {
+            val fields = codec?.lowercase()?.split(';') ?: return null
+            val raw = fields.drop(1)
+                .firstOrNull { it.trim().startsWith("codecs=") }
+                ?.substringAfter('=')
+                ?.trim()
+                ?.trim('"', '\'')
+                ?.substringBefore(',')
+                ?: fields.first().trim()
+            if (raw.isEmpty()) return null
+            val name = raw.substringAfterLast('/').removePrefix("x-")
+            return when (name) {
+                "wavpack" -> "wv"
+                "dsd", "dsf", "dff" -> "dsd"
+                "e-ac-3", "ec-3" -> "eac3"
+                "ec3-joc" -> "eac3-joc"
+                "ac-3" -> "ac3"
+                "dts-hd", "vnd.dts", "vnd.dts.hd" -> "dts"
+                "vnd.dolby.dd-ec3" -> "eac3"
+                "true-hd", "mlp" -> "truehd"
+                "x-ms-wma", "ms-wma" -> "wma"
+                "wave", "x-wav" -> "wav"
+                "x-aiff" -> "aiff"
+                else -> name
+            }
+        }
+
     /**
      * Whether this is a bit-exact copy of the master the source holds.
      *
@@ -46,11 +75,19 @@ data class StreamFormat(
      * callers that care have to say what they want done about it.
      */
     val isLossless: Boolean?
-        get() = codec?.let { it.lowercase() in LOSSLESS_CODECS }
+        get() = normalizedCodec?.let { it in LOSSLESS_CODECS }
 
     /** Dolby Atmos carried in E-AC-3 JOC. Immersive, but not lossless. */
     val isDolbyAtmos: Boolean
-        get() = codec?.lowercase() in DOLBY_ATMOS_CODECS
+        get() = normalizedCodec in DOLBY_ATMOS_CODECS
+
+    /**
+     * Whether the codec is known to be absent from BitChord's native decoder.
+     * Unknown names stay eligible so container probing can make the final call;
+     * known unsupported streams must not outrank a source the engine can play.
+     */
+    val isKnownUnsupportedByNativeDecoder: Boolean
+        get() = normalizedCodec?.let { it in UNSUPPORTED_NATIVE_CODECS } == true
 
     /** "24-bit · 192 kHz", "FLAC", "320 kbps" — whichever parts are known. */
     val summary: String
@@ -82,8 +119,12 @@ data class StreamFormat(
     }
 
     private companion object {
-        val LOSSLESS_CODECS = setOf("flac", "alac", "wav", "aiff", "ape", "wv", "dsf", "dff")
-        val DOLBY_ATMOS_CODECS = setOf("eac3-joc", "ec3-joc", "dolby-atmos")
+        val LOSSLESS_CODECS = setOf("flac", "alac", "wav", "aiff", "ape", "wv", "dsd")
+        val DOLBY_ATMOS_CODECS = setOf("eac3-joc", "dolby-atmos")
+        val UNSUPPORTED_NATIVE_CODECS = setOf(
+            "ape", "wv", "dsd", "eac3", "eac3-joc", "dolby-atmos", "ac3",
+            "dts", "mpc", "wma", "truehd",
+        )
     }
 }
 
