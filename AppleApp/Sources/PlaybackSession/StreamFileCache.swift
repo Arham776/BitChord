@@ -110,13 +110,24 @@ actor CanvasFileCache {
 
     func cachedFile(for remote: URL) async -> URL {
         if remote.isFileURL { return remote }
-        let dest = folder.appendingPathComponent(DiskCache.hashName(remote.absoluteString))
+        let ext = remote.pathExtension.lowercased()
+        // AVPlayer must see an HLS playlist as a network resource so it can
+        // resolve and fetch its media segments. Do not snapshot the playlist
+        // into a local file, where its relative segment URLs would break.
+        if ["m3u", "m3u8"].contains(ext) { return remote }
+        // Keep the container extension on disk; AVPlayer uses it when opening
+        // the downloaded movie as a local asset.
+        guard ["mp4", "m4v", "mov", "webm"].contains(ext) else { return remote }
+        let dest = folder.appendingPathComponent("\(DiskCache.hashName(remote.absoluteString)).\(ext)")
         if FileManager.default.fileExists(atPath: dest.path) {
             DiskCache.touch(dest)
             return dest
         }
         guard let (data, response) = try? await URLSession.shared.data(from: remote) else { return remote }
         if let http = response as? HTTPURLResponse, !(200..<300).contains(http.statusCode) {
+            return remote
+        }
+        if let mimeType = response.mimeType?.lowercased(), mimeType.contains("mpegurl") {
             return remote
         }
         try? data.write(to: dest, options: .atomic)

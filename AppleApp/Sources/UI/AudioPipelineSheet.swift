@@ -22,10 +22,10 @@ import AppKit
 /// filled in with a plausible guess. Every filled row is read from the engine or
 /// from a setting that is actually in effect.
 ///
-/// The bit-exactness verdict is the one row that is *computed* rather than read,
-/// and it is the reason the panel is worth opening: it names the single stage
-/// that is altering samples, which is otherwise something the reader has to infer
-/// from four rows above it.
+/// The sample-processing verdict is computed from the format and DSP state.
+/// Bit-perfect is shown as active only after macOS grants exclusive device
+/// access and CoreAudio reports the requested physical integer format and rate.
+/// This still cannot inspect processing inside a DAC after its input stream.
 struct AudioPipelineSheet: View {
     @Environment(PlaybackController.self) private var controller
     @Environment(\.dismiss) private var dismiss
@@ -63,20 +63,21 @@ struct AudioPipelineSheet: View {
                     stage(3, "slider.horizontal.3", "DSP") {
                         row("PCM Format", pcmFormat)
                         row("Sample Rate", deviceRate)
+                        row("Bit-perfect", bitPerfectStatus)
                         row("Loudness", loudness)
                         row("EQ Preset", eqPreset)
                         row("Spatial Audio", spatial ? "On" : "Off")
                         row("Output API", "CoreAudio")
-                        // The verdict, not the settings. Names whichever stage is
-                        // altering samples — or, when none is, that the route
-                        // carries the decoder's own encoding unchanged.
-                        row("Bit-exact", bitExactVerdict)
+                        // Reports engine-side sample changes; a clean engine path
+                        // still does not prove CoreAudio's final hardware output.
+                        row("Sample Path", samplePathVerdict)
                     }
                     rule
                     stage(4, "speaker.wave.2", "Output Device") {
                         row("Device Name", deviceName)
                         row("Sample Rate", deviceRate)
                         row("Channels", deviceChannels)
+                        row("Bit-perfect", bitPerfectStatus)
                     }
                     rule
                     TimelineView(.periodic(from: .now, by: 1)) { _ in
@@ -245,8 +246,18 @@ struct AudioPipelineSheet: View {
         guard device.started else { return "—" }
         switch device.sampleFormat {
         case "FLOAT_32": return "Float32"
+        case "PCM_24": return "PCM 24"
         default: return "PCM 16"
         }
+    }
+
+    private var bitPerfectStatus: String {
+        guard device.started else { return "Waiting for output" }
+        if device.bitPerfectActive { return "Active · \(pcmFormat)" }
+        guard PlatformSettings.shared.getBoolean(key: "bit_perfect_output", default: false) else {
+            return "Off"
+        }
+        return "Unavailable · \(device.bitPerfectReason)"
     }
 
     /// Applied loudness correction, read off the engine rather than the
@@ -273,22 +284,28 @@ struct AudioPipelineSheet: View {
         return preset.isEmpty ? "Custom" : preset
     }
 
-    /// The one computed row: which stage, if any, is altering samples.
+    /// The one computed row: engine-side sample processing and its limits.
     ///
     /// A resampler is only a lossless pass-through when the rates already agree,
     /// which is why it is asked about the two numbers rather than the setting —
     /// upstream makes the same distinction, and a panel that claimed bit-exactness
     /// because no DSP was switched on would be wrong for every 44.1 kHz track on
     /// a 48 kHz route, which is most of them.
-    private var bitExactVerdict: String {
+    private var samplePathVerdict: String {
         guard device.started else { return "—" }
+        if device.bitPerfectActive {
+            return "Yes — exclusive integer PCM; engine DSP and system mixing bypassed"
+        }
+        if PlatformSettings.shared.getBoolean(key: "bit_perfect_output", default: false) {
+            return "No — \(device.bitPerfectReason)"
+        }
         let src = nerd?.sampleRate ?? 0
         let resampling = src > 0 && device.sampleRate > 0 && src != device.sampleRate
         if equalizerEnabled || spatial { return "No — DSP is active" }
         if let gain = nerd?.loudnessGainDb, gain != 0 { return "No — loudness correction active" }
         if device.sampleFormat == "PCM_16" { return "No — 16-bit quantization at the output" }
         if resampling { return "No — resampling \(src) → \(device.sampleRate) Hz" }
-        return "Yes — decoded straight to the device"
+        return "No conversion in engine; CoreAudio path unverified"
     }
 }
 
@@ -336,12 +353,20 @@ struct AudioOutputRow: View {
     private var summary: String {
         let device = controller.outputDevice
         guard device.started else { return "Nothing open yet" }
-        var parts: [String] = [device.sampleFormat == "FLOAT_32" ? "Float32" : "PCM 16"]
+        var parts: [String] = [Self.formatLabel(device.sampleFormat)]
         if device.sampleRate > 0 {
             let khz = Double(device.sampleRate) / 1000
             parts.append(String(format: khz == khz.rounded() ? "%.0f kHz" : "%.1f kHz", khz))
         }
         return parts.joined(separator: " · ")
+    }
+
+    private static func formatLabel(_ format: String) -> String {
+        switch format {
+        case "FLOAT_32": "Float32"
+        case "PCM_24": "PCM 24"
+        default: "PCM 16"
+        }
     }
 }
 
@@ -438,9 +463,17 @@ struct OutputDeviceSheet: View {
     }
     private var pipelineSummary: String {
         guard device.started else { return "—" }
-        var parts = [device.sampleFormat == "FLOAT_32" ? "Float32" : "PCM 16"]
+        var parts = [Self.formatLabel(device.sampleFormat)]
         if device.sampleRate > 0 { parts.append("\(device.sampleRate) Hz") }
         return parts.joined(separator: " · ")
+    }
+
+    private static func formatLabel(_ format: String) -> String {
+        switch format {
+        case "FLOAT_32": "Float32"
+        case "PCM_24": "PCM 24"
+        default: "PCM 16"
+        }
     }
 }
 

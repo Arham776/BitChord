@@ -414,6 +414,22 @@ final class ListeningStore {
         )
     }
 
+    /// Latest recorded play time for each track, in milliseconds since epoch.
+    /// Replay's display summary intentionally keeps only its ten top songs;
+    /// Autoplay needs the full recency map so repeats outside that short list
+    /// still count as recently heard.
+    func lastPlayedByTrack() -> [String: Double] {
+        persist()
+        var result: [String: Double] = [:]
+        for month in collected(period: .allTime) {
+            for track in month.tracks {
+                guard let last = track.last else { continue }
+                result[track.id] = max(result[track.id] ?? 0, last)
+            }
+        }
+        return result
+    }
+
     func exportJSON() -> Data? {
         persist()
         let months = collected(period: .allTime)

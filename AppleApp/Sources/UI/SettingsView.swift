@@ -41,6 +41,8 @@ struct SettingsView: View {
     @State private var hideVolume = PlatformSettings.shared.getBoolean(key: "hide_volume_bar", default: false)
     @State private var hideSongStatus = PlatformSettings.shared.getBoolean(key: "hide_song_status", default: false)
     @State private var outputPcm = PlaybackController.migrateOutputPcmMode()
+    @State private var matchSourceRate = PlatformSettings.shared.getBoolean(key: "match_source_sample_rate", default: true)
+    @State private var bitPerfect = PlatformSettings.shared.getBoolean(key: "bit_perfect_output", default: false)
     @State private var preferUsbDac = PlatformSettings.shared.getBoolean(key: "prefer_usb_dac", default: false)
     @State private var loudness = PlatformSettings.shared.getBoolean(key: "loudness_normalization", default: true)
     @State private var automixPerf = PlatformSettings.shared.getString(key: "automix_performance", default: "BALANCED")
@@ -66,7 +68,7 @@ struct SettingsView: View {
     @State private var jiosaavn = PlatformSettings.shared.getBoolean(key: "jiosaavn_enabled", default: true)
     @State private var stopBackground = PlatformSettings.shared.getBoolean(key: "stop_when_backgrounded", default: false)
     @State private var mixWithOtherAudio = PlatformSettings.shared.getBoolean(key: "mix_with_other_audio", default: true)
-    @State private var syllableSync = PlatformSettings.shared.getBoolean(key: "prioritize_syllable_sync", default: false)
+    @State private var syllableSync = PlatformSettings.shared.getBoolean(key: "prioritize_syllable_sync", default: true)
     @State private var language = PlatformSettings.shared.getString(key: "app_language", default: "")
     @State private var spotifyCookie = PlatformSettings.shared.getString(key: "spotify_spdc_token", default: "")
     @State private var replayGenres = PlatformSettings.shared.getBoolean(key: "replay_genres", default: true)
@@ -152,6 +154,8 @@ struct SettingsView: View {
             wifiOnlyDownloads: $wifiOnlyDownloads,
             cacheLimitMB: $cacheLimitMB,
             outputPcm: $outputPcm,
+            matchSourceRate: $matchSourceRate,
+            bitPerfect: $bitPerfect,
             preferUsbDac: $preferUsbDac,
             loudness: $loudness
         ))
@@ -492,17 +496,31 @@ struct SettingsView: View {
                 .padding(.leading, 41)
             }
             .padding(.vertical, 4)
+            SettingsToggleLine(
+                glyph: .precision,
+                title: "Match Source Sample Rate",
+                subtitle: "Request each track’s native rate from the output route",
+                isOn: $matchSourceRate
+            )
+            #if os(macOS)
+            SettingsToggleLine(
+                glyph: .precision,
+                title: "Bit-perfect Output",
+                subtitle: "Bypasses app volume, DSP and transitions for supported lossless stereo",
+                isOn: $bitPerfect
+            )
+            #endif
             SettingsSubToggle(title: "Prefer USB DAC", isOn: $preferUsbDac)
             SettingsToggleLine(
                 glyph: .loudness,
                 title: "Loudness Normalization",
-                subtitle: "Levels every track to the same loudness across sources",
+                subtitle: "Attenuates loud tracks; avoids boosting masters into clipping",
                 isOn: $loudness
             )
         } header: {
             Text("Audio Quality")
         } footer: {
-            Text("Precision is the word length at the output boundary. PCM 16 quantizes once at the unit; Float 32 passes the mix through untouched. The Audio Pipeline readout shows what is actually in effect.")
+            Text("Match Source Sample Rate asks the route to switch clock families between tracks. Bit-perfect output is available on macOS when the DAC grants exclusive access and the lossless source format is supported. The Audio Pipeline readout shows what is actually in effect.")
         }
     }
 
@@ -511,7 +529,11 @@ struct SettingsView: View {
     private var outputPrecisionSubtitle: String {
         let device = controller.outputDevice
         guard device.started else { return "Requested \(Self.pcmLabel(outputPcm))" }
-        var parts = [Self.pcmLabel(outputPcm)]
+        let actual = Self.pcmLabel(device.sampleFormat)
+        var parts = [actual]
+        if device.sampleFormat != outputPcm {
+            parts.append("requested \(Self.pcmLabel(outputPcm))")
+        }
         if !device.name.isEmpty { parts.append(device.name) }
         if device.sampleRate > 0 {
             let khz = Double(device.sampleRate) / 1000
@@ -523,6 +545,8 @@ struct SettingsView: View {
     private static func pcmLabel(_ mode: String) -> String {
         switch mode {
         case "FLOAT_32": return "Float 32"
+        case "PCM_16": return "PCM 16"
+        case "PCM_24": return "PCM 24"
         default: return "PCM 16"
         }
     }
@@ -2094,7 +2118,7 @@ private struct AudioQualityOption: Identifiable {
         .init(id: "LOW", title: "Low", detail: "64 kbps · uses the least data"),
         .init(id: "MEDIUM", title: "Medium", detail: "Best available · ~171 kbps Opus"),
         .init(id: "HIGH", title: "High", detail: "JioSaavn up to 320 kbps · YouTube fallback"),
-        .init(id: "LOSSLESS", title: "Lossless", detail: "Your addons and JioSaavn · bit-exact where available"),
+        .init(id: "LOSSLESS", title: "Lossless", detail: "Requests lossless audio from sources that support it"),
     ]
 
     static let download: [AudioQualityOption] = [
@@ -2208,6 +2232,8 @@ private struct SettingsQualityPersist: ViewModifier {
     @Binding var wifiOnlyDownloads: Bool
     @Binding var cacheLimitMB: Int
     @Binding var outputPcm: String
+    @Binding var matchSourceRate: Bool
+    @Binding var bitPerfect: Bool
     @Binding var preferUsbDac: Bool
     @Binding var loudness: Bool
 
@@ -2218,6 +2244,8 @@ private struct SettingsQualityPersist: ViewModifier {
             .onChange(of: downloadQuality) { _, value in AppSettings.shared.setDownloadQuality(value: value) }
             .onChange(of: wifiOnlyDownloads) { _, value in AppSettings.shared.setWifiOnlyDownloads(value: value) }
             .onChange(of: outputPcm) { _, value in controller.updateOutputPcmMode(value) }
+            .onChange(of: matchSourceRate) { _, value in controller.updateMatchSourceSampleRate(value) }
+            .onChange(of: bitPerfect) { _, value in controller.updateBitPerfectOutput(value) }
             .onChange(of: preferUsbDac) { _, value in controller.updatePreferUsbDac(value) }
             .onChange(of: loudness) { _, value in controller.updateLoudnessNormalization(value) }
             .onChange(of: cacheLimitMB) { _, value in

@@ -659,7 +659,7 @@ object AppSettings {
         settings.putBoolean("stop_when_backgrounded", value)
     }
 
-    private val _prioritizeSyllableSync = MutableStateFlow(settings.getBoolean("prioritize_syllable_sync", false))
+    private val _prioritizeSyllableSync = MutableStateFlow(settings.getBoolean("prioritize_syllable_sync", true))
     val prioritizeSyllableSync: StateFlow<Boolean> = _prioritizeSyllableSync.asStateFlow()
     fun setPrioritizeSyllableSync(value: Boolean) {
         _prioritizeSyllableSync.value = value
@@ -710,10 +710,9 @@ object AppSettings {
     }
 
     /**
-     * Level every track to the same loudness. On by default: a queue drawn from
-     * several sources spans several mastering eras, and the gap between them is
-     * routinely fifteen decibels — every streaming service normalizes by default
-     * for the same reason.
+     * Attenuate tracks whose source reports a loudness above target. The Apple
+     * mixer avoids positive gain because stream metadata does not include a
+     * true-peak ceiling; boosting a full-scale master can clip.
      */
     private val _loudnessNormalization = MutableStateFlow(settings.getBoolean("loudness_normalization", true))
     val loudnessNormalization: StateFlow<Boolean> = _loudnessNormalization.asStateFlow()

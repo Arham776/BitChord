@@ -49,7 +49,7 @@ enum AudioSessionManager {
     /// track after a cold start. Every caller reaches here from a detached task,
     /// so the work is never on the main thread in the first place.
     @discardableResult
-    static func activate() async -> Format? {
+    static func activate(preferredSampleRate: Double? = nil) async -> Format? {
 #if os(iOS)
         let session = AVAudioSession.sharedInstance()
         do {
@@ -74,6 +74,17 @@ enum AudioSessionManager {
                 mode: .default,
                 options: options
             )
+            if PlatformSettings.shared.getBoolean(
+                key: "match_source_sample_rate", default: true
+            ), let preferredSampleRate, preferredSampleRate > 0 {
+                // A preference is a request, not a promise: read sampleRate
+                // after activation and give that actual value to the engine.
+                do {
+                    try session.setPreferredSampleRate(preferredSampleRate)
+                } catch {
+                    NSLog("[BitChord] preferred output rate \(preferredSampleRate) Hz was not accepted: \(error.localizedDescription)")
+                }
+            }
             try session.setActive(true)
         } catch {
             // Worth surfacing: a session that will not activate is a session with

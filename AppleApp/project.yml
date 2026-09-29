@@ -65,6 +65,7 @@ targets:
       - sdk: CoreMotion.framework
       - sdk: MusicUnderstanding.framework
         weak: true
+      - sdk: Speech.framework
     info:
       path: BitChord-Info.plist
       properties:
@@ -89,6 +90,7 @@ targets:
           - UIInterfaceOrientationLandscapeRight
         UILaunchScreen: {}
         NSMotionUsageDescription: BitChord uses headphone motion to keep spatial audio anchored when you turn your head.
+        NSSpeechRecognitionUsageDescription: BitChord uses on-device speech recognition to align fetched lyrics with the playing audio. Audio is not sent to a server for alignment.
     entitlements:
       path: BitChord.entitlements
       properties:
