@@ -1,5 +1,8 @@
 import SwiftUI
 import BitChordShared
+#if canImport(UIKit)
+import UIKit
+#endif
 
 /// The Apple Music-style playback pill (UI spec §3.1/§3.2), shared by both
 /// platforms. Ports upstream's `MiniPlayer.kt`: artwork thumbnail (tap →
@@ -53,12 +56,8 @@ struct PlaybackPill: View {
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 8)
-        .background {
-            Capsule().fill(chromeFill)
-        }
-        .overlay { Capsule().stroke(.white.opacity(0.10), lineWidth: 0.5) }
-        .overlay(alignment: .bottom) { progressHairline }
-        .clipShape(Capsule())
+        .modifier(MiniPlayerChrome(fill: chromeFill))
+        .overlay(alignment: .bottom) { progressHairline.clipShape(Capsule()) }
         .contentShape(.rect)
         .modifier(NowPlayingZoomSource())
         // Horizontal swipe to skip, matching upstream MiniPlayer's 72dp fling:
@@ -383,6 +382,30 @@ struct PlaybackPill: View {
         }
         .allowsHitTesting(false)
     }
+
+    #if os(iOS)
+    /// The mini-player's capsule shell — drawn by us everywhere except inside
+    /// iOS 27's bottom accessory on iPhone, whose container draws its own
+    /// pill. Keeping ours there nests a second capsule inside the system's
+    /// (verified by stripping ours in the simulator: the pill still renders
+    /// fully). iPad mounts via inset with no system shell, so it keeps ours,
+    /// as do iOS 26 and the pre-26 fallback.
+    private struct MiniPlayerChrome: ViewModifier {
+        var fill: AnyShapeStyle
+
+        func body(content: Content) -> some View {
+            if #available(iOS 27.0, *),
+               UIDevice.current.userInterfaceIdiom == .phone {
+                content
+            } else {
+                content
+                    .background { Capsule().fill(fill) }
+                    .overlay { Capsule().stroke(.white.opacity(0.10), lineWidth: 0.5) }
+                    .clipShape(Capsule())
+            }
+        }
+    }
+    #endif
 
     #if os(iOS)
     private var buttons: some View {

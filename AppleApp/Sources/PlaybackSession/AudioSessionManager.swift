@@ -27,6 +27,7 @@ import BitChordShared
 /// fail to start without an error worth reading. Handing the engine the
 /// session's own numbers makes the two agree by construction.
 enum AudioSessionManager {
+    private static let sessionQueue = DispatchQueue(label: "com.example.bitchord.audio-session")
     /// The format the session settled on, or `nil` on macOS (where cpal's device
     /// choice stands) and on iOS when the session reported an unusable format.
     struct Format: Equatable {
@@ -50,6 +51,14 @@ enum AudioSessionManager {
     /// so the work is never on the main thread in the first place.
     @discardableResult
     static func activate(preferredSampleRate: Double? = nil) async -> Format? {
+        await withCheckedContinuation { continuation in
+            sessionQueue.async {
+                continuation.resume(returning: activateSynchronously(preferredSampleRate: preferredSampleRate))
+            }
+        }
+    }
+
+    private static func activateSynchronously(preferredSampleRate: Double?) -> Format? {
 #if os(iOS)
         let session = AVAudioSession.sharedInstance()
         do {
@@ -69,11 +78,9 @@ enum AudioSessionManager {
             if mixing {
                 options.insert(.mixWithOthers)
             }
-            try session.setCategory(
-                .playback,
-                mode: .default,
-                options: options
-            )
+            if session.category != .playback || session.mode != .default || session.categoryOptions != options {
+                try session.setCategory(.playback, mode: .default, options: options)
+            }
             if PlatformSettings.shared.getBoolean(
                 key: "match_source_sample_rate", default: true
             ), let preferredSampleRate, preferredSampleRate > 0 {
@@ -134,6 +141,15 @@ enum AudioSessionManager {
     /// Deactivates the playback session and notifies other audio apps that
     /// they may resume or take back exclusive hardware access.
     static func deactivate() async {
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            sessionQueue.async {
+                deactivateSynchronously()
+                continuation.resume()
+            }
+        }
+    }
+
+    private static func deactivateSynchronously() {
 #if os(iOS)
         do {
             try AVAudioSession.sharedInstance().setActive(false, options: [.notifyOthersOnDeactivation])

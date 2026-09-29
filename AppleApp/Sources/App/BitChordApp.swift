@@ -11,12 +11,16 @@ struct BitChordApp: App {
     @State private var party = PartyStore.shared
     /// The one binding between a party and this device's player.
     ///
-    /// Replaced rather than constructed inline, because it has to hold *this* session's
-    /// `PlaybackController` and a `@State` initialiser runs before the environment is
-    /// available. Kept at the app rather than in a view because a party's lifetime is
-    /// the listener's and not a view's — most of listening together is the screen
-    /// being somewhere else.
-    @State private var partySync = PartySync(controller: PlaybackController())
+    /// Built in the launch task with *this* session's `PlaybackController`,
+    /// not constructed inline: a `@State` initialiser cannot reference its
+    /// sibling `controller`, and the old placeholder `PlaybackController()`
+    /// here booted a whole second engine every launch — a second output
+    /// stream, a second set of remote-command handlers, and on iOS a second
+    /// same-id MediaSession fighting the real one for the system slot.
+    /// Kept at the app rather than in a view because a party's lifetime is
+    /// the listener's and not a view's — most of listening together is the
+    /// screen being somewhere else.
+    @State private var partySync: PartySync?
     @Environment(\.scenePhase) private var scenePhase
 
     var body: some Scene {
@@ -36,15 +40,15 @@ struct BitChordApp: App {
                     // clock and somewhere to publish, and a coordinator that has
                     // neither measures against a clock of zero and believes the answer.
                     PartyStore.install()
-                    partySync = PartySync(controller: controller)
-                    party.attach(player: partySync)
+                    let binding = PartySync(controller: controller)
+                    partySync = binding
+                    party.attach(player: binding)
                     // The player tells the party when the *listener* presses something,
                     // so a press is not undone by the next frame still describing the
                     // old transport. Wired here, once, because the controller outlives
                     // every view and the party binding is replaced on each launch.
-                    let localPartySync = partySync
-                    controller.onLocalIntent = { [weak localPartySync] in
-                        localPartySync?.onLocalIntent()
+                    controller.onLocalIntent = { [weak binding] in
+                        binding?.onLocalIntent()
                     }
                     // What is on disk decides what the analyzer gets. Refreshed first
                     // so a resumed or already-downloaded graph is visible, and loaded
@@ -76,11 +80,18 @@ struct BitChordApp: App {
                 .onChange(of: scenePhase) { _, phase in
                     appModel.scenePhase = phase
                     if phase == .background {
+                        // No GPU work back here: a Music Understanding inference
+                        // caught mid-flight aborts with
+                        // BackgroundExecutionNotPermitted and sprays Metal/E5RT
+                        // errors. The analyzer suspends the rest of the stretch
+                        // and serves Automix from its disk cache instead.
+                        MusicUnderstandingAnalyzer.noteBackground()
                         controller.persistSession()
                         if PlatformSettings.shared.getBoolean(key: "stop_when_backgrounded", default: false) {
                             controller.pauseForBackground()
                         }
                     } else if phase == .active {
+                        MusicUnderstandingAnalyzer.noteForeground()
                         controller.reactivateAudioSessionAfterForeground()
                     }
                 }

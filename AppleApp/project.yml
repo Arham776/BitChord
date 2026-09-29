@@ -78,7 +78,6 @@ targets:
             CFBundleURLSchemes: [bitchord]
         UIBackgroundModes:
           - audio
-        NSSupportsLiveActivities: true
         UISupportedInterfaceOrientations:
           - UIInterfaceOrientationPortrait
           - UIInterfaceOrientationPortraitUpsideDown
@@ -113,7 +112,6 @@ targets:
         PRODUCT_BUNDLE_IDENTIFIER: com.example.bitchord.widget
     sources:
       - Sources/Widget
-      - Sources/Shared/NowPlayingActivityAttributes.swift
     info:
       path: BitChordWidget-Info.plist
       properties:

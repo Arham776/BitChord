@@ -16,6 +16,7 @@ import AVFoundation
 /// and iOS for an audio app.
 @MainActor
 final class NowPlayingController {
+    private var metadataKey: String?
     private var artwork: MPMediaItemArtwork?
     /// URL that `artwork` was built from — not the in-flight request.
     private var artworkURL: String?
@@ -23,53 +24,56 @@ final class NowPlayingController {
     private var handlers: [Any] = []
 #if os(iOS)
     private var modern: AnyObject?
-    private let liveActivity = NowPlayingActivityController()
 #endif
 
     init() {
 #if os(iOS)
+        NowPlayingActivityController.endLegacyActivities()
         if #available(iOS 27, *) {
             let model = ModernNowPlaying()
             model.delegate = self
             modern = model
-            // The session publishes metadata. This is what delivers the
-            // commands the lock screen and the island send back. Returning
-            // before it left a session with nothing listening.
             DispatchQueue.main.async {
                 UIApplication.shared.beginReceivingRemoteControlEvents()
             }
-            // Apple's rule for iOS 27: do not also publish this playback
-            // through MPRemoteCommandCenter. The commands live on the session.
+            // iOS 27+: metadata and commands live EXCLUSIVELY on the
+            // MediaSession. Publishing this playback through
+            // MPNowPlayingInfoCenter / MPRemoteCommandCenter alongside it is
+            // undefined behavior per Apple ("Don't mix the Now Playing
+            // framework with ... MPNowPlayingInfoCenter and
+            // MPRemoteCommandCenter ... for local playback"), and is what the
+            // system answers with `internalFailure`. So: no MP handlers here.
             return
         }
         DispatchQueue.main.async {
             UIApplication.shared.beginReceivingRemoteControlEvents()
         }
 #endif
+        // MP path: macOS, and iOS versions without the NowPlaying framework.
         let center = MPRemoteCommandCenter.shared()
         center.playCommand.isEnabled = true
         handlers.append(center.playCommand.addTarget { [weak self] _ in
-            self?.onPlay?()
+            Task { @MainActor [weak self] in self?.onPlay?() }
             return .success
         })
         center.pauseCommand.isEnabled = true
         handlers.append(center.pauseCommand.addTarget { [weak self] _ in
-            self?.onPause?()
+            Task { @MainActor [weak self] in self?.onPause?() }
             return .success
         })
         center.togglePlayPauseCommand.isEnabled = true
         handlers.append(center.togglePlayPauseCommand.addTarget { [weak self] _ in
-            self?.onToggle?()
+            Task { @MainActor [weak self] in self?.onToggle?() }
             return .success
         })
         center.nextTrackCommand.isEnabled = true
         handlers.append(center.nextTrackCommand.addTarget { [weak self] _ in
-            self?.onNext?()
+            Task { @MainActor [weak self] in self?.onNext?() }
             return .success
         })
         center.previousTrackCommand.isEnabled = true
         handlers.append(center.previousTrackCommand.addTarget { [weak self] _ in
-            self?.onPrevious?()
+            Task { @MainActor [weak self] in self?.onPrevious?() }
             return .success
         })
         center.changePlaybackPositionCommand.isEnabled = true
@@ -77,7 +81,7 @@ final class NowPlayingController {
             guard let position = (event as? MPChangePlaybackPositionCommandEvent)?.positionTime else {
                 return .commandFailed
             }
-            self?.onSeek?(position)
+            Task { @MainActor [weak self] in self?.onSeek?(position) }
             return .success
         })
     }
@@ -92,19 +96,9 @@ final class NowPlayingController {
     func update(title: String, artist: String, duration: Double,
                 artworkData: Data?, thumbnailUrl: String?, isPlaying: Bool,
                 position: Double? = nil) {
+        // iOS 27 publishes exclusively through the MediaSession (see init:
+        // mixing in MPNowPlayingInfoCenter yields undefined behavior).
 #if os(iOS)
-        liveActivity.update(
-            title: title,
-            artist: artist,
-            duration: duration,
-            artworkData: artworkData,
-            thumbnailURL: thumbnailUrl,
-            isPlaying: isPlaying,
-            position: position,
-            rate: isPlaying
-                ? Double(PlatformSettings.shared.getFloat(key: "playback_speed", default: 1))
-                : 0
-        )
         if #available(iOS 27, *), let model = modern as? ModernNowPlaying {
             model.update(title: title, artist: artist, duration: duration,
                          artworkData: artworkData, thumbnailUrl: thumbnailUrl,
@@ -112,6 +106,13 @@ final class NowPlayingController {
             return
         }
 #endif
+        let key = "\(title)|\(artist)"
+        if metadataKey != key {
+            metadataKey = key
+            artwork = nil
+            artworkURL = nil
+            lastRequestedURL = nil
+        }
         var info: [String: Any] = [
             MPMediaItemPropertyTitle: title,
             MPMediaItemPropertyArtist: artist,
@@ -124,6 +125,7 @@ final class NowPlayingController {
         } else if let old = MPNowPlayingInfoCenter.default().nowPlayingInfo?[MPNowPlayingInfoPropertyElapsedPlaybackTime] {
             info[MPNowPlayingInfoPropertyElapsedPlaybackTime] = old
         }
+        if lastRequestedURL != thumbnailUrl { lastRequestedURL = nil }
         if let item = artworkFromBytes(artworkData) {
             info[MPMediaItemPropertyArtwork] = item
             artworkURL = thumbnailUrl
@@ -132,6 +134,9 @@ final class NowPlayingController {
             info[MPMediaItemPropertyArtwork] = artwork
         }
         MPNowPlayingInfoCenter.default().nowPlayingInfo = info
+#if os(macOS)
+        MPNowPlayingInfoCenter.default().playbackState = isPlaying ? .playing : .paused
+#endif
         if let thumbnailUrl, !thumbnailUrl.isEmpty, artworkData == nil,
            artworkURL != thumbnailUrl, lastRequestedURL != thumbnailUrl {
             fetchArtwork(
@@ -141,9 +146,23 @@ final class NowPlayingController {
         }
     }
 
+    func updateCommands(canNext: Bool, canPrevious: Bool, canSeek: Bool) {
+#if os(iOS)
+        if #available(iOS 27, *), let model = modern as? ModernNowPlaying {
+            model.canNext = canNext
+            model.canPrevious = canPrevious
+            model.canSeek = canSeek
+            return
+        }
+#endif
+        let commands = MPRemoteCommandCenter.shared()
+        commands.nextTrackCommand.isEnabled = canNext
+        commands.previousTrackCommand.isEnabled = canPrevious
+        commands.changePlaybackPositionCommand.isEnabled = canSeek
+    }
+
     func update(position: Double) {
 #if os(iOS)
-        liveActivity.updatePosition(position)
         if #available(iOS 27, *), let model = modern as? ModernNowPlaying {
             model.position = position
             return
@@ -157,7 +176,6 @@ final class NowPlayingController {
 
     func updateRate(_ rate: Double, position: Double? = nil) {
 #if os(iOS)
-        liveActivity.updateRate(rate, position: position)
         if #available(iOS 27, *), let model = modern as? ModernNowPlaying {
             model.rate = rate
             if let position { model.position = position }
@@ -172,21 +190,13 @@ final class NowPlayingController {
         }
         info[MPNowPlayingInfoPropertyMediaType] = MPNowPlayingInfoMediaType.audio.rawValue
         MPNowPlayingInfoCenter.default().nowPlayingInfo = info
+#if os(macOS)
+        MPNowPlayingInfoCenter.default().playbackState = rate > 0 ? .playing : .paused
+#endif
     }
-
-    // NOTE: `MPNowPlayingInfoCenter.playbackState` is *not* used here, and
-    // cannot be. It requires the restricted entitlement
-    // `com.apple.mediaremote.set-playback-state`, which Apple grants by
-    // exception; without it every assignment is ignored and logged as
-    // "[MRNowPlaying] Ignoring setPlaybackState because application does not
-    // contain entitlement ...". It was tried, and the device log is the proof.
-    //
-    // iOS 27 uses NowPlaying.MediaSession above. On iOS 18–26 the system
-    // chooses which mixing app owns its single prominent control surface.
 
     func requestPrimaryIfPossible() {
 #if os(iOS)
-        liveActivity.requestIfPossible()
         if #available(iOS 27, *), let model = modern as? ModernNowPlaying {
             model.requestPrimaryIfPossible()
         }
@@ -204,9 +214,17 @@ final class NowPlayingController {
 #endif
     }
 
-    func endActivity() {
+    func stop() {
 #if os(iOS)
-        liveActivity.end()
+        if #available(iOS 27, *), let model = modern as? ModernNowPlaying {
+            model.stop()
+            return
+        }
+#endif
+        lastRequestedURL = nil
+        MPNowPlayingInfoCenter.default().nowPlayingInfo = nil
+#if os(macOS)
+        MPNowPlayingInfoCenter.default().playbackState = .stopped
 #endif
     }
 
@@ -249,14 +267,8 @@ final class NowPlayingController {
                 guard let item = self.artworkFromBytes(data) else { return }
                 self.artworkURL = url
                 var info = MPNowPlayingInfoCenter.default().nowPlayingInfo ?? [:]
-                info[MPMediaItemPropertyTitle] = title
-                info[MPMediaItemPropertyArtist] = artist
-                info[MPMediaItemPropertyPlaybackDuration] = duration
                 info[MPMediaItemPropertyArtwork] = item
                 info[MPNowPlayingInfoPropertyMediaType] = MPNowPlayingInfoMediaType.audio.rawValue
-                info[MPNowPlayingInfoPropertyPlaybackRate] = isPlaying
-                    ? Double(PlatformSettings.shared.getFloat(key: "playback_speed", default: 1))
-                    : 0.0
                 MPNowPlayingInfoCenter.default().nowPlayingInfo = info
             }
         }
@@ -276,10 +288,14 @@ private final class ModernNowPlaying: MediaSessionRepresentable {
     var title = ""
     var artist = ""
     var duration: Double = 0
-    var position: Double = 0
-    var rate: Double = 0
+    var position: Double = 0 { didSet { timestamp = Date() } }
+    var timestamp = Date()
+    var rate: Double = 0 { didSet { timestamp = Date() } }
     var artworkData: Data?
     var artworkURL: String?
+    var canNext = false
+    var canPrevious = false
+    var canSeek = false
     private var session: MediaSession<ModernNowPlaying>?
     private var primaryRequestInFlight = false
     /// `internalFailure` retried every two seconds flooded the log and the
@@ -314,7 +330,7 @@ private final class ModernNowPlaying: MediaSessionRepresentable {
         guard !title.isEmpty else { return nil }
         return MediaPlaybackSnapshot(
             state: rate > 0 ? .playing(rate: Float(rate)) : .paused,
-            elapsedTime: position
+            elapsedTime: position, timestamp: timestamp
         )
     }
 
@@ -323,9 +339,9 @@ private final class ModernNowPlaying: MediaSessionRepresentable {
             .play { [weak self] in self?.delegate?.onPlay?() },
             .pause { [weak self] in self?.delegate?.onPause?() },
             .togglePlayPause { [weak self] in self?.delegate?.onToggle?() },
-            .next { [weak self] in self?.delegate?.onNext?() },
-            .previous { [weak self] in self?.delegate?.onPrevious?() },
-            .seekToPosition { [weak self] seconds in self?.delegate?.onSeek?(seconds) },
+            .next { [weak self] in self?.delegate?.onNext?() }.enabled(canNext),
+            .previous { [weak self] in self?.delegate?.onPrevious?() }.enabled(canPrevious),
+            .seekToPosition { [weak self] seconds in self?.delegate?.onSeek?(seconds) }.enabled(canSeek),
         ]
     }
 
@@ -334,6 +350,10 @@ private final class ModernNowPlaying: MediaSessionRepresentable {
                 position: Double?) {
         if self.title != title || self.artist != artist {
             self.position = position ?? 0
+            // A new track gets a fresh claim attempt: a backoff set by the
+            // previous track's failure must not mute this one.
+            nextClaimAt = .distantPast
+            reportedClaimFailure = false
         } else if let position {
             self.position = position
         }
@@ -344,6 +364,9 @@ private final class ModernNowPlaying: MediaSessionRepresentable {
         self.artworkURL = thumbnailUrl
         self.rate = isPlaying
             ? Double(PlatformSettings.shared.getFloat(key: "playback_speed", default: 1)) : 0
+        // The session is created on the claim path below, not here: creating
+        // it for a paused/restored track would register a same-id session
+        // with the system before anything is playing.
         if isPlaying { claimNowPlaying(reason: "playback") }
     }
 
@@ -353,37 +376,41 @@ private final class ModernNowPlaying: MediaSessionRepresentable {
         claimNowPlaying(reason: "foreground")
     }
 
-    func reclaimAfterOtherAudioStops() {
-        let other = AVAudioSession.sharedInstance().isOtherAudioPlaying
-        let justStopped = otherAudioWasPlaying && !other
-        otherAudioWasPlaying = other
-        guard justStopped else { return }
-        // iOS only promotes a system-primary session while its app is in the
-        // foreground. The scene activation path retries if audio stopped while
-        // BitChord was backgrounded.
-        guard UIApplication.shared.applicationState == .active else { return }
-        guard rate > 0, session?.isSystemPrimary != true else { return }
+    func stop() {
+        rate = 0
+        title = ""
+        session = nil
         nextClaimAt = .distantPast
-        claimNowPlaying(reason: "other audio stopped")
     }
 
-    /// Publish the session and ask for the system slot.
+    func reclaimAfterOtherAudioStops() {
+        let other = AVAudioSession.sharedInstance().isOtherAudioPlaying
+        if otherAudioWasPlaying && !other { nextClaimAt = .distantPast }
+        otherAudioWasPlaying = other
+        // Keep publishing in the background. Only the explicit system takeover
+        // below requires foreground; iOS arbitrates background prominence.
+        guard rate > 0 else { return }
+        claimNowPlaying(reason: "eligibility changed")
+    }
+
+    /// Publish the session and, when appropriate, ask for the system slot.
     ///
-    /// iOS 27 has two steps, and skipping the first is why nothing appeared.
-    /// The session has to become *this app's* primary before it can become the
-    /// system's, which is the lock screen, the island and Control Center.
-    /// This system-slot request is independent of the audio session's
-    /// `.mixWithOthers` setting, which remains enabled while playback is active.
-    /// Promotion is retried on foreground return and after competing audio
-    /// stops while BitChord is foregrounded.
+    /// Two separate steps with separate rules (Apple docs):
+    /// - `requestToBecomeApplicationPrimary` is what publishes local playback
+    ///   — lock screen, island, Control Center. It is attempted whenever there
+    ///   is something to publish, after the audio session is active (callers
+    ///   only invoke this while loaded/playing).
+    /// - `requestToBecomeSystemPrimary` is ONLY for taking over the prominent
+    ///   slot from another session (our exact "shows Apple Music instead"
+    ///   symptom), requires the foreground, and errors when there is nothing
+    ///   to take over. Calling it for plain local playback, from the
+    ///   background, or alongside MPNowPlayingInfoCenter publishing is what
+    ///   the system answers with `internalFailure` / no effect.
     private func claimNowPlaying(reason: String) {
         guard !title.isEmpty else { return }
         if session == nil { session = MediaSession(self) }
-        guard let session else { return }
-        guard UIApplication.shared.applicationState == .active else { return }
-        guard !primaryRequestInFlight else { return }
-        guard !session.isSystemPrimary else { return }
-        guard Date() >= nextClaimAt else { return }
+        guard let session, !primaryRequestInFlight, Date() >= nextClaimAt else { return }
+        guard !session.isApplicationPrimary || !session.isSystemPrimary else { return }
         primaryRequestInFlight = true
         Task { @MainActor in
             defer { primaryRequestInFlight = false }
@@ -395,8 +422,12 @@ private final class ModernNowPlaying: MediaSessionRepresentable {
                     return
                 }
             }
-            guard UIApplication.shared.applicationState == .active else { return }
-            guard !session.isSystemPrimary else { return }
+            // Takeover only: playing, foregrounded, and not already prominent.
+            // Apple: "Your app must be in the foreground when calling this
+            // method, otherwise this request doesn't take effect."
+            guard self.session === session, self.rate > 0,
+                  UIApplication.shared.applicationState == .active,
+                  !session.isSystemPrimary else { return }
             do {
                 try await session.requestToBecomeSystemPrimary()
                 self.reportedClaimFailure = false

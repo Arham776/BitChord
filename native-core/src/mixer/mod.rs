@@ -30,7 +30,7 @@ use crate::transition_filter::TransitionFilter;
 /// Callback surface — the UniFFI-generated Swift side implements this.
 pub trait EngineEvents: Send + Sync {
     fn state_changed(&self, state: crate::PlaybackState);
-    fn track_ended(&self, reason: crate::TrackEndReason);
+    fn track_ended(&self, reason: crate::TrackEndReason, source: String);
     fn error(&self, message: String);
     /// The incoming track became audible: current-track metadata flips now
     /// (upstream fires `onHandoff` as the first note sounds, not at blend end).
@@ -166,7 +166,18 @@ impl Default for TransitionPlan {
     }
 }
 
+/// Identity of the armed successor, for the skip peek. Title/artist is what
+/// the app matches against its queue; the source disambiguates repeats.
+#[derive(Clone, Debug)]
+pub struct QueuedTrack {
+    pub title: String,
+    pub artist: String,
+    pub source: String,
+}
+
 pub enum Command {
+    /// Background preparation only applies to the voice it was prepared for.
+    ForSource { source: String, command: Box<Command> },
     Load {
         request: TrackSource,
         reply: Sender<Result<TrackInfo, String>>,
@@ -186,6 +197,22 @@ pub enum Command {
     },
     QueueNext {
         request: TrackSource,
+    },
+    /// Peek at the armed successor without touching it: the pending request
+    /// first, else the incoming voice of a running blend. Lets a manual Next
+    /// promote exactly the track the listener picked instead of re-resolving
+    /// it over the network.
+    PendingTrack {
+        reply: Sender<Option<QueuedTrack>>,
+    },
+    /// Manual Next into the armed successor, now instead of at the planned
+    /// mix point. A sounding blend completes immediately; a merely queued
+    /// request opens and replaces the current voice with the same backlog
+    /// ramp a Load uses. Replies Err when nothing is armed, and the caller
+    /// falls back to a full load. Upstream's skip-to-next-item, minus the
+    /// playlist (the app owns the queue and flips its own index on reply).
+    SkipToPending {
+        reply: Sender<Result<TrackInfo, String>>,
     },
     Play,
     Pause,
@@ -2236,6 +2263,19 @@ pub fn run_mixer(
 
 fn handle_command(state: &mut MixerState, cmd: Command, ring: &mut Producer<f32>) {
     match cmd {
+        Command::ForSource { source, command } => {
+            let handed_off = state.transition.as_ref().is_some_and(|t| t.handed_off);
+            let voice = if handed_off {
+                state.incoming.as_ref().or(state.current.as_ref())
+            } else {
+                state.current.as_ref()
+            };
+            if voice.is_some_and(|voice| voice.info.source == source) {
+                handle_command(state, *command, ring);
+            } else if let Command::SwapSource { reply, .. } = *command {
+                let _ = reply.send(Err("source swap belongs to a superseded track".into()));
+            }
+        }
         Command::Load { request, reply } => {
             // Upstream: a skip/replace is not a blend. `onSkipRequested` bails
             // and `setMediaItems` replaces the session playlist; the spare is
@@ -2308,6 +2348,10 @@ fn handle_command(state: &mut MixerState, cmd: Command, ring: &mut Producer<f32>
             if state.bit_perfect { return; }
             if request.source.is_empty() {
                 state.pending_next = None;
+                if state.transition.as_ref().is_some_and(|t| t.phase == Phase::Arming && !t.swap) {
+                    state.transition = None;
+                    state.incoming = None;
+                }
             } else if state.current.as_ref().is_some_and(|c| c.info.source == request.source) {
                 // Same path as the playing voice is normally a duplicate and is
                 // dropped. A planned fade is the repeat-one / single-item
@@ -2344,6 +2388,103 @@ fn handle_command(state: &mut MixerState, cmd: Command, ring: &mut Producer<f32>
                 log::info!("held a same-song source change; the blend is already audible");
             } else {
                 state.pending_next = Some(request);
+            }
+        }
+        Command::PendingTrack { reply } => {
+            let queued = state
+                .pending_next
+                .as_ref()
+                .map(|request| QueuedTrack {
+                    title: request.title.clone(),
+                    artist: request.artist.clone(),
+                    source: request.source.clone(),
+                })
+                .or_else(|| {
+                    state.incoming.as_ref().map(|voice| QueuedTrack {
+                        title: voice.info.title.clone(),
+                        artist: voice.info.artist.clone(),
+                        source: voice.info.source.clone(),
+                    })
+                });
+            let _ = reply.send(queued);
+        }
+        Command::SkipToPending { reply } => {
+            // A blend already sounding completes now: the listener asked for
+            // its target, not for the rest of the fade.
+            if state.incoming.is_some() {
+                let info = state.incoming.as_ref().map(|voice| voice.info.clone());
+                state.promote_incoming();
+                state.position_ms.store(0, Ordering::Relaxed);
+                if !state.playing {
+                    state.playing = true;
+                    state.set_state(crate::PlaybackState::Playing);
+                }
+                match info {
+                    Some(info) => {
+                        log::info!("skip promoted blending {}", info.title);
+                        let _ = reply.send(Ok(info));
+                    }
+                    None => {
+                        let _ = reply.send(Err("nothing to skip to".into()));
+                    }
+                }
+            } else if let Some(request) = state.pending_next.take() {
+                let title = request.title.clone();
+                match Voice::open(
+                    &request,
+                    state.spatial_enabled,
+                    state.head_yaw,
+                    state.device_rate,
+                    state.playback_speed,
+                    state.skip_silence,
+                    true,
+                ) {
+                    Ok(mut voice) => {
+                        // Same landing as a Load: ramp out the backlog, drop
+                        // every straggler, start the new voice at the top.
+                        state.hard_cut();
+                        voice.gain = 1.0;
+                        voice.release_plan_stretch(state.playback_speed, state.device_rate);
+                        let info = voice.info.clone();
+                        let duration = info.duration_seconds;
+                        let (_, gain_db) =
+                            loudness_gain(voice.loudness_db, state.loudness_enabled);
+                        if let Ok(mut nerd) = state.nerd.lock() {
+                            *nerd = NerdSnapshot {
+                                codec: info.codec.clone(),
+                                sample_rate: info.sample_rate,
+                                bit_depth: info.bit_depth,
+                                channels: info.channels,
+                                kbps: info.kbps,
+                                loudness_gain_db: gain_db,
+                                swap_correlation: None,
+                            };
+                        }
+                        state.current = Some(voice);
+                        state.playing = true;
+                        state.set_state(crate::PlaybackState::Playing);
+                        state.position_ms.store(0, Ordering::Relaxed);
+                        state
+                            .duration_ms
+                            .store((duration * 1000.0) as u64, Ordering::Relaxed);
+                        if duration > 0.0 {
+                            state.events.duration_changed(duration);
+                        }
+                        state.publish_audible_position();
+                        state.events.handoff(info.clone());
+                        log::info!("skip promoted queued {}", info.title);
+                        let _ = reply.send(Ok(info));
+                    }
+                    Err(error) => {
+                        // The track is not lost: put the request back so the
+                        // planned blend (or a retry) still finds it.
+                        state.pending_next = Some(request);
+                        log::warn!("skip could not open {title}: {error}");
+                        let _ = reply.send(Err(error));
+                    }
+                }
+            } else {
+                let _ = reply.send(Err("nothing queued to skip to".into()));
             }
         }
         Command::Play => {
@@ -2506,21 +2647,21 @@ fn handle_command(state: &mut MixerState, cmd: Command, ring: &mut Producer<f32>
             // was, instead of silently skipping the whole ring depth, which is
             // seconds of music, the moment the output route changes.
             let resume_s = state.position_ms.load(Ordering::Relaxed) as f64 / 1000.0;
-            if resume_s > 0.0 {
-                if let Some(voice) = &mut state.current {
-                    match voice.decoder.seek_seconds(resume_s) {
-                        Ok(()) => {
-                            voice.base_position = 0.0;
-                            voice.spatial.flush();
-                            voice.filter.flush();
-                            voice.pending_dev.clear();
-                            voice.pending_dev_cursor = 0;
-                            voice.silent_dev_frames = 0;
-                            voice.finished = false;
-                            log::info!("output changed; resuming at {resume_s:.3}s");
-                        }
-                        Err(e) => log::warn!("re-seek after output change failed: {e}"),
+            // Zero is a valid playhead: a muted freshly loaded voice may
+            // already have decoded the entire short track into the old ring.
+            if let Some(voice) = &mut state.current {
+                match voice.decoder.seek_seconds(resume_s) {
+                    Ok(()) => {
+                        voice.base_position = 0.0;
+                        voice.spatial.flush();
+                        voice.filter.flush();
+                        voice.pending_dev.clear();
+                        voice.pending_dev_cursor = 0;
+                        voice.silent_dev_frames = 0;
+                        voice.finished = false;
+                        log::info!("output changed; resuming at {resume_s:.3}s");
                     }
+                    Err(e) => log::warn!("re-seek after output change failed: {e}"),
                 }
             }
             state.flush_ring.store(true, Ordering::Release);
@@ -2677,7 +2818,8 @@ fn render_available(state: &mut MixerState, ring: &mut Producer<f32>) {
                     log::info!("queue drained; natural end");
                     state.playing = false;
                     state.set_state(crate::PlaybackState::Stopped);
-                    state.events.track_ended(crate::TrackEndReason::Natural);
+                    state.events.track_ended(crate::TrackEndReason::Natural,
+                    state.current.as_ref().map(|v| v.info.source.clone()).unwrap_or_default());
                 }
                 break;
             }
@@ -2732,7 +2874,8 @@ fn render_bitperfect_available(state: &mut MixerState, ring: &mut Producer<f32>)
             if exhausted && state.buffered_frames.load(Ordering::Relaxed) == 0 {
                 state.playing = false;
                 state.set_state(crate::PlaybackState::Stopped);
-                state.events.track_ended(crate::TrackEndReason::Natural);
+                state.events.track_ended(crate::TrackEndReason::Natural,
+                    state.current.as_ref().map(|v| v.info.source.clone()).unwrap_or_default());
             }
             break;
         }
@@ -2793,7 +2936,7 @@ mod tests {
                 crate::PlaybackState::Paused => "paused",
             });
         }
-        fn track_ended(&self, reason: crate::TrackEndReason) {
+        fn track_ended(&self, reason: crate::TrackEndReason, _source: String) {
             self.ended.lock().unwrap().push(match reason {
                 crate::TrackEndReason::Natural => "natural",
                 crate::TrackEndReason::Skipped => "skipped",
@@ -4558,6 +4701,83 @@ mod tests {
                 let _ = handle.join();
             }
         }
+    }
+
+    #[test]
+    fn stale_preparation_cannot_modify_a_new_selection() {
+        let (mut harness, low, high) = SwapHarness::new("stale-preparation");
+        let (reply, loaded) = crossbeam_channel::bounded(1);
+        harness.tx.send(Command::Load {
+            request: SwapHarness::source(&high, "Selected", 320), reply,
+        }).unwrap();
+        loaded.recv_timeout(Duration::from_secs(5)).unwrap().unwrap();
+        let (reply, swapped) = crossbeam_channel::bounded(1);
+        harness.tx.send(Command::ForSource {
+            source: low.display().to_string(),
+            command: Box::new(Command::SwapSource {
+                request: SwapHarness::source(&low, "Obsolete", 96),
+                crossfade_seconds: 0.1, reply,
+            }),
+        }).unwrap();
+        assert!(swapped.recv_timeout(Duration::from_secs(5)).unwrap().is_err());
+        harness.tx.send(Command::ForSource {
+            source: low.display().to_string(),
+            command: Box::new(Command::QueueNext {
+                request: SwapHarness::source(&low, "Obsolete", 96),
+            }),
+        }).unwrap();
+        drain_frames(&mut harness.consumer, &harness.buffered, 44_100 * 10);
+        assert!(harness.events.handoffs.lock().unwrap().is_empty(),
+                "stale queued audio must never become audible");
+        harness.finish();
+    }
+
+    /// A manual Next must not re-resolve: the upcoming track is already armed,
+    /// so the skip promotes it now — peek names it, the skip opens it and
+    /// reports the handoff, all without a catalogue round-trip.
+    #[test]
+    fn skip_promotes_queued_track_immediately() {
+        let (harness, low, high) = SwapHarness::new("skip-queued");
+        let (reply, loaded) = crossbeam_channel::bounded(1);
+        harness.tx.send(Command::Load {
+            request: SwapHarness::source(&low, "First", 96), reply,
+        }).unwrap();
+        loaded.recv_timeout(Duration::from_secs(5)).unwrap().unwrap();
+        harness.tx.send(Command::QueueNext {
+            request: SwapHarness::source(&high, "Second", 320),
+        }).unwrap();
+        // The peek names the armed successor without touching it.
+        let (reply, peeked) = crossbeam_channel::bounded(1);
+        harness.tx.send(Command::PendingTrack { reply }).unwrap();
+        let queued = peeked.recv_timeout(Duration::from_secs(5)).unwrap()
+            .expect("a queued track must be visible to the skip peek");
+        assert_eq!(queued.title, "Second");
+        // The skip opens it now and reports the handoff, like a load would.
+        let (reply, skipped) = crossbeam_channel::bounded(1);
+        harness.tx.send(Command::SkipToPending { reply }).unwrap();
+        let info = skipped.recv_timeout(Duration::from_secs(10)).unwrap()
+            .expect("an armed track must be skippable");
+        assert_eq!(info.title, "Second");
+        assert!(harness.events.handoffs.lock().unwrap().contains(&"Second".to_string()),
+                "the skip must report the handoff the app flips its queue on");
+        // Nothing left armed: a second skip is refused, not invented.
+        let (reply, again) = crossbeam_channel::bounded(1);
+        harness.tx.send(Command::SkipToPending { reply }).unwrap();
+        assert!(again.recv_timeout(Duration::from_secs(5)).unwrap().is_err());
+        harness.finish();
+    }
+
+    #[test]
+    fn skip_with_nothing_armed_is_refused() {
+        let (harness, _, _) = SwapHarness::new("skip-empty");
+        let (reply, peeked) = crossbeam_channel::bounded(1);
+        harness.tx.send(Command::PendingTrack { reply }).unwrap();
+        assert!(peeked.recv_timeout(Duration::from_secs(5)).unwrap().is_none());
+        let (reply, skipped) = crossbeam_channel::bounded(1);
+        harness.tx.send(Command::SkipToPending { reply }).unwrap();
+        assert!(skipped.recv_timeout(Duration::from_secs(5)).unwrap().is_err(),
+                "with no armed successor the caller must fall back to a full load");
+        harness.finish();
     }
 
     #[test]

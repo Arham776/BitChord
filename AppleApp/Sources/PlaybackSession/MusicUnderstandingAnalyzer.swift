@@ -19,6 +19,49 @@ import MusicUnderstanding
 /// `shape for TensorData is not static`. We therefore only analyze in the
 /// foreground and never request `.instrumentActivity`.
 enum MusicUnderstandingAnalyzer {
+    /// True while GPU work must not be started. Set synchronously from the
+    /// scene's background transition and cleared on foreground return.
+    ///
+    /// Why sticky instead of just checking `applicationState` before each
+    /// analysis: the check-then-submit races the lock button — the state reads
+    /// `.active`, the app backgrounds mid-inference, and the submission fails
+    /// with `BackgroundExecutionNotPermitted`, spraying a wall of Metal/E5RT
+    /// errors into the log once *per track*. The in-flight inference cannot be
+    /// cancelled, so the first background failure teaches the rest of the
+    /// stretch to go straight to the disk cache instead.
+    ///
+    /// iOS only: macOS allows background GPU work, so the flag is never set
+    /// there.
+    private static var gpuSuspended = false
+    private static let gpuSuspendLock = NSLock()
+
+    /// Call from the scene's `.background` transition.
+    static func noteBackground() {
+#if canImport(UIKit)
+        setGpuSuspended(true)
+#endif
+    }
+
+    /// Call from the scene's `.active` transition.
+    static func noteForeground() {
+        setGpuSuspended(false)
+    }
+
+    private static func isGpuSuspended() -> Bool {
+        gpuSuspendLock.lock()
+        defer { gpuSuspendLock.unlock() }
+        return gpuSuspended
+    }
+
+    /// Synchronous so it can be called from async contexts without tripping
+    /// Swift 6's scoped-locking rule (`lock()`/`unlock()` must not appear
+    /// lexically inside an async function).
+    private static func setGpuSuspended(_ value: Bool) {
+        gpuSuspendLock.lock()
+        defer { gpuSuspendLock.unlock() }
+        gpuSuspended = value
+    }
+
     /// True when the current OS can run Music Understanding analysis.
     static var isAvailable: Bool {
         if #available(iOS 27.0, macOS 27.0, tvOS 27.0, watchOS 27.0, visionOS 27.0, *) {
@@ -39,6 +82,11 @@ enum MusicUnderstandingAnalyzer {
             : filePath
         guard !path.isEmpty, FileManager.default.fileExists(atPath: path) else {
             return false
+        }
+        // A background stretch goes straight to the disk cache without an
+        // await: no MainActor hop, no race with the lock button.
+        if isGpuSuspended() {
+            return AutomixOverlayCache.seedCached(forFilePath: path)
         }
         // Prefer a fresh Music Understanding pass while foregrounded; otherwise
         // (or on failure) fall back to the disk cache so Automix still plans.
@@ -66,6 +114,10 @@ enum MusicUnderstandingAnalyzer {
     @available(iOS 27.0, macOS 27.0, tvOS 27.0, watchOS 27.0, visionOS 27.0, *)
     private static func analyzeAvailable(path: String) async -> Bool {
         #if canImport(MusicUnderstanding)
+        // Synchronous pre-check before the MainActor hop below narrows the
+        // race further: a backgrounding that landed between the caller's check
+        // and this one still turns back here.
+        guard !isGpuSuspended() else { return false }
         // Re-check right before GPU work — the first await can race a lock.
         guard await isForeground() else { return false }
         do {
@@ -85,7 +137,15 @@ enum MusicUnderstandingAnalyzer {
             AutomixOverlayCache.store(overlay, forFilePath: path)
             return seedAutomixAnalysis(path: path, overlay: overlay)
         } catch {
-            NSLog("[BitChord] Music Understanding failed for %@: %@", path, String(describing: error))
+            if await isForeground() {
+                NSLog("[BitChord] Music Understanding failed for %@: %@", path, String(describing: error))
+            } else {
+                // Expected, not news: the GPU submission raced a lock and lost.
+                // Suspend the rest of this background stretch so the failure —
+                // and Apple's own Metal/E5RT wall that comes with it — happens
+                // once per stretch instead of once per track.
+                setGpuSuspended(true)
+            }
             return false
         }
         #else

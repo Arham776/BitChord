@@ -26,7 +26,7 @@ impl EngineEvents for LogEvents {
     fn state_changed(&self, state: PlaybackState) {
         eprintln!("state {state:?}");
     }
-    fn track_ended(&self, reason: TrackEndReason) {
+    fn track_ended(&self, reason: TrackEndReason, _source: String) {
         eprintln!("ended {reason:?}");
     }
     fn error(&self, message: String) {

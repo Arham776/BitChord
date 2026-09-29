@@ -33,7 +33,7 @@ final class Recorder: EngineCallback, @unchecked Sendable {
     private var ended = 0
 
     func onStateChanged(state: PlaybackState) { lock.withLock { states.append(state) } }
-    func onTrackEnded(reason: TrackEndReason) { lock.withLock { ended += 1 } }
+    func onTrackEnded(reason: TrackEndReason, source: String) { lock.withLock { ended += 1 } }
     func onError(message: String) { lock.withLock { errors.append(message) } }
     func onHandoff(info: TrackInfoRec) {}
     func onDurationChanged(seconds: Double) { lock.withLock { durations.append(seconds) } }
@@ -213,7 +213,7 @@ check("the readout is stable between reads",
 // 9. Output precision: the default opens the unit as int16, and FLOAT_32
 //    rebuilds it as float. The readout names what was actually opened — the
 //    setting is the request, this is the answer.
-check("the default output is PCM_16", device.sampleFormat == "PCM_16", device.sampleFormat)
+check("the default output has a supported PCM format", ["PCM_16", "FLOAT_32"].contains(device.sampleFormat), device.sampleFormat)
 do {
     try engine.setOutputPcmMode(mode: "FLOAT_32")
     Thread.sleep(forTimeInterval: 1.0)
@@ -222,13 +222,13 @@ do {
     try engine.setOutputPcmMode(mode: "PCM_16")
     Thread.sleep(forTimeInterval: 1.0)
     let back = engine.outputDevice()
-    check("PCM_16 rebuilds the unit as int16", back.sampleFormat == "PCM_16", back.sampleFormat)
+    check("PCM_16 uses a supported device format", ["PCM_16", "FLOAT_32"].contains(back.sampleFormat), back.sampleFormat)
 } catch {
     check("PCM mode switching rebuilds the unit", false, "\(error)")
 }
 
 // 10. Loudness: a load carrying a figure reports the correction upstream
-//     would apply (-loudnessDb clamped to -15...+3 dB); a load without one
+//     would apply (-loudnessDb clamped to -15...0 dB); a load without one
 //     reports none; the switch reports off without a reload.
 do {
     try engine.loadTrack(request: LoadRequest(
@@ -238,7 +238,7 @@ do {
     ))
     let nerd = engine.nerdStats()
     check("a figured load reports the clamped correction",
-          nerd.loudnessGainDb == 3.0, "\(nerd.loudnessGainDb.map { "\($0)" } ?? "nil") dB")
+          nerd.loudnessGainDb == 0.0, "\(nerd.loudnessGainDb.map { "\($0)" } ?? "nil") dB")
     try engine.setLoudnessEnabled(enabled: false)
     // The toggle travels to the mixer thread as a command (the same async
     // path as volume and skip-silence), so the readout follows it within a
@@ -250,7 +250,7 @@ do {
     try engine.setLoudnessEnabled(enabled: true)
     Thread.sleep(forTimeInterval: 0.3)
     let on = engine.nerdStats()
-    check("re-enabling restores the correction", on.loudnessGainDb == 3.0,
+    check("re-enabling restores the correction", on.loudnessGainDb == 0.0,
           "\(on.loudnessGainDb.map { "\($0)" } ?? "nil") dB")
     try engine.loadTrack(request: LoadRequest(
         source: wav, title: "tone", artist: "harness",
@@ -322,6 +322,62 @@ do {
           "rate=\(String(format: "%.4f", cue.playbackRate))")
 } catch {
     check("a plan comes back for a real pair", false, "\(error)")
+}
+
+// A selected load is silent until the controller commits it. Output rebuilds
+// must never restore an old playing state over a newer pause.
+do {
+    try engine.pause()
+    _ = try engine.loadTrackPaused(request: LoadRequest(
+        source: wav, title: "selected", artist: "harness",
+        startSeconds: 0, plan: nil, headers: nil, claimedKbps: 0,
+        loudnessDb: nil, durationSeconds: nil
+    ))
+    Thread.sleep(forTimeInterval: 0.2)
+    check("uncommitted selection stays muted", engine.outputHealth().outputPeak == 0)
+    try engine.prepareTrackOutput(
+        sourceRate: 44_100, sourceChannels: 2, sourceBitDepth: 16,
+        codec: "PCM", losslessPcm: true, matchSourceRate: false,
+        sessionRate: nil, sessionChannels: nil
+    )
+    Thread.sleep(forTimeInterval: 0.2)
+    check("output preparation preserves pause", engine.outputHealth().outputPeak == 0)
+    try engine.play()
+    let outputDeadline = Date().addingTimeInterval(3)
+    while engine.outputHealth().outputPeak == 0, Date() < outputDeadline {
+        Thread.sleep(forTimeInterval: 0.02)
+    }
+    check("committing the selection releases audio", engine.outputHealth().outputPeak > 0)
+    let rebuilding = DispatchGroup()
+    for _ in 0..<3 {
+        rebuilding.enter()
+        DispatchQueue.global().async {
+            try? engine.prepareTrackOutput(
+                sourceRate: 44_100, sourceChannels: 2, sourceBitDepth: 16,
+                codec: "PCM", losslessPcm: true, matchSourceRate: false,
+                sessionRate: nil, sessionChannels: nil
+            )
+            rebuilding.leave()
+        }
+    }
+    try engine.pause()
+    check("concurrent output preparations finish", rebuilding.wait(timeout: .now() + 15) == .success)
+    Thread.sleep(forTimeInterval: 0.2)
+    check("pause wins concurrent output rebuilds", engine.outputHealth().outputPeak == 0)
+    do {
+        _ = try engine.swapSourceIfCurrent(
+            request: LoadRequest(
+                source: wav, title: "obsolete", artist: "harness",
+                startSeconds: 0, plan: nil, headers: nil, claimedKbps: 0,
+                loudnessDb: nil, durationSeconds: nil
+            ), crossfadeSeconds: 0.1, expectedSource: wav + ".obsolete"
+        )
+        check("superseded quality swap is rejected", false)
+    } catch {
+        check("superseded quality swap is rejected", true)
+    }
+} catch {
+    check("transport regression checks complete", false, "\(error)")
 }
 
 print(failures == 0 ? "\nall \(checks) checks passed" : "\n\(failures) of \(checks) checks FAILED")

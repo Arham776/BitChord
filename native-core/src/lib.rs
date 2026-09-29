@@ -211,6 +211,16 @@ pub struct TrackInfoRec {
     pub kbps: u32,
 }
 
+/// Identity of the mixer's armed successor, for the skip peek. Title/artist
+/// is what the app matches against its queue; the source disambiguates
+/// repeats of the same recording.
+#[derive(uniffi::Record, Debug, Clone)]
+pub struct QueuedTrackRec {
+    pub title: String,
+    pub artist: String,
+    pub source: String,
+}
+
 #[derive(uniffi::Record, Debug, Clone)]
 pub struct NerdStatsRec {
     pub codec: String,
@@ -291,7 +301,7 @@ impl std::error::Error for EngineError {}
 #[uniffi::export(callback_interface)]
 pub trait EngineCallback: Send + Sync {
     fn on_state_changed(&self, state: PlaybackState);
-    fn on_track_ended(&self, reason: TrackEndReason);
+    fn on_track_ended(&self, reason: TrackEndReason, source: String);
     fn on_error(&self, message: String);
     /// The incoming track became audible — current-track metadata flips here.
     fn on_handoff(&self, info: TrackInfoRec);
@@ -315,9 +325,9 @@ impl EngineEvents for SharedEvents {
             holder.0.on_state_changed(state);
         }
     }
-    fn track_ended(&self, reason: TrackEndReason) {
+    fn track_ended(&self, reason: TrackEndReason, source: String) {
         if let Some(holder) = self.inner.lock().unwrap().as_ref() {
-            holder.0.on_track_ended(reason);
+            holder.0.on_track_ended(reason, source);
         }
     }
     fn error(&self, message: String) {
@@ -368,6 +378,7 @@ pub struct PlayerEngine {
     /// When set, the device callback outputs silence immediately — pause must
     /// not wait for the mixer to drain ~2 s of already-queued samples.
     output_paused: Arc<AtomicBool>,
+    output_holds: Arc<AtomicU32>,
     started: AtomicBool,
     stream: Arc<Mutex<Option<cpal::Stream>>>,
     rebuilding: Arc<AtomicBool>,
@@ -545,6 +556,7 @@ impl PlayerEngine {
             flush_ring: Arc::new(AtomicBool::new(false)),
             bail_flush: Arc::new(AtomicBool::new(false)),
             output_paused: Arc::new(AtomicBool::new(false)),
+            output_holds: Arc::new(AtomicU32::new(0)),
             started: AtomicBool::new(false),
             stream: Arc::new(Mutex::new(None)),
             rebuilding: Arc::new(AtomicBool::new(false)),
@@ -681,6 +693,8 @@ impl PlayerEngine {
             flush_ring: self.flush_ring.clone(),
             bail_flush: self.bail_flush.clone(),
             output_paused: self.output_paused.clone(),
+            output_holds: self.output_holds.clone(),
+            rebuild_lock: Arc::new(Mutex::new(())),
             pcm_mode: self.pcm_mode.clone(),
             active_pcm_mode: self.active_pcm_mode.clone(),
             bit_perfect_depth: self.bit_perfect_depth.clone(),
@@ -711,6 +725,12 @@ impl PlayerEngine {
 
     pub fn load_track(&self, request: LoadRequest) -> Result<TrackInfoRec, EngineError> {
         self.output_paused.store(false, Ordering::Release);
+        self.load_track_paused(request)
+    }
+
+    /// Loads without releasing the transport mute. The session owner commits
+    /// playback with play() only after checking that this is still its selection.
+    pub fn load_track_paused(&self, request: LoadRequest) -> Result<TrackInfoRec, EngineError> {
         let (reply_tx, reply_rx) = crossbeam_channel::bounded::<Result<TrackInfo, String>>(1);
         self.send(Command::Load {
             request: to_track_source(request),
@@ -798,7 +818,7 @@ impl PlayerEngine {
             && source_channels == 2
             && source_rate > 0
             && target_rate == source_rate;
-        let old_pause = self.output_paused.swap(true, Ordering::AcqRel);
+        let _hold = OutputHold::new(&self.output_holds);
         self.send(Command::SetBitPerfect(false))?;
         self.bit_perfect_depth.store(0, Ordering::Relaxed);
         self.active_bit_perfect_depth.store(0, Ordering::Relaxed);
@@ -848,7 +868,6 @@ impl PlayerEngine {
             bit_perfect_reason = "The route rejected the source-depth integer format".into();
             let _ = control.rebuild(true);
         } else if let Err(error) = result {
-            self.output_paused.store(old_pause, Ordering::Release);
             return Err(error);
         }
 
@@ -864,7 +883,6 @@ impl PlayerEngine {
             bit_perfect_reason
         };
         self.send(Command::SetBitPerfect(active))?;
-        self.output_paused.store(old_pause, Ordering::Release);
         Ok(())
     }
 
@@ -889,6 +907,63 @@ impl PlayerEngine {
             Ok(Ok(info)) => Ok(info_to_rec(info)),
             Ok(Err(e)) => Err(EngineError::LoadFailed(e)),
             Err(_) => Err(EngineError::LoadFailed("swap timed out".into())),
+        }
+    }
+
+    /// Compare on the mixer thread, where automatic handoffs also occur.
+    pub fn swap_source_if_current(
+        &self, request: LoadRequest, crossfade_seconds: f64, expected_source: String,
+    ) -> Result<TrackInfoRec, EngineError> {
+        let (reply, result) = crossbeam_channel::bounded(1);
+        self.send(Command::ForSource {
+            source: expected_source,
+            command: Box::new(Command::SwapSource {
+                request: to_track_source(request), crossfade_seconds, reply,
+            }),
+        })?;
+        match result.recv_timeout(std::time::Duration::from_secs(30)) {
+            Ok(Ok(info)) => Ok(info_to_rec(info)),
+            Ok(Err(error)) => Err(EngineError::LoadFailed(error)),
+            Err(_) => Err(EngineError::LoadFailed("swap timed out".into())),
+        }
+    }
+
+    pub fn queue_next_if_current(&self, request: LoadRequest, expected_source: String) -> Result<(), EngineError> {
+        self.send(Command::ForSource {
+            source: expected_source,
+            command: Box::new(Command::QueueNext { request: to_track_source(request) }),
+        })
+    }
+
+    /// What a manual Next would promote: the pending request first, else the
+    /// incoming voice of a running blend. `None` when nothing is armed (or
+    /// the engine is not running) — the caller falls back to a full load.
+    /// Read-only and fast: no decoding, no network.
+    pub fn pending_track(&self) -> Option<QueuedTrackRec> {
+        let (reply, result) = crossbeam_channel::bounded(1);
+        if self.send(Command::PendingTrack { reply }).is_err() {
+            return None;
+        }
+        match result.recv_timeout(std::time::Duration::from_secs(5)) {
+            Ok(queued) => queued.map(|track| QueuedTrackRec {
+                title: track.title,
+                artist: track.artist,
+                source: track.source,
+            }),
+            Err(_) => None,
+        }
+    }
+
+    /// Promote the armed successor now instead of at the planned mix point.
+    /// Returns the promoted track's info so the app can flip its queue index
+    /// without waiting for the handoff event. Err when nothing is armed.
+    pub fn skip_to_pending(&self) -> Result<TrackInfoRec, EngineError> {
+        let (reply, result) = crossbeam_channel::bounded(1);
+        self.send(Command::SkipToPending { reply })?;
+        match result.recv_timeout(std::time::Duration::from_secs(30)) {
+            Ok(Ok(info)) => Ok(info_to_rec(info)),
+            Ok(Err(error)) => Err(EngineError::LoadFailed(error)),
+            Err(_) => Err(EngineError::LoadFailed("skip timed out".into())),
         }
     }
 
@@ -1214,6 +1289,19 @@ impl PlayerEngine {
     }
 }
 
+/// Output reconfiguration may overlap a user pause. Never restore a saved
+/// pause boolean: that would undo the newer intent. Holds nest independently.
+struct OutputHold<'a>(&'a AtomicU32);
+impl<'a> OutputHold<'a> {
+    fn new(holds: &'a AtomicU32) -> Self {
+        holds.fetch_add(1, Ordering::AcqRel);
+        Self(holds)
+    }
+}
+impl Drop for OutputHold<'_> {
+    fn drop(&mut self) { self.0.fetch_sub(1, Ordering::AcqRel); }
+}
+
 #[derive(Clone)]
 struct OutputControl {
     commands: crossbeam_channel::Sender<Command>,
@@ -1222,6 +1310,7 @@ struct OutputControl {
     /// A forced rebuild arrived while one was already running. The worker
     /// re-runs for it rather than dropping it — see `request_rebuild`.
     rebuild_forced: Arc<AtomicBool>,
+    rebuild_lock: Arc<Mutex<()>>,
     output_rate: Arc<AtomicU32>,
     output_channels: Arc<AtomicU32>,
     requested_rate: Arc<AtomicU32>,
@@ -1236,6 +1325,7 @@ struct OutputControl {
     flush_ring: Arc<AtomicBool>,
     bail_flush: Arc<AtomicBool>,
     output_paused: Arc<AtomicBool>,
+    output_holds: Arc<AtomicU32>,
     pcm_mode: Arc<AtomicU32>,
     active_pcm_mode: Arc<AtomicU32>,
     bit_perfect_depth: Arc<AtomicU32>,
@@ -1334,6 +1424,8 @@ impl OutputControl {
     }
 
     fn rebuild(&self, force: bool) -> Result<(), EngineError> {
+        // Direct per-track preparation and route recovery share this lock.
+        let _rebuild = self.rebuild_lock.lock().unwrap();
         let host = cpal::default_host();
         let device = pick_output_device(&host, self.prefer_usb.load(Ordering::Relaxed))
             .ok_or(EngineError::NoOutputDevice)?;
@@ -1466,15 +1558,13 @@ impl OutputControl {
         // From here the swap cannot fail. Mute both units for the handover so
         // the outgoing ring's backlog — seconds of it — cannot double the
         // incoming audio while it drains.
-        let user_paused = self.output_paused.load(Ordering::Acquire);
-        self.output_paused.store(true, Ordering::Release);
+        let _hold = OutputHold::new(&self.output_holds);
         self.flush_ring.store(true, Ordering::Release);
         if self
             .commands
             .send(Command::SetOutputFormat { rate, producer })
             .is_err()
         {
-            self.output_paused.store(user_paused, Ordering::Release);
             return Err(EngineError::NotStarted);
         }
         if selected.bit_perfect_depth == 0 && prev_bit_perfect_depth > 0 {
@@ -1483,7 +1573,6 @@ impl OutputControl {
         // Hand the new stream in and drop the old one, whose device has gone.
         let previous = self.stream.lock().unwrap().replace(stream);
         drop(previous);
-        self.output_paused.store(user_paused, Ordering::Release);
         self.output_rate.store(rate, Ordering::Relaxed);
         self.output_channels.store(channels as u32, Ordering::Relaxed);
         self.active_pcm_mode
@@ -2060,6 +2149,7 @@ fn open_output_stream(
     let flush_ring = control.flush_ring.clone();
     let bail_flush = control.bail_flush.clone();
     let paused = control.output_paused.clone();
+    let holds = control.output_holds.clone();
     let err_ctrl = control.clone();
     if bit_perfect_depth == 16 {
         let mut scratch = Vec::<f32>::new();
@@ -2067,6 +2157,10 @@ fn open_output_stream(
             .build_output_stream(
                 config,
                 move |data: &mut [i16], _| {
+                    if holds.load(Ordering::Acquire) > 0 {
+                        data.fill(Default::default());
+                        return;
+                    }
                     if scratch.len() < data.len() { scratch.resize(data.len(), 0.0); }
                     render_bitperfect(
                         &mut consumer, &buffered, &callback_underruns, &output_peak,
@@ -2087,6 +2181,10 @@ fn open_output_stream(
             .build_output_stream(
                 config,
                 move |data: &mut [cpal::I24], _| {
+                    if holds.load(Ordering::Acquire) > 0 {
+                        data.fill(Default::default());
+                        return;
+                    }
                     if scratch.len() < data.len() { scratch.resize(data.len(), 0.0); }
                     render_bitperfect(
                         &mut consumer, &buffered, &callback_underruns, &output_peak,
@@ -2124,6 +2222,10 @@ fn open_output_stream(
             .build_output_stream(
                 config,
                 move |data: &mut [i16], _| {
+                    if holds.load(Ordering::Acquire) > 0 {
+                        data.fill(Default::default());
+                        return;
+                    }
                     if scratch.len() < data.len() {
                         scratch.resize(data.len(), 0.0);
                     }
@@ -2160,6 +2262,10 @@ fn open_output_stream(
             .build_output_stream(
                 config,
                 move |data: &mut [f32], _| {
+                    if holds.load(Ordering::Acquire) > 0 {
+                        data.fill(Default::default());
+                        return;
+                    }
                     render_f32(
                         &mut consumer,
                         &volume,

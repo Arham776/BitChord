@@ -14,7 +14,9 @@ import AppKit
 /// Full Now Playing (UI spec §3.3). On macOS this *is* the window: traffic
 /// lights stay, close / volume / AirPlay live in the real toolbar, and the
 /// wash shows through a hidden title. On iPhone it is a swipe-to-dismiss
-/// sheet that zooms from the mini player; on iPad a page-sized sheet.
+/// sheet that zooms from the mini player; on iPad a full-screen cover with
+/// Music's grabber-plus-swipe dismissal (a sheet can no longer be trusted
+/// full-screen — `.page` sizing presented as a floating card on iPadOS 27).
 struct NowPlayingView: View {
     @Environment(PlaybackController.self) private var controller
     @Environment(AppModel.self) private var appModel
@@ -273,6 +275,34 @@ struct NowPlayingView: View {
                     }
                 }
             }
+            // Full-screen covers have no swipe-to-dismiss of their own, so the
+            // iPad cover gets Music's treatment: a grabber pill top-center
+            // plus a top-edge downward drag. The iPhone sheet keeps its
+            // system drag indicator and needs no chrome here. The drag is
+            // gated to starts in the top chrome band with a deliberate
+            // downward travel, so queue/lyrics scrolling underneath never
+            // trips it (child scroll gestures win ties by default anyway).
+            .overlay(alignment: .top) {
+                if isIPad {
+                    Capsule()
+                        .fill(.white.opacity(0.35))
+                        .frame(width: 42, height: 5)
+                        .padding(.top, 10)
+                        .accessibilityLabel("Close")
+                        .accessibilityAction { dismiss() }
+                }
+            }
+            .gesture(
+                DragGesture(minimumDistance: 24)
+                    .onEnded { value in
+                        guard isIPad,
+                              value.translation.height > 140,
+                              abs(value.translation.width) < 80,
+                              value.startLocation.y < 120
+                        else { return }
+                        dismiss()
+                    }
+            )
             .toolbar(.hidden, for: .navigationBar)
             .toolbarTitleDisplayMode(.inline)
             // Keep the established edge-to-edge phone artwork. The iPad page
@@ -396,7 +426,13 @@ struct NowPlayingView: View {
                         deckVolumeRow
                             .padding(.horizontal, 12)
                     }
-                    outputPartyPill
+                    #endif
+                    // The pane-reactive pill lives on every platform: queue
+                    // modes in the queue pane, output/party elsewhere. It used
+                    // to sit inside the iOS gate below, so macOS never showed
+                    // it at all.
+                    actionRowPill
+                    #if os(iOS)
                     Text(outputCaption)
                         .font(.caption.weight(.medium))
                         .foregroundStyle(.white.opacity(0.62))
@@ -409,26 +445,33 @@ struct NowPlayingView: View {
                 Spacer(minLength: 0)
             }
             .frame(maxWidth: leftColumnMaximum)
-            .padding(.leading, gutter)
+            // No leading inset when the player stands alone: it centers in
+            // the full width rather than sitting gutter-shifted.
+            .padding(.leading, pane == .main ? 0 : gutter)
 
-            // Right column: Lyrics or Queue, with switching pinned to its foot.
-            Group {
-                if pane == .queue {
-                    UpNextPane(showsCurrentTrackHeader: false)
-                        .transition(.opacity)
-                } else {
-                    desktopLyricsPane
-                        .transition(.opacity)
+            // Right column: Lyrics or Queue — and nothing in the main pane.
+            // With neither panel selected the player takes the full width,
+            // centered; an empty panel column would just leave dead space.
+            if pane != .main {
+                Group {
+                    if pane == .queue {
+                        UpNextPane(showsCurrentTrackHeader: false)
+                            .transition(.opacity)
+                    } else {
+                        desktopLyricsPane
+                            .transition(.opacity)
+                    }
                 }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .padding(.bottom, 72)
+                .padding(.trailing, gutter)
+                .transition(.opacity)
             }
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
-            .padding(.bottom, 72)
-            .padding(.trailing, gutter)
         }
         .frame(maxWidth: maximumWidth)
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .overlay(alignment: .topTrailing) {
-            if pane != .queue {
+            if pane == .lyrics {
                 lyricsToolsButton
                     .padding(.trailing, gutter)
                     .padding(.top, 18)
@@ -443,18 +486,21 @@ struct NowPlayingView: View {
     }
 
     private var landscapePaneSwitcher: some View {
-        HStack(spacing: 2) {
-            actionGlyph(.bchLyrics, selected: pane != .queue, label: "Lyrics") {
+        // Two separate buttons with air between them, like Music: lyrics and
+        // queue are mutually exclusive in function but not one joined
+        // toggle — no shared capsule, no cramped spacing. Each one toggles:
+        // tapping the highlighted pane returns to the main player, so the
+        // switcher can always reach the neither-selected state.
+        HStack(spacing: 18) {
+            actionGlyph(.bchLyrics, selected: pane == .lyrics, label: "Lyrics") {
                 Haptics.play(.expand)
-                pane = .lyrics
+                pane = pane == .lyrics ? .main : .lyrics
             }
             actionGlyph(.bchQueue, selected: pane == .queue, label: "Up Next") {
                 Haptics.play(.expand)
-                pane = .queue
+                pane = pane == .queue ? .main : .queue
             }
         }
-        .padding(2)
-        .background(.ultraThinMaterial, in: Capsule())
     }
 
     private var lyricsToolsButton: some View {
@@ -881,14 +927,32 @@ struct NowPlayingView: View {
         .padding(.horizontal, 24)
     }
 
+    /// Below-volume pill, pane-reactive on every layout that carries one:
+    /// the queue-modes pill (shuffle · repeat · AutoPlay · AutoMix) in the
+    /// queue pane, output/party everywhere else. One definition so the
+    /// portrait deck, compact landscape and desktop columns cannot disagree
+    /// about which pill a pane shows — the desktop column used to hardcode
+    /// the output pill, which is why pane toggles never changed anything on
+    /// iPad landscape or macOS.
+    private var actionRowPill: some View {
+        Group {
+            if pane == .queue {
+                queueModesPill
+            } else {
+                outputPartyPill
+            }
+        }
+        .transition(.opacity.combined(with: .scale(scale: 0.94)))
+    }
+
     /// Which of the three panes is showing.
     ///
     /// The artwork toggle is here rather than implied by the artwork's size: a
     /// control that only exists while a panel is closed cannot be used to open
     /// the first one, and one that only exists while a panel is open cannot be
     /// used to leave it.
-    /// Lyrics and Up Next stay at the two ends. iPad keeps output available
-    /// between them on every pane; the phone queue retains its mode pill here.
+    /// Lyrics and Up Next stay at the two ends. The middle pill follows the
+    /// pane through `actionRowPill`, the same definition every layout uses.
     private var playerActionRow: some View {
         VStack(spacing: 10) {
             GeometryReader { geometry in
@@ -899,17 +963,12 @@ struct NowPlayingView: View {
                         pane = pane == .lyrics ? .main : .lyrics
                     }
                     Spacer(minLength: 0)
-                    #if os(iOS)
-                    if pane == .queue && !isIPad {
-                        queueModesPill
-                            .transition(.opacity.combined(with: .scale(scale: 0.94)))
-                    } else {
-                        outputPartyPill
-                            .transition(.opacity.combined(with: .scale(scale: 0.94)))
-                    }
-                    #else
-                    outputPartyPill
-                    #endif
+                    // The queue pane swaps the output/party pill for the
+                    // queue-modes pill (shuffle · repeat · AutoPlay · AutoMix).
+                    // This is the pill's only home, and it is per platform and
+                    // pane alike: iPad used to be excluded here, which is why its
+                    // queue pane showed output controls instead of these.
+                    actionRowPill
                     Spacer(minLength: 0)
                     actionGlyph(.bchQueue, selected: pane == .queue, label: "Up Next") {
                         Haptics.play(.expand)
@@ -1045,6 +1104,28 @@ struct NowPlayingView: View {
             }
             .buttonStyle(.plain)
             .accessibilityLabel(controller.autoplayEnabled ? "AutoPlay on" : "AutoPlay off")
+
+            pillDivider
+
+            // AutoMix is the fourth and last slot, at the right end of the pill.
+            // Deliberately a waveform rather than another infinity: AutoPlay and
+            // AutoMix are separate switches and must not read as the same one.
+            Button {
+                Haptics.play(controller.automixEnabled ? .toggleOff : .toggleOn)
+                controller.toggleAutomix()
+            } label: {
+                Image(systemName: "waveform")
+                    .resizable().scaledToFit()
+                    .frame(width: 22, height: 22)
+                    .foregroundStyle(.white.opacity(controller.automixEnabled ? 1 : 0.75))
+                    .frame(width: 52, height: 44)
+                    .background(.white.opacity(controller.automixEnabled ? 0.14 : 0))
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel(controller.automixEnabled ? "AutoMix on" : "AutoMix off")
+            .help(controller.automixEnabled
+                ? "AutoMix blends the end of one track into the next"
+                : "AutoMix off — tracks change at the end")
         }
         .background(.white.opacity(0.12))
         .clipShape(Capsule())
@@ -1268,25 +1349,14 @@ struct NowPlayingView: View {
     /// template images and VoiceOver announced the asset name — "bch shuffle,
     /// button" — rather than what the button does. The labels are the same
     /// strings, so the two platforms say the same thing.
+    /// Transport: skip, play, skip — and nothing else.
+    ///
+    /// Shuffle and repeat are not here. They live in the queue-modes pill
+    /// (`queueModesPill`), which is their single home on every platform and
+    /// pane; repeating them beside the playback keys put the same two switches
+    /// on screen twice with nothing saying they are the same switch.
     private var playerTransport: some View {
         HStack(spacing: 14) {
-            Button {
-                Haptics.play(controller.shuffleEnabled ? .toggleOff : .toggleOn)
-                controller.toggleShuffle()
-            } label: {
-                Image(.bchShuffle)
-                    .resizable()
-                    .scaledToFit()
-                    .frame(width: 22, height: 22)
-                    .foregroundStyle(.white.opacity(controller.shuffleEnabled ? 1 : 0.76))
-                    .frame(width: 44, height: 44)
-                    .background(.white.opacity(controller.shuffleEnabled ? 0.16 : 0), in: Circle())
-                    .contentShape(Circle())
-                    .playerGlyph()
-            }
-            .buttonStyle(.plain)
-            .accessibilityLabel(controller.shuffleEnabled ? "Shuffle on" : "Shuffle off")
-
             Button {
                 Haptics.play(.skipPrevious)
                 controller.previous()
@@ -1344,31 +1414,6 @@ struct NowPlayingView: View {
             .disabled(!controller.canPlayNext)
             .help("Next")
             .accessibilityLabel("Next track")
-
-            Button {
-                Haptics.play(.select)
-                controller.cycleRepeat()
-            } label: {
-                Group {
-                    if controller.repeatMode == .one {
-                        Text("1")
-                            .font(.system(size: 18, weight: .bold))
-                    } else {
-                        Image(.bchRepeat)
-                            .resizable()
-                            .scaledToFit()
-                            .frame(width: 22, height: 22)
-                    }
-                }
-                .foregroundStyle(.white.opacity(controller.repeatMode == .off ? 0.76 : 1))
-                .frame(width: 44, height: 44)
-                .background(.white.opacity(controller.repeatMode == .off ? 0 : 0.16), in: Circle())
-                .contentShape(Circle())
-                .playerGlyph()
-            }
-            .buttonStyle(.plain)
-            .accessibilityLabel(repeatLabel)
-
         }
         .foregroundStyle(.white)
     }
@@ -1550,26 +1595,10 @@ private struct UpNextPane: View {
             }
 
             if showsCurrentTrackHeader {
-                ViewThatFits(in: .horizontal) {
-                    HStack(spacing: 16) {
-                        queueTitleAndClear
-                        Spacer(minLength: 8)
-                        queueAutomationControls
-                            .frame(maxWidth: 440)
-                    }
+                queueTitleAndClear
                     .padding(.horizontal, 24)
-
-                    VStack(alignment: .leading, spacing: 14) {
-                        queueAutomationControls
-                        queueTitleAndClear
-                    }
-                    .padding(.horizontal, 24)
-                }
-                .padding(.bottom, 8)
+                    .padding(.bottom, 8)
             } else {
-                queueAutomationControls
-                    .padding(.horizontal, 24)
-                    .padding(.bottom, 16)
                 queueTitleAndClear
                     .padding(.horizontal, 24)
                     .padding(.bottom, 8)
@@ -1939,53 +1968,6 @@ private struct UpNextPane: View {
             .help("More")
         }
         .padding(.horizontal, 24)
-    }
-
-    private var queueAutomationControls: some View {
-        HStack(spacing: 10) {
-            automationButton(
-                title: "AutoPlay",
-                symbol: "infinity",
-                enabled: controller.autoplayEnabled,
-                value: controller.autoplayEnabled ? "On" : "Off",
-                action: controller.toggleAutoplay
-            )
-            automationButton(
-                title: "AutoMix",
-                symbol: "link",
-                enabled: controller.automixEnabled,
-                value: controller.automixEnabled ? "On" : "Off",
-                action: controller.toggleAutomix
-            )
-        }
-    }
-
-    private func automationButton(
-        title: String,
-        symbol: String,
-        enabled: Bool,
-        value: String,
-        action: @escaping () -> Void
-    ) -> some View {
-        Button {
-            Haptics.play(.tap)
-            action()
-        } label: {
-            HStack(spacing: 7) {
-                Image(systemName: symbol)
-                    .font(.system(size: 15, weight: .semibold))
-                Text(title)
-                    .font(.subheadline.weight(.semibold))
-            }
-            .foregroundStyle(enabled ? Color.black.opacity(0.82) : Color.white.opacity(0.9))
-            .frame(maxWidth: .infinity, minHeight: 38)
-            .background(enabled ? Color.white.opacity(0.88) : Color.white.opacity(0.17), in: Capsule())
-            .contentShape(Capsule())
-        }
-        .buttonStyle(.plain)
-        .accessibilityLabel(title)
-        .accessibilityValue(value)
-        .accessibilityAddTraits(enabled ? [.isButton, .isSelected] : .isButton)
     }
 
     /// What the row-motion animation tracks: every move changes it, nothing

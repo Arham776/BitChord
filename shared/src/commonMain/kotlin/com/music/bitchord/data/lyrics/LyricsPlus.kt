@@ -1,7 +1,9 @@
 package com.music.bitchord.data.lyrics
 
+import kotlinx.coroutines.Deferred
 import kotlinx.coroutines.async
 import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.selects.onTimeout
 import kotlinx.coroutines.selects.select
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
@@ -12,12 +14,26 @@ import kotlinx.serialization.Serializable
 object LyricsPlus {
     private val MIRRORS = listOf(
         "https://lyricsplus.prjktla.my.id",
-        "https://lyricsplus.atomix.one",
         "https://lyricsplus.binimum.org",
         "https://lyricsplus.prjktla.workers.dev",
         "https://lyricsplus-seven.vercel.app",
         "https://lyrics-plus-backend.vercel.app",
+        // Last on purpose: this host serves a certificate chain iOS will not
+        // accept (chain stops at an intermediate, ATS -9802), so every request
+        // to it is a wasted TLS handshake plus a wall of trust-failure noise.
+        // [MirrorHealth] still retries it on backoff in case the cert is fixed;
+        // the hedged rollout below just never spends the first attempt on it.
+        "https://lyricsplus.atomix.one",
     )
+
+    /**
+     * Delay before asking the next mirror while the ones already asked have
+     * neither answered nor failed. Long enough that the usual case — the last
+     * good mirror answering in a few hundred milliseconds — costs a single
+     * request instead of six concurrent TLS handshakes, short enough that a
+     * hanging mirror only delays the fallback by this much per mirror.
+     */
+    private const val HEDGE_DELAY_MS = 750L
 
     /**
      * What each mirror has done lately.
@@ -30,6 +46,24 @@ object LyricsPlus {
      */
     private val health = MirrorHealth()
 
+    /**
+     * Lyrics for a track, trying mirrors in [MirrorHealth] order with hedged
+     * starts rather than all at once.
+     *
+     * Racing every mirror concurrently meant each track cost up to six TLS
+     * handshakes — including one to a host whose certificate deterministically
+     * fails, so every track also bought a trust-failure log. Instead the first
+     * host goes out alone and the next one starts only if nothing has answered
+     * or failed within [HEDGE_DELAY_MS]. A fast failure also starts the next
+     * host immediately rather than waiting out the delay, and a host that
+     * answers empty fans the rest out at once, since a catalogue miss on one
+     * mirror says nothing about the others.
+     *
+     * Cancellation, penalties and the never-empty guarantee behave as before:
+     * anything still in flight is cancelled on return, [FetchOutcome.Unreachable]
+     * penalises only the host that failed, and [MirrorHealth.order] always
+     * offers at least one host.
+     */
     suspend fun lyrics(
         title: String,
         artist: String,
@@ -43,24 +77,50 @@ object LyricsPlus {
         // track LyricsPlus has, indistinguishable from a catalogue miss.
         val hosts = health.order(MIRRORS)
 
-        val pending = hosts.map { host ->
-            host to async { fetch(host, title, artist, durationMs, album, isrc) }
-        }.toMutableList()
+        val pending = mutableListOf<Pair<String, Deferred<FetchOutcome>>>()
+        var nextHost = 0
+        fun startNext(): Boolean {
+            if (nextHost >= hosts.size) return false
+            val host = hosts[nextHost++]
+            pending += host to async { fetch(host, title, artist, durationMs, album, isrc) }
+            return true
+        }
+        startNext()
 
         try {
-            while (pending.isNotEmpty()) {
-                val (host, outcome) = select {
-                    pending.forEach { (host, job) -> job.onAwait { host to it } }
+            while (pending.isNotEmpty() || nextHost < hosts.size) {
+                if (pending.isEmpty()) {
+                    startNext()
+                    continue
                 }
+                val finished: Pair<String, FetchOutcome>? = select {
+                    pending.forEach { (host, job) -> job.onAwait { host to it } }
+                    if (nextHost < hosts.size) onTimeout(HEDGE_DELAY_MS) { null }
+                }
+                if (finished == null) {
+                    // Hedge timer: nothing answered or failed in time, ask the
+                    // next mirror too.
+                    startNext()
+                    continue
+                }
+                val (host, outcome) = finished
                 pending.removeAll { it.first == host }
                 // The three outcomes are kept apart, because only one of them is
                 // a fact about the host: a mirror that answered with nothing is
                 // working, and must not be penalised for the track being absent.
                 when (outcome) {
-                    is FetchOutcome.Unreachable -> health.unreachable(host)
+                    is FetchOutcome.Unreachable -> {
+                        health.unreachable(host)
+                        // The slot is free now; ask the next mirror at once
+                        // rather than waiting out the hedge delay.
+                        startNext()
+                    }
                     is FetchOutcome.Answered -> {
                         health.answered(host)
                         if (outcome.lines.isNotEmpty()) return@coroutineScope outcome.lines
+                        // Answered empty: fan the rest out at once instead of
+                        // trickling, since the track may be on any of them.
+                        while (startNext()) { /* all remaining hosts */ }
                     }
                 }
             }

@@ -284,61 +284,61 @@ struct RootView: View {
             #else
             if UIDevice.current.userInterfaceIdiom == .pad {
                 Tab("Home", image: "bch-home", value: AppModel.Tab.home) {
-                    HomeView(feed: homeFeed)
+                    HomeView(feed: homeFeed).modifier(iPadPlaybackChrome())
                 }
                 Tab("Explore", image: "bch-explore", value: AppModel.Tab.explore) {
-                    ExploreView()
+                    ExploreView().modifier(iPadPlaybackChrome())
                 }
                 TabSection("Library") {
                     Tab(value: AppModel.Tab.libraryYouTube) {
-                        LibraryView(lockedSection: .youtube)
+                        LibraryView(lockedSection: .youtube).modifier(iPadPlaybackChrome())
                     } label: {
                         Label("Recent", systemImage: "clock.arrow.circlepath")
                     }
                     Tab("Songs", image: "bch-music-note", value: AppModel.Tab.librarySongs) {
-                        LibraryView(lockedSection: .songs)
+                        LibraryView(lockedSection: .songs).modifier(iPadPlaybackChrome())
                     }
                     Tab("Albums", image: "bch-library", value: AppModel.Tab.libraryAlbums) {
-                        LibraryView(lockedSection: .albums)
+                        LibraryView(lockedSection: .albums).modifier(iPadPlaybackChrome())
                     }
                     Tab(value: AppModel.Tab.libraryArtists) {
-                        LibraryView(lockedSection: .artists)
+                        LibraryView(lockedSection: .artists).modifier(iPadPlaybackChrome())
                     } label: {
                         Label("Artists", systemImage: "music.mic")
                     }
                     Tab(value: AppModel.Tab.libraryPlaylists) {
-                        LibraryView(lockedSection: .playlists)
+                        LibraryView(lockedSection: .playlists).modifier(iPadPlaybackChrome())
                     } label: {
                         Label("Playlists", systemImage: "music.note.list")
                     }
                     Tab(value: AppModel.Tab.librarySubscriptions) {
-                        LibraryView(lockedSection: .subscriptions)
+                        LibraryView(lockedSection: .subscriptions).modifier(iPadPlaybackChrome())
                     } label: {
                         Label("Subscriptions", systemImage: "bell")
                     }
                     Tab(value: AppModel.Tab.libraryPodcasts) {
-                        LibraryView(lockedSection: .podcasts)
+                        LibraryView(lockedSection: .podcasts).modifier(iPadPlaybackChrome())
                     } label: {
                         Label("Podcasts", systemImage: "radio")
                     }
                     Tab(value: AppModel.Tab.libraryOnDevice) {
-                        LibraryView(lockedSection: .ondevice)
+                        LibraryView(lockedSection: .ondevice).modifier(iPadPlaybackChrome())
                     } label: {
                         Label("On Device", systemImage: "externaldrive")
                     }
                     Tab("History", image: "bch-clock", value: AppModel.Tab.libraryHistory) {
-                        LibraryView(lockedSection: .history)
+                        LibraryView(lockedSection: .history).modifier(iPadPlaybackChrome())
                     }
                     if WebDavStore.shared.isConfigured {
                         Tab(value: AppModel.Tab.libraryWebDav) {
-                            LibraryView(lockedSection: .webdav)
+                            LibraryView(lockedSection: .webdav).modifier(iPadPlaybackChrome())
                         } label: {
                             Label("WebDAV", systemImage: "cloud")
                         }
                     }
                 }
                 Tab("Search", image: "bch-search", value: AppModel.Tab.search, role: .search) {
-                    SearchView()
+                    SearchView().modifier(iPadPlaybackChrome())
                 }
             } else {
                 Tab("Home", image: "bch-home", value: AppModel.Tab.home) {
@@ -440,17 +440,21 @@ struct RootView: View {
 
 /// The shared playback pill (UI spec §3.1/§3.2): `.tabViewBottomAccessory` on
 /// iOS 26 — Music's own bottom accessory — with a material `safeAreaInset`
-/// fallback on macOS and below that floor. Same view, mounted per platform.
+/// fallback below that floor. Same view, mounted per platform.
+///
+/// The accessory is tab-level, so it is unaffected by iPad sidebar
+/// collapse/expand; inset mounting broke that and overlapped the tab bar.
 struct PlaybackPillMount: ViewModifier {
     func body(content: Content) -> some View {
         #if os(iOS)
-        if #available(iOS 26.0, *) {
+        if UIDevice.current.userInterfaceIdiom == .pad {
+            // iPad mounts per tab (iPadPlaybackChrome): the tab-level
+            // accessory container spans full width and stretches the pill,
+            // and a TabView-level inset never reflows with the sidebar.
+            content
+        } else if #available(iOS 26.0, *) {
             content.tabViewBottomAccessory {
                 PlaybackPill()
-                    // Keep the iPad player centered and compact at landscape
-                    // widths; on iPhone the proposal remains narrower and fills.
-                    .frame(maxWidth: 720)
-                    .padding(.horizontal, 10)
                     .frame(maxWidth: .infinity)
             }
         } else {
@@ -476,6 +480,29 @@ struct PlaybackPillMount: ViewModifier {
     }
 }
 
+#if os(iOS)
+/// iPad per-tab pill mount. Lives inside the detail column — like
+/// MacPlaybackChrome on macOS — so sidebar collapse/expand reflows it and it
+/// stays centered on the main view. Content-sized at 620pt like Music's
+/// compact pill instead of the full-width stretch of the tab-level
+/// accessory container. No-op on iPhone, which mounts once at the TabView.
+struct iPadPlaybackChrome: ViewModifier {
+    func body(content: Content) -> some View {
+        if UIDevice.current.userInterfaceIdiom == .pad {
+            content.safeAreaInset(edge: .bottom) {
+                PlaybackPill()
+                    .frame(maxWidth: 620)
+                    .padding(.horizontal, 10)
+                    .padding(.bottom, 8)
+                    .frame(maxWidth: .infinity)
+            }
+        } else {
+            content
+        }
+    }
+}
+#endif
+
 #if os(macOS)
 /// Pins the playback pill to the tab's content column — the same place Music
 /// keeps it — instead of spanning the whole window and covering the sidebar.
@@ -500,10 +527,22 @@ struct NowPlayingTakeover: ViewModifier {
     var zoomNamespace: Namespace.ID
 
     func body(content: Content) -> some View {
-        content.sheet(isPresented: $isPresented) {
-            NowPlayingView()
-                .modifier(NowPlayingSheetSizing())
-                .navigationTransition(.zoom(sourceID: NowPlayingZoom.sourceID, in: zoomNamespace))
+        Group {
+            if UIDevice.current.userInterfaceIdiom == .pad {
+                // Full screen, unconditionally: `.page` sheet sizing renders
+                // as a floating card on iPadOS 27, and only a cover is
+                // guaranteed edge to edge.
+                content.fullScreenCover(isPresented: $isPresented) {
+                    NowPlayingView()
+                        .navigationTransition(.zoom(sourceID: NowPlayingZoom.sourceID, in: zoomNamespace))
+                }
+            } else {
+                content.sheet(isPresented: $isPresented) {
+                    NowPlayingView()
+                        .modifier(NowPlayingSheetSizing())
+                        .navigationTransition(.zoom(sourceID: NowPlayingZoom.sourceID, in: zoomNamespace))
+                }
+            }
         }
     }
 }
