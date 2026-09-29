@@ -2895,27 +2895,73 @@ private struct LocalPlaylistsView: View {
     @State private var files: [LocalM3uPlaylist] = []
     @State private var user: [UserPlaylistDTO] = []
     @State private var loading = true
+    @State private var imported = ImportedPlaylistStore.shared
+    @State private var showImportPicker = false
+    @State private var importDraft: PlaylistImportDraft?
+    @State private var matchingImport = false
+    @State private var showImportMessage = false
+    @State private var importMessage = ""
 
     var body: some View {
         Group {
             if loading {
                 ProgressView().frame(maxWidth: .infinity, maxHeight: .infinity)
-            } else if files.isEmpty && user.isEmpty {
+            } else if files.isEmpty && user.isEmpty && imported.playlists.isEmpty {
                 VStack(spacing: 16) {
                     EmptyStateView(
                         icon: Image(.bchLibrary),
                         title: "No playlists yet",
                         subtitle: auth.signedIn
-                            ? "Save a playlist on YouTube Music, or drop an .m3u file in your music folder."
-                            : "Drop an .m3u file in your music folder — or sign in for your YouTube playlists.",
-                        buttonTitle: auth.signedIn ? "New Playlist" : nil,
-                        action: auth.signedIn ? {
-                            appModel.playlistPicker = PlaylistPickerRequest(videoId: "", title: "")
-                        } : nil
+                            ? "Import a CSV or TSV playlist export from Spotify or Apple Music, save a playlist on YouTube Music, or drop an .m3u file in your music folder."
+                            : "Import a CSV or TSV playlist export from Spotify or Apple Music, or drop an .m3u file in your music folder.",
+                        buttonTitle: nil,
+                        action: nil
                     )
+                    Button("Import Playlist File", systemImage: "square.and.arrow.down") {
+                        showImportPicker = true
+                    }
+                    .buttonStyle(.bordered)
+                    if auth.signedIn {
+                        Button("New YouTube Music Playlist", systemImage: "plus") {
+                            appModel.playlistPicker = PlaylistPickerRequest(videoId: "", title: "")
+                        }
+                        .buttonStyle(.bordered)
+                    }
                 }
             } else {
                 List {
+                    if !imported.playlists.isEmpty {
+                        Section("Imported to BitChord") {
+                            ForEach(imported.playlists) { playlist in
+                                NavigationLink {
+                                    ImportedPlaylistDetailView(playlist: playlist)
+                                } label: {
+                                    HStack(spacing: 12) {
+                                        Image(systemName: "music.note.list")
+                                            .foregroundStyle(.secondary)
+                                        VStack(alignment: .leading, spacing: 2) {
+                                            Text(playlist.title).lineLimit(1)
+                                            Text("\(playlist.matchedCount) of \(playlist.tracks.count) tracks · \(playlist.sourceName)")
+                                                .font(.caption)
+                                                .foregroundStyle(.secondary)
+                                                .lineLimit(1)
+                                        }
+                                    }
+                                    .padding(.vertical, 3)
+                                }
+                                .swipeActions {
+                                    Button("Delete", systemImage: "trash", role: .destructive) {
+                                        imported.remove(playlist)
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    Section {
+                        Button("Import Playlist File", systemImage: "square.and.arrow.down") {
+                            showImportPicker = true
+                        }
+                    }
                     if !files.isEmpty {
                         Section("On This Device") {
                             ForEach(files) { playlist in
@@ -2972,6 +3018,19 @@ private struct LocalPlaylistsView: View {
                 TopBarLeadingMark()
             }
             ToolbarItemGroup(placement: .topBarTrailing) {
+                Button {
+                    showImportPicker = true
+                } label: {
+                    Image(systemName: "square.and.arrow.down")
+                        .font(.system(size: 15, weight: .medium))
+                        .foregroundStyle(.primary)
+                        .frame(width: 34, height: 34)
+                        .background(.ultraThinMaterial, in: Circle())
+                        .overlay(Circle().strokeBorder(Color.white.opacity(0.22), lineWidth: 0.6))
+                }
+                .buttonStyle(ProfileCircleButtonStyle())
+                .accessibilityLabel("Import Playlist File")
+
                 if auth.signedIn {
                     Button {
                         appModel.playlistPicker = PlaylistPickerRequest(videoId: "", title: "")
@@ -2994,6 +3053,34 @@ private struct LocalPlaylistsView: View {
         .task(id: auth.sessionEpoch) { await load() }
         .onAppear { local.restoreViewPreferences() }
         .refreshable { await load() }
+        .overlay {
+            if matchingImport {
+                ZStack {
+                    Color.black.opacity(0.12).ignoresSafeArea()
+                    ProgressView("Matching playlist tracks…")
+                        .padding(20)
+                        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 16))
+                }
+            }
+        }
+        .fileImporter(
+            isPresented: $showImportPicker,
+            allowedContentTypes: [.commaSeparatedText, .tabSeparatedText, .plainText],
+            allowsMultipleSelection: false
+        ) { result in
+            prepareImport(result)
+        }
+        .sheet(item: $importDraft) { draft in
+            PlaylistImportReviewView(draft: draft) { error in
+                importMessage = error ?? "Playlist saved to BitChord. Reimporting this file will update the same playlist."
+                showImportMessage = true
+            }
+        }
+        .alert("Playlist Import", isPresented: $showImportMessage) {
+            Button("OK", role: .cancel) {}
+        } message: {
+            Text(importMessage)
+        }
     }
 
     private func load() async {
@@ -3005,6 +3092,30 @@ private struct LocalPlaylistsView: View {
             user = []
         }
         loading = false
+    }
+
+    private func prepareImport(_ result: Result<[URL], Error>) {
+        switch result {
+        case .failure(let error):
+            importMessage = error.localizedDescription
+            showImportMessage = true
+        case .success(let urls):
+            guard let url = urls.first else { return }
+            let access = url.startAccessingSecurityScopedResource()
+            defer { if access { url.stopAccessingSecurityScopedResource() } }
+            do {
+                let parsed = try PlaylistFileImport.parse(data: Data(contentsOf: url), filename: url.lastPathComponent)
+                Task {
+                    matchingImport = true
+                    defer { matchingImport = false }
+                    let matched = await PlaylistFileImport.match(parsed)
+                    importDraft = matched
+                }
+            } catch {
+                importMessage = error.localizedDescription
+                showImportMessage = true
+            }
+        }
     }
 
     /// Reads `.m3u`/`.m3u8` files from the scanned folder and resolves their
