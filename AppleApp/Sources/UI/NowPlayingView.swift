@@ -199,6 +199,30 @@ struct NowPlayingView: View {
             width >= PlayerLayout.tabletMinWidth
     }
 
+    private var isIPad: Bool {
+        #if os(iOS)
+        UIDevice.current.userInterfaceIdiom == .pad
+        #else
+        false
+        #endif
+    }
+
+    private var keepsLyricsPlaybackDeckVisible: Bool {
+        #if os(iOS)
+        isIPad
+        #else
+        true
+        #endif
+    }
+
+    private var showsPlaybackStatusLine: Bool {
+        #if os(iOS)
+        !isIPad
+        #else
+        false
+        #endif
+    }
+
     // ---- The player's two shapes -------------------------------------------
     //
     // Upstream's portrait player is two things, and the port had them the wrong
@@ -230,7 +254,7 @@ struct NowPlayingView: View {
                 ZStack {
                     MeshBackdrop(seed: controller.current?.id.hashValue ?? 0, artwork: controller.current?.artworkData)
                         .ignoresSafeArea()
-                    if pane == .main && !PlayerLayout.takesLandscapeShape(width: geo.size.width, height: geo.size.height) && fullBleedOn {
+                    if !isIPad && pane == .main && !PlayerLayout.takesLandscapeShape(width: geo.size.width, height: geo.size.height) && fullBleedOn {
                         ArtworkContinuation(entry: controller.current, seam: geo.size.width)
                             .ignoresSafeArea(edges: .bottom)
                     }
@@ -249,38 +273,11 @@ struct NowPlayingView: View {
                     }
                 }
             }
-            // The artwork starts at the sheet's top edge, behind its grabber.
-            // Output selection lives in the deck, as it does upstream.
-            .ignoresSafeArea(.container, edges: .top)
             .toolbar(.hidden, for: .navigationBar)
             .toolbarTitleDisplayMode(.inline)
-            .overlay(alignment: .top) {
-                if UIDevice.current.userInterfaceIdiom == .pad {
-                    HStack {
-                        Button {
-                            dismiss()
-                        } label: {
-                            Image(systemName: "chevron.down")
-                                .font(.system(size: 15, weight: .bold))
-                                .foregroundStyle(.white.opacity(0.85))
-                                .frame(width: 36, height: 36)
-                                .background(.ultraThinMaterial, in: Circle())
-                        }
-                        .buttonStyle(.plain)
-                        .accessibilityLabel("Dismiss")
-
-                        Spacer()
-
-                        AirPlayRouteButton()
-                            .frame(width: 22, height: 22)
-                            .frame(width: 36, height: 36)
-                            .background(.ultraThinMaterial, in: Circle())
-                            .accessibilityLabel("AirPlay")
-                    }
-                    .padding(.horizontal, 24)
-                    .padding(.top, 16)
-                }
-            }
+            // Keep the established edge-to-edge phone artwork. The iPad page
+            // respects its system top inset so the player has room for chrome.
+            .ignoresSafeArea(.container, edges: isIPad ? [] : .top)
         }
     }
     #endif
@@ -292,7 +289,7 @@ struct NowPlayingView: View {
     private var portraitPlayer: some View {
         VStack(spacing: 0) {
             stage
-            if pane != .lyrics || lyricsControlsOpen {
+            if pane != .lyrics || lyricsControlsOpen || keepsLyricsPlaybackDeckVisible {
                 deck
                     .transition(.move(edge: .bottom).combined(with: .opacity))
             }
@@ -341,7 +338,7 @@ struct NowPlayingView: View {
                     }
                     .transition(.opacity)
                 case .lyrics, .queue:
-                    panel
+                    panel(showsQueueCurrentTrackHeader: true)
                         .transition(.opacity)
                 }
             }
@@ -353,7 +350,18 @@ struct NowPlayingView: View {
     }
 
     private func desktopLandscapePlayer(size: CGSize, gutter: CGFloat) -> some View {
-        HStack(spacing: 36) {
+#if os(macOS)
+        let maximumWidth = PlayerLayout.macLandscapeMaxWidth
+        let artworkMaximum: CGFloat = 460
+        let artworkHeightFraction: CGFloat = 0.46
+        let leftColumnMaximum: CGFloat = 480
+#else
+        let maximumWidth = PlayerLayout.ipadLandscapeMaxWidth
+        let artworkMaximum: CGFloat = 560
+        let artworkHeightFraction: CGFloat = 0.58
+        let leftColumnMaximum: CGFloat = 600
+#endif
+        return HStack(spacing: 36) {
             // Left column: Large Album Artwork + Full Transport Deck
             VStack(spacing: 16) {
                 Spacer(minLength: 0)
@@ -363,12 +371,12 @@ struct NowPlayingView: View {
                     artworkStage(side: max(180, side), collapsed: false)
                         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .center)
                 }
-                .frame(maxHeight: min(size.height * 0.46, 380))
+                .frame(maxHeight: min(size.height * artworkHeightFraction, artworkMaximum))
 
                 VStack(spacing: 12) {
                     creditsRow
 
-                    if let status = songStatusLine {
+                    if showsPlaybackStatusLine, let status = songStatusLine {
                         Text(status)
                             .font(.caption2.weight(.medium))
                             .foregroundStyle(.white.opacity(0.6))
@@ -389,116 +397,86 @@ struct NowPlayingView: View {
                             .padding(.horizontal, 12)
                     }
                     outputPartyPill
+                    Text(outputCaption)
+                        .font(.caption.weight(.medium))
+                        .foregroundStyle(.white.opacity(0.62))
+                        .lineLimit(1)
+                        .accessibilityLabel(outputCaption)
                     #endif
                 }
-                .frame(maxWidth: 420)
+                .frame(maxWidth: leftColumnMaximum - 40)
 
                 Spacer(minLength: 0)
             }
-            .frame(maxWidth: 460)
+            .frame(maxWidth: leftColumnMaximum)
             .padding(.leading, gutter)
 
-            // Right column: Pane switcher header + Lyrics or Queue
-            VStack(spacing: 0) {
-                desktopPaneHeader
-                    .padding(.bottom, 8)
-
-                Group {
-                    if pane == .queue {
-                        UpNextPane(onOpenLyrics: { pane = .lyrics })
-                            .transition(.opacity)
-                    } else {
-                        desktopLyricsPane
-                            .transition(.opacity)
-                    }
+            // Right column: Lyrics or Queue, with switching pinned to its foot.
+            Group {
+                if pane == .queue {
+                    UpNextPane(showsCurrentTrackHeader: false)
+                        .transition(.opacity)
+                } else {
+                    desktopLyricsPane
+                        .transition(.opacity)
                 }
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .padding(.bottom, 72)
             .padding(.trailing, gutter)
         }
-        .frame(maxWidth: PlayerLayout.landscapeMaxWidth)
+        .frame(maxWidth: maximumWidth)
         .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .overlay(alignment: .topTrailing) {
+            if pane != .queue {
+                lyricsToolsButton
+                    .padding(.trailing, gutter)
+                    .padding(.top, 18)
+            }
+        }
+        .overlay(alignment: .bottomTrailing) {
+            landscapePaneSwitcher
+                .padding(.trailing, gutter)
+                .padding(.bottom, 12)
+        }
         .animation(.easeInOut(duration: 0.2), value: pane)
     }
 
-    private var desktopPaneHeader: some View {
-        HStack(spacing: 12) {
-            HStack(spacing: 4) {
-                Button {
-                    Haptics.play(.expand)
-                    pane = .lyrics
-                } label: {
-                    HStack(spacing: 6) {
-                        Image(.bchLyrics)
-                            .resizable().scaledToFit().frame(width: 14, height: 14)
-                        Text("Lyrics")
-                            .font(.subheadline.weight(pane != .queue ? .semibold : .regular))
-                    }
-                    .padding(.horizontal, 14)
-                    .padding(.vertical, 6)
-                    .background(pane != .queue ? Color.white.opacity(0.20) : Color.clear, in: Capsule())
-                    .foregroundStyle(pane != .queue ? .white : .white.opacity(0.6))
-                }
-                .buttonStyle(.plain)
-
-                Button {
-                    Haptics.play(.expand)
-                    pane = .queue
-                } label: {
-                    HStack(spacing: 6) {
-                        Image(.bchQueue)
-                            .resizable().scaledToFit().frame(width: 14, height: 14)
-                        Text("Up Next")
-                            .font(.subheadline.weight(pane == .queue ? .semibold : .regular))
-                    }
-                    .padding(.horizontal, 14)
-                    .padding(.vertical, 6)
-                    .background(pane == .queue ? Color.white.opacity(0.20) : Color.clear, in: Capsule())
-                    .foregroundStyle(pane == .queue ? .white : .white.opacity(0.6))
-                }
-                .buttonStyle(.plain)
+    private var landscapePaneSwitcher: some View {
+        HStack(spacing: 2) {
+            actionGlyph(.bchLyrics, selected: pane != .queue, label: "Lyrics") {
+                Haptics.play(.expand)
+                pane = .lyrics
             }
-            .padding(3)
-            .background(.white.opacity(0.08), in: Capsule())
-
-            Spacer()
-
-            if pane == .queue {
-                queueModesPill
-            } else {
-                HStack(spacing: 8) {
-                    if let source = controller.lyricsSourceLabel, !source.isEmpty {
-                        Button {
-                            showLyricsSources = true
-                        } label: {
-                            Text(source)
-                                .font(.caption.weight(.medium))
-                                .foregroundStyle(.white.opacity(0.6))
-                                .padding(.horizontal, 8)
-                                .padding(.vertical, 4)
-                                .background(.white.opacity(0.08), in: Capsule())
-                        }
-                        .buttonStyle(.plain)
-                        .help("Change lyrics source")
-                    }
-
-                    Button {
-                        showLyricsOffset = true
-                    } label: {
-                        Image(systemName: "slider.horizontal.2.square")
-                            .font(.system(size: 15))
-                            .foregroundStyle(.white.opacity(0.7))
-                            .frame(width: 30, height: 30)
-                            .contentShape(.rect)
-                    }
-                    .buttonStyle(.plain)
-                    .help("Adjust lyrics timing")
-                }
+            actionGlyph(.bchQueue, selected: pane == .queue, label: "Up Next") {
+                Haptics.play(.expand)
+                pane = .queue
             }
         }
-        .padding(.horizontal, 8)
-        .padding(.top, 14)
+        .padding(2)
+        .background(.ultraThinMaterial, in: Capsule())
+    }
+
+    private var lyricsToolsButton: some View {
+        Menu {
+            Button("Change Lyrics Source", systemImage: "text.magnifyingglass") {
+                showLyricsSources = true
+            }
+            Button("Adjust Lyrics Timing", systemImage: "slider.horizontal.2.square") {
+                showLyricsOffset = true
+            }
+        } label: {
+            Image(systemName: "wand.and.stars")
+                .font(.system(size: 16, weight: .semibold))
+                .foregroundStyle(.white.opacity(0.9))
+                .frame(width: 42, height: 42)
+                .background(.ultraThinMaterial, in: Circle())
+                .contentShape(Circle())
+        }
+        .menuStyle(.borderlessButton)
+        .menuIndicator(.hidden)
+        .help("Lyrics options")
+        .accessibilityLabel("Lyrics options")
     }
 
     private var desktopLyricsPane: some View {
@@ -509,6 +487,7 @@ struct NowPlayingView: View {
                 position: controller.livePosition(at: timeline.date),
                 hasTrack: controller.current != nil,
                 sourceLabel: controller.lyricsSourceLabel,
+                alignmentInProgress: controller.lyricsAligning,
                 onSeek: { controller.seek(to: $0) },
                 translator: controller.lyricsTranslator,
                 trackId: controller.current?.id ?? "",
@@ -534,48 +513,50 @@ struct NowPlayingView: View {
             // Measured rather than assumed, so a short window shrinks the
             // artwork instead of pushing the deck off the bottom.
             let full = PlayerLayout.portraitArtworkSide(
-                stageWidth: geo.size.width, stageHeight: geo.size.height
+                stageWidth: geo.size.width,
+                stageHeight: geo.size.height,
+                maximumSide: isIPad
+                    ? min(
+                        PlayerLayout.ipadPortraitArtworkMaxSide,
+                        geo.size.width * PlayerLayout.ipadPortraitArtworkWidthFraction
+                    )
+                    : nil
             )
-            // Full-bleed is a phone idiom: only where the setting has anything
-            // to act on, and never while a panel owns the stage.
-            let hero = !collapsed && PlayerLayout.usesFullBleedArtwork(
+            // Full Bleed remains a phone preference; the iPad keeps its
+            // contained sleeve even when the preference is enabled.
+            let hero = !isIPad && !collapsed && PlayerLayout.usesFullBleedArtwork(
                 width: geo.size.width, preferenceEnabled: fullBleedOn
             )
-            // iPad portrait panels present as a bottom drawer with a grabber
-            // and swipe-to-close, upstream `PlayerDrawer`'s tablet treatment.
-            let drawer = collapsed && PlayerLayout.presentsPanelDrawer(
-                width: geo.size.width, height: geo.size.height
-            )
+            // On iPad portrait, the panel takes the whole stage above the
+            // pinned transport; it is part of the player page, not a nested sheet.
             VStack(spacing: 0) {
                 if pane == .lyrics {
                     lyricsHeader
                 } else if pane == .main {
-                    artworkStage(
-                        side: hero ? geo.size.width : full,
-                        collapsed: false,
-                        hero: hero
-                    )
-                }
-                // The queue pane draws no sleeve of its own: its first row is the
-                // playing track with its artwork, like and overflow, and a
-                // shrunken sleeve above that was a second artwork for the same
-                // song — the thing upstream's queue screen never had.
-                if collapsed {
-                    if drawer {
-                        PlayerDrawerView(onDismiss: {
-                            Haptics.play(.tap)
-                            pane = .main
-                        }) {
-                            panel
-                        }
-                        .transition(.move(edge: .bottom).combined(with: .opacity))
+                    if isIPad {
+                        artworkStage(side: full, collapsed: false)
+                            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .center)
                     } else {
-                        panel
-                            .transition(.opacity.combined(with: .move(edge: .bottom)))
+                        artworkStage(
+                            side: hero ? geo.size.width : full,
+                            collapsed: false,
+                            hero: hero
+                        )
                     }
+                }
+                if collapsed {
+                    panel()
+                        .transition(.opacity.combined(with: .move(edge: .bottom)))
                 }
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+            .overlay(alignment: .bottomTrailing) {
+                if pane == .lyrics {
+                    lyricsToolsButton
+                        .padding(.trailing, 20)
+                        .padding(.bottom, 12)
+                }
+            }
             .animation(.snappy(duration: 0.28), value: pane)
             // Additive sleeve swipe, upstream's vertical drag: up past 60pt
             // opens Up Next, down while a panel is up returns to the player.
@@ -670,9 +651,10 @@ struct NowPlayingView: View {
         }
     }
 
-    /// The open panel, filling whatever the collapsed sleeve has left.
+    /// The selected content pane, filling the portrait stage or the requested
+    /// portion of a compact landscape layout.
     @ViewBuilder
-    private var panel: some View {
+    private func panel(showsQueueCurrentTrackHeader: Bool = true) -> some View {
         switch pane {
         case .main:
             Color.clear
@@ -691,6 +673,7 @@ struct NowPlayingView: View {
                 position: controller.livePosition(at: timeline.date),
                 hasTrack: controller.current != nil,
                 sourceLabel: controller.lyricsSourceLabel,
+                alignmentInProgress: controller.lyricsAligning,
                 onSeek: { controller.seek(to: $0) },
                 translator: controller.lyricsTranslator,
                 trackId: controller.current?.id ?? "",
@@ -702,11 +685,14 @@ struct NowPlayingView: View {
             )
             }
         case .queue:
-            UpNextPane(onOpenLyrics: { pane = .lyrics })
+            UpNextPane(
+                showsCurrentTrackHeader: showsQueueCurrentTrackHeader,
+                onOpenLyrics: { pane = .lyrics }
+            )
         }
     }
 
-    /// The pinned deck: credits, scrubber, transport, toggles.
+    /// The pinned playback deck: credits, scrubber, transport, volume and actions.
     ///
     /// Measured at its natural height and fixed to the foot, so opening the
     /// lyrics does not shove the transport down. The pane toggles live here
@@ -721,7 +707,7 @@ struct NowPlayingView: View {
             if pane == .main { creditsRow }
             // The playback-origin caption / nerd line, hidden behind
             // `hide_song_status` exactly as upstream hides it.
-            if pane == .main, let status = songStatusLine {
+            if pane == .main, showsPlaybackStatusLine, let status = songStatusLine {
                 Text(status)
                     .font(.caption2.weight(.medium))
                     .foregroundStyle(.white.opacity(0.6))
@@ -731,11 +717,10 @@ struct NowPlayingView: View {
                     .padding(.horizontal, 24)
                     .accessibilityLabel(status)
             }
-            // Upstream's deck is "lyric strip, scrubber, transport, volume,
-            // toggles" — the strip sits directly above the seek line, in the
-            // main and queue panes alike. Only the lyrics pane hides it,
-            // because there the whole lyric is already on screen.
-            if pane != .lyrics { currentLyricStrip }
+            // Phones keep the lyric strip in the main and queue panes. On iPad
+            // the larger lyric/queue pane already has that space, so the pinned
+            // deck stays focused on seek and playback controls.
+            if pane != .lyrics && !isIPad { currentLyricStrip }
             positionControls
                 .padding(.horizontal, 32)
             playerTransport
@@ -902,9 +887,8 @@ struct NowPlayingView: View {
     /// control that only exists while a panel is closed cannot be used to open
     /// the first one, and one that only exists while a panel is open cannot be
     /// used to leave it.
-    /// Lyrics and Up Next stay at the two ends, with Android's divided center
-    /// capsule switching between output/party and shuffle/repeat/autoplay when
-    /// the queue pane opens.
+    /// Lyrics and Up Next stay at the two ends. iPad keeps output available
+    /// between them on every pane; the phone queue retains its mode pill here.
     private var playerActionRow: some View {
         VStack(spacing: 10) {
             GeometryReader { geometry in
@@ -915,13 +899,17 @@ struct NowPlayingView: View {
                         pane = pane == .lyrics ? .main : .lyrics
                     }
                     Spacer(minLength: 0)
-                    if pane == .queue {
+                    #if os(iOS)
+                    if pane == .queue && !isIPad {
                         queueModesPill
                             .transition(.opacity.combined(with: .scale(scale: 0.94)))
                     } else {
                         outputPartyPill
                             .transition(.opacity.combined(with: .scale(scale: 0.94)))
                     }
+                    #else
+                    outputPartyPill
+                    #endif
                     Spacer(minLength: 0)
                     actionGlyph(.bchQueue, selected: pane == .queue, label: "Up Next") {
                         Haptics.play(.expand)
@@ -931,7 +919,6 @@ struct NowPlayingView: View {
                 .padding(.horizontal, edgeInset)
             }
             .frame(height: 44)
-            .animation(.easeInOut(duration: 0.2), value: pane == .queue)
 
             if !outputCaption.isEmpty {
                 Text(outputCaption)
@@ -1005,6 +992,8 @@ struct NowPlayingView: View {
         .accessibilityElement(children: .contain)
     }
 
+    /// The phone queue keeps its established shuffle/repeat/AutoPlay pill.
+    /// iPad and desktop show these modes with the queue itself instead.
     private var queueModesPill: some View {
         HStack(spacing: 0) {
             Button {
@@ -1055,7 +1044,7 @@ struct NowPlayingView: View {
                     .background(.white.opacity(controller.autoplayEnabled ? 0.14 : 0))
             }
             .buttonStyle(.plain)
-            .accessibilityLabel(controller.autoplayEnabled ? "Autoplay on" : "Autoplay off")
+            .accessibilityLabel(controller.autoplayEnabled ? "AutoPlay on" : "AutoPlay off")
         }
         .background(.white.opacity(0.12))
         .clipShape(Capsule())
@@ -1280,7 +1269,24 @@ struct NowPlayingView: View {
     /// button" — rather than what the button does. The labels are the same
     /// strings, so the two platforms say the same thing.
     private var playerTransport: some View {
-        HStack(spacing: 28) {
+        HStack(spacing: 14) {
+            Button {
+                Haptics.play(controller.shuffleEnabled ? .toggleOff : .toggleOn)
+                controller.toggleShuffle()
+            } label: {
+                Image(.bchShuffle)
+                    .resizable()
+                    .scaledToFit()
+                    .frame(width: 22, height: 22)
+                    .foregroundStyle(.white.opacity(controller.shuffleEnabled ? 1 : 0.76))
+                    .frame(width: 44, height: 44)
+                    .background(.white.opacity(controller.shuffleEnabled ? 0.16 : 0), in: Circle())
+                    .contentShape(Circle())
+                    .playerGlyph()
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel(controller.shuffleEnabled ? "Shuffle on" : "Shuffle off")
+
             Button {
                 Haptics.play(.skipPrevious)
                 controller.previous()
@@ -1338,6 +1344,30 @@ struct NowPlayingView: View {
             .disabled(!controller.canPlayNext)
             .help("Next")
             .accessibilityLabel("Next track")
+
+            Button {
+                Haptics.play(.select)
+                controller.cycleRepeat()
+            } label: {
+                Group {
+                    if controller.repeatMode == .one {
+                        Text("1")
+                            .font(.system(size: 18, weight: .bold))
+                    } else {
+                        Image(.bchRepeat)
+                            .resizable()
+                            .scaledToFit()
+                            .frame(width: 22, height: 22)
+                    }
+                }
+                .foregroundStyle(.white.opacity(controller.repeatMode == .off ? 0.76 : 1))
+                .frame(width: 44, height: 44)
+                .background(.white.opacity(controller.repeatMode == .off ? 0 : 0.16), in: Circle())
+                .contentShape(Circle())
+                .playerGlyph()
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel(repeatLabel)
 
         }
         .foregroundStyle(.white)
@@ -1483,17 +1513,137 @@ private extension View {
     }
 }
 
-/// Upstream's queue: title plus Clear, Now playing, the upcoming rows split
-/// into manual vs AutoPlay, an AutoPlay heading, and a Lyrics link.
-/// Mode toggles live only in the bottom pill — never as pills on top — and
-/// the deck drops its credits and lyric strip here, so the words never sit
-/// on top of the list.
+/// Queue column. The current song stays in the compact player header when
+/// there is no neighbouring player column (portrait); wide layouts already have
+/// that information beside the queue, so they omit the duplicate header.
 private struct UpNextPane: View {
     @Environment(PlaybackController.self) private var controller
     @Environment(AuthController.self) private var auth
-    var onOpenLyrics: () -> Void = {}
 
+    var showsCurrentTrackHeader = true
+    var onOpenLyrics: () -> Void = {}
+    @State private var hasScrolledOnce = false
+
+    private var usesExpandedQueueLayout: Bool {
+        #if os(macOS)
+        true
+        #else
+        UIDevice.current.userInterfaceIdiom == .pad
+        #endif
+    }
+
+    @ViewBuilder
     var body: some View {
+        if usesExpandedQueueLayout {
+            expandedQueue
+        } else {
+            legacyPhoneQueue
+        }
+    }
+
+    private var expandedQueue: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            if showsCurrentTrackHeader {
+                queueHeader
+                    .padding(.top, 8)
+                    .padding(.bottom, 14)
+            }
+
+            if showsCurrentTrackHeader {
+                ViewThatFits(in: .horizontal) {
+                    HStack(spacing: 16) {
+                        queueTitleAndClear
+                        Spacer(minLength: 8)
+                        queueAutomationControls
+                            .frame(maxWidth: 440)
+                    }
+                    .padding(.horizontal, 24)
+
+                    VStack(alignment: .leading, spacing: 14) {
+                        queueAutomationControls
+                        queueTitleAndClear
+                    }
+                    .padding(.horizontal, 24)
+                }
+                .padding(.bottom, 8)
+            } else {
+                queueAutomationControls
+                    .padding(.horizontal, 24)
+                    .padding(.bottom, 16)
+                queueTitleAndClear
+                    .padding(.horizontal, 24)
+                    .padding(.bottom, 8)
+            }
+
+            if controller.current == nil && manualUpcoming.isEmpty && autoplayUpcoming.isEmpty {
+                Text("Nothing playing.")
+                    .font(.callout)
+                    .foregroundStyle(.white.opacity(0.58))
+                    .padding(.top, 12)
+                    .padding(.horizontal, 24)
+                Spacer(minLength: 0)
+            } else if manualUpcoming.isEmpty && autoplayUpcoming.isEmpty {
+                Text("No upcoming songs")
+                    .font(.callout)
+                    .foregroundStyle(.white.opacity(0.58))
+                    .padding(.top, 12)
+                    .padding(.horizontal, 24)
+                Spacer(minLength: 0)
+            } else {
+                ScrollViewReader { proxy in
+                    List {
+                        ForEach(Array(manualUpcoming.enumerated()), id: \.element.id) { localIndex, item in
+                            queueRow(item, section: 0, index: localIndex, rows: manualUpcoming)
+                                .id(localIndex == 0 ? "queueListTop" : item.id)
+                        }
+                        .onMove { source, dest in
+                            move(source, dest, rows: manualUpcoming)
+                        }
+                        .onDelete { offsets in
+                            remove(offsets, rows: manualUpcoming)
+                        }
+
+                        ForEach(Array(autoplayUpcoming.enumerated()), id: \.element.id) { localIndex, item in
+                            queueRow(item, section: 1, index: localIndex, rows: autoplayUpcoming)
+                                .id(manualUpcoming.isEmpty && localIndex == 0 ? "queueListTop" : item.id)
+                        }
+                        .onMove { source, dest in
+                            move(source, dest, rows: autoplayUpcoming)
+                        }
+                        .onDelete { offsets in
+                            remove(offsets, rows: autoplayUpcoming)
+                        }
+                    }
+                    .listStyle(.plain)
+                    .scrollContentBackground(.hidden)
+                    // Keep the first row fully legible; fade only where the list
+                    // reaches the pinned transport at the bottom.
+                    .mask(alignment: .bottom) {
+                        LinearGradient(
+                            stops: [
+                                .init(color: .black, location: 0),
+                                .init(color: .black, location: 0.88),
+                                .init(color: .clear, location: 1),
+                            ],
+                            startPoint: .top, endPoint: .bottom
+                        )
+                    }
+                    .animation(.easeOut(duration: 0.2), value: queueSignature)
+                    .onChange(of: controller.playingIndex) { _, _ in
+                        if hasScrolledOnce {
+                            withAnimation { proxy.scrollTo("queueListTop", anchor: .top) }
+                        } else {
+                            proxy.scrollTo("queueListTop", anchor: .top)
+                            hasScrolledOnce = true
+                        }
+                    }
+                }
+            }
+        }
+        .padding(.top, 8)
+    }
+
+    private var legacyPhoneQueue: some View {
         VStack(alignment: .leading, spacing: 12) {
             queueHeader
             HStack(alignment: .firstTextBaseline) {
@@ -1520,205 +1670,151 @@ private struct UpNextPane: View {
                 Spacer()
             } else {
                 ScrollViewReader { proxy in
-                List {
-                    if controller.current != nil {
-                        Text("Now playing")
-                            .font(.headline.weight(.medium))
-                            .foregroundStyle(.white.opacity(0.75))
-                            .padding(.top, 12)
-                            .listRowBackground(Color.clear)
-                            .listRowSeparator(.hidden)
-                            .listRowInsets(EdgeInsets(top: 12, leading: 24, bottom: 6, trailing: 24))
-                        currentRow
-                    }
-                    if !manualUpcoming.isEmpty {
-                        Text("Up next")
-                            .font(.headline.weight(.medium))
-                            .foregroundStyle(.white.opacity(0.75))
-                            .padding(.top, 16)
-                            .listRowBackground(Color.clear)
-                            .listRowSeparator(.hidden)
-                            .listRowInsets(EdgeInsets(top: 16, leading: 24, bottom: 6, trailing: 24))
-                        ForEach(Array(manualUpcoming.enumerated()), id: \.element.id) { localIndex, item in
-                            queueRow(item, section: 0, index: localIndex, rows: manualUpcoming)
-                        }
-                        .onMove { source, dest in
-                            move(source, dest, rows: manualUpcoming)
-                        }
-                        .onDelete { offsets in
-                            remove(offsets, rows: manualUpcoming)
-                        }
-                    }
-                    if showAutoplayHeading {
-                        HStack(spacing: 8) {
-                            Image(.bchInfinity)
-                                .resizable()
-                                .scaledToFit()
-                                .frame(width: 18, height: 18)
+                    List {
+                        if controller.current != nil {
+                            Text("Now playing")
+                                .font(.headline.weight(.medium))
                                 .foregroundStyle(.white.opacity(0.75))
-                            VStack(alignment: .leading, spacing: 1) {
-                                Text("AutoPlay")
-                                    .font(.headline.weight(.medium))
-                                    .foregroundStyle(.white)
-                                Text(autoplayUpcoming.isEmpty
-                                     ? "Similar music will keep playing"
-                                     : "Similar music, selected to play next")
-                                    .font(.callout)
-                                    .foregroundStyle(.white.opacity(0.55))
+                                .padding(.top, 12)
+                                .listRowBackground(Color.clear)
+                                .listRowSeparator(.hidden)
+                                .listRowInsets(EdgeInsets(top: 12, leading: 24, bottom: 6, trailing: 24))
+                            legacyCurrentRow
+                        }
+                        if !manualUpcoming.isEmpty {
+                            Text("Up next")
+                                .font(.headline.weight(.medium))
+                                .foregroundStyle(.white.opacity(0.75))
+                                .padding(.top, 16)
+                                .listRowBackground(Color.clear)
+                                .listRowSeparator(.hidden)
+                                .listRowInsets(EdgeInsets(top: 16, leading: 24, bottom: 6, trailing: 24))
+                            ForEach(Array(manualUpcoming.enumerated()), id: \.element.id) { localIndex, item in
+                                legacyPhoneQueueRow(item, section: 0, index: localIndex, rows: manualUpcoming)
+                            }
+                            .onMove { source, dest in move(source, dest, rows: manualUpcoming) }
+                            .onDelete { offsets in remove(offsets, rows: manualUpcoming) }
+                        }
+                        if controller.autoplayEnabled || !autoplayUpcoming.isEmpty {
+                            HStack(spacing: 8) {
+                                Image(.bchInfinity)
+                                    .resizable()
+                                    .scaledToFit()
+                                    .frame(width: 18, height: 18)
+                                    .foregroundStyle(.white.opacity(0.75))
+                                VStack(alignment: .leading, spacing: 1) {
+                                    Text("AutoPlay")
+                                        .font(.headline.weight(.medium))
+                                        .foregroundStyle(.white)
+                                    Text(autoplayUpcoming.isEmpty
+                                         ? "Similar music will keep playing"
+                                         : "Similar music, selected to play next")
+                                        .font(.callout)
+                                        .foregroundStyle(.white.opacity(0.55))
+                                }
+                            }
+                            .padding(.vertical, 14)
+                            .listRowBackground(Color.clear)
+                            .listRowSeparator(.hidden)
+                            .listRowInsets(EdgeInsets(top: 14, leading: 24, bottom: 14, trailing: 24))
+                            if !autoplayUpcoming.isEmpty {
+                                ForEach(Array(autoplayUpcoming.enumerated()), id: \.element.id) { localIndex, item in
+                                    legacyPhoneQueueRow(item, section: 1, index: localIndex, rows: autoplayUpcoming)
+                                }
+                                .onMove { source, dest in move(source, dest, rows: autoplayUpcoming) }
+                                .onDelete { offsets in remove(offsets, rows: autoplayUpcoming) }
                             }
                         }
-                        .padding(.vertical, 14)
+                        Button {
+                            Haptics.play(.expand)
+                            onOpenLyrics()
+                        } label: {
+                            HStack(spacing: 6) {
+                                Image(systemName: "music.note")
+                                    .font(.body.weight(.medium))
+                                Text("Lyrics")
+                                    .font(.headline.weight(.medium))
+                                Image(systemName: "chevron.right")
+                                    .font(.caption.weight(.semibold))
+                            }
+                            .foregroundStyle(.white)
+                            .padding(.vertical, 10)
+                            .contentShape(.rect)
+                        }
+                        .buttonStyle(.plain)
                         .listRowBackground(Color.clear)
                         .listRowSeparator(.hidden)
-                        .listRowInsets(EdgeInsets(top: 14, leading: 24, bottom: 14, trailing: 24))
-                        if !autoplayUpcoming.isEmpty {
-                            ForEach(Array(autoplayUpcoming.enumerated()), id: \.element.id) { localIndex, item in
-                                queueRow(item, section: 1, index: localIndex, rows: autoplayUpcoming)
-                            }
-                            .onMove { source, dest in
-                                move(source, dest, rows: autoplayUpcoming)
-                            }
-                            .onDelete { offsets in
-                                remove(offsets, rows: autoplayUpcoming)
-                            }
-                        }
+                        .listRowInsets(EdgeInsets(top: 10, leading: 24, bottom: 10, trailing: 24))
                     }
-                    Button {
-                        Haptics.play(.expand)
-                        onOpenLyrics()
-                    } label: {
-                        HStack(spacing: 6) {
-                            Image(systemName: "music.note")
-                                .font(.body.weight(.medium))
-                            Text("Lyrics")
-                                .font(.headline.weight(.medium))
-                            Image(systemName: "chevron.right")
-                                .font(.caption.weight(.semibold))
-                        }
-                        .foregroundStyle(.white)
-                        .padding(.vertical, 10)
-                        .contentShape(.rect)
-                    }
-                    .buttonStyle(.plain)
-                    .listRowBackground(Color.clear)
-                    .listRowSeparator(.hidden)
-                    .listRowInsets(EdgeInsets(top: 10, leading: 24, bottom: 10, trailing: 24))
-                }
-                .listStyle(.plain)
-                .scrollContentBackground(.hidden)
-                // Softens the list where it meets the header and the deck,
-                // like upstream's fading edges.
-                .mask(
-                    LinearGradient(
-                        stops: [
-                            .init(color: .clear, location: 0),
-                            .init(color: .black, location: 0.04),
-                            .init(color: .black, location: 0.96),
-                            .init(color: .clear, location: 1),
-                        ],
-                        startPoint: .top, endPoint: .bottom
+                    .listStyle(.plain)
+                    .scrollContentBackground(.hidden)
+                    .mask(
+                        LinearGradient(
+                            stops: [
+                                .init(color: .clear, location: 0),
+                                .init(color: .black, location: 0.04),
+                                .init(color: .black, location: 0.96),
+                                .init(color: .clear, location: 1),
+                            ],
+                            startPoint: .top, endPoint: .bottom
+                        )
                     )
-                )
-                // Rows trade places across the section boundary on every track
-                // change; animate the placement, briskly, rather than jumping.
-                .animation(.easeOut(duration: 0.2), value: queueSignature)
-                .onChange(of: controller.playingIndex) { _, _ in
-                    // Back to the top on a track change — snapped the first
-                    // time, animated after.
-                    if hasScrolledOnce {
-                        withAnimation { proxy.scrollTo("queueTop", anchor: .top) }
-                    } else {
-                        proxy.scrollTo("queueTop", anchor: .top)
-                        hasScrolledOnce = true
+                    .animation(.easeOut(duration: 0.2), value: queueSignature)
+                    .onChange(of: controller.playingIndex) { _, _ in
+                        if hasScrolledOnce {
+                            withAnimation { proxy.scrollTo("queueTop", anchor: .top) }
+                        } else {
+                            proxy.scrollTo("queueTop", anchor: .top)
+                            hasScrolledOnce = true
+                        }
                     }
-                }
                 }
             }
         }
         .padding(.top, 8)
     }
 
-    @State private var hasScrolledOnce = false
-
-    private var autoplayStart: Int { controller.autoplaySectionStart }
-
-    /// Upcoming manual rows — never includes AutoPlay, never the playing track.
-    private var manualUpcoming: [QueueRow] {
-        rows(in: controller.firstMovableQueueIndex..<autoplayStart)
-    }
-
-    private var autoplayUpcoming: [QueueRow] {
-        rows(in: autoplayStart..<controller.queue.count)
-    }
-
-    private var showAutoplayHeading: Bool {
-        controller.autoplayEnabled || !autoplayUpcoming.isEmpty
-    }
-
-    private func rows(in range: Range<Int>) -> [QueueRow] {
-        guard range.lowerBound < range.upperBound else { return [] }
-        return range.compactMap { index in
-            guard controller.queue.indices.contains(index) else { return nil }
-            return QueueRow(index: index, entry: controller.queue[index])
-        }
-    }
-
-    /// The playing track heads the pane, like upstream's queue header:
-    /// artwork and title/artist in the same row as like and overflow.
-    private var queueHeader: some View {
-        HStack(spacing: 12) {
-            ArtworkView(entry: controller.current, side: 56)
-                .clipShape(.rect(cornerRadius: 8, style: .continuous))
-            VStack(alignment: .leading, spacing: 3) {
-                Text(controller.current?.title ?? "Nothing playing")
-                    .font(.title3.weight(.semibold))
-                    .foregroundStyle(.white)
-                    .lineLimit(1)
-                Text(controller.current?.artist ?? "")
-                    .font(.subheadline)
-                    .foregroundStyle(.white.opacity(0.65))
-                    .lineLimit(1)
+    private var legacyCurrentRow: some View {
+        Button {
+            let at = controller.playingIndex
+            if controller.queue.indices.contains(at) {
+                controller.playQueueItem(at: at)
             }
-            Spacer(minLength: 0)
-            if auth.signedIn, controller.current?.videoId != nil {
-                GlassCircleButton(
-                    icon: controller.isLiked ? .bchHeartFilled : .bchHeart,
-                    label: controller.isLiked ? "Remove Like" : "Like"
-                ) { controller.toggleLike() }
-            }
-            Menu {
-                if let current = controller.current {
-                    SongActionButtons(entry: current, showSleepTimer: true, showDebugLog: true)
+        } label: {
+            HStack(spacing: 12) {
+                ArtworkView(entry: controller.current, side: 40)
+                    .clipShape(.rect(cornerRadius: 6, style: .continuous))
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(controller.current?.title ?? "")
+                        .font(.body.weight(.medium))
+                        .foregroundStyle(.white)
+                        .lineLimit(1)
+                    Text(controller.current?.artist ?? "")
+                        .font(.caption)
+                        .foregroundStyle(.white.opacity(0.65))
+                        .lineLimit(1)
                 }
-            } label: {
-                Image(systemName: "ellipsis")
-                    .font(.system(size: 13, weight: .semibold))
+                Spacer(minLength: 0)
+                Image(systemName: "waveform")
+                    .font(.body.weight(.medium))
                     .foregroundStyle(.white)
-                    .frame(width: 34, height: 34)
-                    .background(.white.opacity(0.14), in: Circle())
+                    .accessibilityLabel("Now playing")
             }
-            .buttonStyle(.plain)
-            .help("More")
+            .contentShape(.rect)
         }
-        .padding(.horizontal, 24)
+        .buttonStyle(.plain)
+        .listRowBackground(Color.clear)
+        .listRowSeparator(.hidden)
     }
 
-    /// What the row-motion animation tracks: every move changes it, nothing
-    /// else does.
-    private var queueSignature: String {
-        (manualUpcoming.map(\.id) + autoplayUpcoming.map(\.id)).joined(separator: "|")
-    }
-
-    private func queueRow(_ item: QueueRow, section: Int, index: Int, rows: [QueueRow]) -> some View {
+    private func legacyPhoneQueueRow(_ item: QueueRow, section: Int, index: Int, rows: [QueueRow]) -> some View {
         HStack(spacing: 10) {
             Image(systemName: "line.3.horizontal")
                 .font(.body.weight(.medium))
                 .foregroundStyle(.white.opacity(0.4))
                 .frame(width: 20, height: 44)
                 .contentShape(.rect)
-                .onDrag {
-                    NSItemProvider(object: "\(section):\(index)" as NSString)
-                }
+                .onDrag { NSItemProvider(object: "\(section):\(index)" as NSString) }
             Button {
                 controller.playQueueItem(at: item.index)
             } label: {
@@ -1758,48 +1854,250 @@ private struct UpNextPane: View {
         .onDrop(of: [.text], delegate: QueueReorderDelegate(section: section, rows: rows, destIndex: index) { from, dest in
             move(IndexSet(integer: from), dest, rows: rows)
         })
+    }
+
+    private var queueTitleAndClear: some View {
+        HStack(alignment: .firstTextBaseline, spacing: 12) {
+            VStack(alignment: .leading, spacing: 2) {
+                Text("Continue Playing")
+                    .font(.title2.weight(.bold))
+                    .foregroundStyle(.white)
+                    .lineLimit(1)
+                if let context = controller.playbackContext, !context.isEmpty {
+                    Text("From \(context)")
+                        .font(.caption)
+                        .foregroundStyle(.white.opacity(0.62))
+                        .lineLimit(1)
+                }
+            }
+            Spacer(minLength: 0)
+            if !manualUpcoming.isEmpty || !autoplayUpcoming.isEmpty {
+                Button("Clear") { controller.clearUpcoming() }
+                    .buttonStyle(.plain)
+                    .font(.callout.weight(.semibold))
+                    #if os(macOS)
+                    .foregroundStyle(.red)
+                    #else
+                    .foregroundStyle(Color.accentColor)
+                    #endif
+            }
+        }
+    }
+
+    private var autoplayStart: Int { controller.autoplaySectionStart }
+
+    /// Upcoming manual rows — never includes AutoPlay, never the playing track.
+    private var manualUpcoming: [QueueRow] {
+        rows(in: controller.firstMovableQueueIndex..<autoplayStart)
+    }
+
+    private var autoplayUpcoming: [QueueRow] {
+        rows(in: autoplayStart..<controller.queue.count)
+    }
+
+    private func rows(in range: Range<Int>) -> [QueueRow] {
+        guard range.lowerBound < range.upperBound else { return [] }
+        return range.compactMap { index in
+            guard controller.queue.indices.contains(index) else { return nil }
+            return QueueRow(index: index, entry: controller.queue[index])
+        }
+    }
+
+    private var queueHeader: some View {
+        HStack(spacing: 12) {
+            ArtworkView(entry: controller.current, side: 56)
+                .clipShape(.rect(cornerRadius: 8, style: .continuous))
+            VStack(alignment: .leading, spacing: 3) {
+                Text(controller.current?.title ?? "Nothing playing")
+                    .font(.title3.weight(.semibold))
+                    .foregroundStyle(.white)
+                    .lineLimit(1)
+                Text(controller.current?.artist ?? "")
+                    .font(.subheadline)
+                    .foregroundStyle(.white.opacity(0.68))
+                    .lineLimit(1)
+            }
+            Spacer(minLength: 0)
+            if auth.signedIn, controller.current?.videoId != nil {
+                GlassCircleButton(
+                    icon: controller.isLiked ? .bchHeartFilled : .bchHeart,
+                    label: controller.isLiked ? "Remove Like" : "Like"
+                ) { controller.toggleLike() }
+            }
+            Menu {
+                if let current = controller.current {
+                    SongActionButtons(entry: current, showSleepTimer: true, showDebugLog: true)
+                }
+            } label: {
+                Image(systemName: "ellipsis")
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundStyle(.white)
+                    .frame(width: 34, height: 34)
+                    .background(.white.opacity(0.14), in: Circle())
+            }
+            .buttonStyle(.plain)
+            .help("More")
+        }
+        .padding(.horizontal, 24)
+    }
+
+    private var queueAutomationControls: some View {
+        HStack(spacing: 10) {
+            automationButton(
+                title: "AutoPlay",
+                symbol: "infinity",
+                enabled: controller.autoplayEnabled,
+                value: controller.autoplayEnabled ? "On" : "Off",
+                action: controller.toggleAutoplay
+            )
+            automationButton(
+                title: "AutoMix",
+                symbol: "link",
+                enabled: controller.automixEnabled,
+                value: controller.automixEnabled ? "On" : "Off",
+                action: controller.toggleAutomix
+            )
+        }
+    }
+
+    private func automationButton(
+        title: String,
+        symbol: String,
+        enabled: Bool,
+        value: String,
+        action: @escaping () -> Void
+    ) -> some View {
+        Button {
+            Haptics.play(.tap)
+            action()
+        } label: {
+            HStack(spacing: 7) {
+                Image(systemName: symbol)
+                    .font(.system(size: 15, weight: .semibold))
+                Text(title)
+                    .font(.subheadline.weight(.semibold))
+            }
+            .foregroundStyle(enabled ? Color.black.opacity(0.82) : Color.white.opacity(0.9))
+            .frame(maxWidth: .infinity, minHeight: 38)
+            .background(enabled ? Color.white.opacity(0.88) : Color.white.opacity(0.17), in: Capsule())
+            .contentShape(Capsule())
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel(title)
+        .accessibilityValue(value)
+        .accessibilityAddTraits(enabled ? [.isButton, .isSelected] : .isButton)
+    }
+
+    /// What the row-motion animation tracks: every move changes it, nothing
+    /// else does.
+    private var queueSignature: String {
+        (manualUpcoming.map(\.id) + autoplayUpcoming.map(\.id)).joined(separator: "|")
+    }
+
+    private func queueRow(_ item: QueueRow, section: Int, index: Int, rows: [QueueRow]) -> some View {
+        #if os(macOS)
+        let artworkSide: CGFloat = 36
+        let rowInsets = EdgeInsets(top: 5, leading: 16, bottom: 5, trailing: 16)
+        let titleFont: Font = .system(size: 14, weight: .medium)
+        let detailFont: Font = .system(size: 12)
+        #else
+        let artworkSide: CGFloat = 44
+        let rowInsets = EdgeInsets(top: 6, leading: 24, bottom: 6, trailing: 20)
+        let titleFont: Font = .body.weight(.medium)
+        let detailFont: Font = .caption
+        #endif
+
+        return HStack(spacing: 10) {
+            Button {
+                controller.playQueueItem(at: item.index)
+            } label: {
+                HStack(spacing: 12) {
+                    ArtworkView(entry: item.entry, side: artworkSide)
+                        .clipShape(.rect(cornerRadius: 6, style: .continuous))
+                    VStack(alignment: .leading, spacing: 2) {
+                        HStack(spacing: 5) {
+                            Text(item.entry.title)
+                                .font(titleFont)
+                                .foregroundStyle(.white)
+                                .lineLimit(1)
+                            if item.entry.isExplicit == true {
+                                Text("E")
+                                    .font(.system(size: 9, weight: .heavy))
+                                    .foregroundStyle(.white.opacity(0.85))
+                                    .padding(.horizontal, 3)
+                                    .padding(.vertical, 1)
+                                    .background(.white.opacity(0.22), in: RoundedRectangle(cornerRadius: 2))
+                            }
+                        }
+                        Text(queueDetail(for: item.entry))
+                            .font(detailFont)
+                            .foregroundStyle(.white.opacity(0.66))
+                            .lineLimit(1)
+                    }
+                    Spacer(minLength: 0)
+                }
+                .contentShape(.rect)
+            }
+            .buttonStyle(.plain)
+
+            #if os(macOS)
+            Menu {
+                Button("Play") { controller.playQueueItem(at: item.index) }
+                Button("Remove from Queue", role: .destructive) {
+                    controller.removeFromQueue(at: IndexSet(integer: item.index))
+                }
+            } label: {
+                Image(systemName: "ellipsis")
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundStyle(.white.opacity(0.65))
+                    .frame(width: 34, height: 40)
+                    .contentShape(.rect)
+            }
+            .menuStyle(.borderlessButton)
+            .menuIndicator(.hidden)
+            .accessibilityLabel("Actions for \(item.entry.title)")
+            #else
+            Image(systemName: "line.3.horizontal")
+                .font(.body.weight(.medium))
+                .foregroundStyle(.white.opacity(0.4))
+                .frame(width: 32, height: 44)
+                .contentShape(.rect)
+                .onDrag { NSItemProvider(object: "\(section):\(index)" as NSString) }
+                .accessibilityLabel("Reorder \(item.entry.title)")
+            #endif
+        }
+        .overlay(alignment: .bottom) {
+            Rectangle()
+                .fill(.white.opacity(0.12))
+                .frame(height: 1)
+                .padding(.leading, artworkSide + 14)
+        }
+        .listRowBackground(Color.clear)
+        .listRowSeparator(.hidden)
+        .listRowInsets(rowInsets)
+        .onDrop(of: [.text], delegate: QueueReorderDelegate(section: section, rows: rows, destIndex: index) { from, dest in
+            move(IndexSet(integer: from), dest, rows: rows)
+        })
+        #if os(macOS)
+        .onDrag { NSItemProvider(object: "\(section):\(index)" as NSString) }
         .contextMenu {
             Button("Play") { controller.playQueueItem(at: item.index) }
             Button("Remove from Queue", role: .destructive) {
                 controller.removeFromQueue(at: IndexSet(integer: item.index))
             }
         }
+        #else
+        .swipeActions(edge: .trailing, allowsFullSwipe: true) {
+            Button("Remove", systemImage: "xmark", role: .destructive) {
+                controller.removeFromQueue(at: IndexSet(integer: item.index))
+            }
+        }
+        #endif
     }
 
-    /// The playing track heads the list, like upstream: tap restarts it, and
-    /// there is deliberately no remove control — removing the current track
-    /// is a skip, `removeFromQueue` ignores it, and the transport owns that.
-    private var currentRow: some View {
-        Button {
-            let at = controller.playingIndex
-            if controller.queue.indices.contains(at) {
-                controller.playQueueItem(at: at)
-            }
-        } label: {
-            HStack(spacing: 12) {
-                ArtworkView(entry: controller.current, side: 40)
-                    .clipShape(.rect(cornerRadius: 6, style: .continuous))
-                VStack(alignment: .leading, spacing: 2) {
-                    Text(controller.current?.title ?? "")
-                        .font(.body.weight(.medium))
-                        .foregroundStyle(.white)
-                        .lineLimit(1)
-                    Text(controller.current?.artist ?? "")
-                        .font(.caption)
-                        .foregroundStyle(.white.opacity(0.65))
-                        .lineLimit(1)
-                }
-                Spacer(minLength: 0)
-                Image(systemName: "waveform")
-                    .font(.body.weight(.medium))
-                    .foregroundStyle(.white)
-                    .accessibilityLabel("Now playing")
-            }
-            .contentShape(.rect)
-        }
-        .buttonStyle(.plain)
-        .listRowBackground(Color.clear)
-        .listRowSeparator(.hidden)
+    private func queueDetail(for entry: QueueEntry) -> String {
+        guard let album = entry.albumName, !album.isEmpty else { return entry.artist }
+        return "\(entry.artist) — \(album)"
     }
 
     private func move(_ source: IndexSet, _ dest: Int, rows: [QueueRow]) {
@@ -2275,6 +2573,7 @@ struct LyricsPane: View {
     var position: Double
     var hasTrack: Bool
     var sourceLabel: String? = nil
+    var alignmentInProgress: Bool = false
     var onSeek: ((Double) -> Void)? = nil
     /// Absent where the caller has no track to translate, which is the case that
     /// matters: an empty lyric has nothing to translate and offering the control
@@ -2323,6 +2622,28 @@ struct LyricsPane: View {
             .map { Int(truncating: $0) }
     }
 
+    /// Whether this document has real line or word timings. Plain-text lyric
+    /// providers still have value; treating every line as an inactive timed row
+    /// dimmed and blurred the entire transcript as if it were out of sync.
+    private var hasSyncedTimings: Bool {
+        LyricFocus.shared.isSynced(lines: lines)
+    }
+
+    /// Keep untimed rows crisp while incremental alignment is filling later
+    /// lines in the same document.
+    private func lineHasSyncedTimings(_ line: LyricLineDto, at index: Int) -> Bool {
+        if line.timeMs > 0 || line.sungUntilMs != nil ||
+            line.words.contains(where: { $0.startMs > 0 || $0.endMs > 0 }) ||
+            (line.background?.timeMs ?? 0) > 0 ||
+            line.background?.words.contains(where: { $0.startMs > 0 || $0.endMs > 0 }) == true
+        {
+            return true
+        }
+        // The first line may start at zero, which is also the DTO default for
+        // unsynced text. A timed document gives that row a real zero timestamp.
+        return index == 0 && hasSyncedTimings
+    }
+
     /// The line the list scrolls to, and the one that is scaled up.
     private var leadIndex: Int {
         let lead = LyricFocus.shared.leadRow(lines: lines, positionMs: adjustedPositionMs)
@@ -2366,6 +2687,7 @@ struct LyricsPane: View {
                                 ForEach(Array(lines.enumerated()), id: \.offset) { index, line in
                                     WordSyncedLine(
                                         line: line,
+                                        hasSyncedTimings: lineHasSyncedTimings(line, at: index),
                                         active: activeRows.contains(index),
                                         distance: abs(index - leadIndex),
                                         // The *adjusted* clock, the one the line
@@ -2396,6 +2718,13 @@ struct LyricsPane: View {
                         // has started: across a duet those differ, and scrolling
                         // to the answer would push the lead off the top while it
                         // was still the line being sung.
+                        .onAppear {
+                            proxy.scrollTo(leadIndex, anchor: .center)
+                        }
+                        .onChange(of: trackId) { _, _ in
+                            reading = false
+                            proxy.scrollTo(leadIndex, anchor: .center)
+                        }
                         .onChange(of: leadIndex) { _, index in
                             // Not while the listener is reading. A list that
                             // snaps back to the playhead as soon as they let go
@@ -2455,12 +2784,19 @@ struct LyricsPane: View {
 
     private var attribution: String? {
         guard let sourceLabel, !sourceLabel.isEmpty else { return nil }
-        return "Lyrics by \(sourceLabel)"
+        if alignmentInProgress { return "Lyrics by \(sourceLabel) · aligning locally…" }
+        guard hasSyncedTimings else { return "Lyrics by \(sourceLabel) · unsynced" }
+        let lyricRows = lines.filter { !$0.isGap }
+        let timedRows = lyricRows.enumerated().filter { lineHasSyncedTimings($0.element, at: $0.offset) }
+        return timedRows.count == lyricRows.count
+            ? "Lyrics by \(sourceLabel)"
+            : "Lyrics by \(sourceLabel) · partially synced"
     }
 }
 
 private struct WordSyncedLine: View {
     let line: LyricLineDto
+    let hasSyncedTimings: Bool
     let active: Bool
     let distance: Int
     let position: Double
@@ -2499,7 +2835,10 @@ private struct WordSyncedLine: View {
                     .onTapGesture { onTap?() }
             }
         }
+        .opacity(hasSyncedTimings ? (active ? 1 : max(0.18, 0.58 - Double(distance) * 0.12)) : 0.9)
+        .blur(radius: hasSyncedTimings && !active ? min(CGFloat(distance) * 1.15, 4) : 0)
         .animation(.easeInOut(duration: 0.2), value: active)
+        .animation(.easeInOut(duration: 0.2), value: distance)
         .animation(.easeInOut(duration: 0.12), value: Int(position * 10))
     }
 
@@ -2511,7 +2850,7 @@ private struct WordSyncedLine: View {
     }
 
     private var leadRendered: AttributedString {
-        render(text: split.lead, words: leadWords, glowing: active)
+        render(text: split.lead, words: leadWords, glowing: hasSyncedTimings && active)
     }
 
     private var backingRendered: AttributedString? {
@@ -2575,75 +2914,6 @@ private struct WordSyncedLine: View {
         let lead = (text[..<open] + text[text.index(after: close)...])
             .trimmingCharacters(in: .whitespaces)
         return (lead.isEmpty ? "♪" : String(lead), String(inner))
-    }
-}
-
-/// The Apple equivalent of upstream `PlayerDrawer`: the shell iPad portrait
-/// panels present in — dark over the mesh, a grab handle, a title, drag down
-/// to put it away. Used when the stage is iPad-portrait shaped (see
-/// [PlayerLayout.presentsPanelDrawer]); phones keep the plain panel. The pane
-/// buttons stay the primary way in and out — the drag only dismisses.
-struct PlayerDrawerView<Content: View>: View {
-    var title: String = "Up Next"
-    var onDismiss: () -> Void
-    @ViewBuilder var content: Content
-
-    @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
-    @State private var drag: CGFloat = 0
-
-    /// How far down the drawer has to be pulled before letting go dismisses
-    /// it rather than springing back — upstream `DISMISS_DRAG_FRACTION`.
-    private let dismissFraction: CGFloat = 0.25
-    @State private var height: CGFloat = 0
-
-    var body: some View {
-        VStack(spacing: 0) {
-            // The grab handle every sheet here has, and the thing that says
-            // the drawer can be pulled away before anybody tries it.
-            Capsule()
-                .fill(.white.opacity(0.25))
-                .frame(width: 36, height: 4)
-                .padding(.top, 10)
-                .padding(.bottom, 12)
-                .accessibilityHidden(true)
-            content
-                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
-        }
-        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
-        .background {
-            if reduceTransparency
-                || PlatformSettings.shared.getBoolean(key: "reduce_dynamic_blur", default: false) {
-                RoundedRectangle(cornerRadius: 26, style: .continuous)
-                    .fill(Color(red: 0.07, green: 0.07, blue: 0.08))
-            } else {
-                RoundedRectangle(cornerRadius: 26, style: .continuous)
-                    .fill(.ultraThinMaterial)
-            }
-        }
-        .clipShape(.rect(cornerRadius: 26, style: .continuous))
-        .offset(y: max(0, drag))
-        .gesture(
-            DragGesture(minimumDistance: 20)
-                .onChanged { value in
-                    // Downward drag only: there is nothing above the drawer
-                    // to reveal.
-                    drag = max(0, value.translation.height)
-                }
-                .onEnded { value in
-                    let threshold = height > 0 ? height * dismissFraction : 120
-                    if value.translation.height > threshold {
-                        Haptics.play(.tap)
-                        onDismiss()
-                    }
-                    withAnimation(.spring(response: 0.35, dampingFraction: 0.8)) {
-                        drag = 0
-                    }
-                }
-        )
-        .onGeometryChange(for: CGFloat.self, of: { $0.size.height }) { height = $0 }
-        .accessibilityElement(children: .contain)
-        .accessibilityLabel(title)
-        .accessibilityAction(named: "Close panel", onDismiss)
     }
 }
 

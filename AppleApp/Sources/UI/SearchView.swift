@@ -99,6 +99,8 @@ struct SearchView: View {
     @Environment(PlaybackController.self) private var controller
     @Environment(AppModel.self) private var appModel
     @State private var query = ""
+    @State private var categories = MoodGenreLoader()
+    @State private var historyRevision = 0
     /// Starts on the mixed page, which is what YouTube Music opens on and the only
     /// one that promotes a card. A first search should answer the question rather
     /// than hand back a list.
@@ -128,6 +130,9 @@ struct SearchView: View {
     /// one-character edit left the old results up under a shorter query, and
     /// editing after a search never offered completions again.
     @State private var searchedTerm = ""
+    #if os(iOS)
+    @Environment(\.horizontalSizeClass) private var horizontalSizeClass
+    #endif
 
     enum Scope: String, CaseIterable, Identifiable {
         /// YouTube Music's mixed page — the only one with a promoted card, and so
@@ -568,92 +573,187 @@ struct SearchView: View {
     }
 
     private var history: some View {
-        Group {
-            let recent = RecentSearchStore.load()
-            if recent.isEmpty {
-                EmptyStateView(
-                    icon: Image(.bchSearch),
-                    title: "Search",
-                    subtitle: "Find songs, albums, artists and playlists — or connect a local folder in Library for offline listening.",
-                    buttonTitle: nil, action: nil
-                )
-            } else {
-                List {
-                    Section {
-                        ForEach(recent) { entity in
-                            recentEntityRow(entity)
-                                .listRowInsets(EdgeInsets(top: 2, leading: 24, bottom: 2, trailing: 12))
-                        }
-                    } header: {
-                        HStack {
-                            Text("Recent searches")
-                            Spacer()
-                            Button("Clear") { RecentSearchStore.clear() }
-                                .font(.caption)
-                                .textCase(nil)
-                        }
+        let _ = historyRevision
+        return ScrollView {
+            VStack(alignment: .leading, spacing: 28) {
+                let recent = RecentSearchStore.load()
+                if !recent.isEmpty {
+                    recentSearches(recent)
+                }
+
+                browseCategories
+            }
+            .frame(maxWidth: 1_520, alignment: .leading)
+            .padding(.horizontal, landingHorizontalInset)
+            .padding(.top, 16)
+            .padding(.bottom, 32)
+            .frame(maxWidth: .infinity, alignment: .top)
+        }
+        .refreshable { await categories.load(force: true) }
+        .task { await categories.load(force: false) }
+    }
+
+    /// Recent items stay in a short, horizontal strip so they are easy to revisit
+    /// without taking the space that belongs to browsing categories.
+    private func recentSearches(_ recent: [RecentSearchEntity]) -> some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack(alignment: .firstTextBaseline) {
+                Text("Recently Searched")
+                    .font(.title3.weight(.bold))
+                Spacer()
+                Button("Clear") {
+                    RecentSearchStore.clear()
+                    historyRevision &+= 1
+                }
+                .font(.callout)
+                .foregroundStyle(.tint)
+            }
+
+            ScrollView(.horizontal, showsIndicators: false) {
+                LazyHStack(spacing: 12) {
+                    ForEach(recent) { entity in
+                        recentSearchCard(entity)
                     }
                 }
-                .listStyle(.plain)
-                .id(requestToken)
+                .padding(.vertical, 2)
             }
         }
     }
 
-    /// Upstream's Spotify-style entity row: square thumbnail, bold title,
-    /// subtitle with the type, and a removal button. Tapping navigates to the
-    /// entity or plays it directly instead of re-running a text search.
-    private func recentEntityRow(_ entity: RecentSearchEntity) -> some View {
+    private func recentSearchCard(_ entity: RecentSearchEntity) -> some View {
         let isArtist = entity.entityType.uppercased() == "ARTIST"
         let isQuery = entity.entityType.uppercased() == "QUERY" || entity.id.hasPrefix("q:")
         return HStack(spacing: 12) {
             Button { openHistoryEntity(entity) } label: {
-                HStack(spacing: 14) {
-                    if isQuery {
-                        ZStack {
-                            Circle()
-                                .fill(Color.secondary.opacity(0.12))
-                                .frame(width: 48, height: 48)
-                            Image(systemName: "magnifyingglass")
-                                .font(.system(size: 18, weight: .medium))
-                                .foregroundStyle(.secondary)
+                HStack(spacing: 12) {
+                    Group {
+                        if isQuery {
+                            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                                .fill(.quaternary)
+                                .overlay {
+                                    Image(systemName: "magnifyingglass")
+                                        .font(.system(size: 18, weight: .medium))
+                                        .foregroundStyle(.secondary)
+                                }
+                                .frame(width: 52, height: 52)
+                        } else {
+                            if isArtist {
+                                ArtworkView(url: entity.artworkUrl, data: nil, side: 52)
+                                    .clipShape(Circle())
+                            } else {
+                                ArtworkView(url: entity.artworkUrl, data: nil, side: 52)
+                                    .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+                            }
                         }
-                    } else if isArtist {
-                        ArtworkView(url: entity.artworkUrl, data: nil, side: 48)
-                            .clipShape(Circle())
-                    } else {
-                        ArtworkView(url: entity.artworkUrl, data: nil, side: 48)
-                            .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
                     }
+
                     VStack(alignment: .leading, spacing: 3) {
                         Text(entity.title)
-                            .font(.body.weight(.medium))
+                            .font(.subheadline.weight(.semibold))
                             .lineLimit(1)
-                        if !isQuery {
-                            Text(entity.subtitle.isEmpty ? entity.typeLabel : "\(entity.subtitle) · \(entity.typeLabel)")
-                                .font(.subheadline)
-                                .foregroundStyle(.secondary)
-                                .lineLimit(1)
-                        }
+                        Text(isQuery ? "Search" : (entity.subtitle.isEmpty ? entity.typeLabel : "\(entity.subtitle) · \(entity.typeLabel)"))
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
                     }
-                    Spacer(minLength: 0)
+                    .frame(maxWidth: .infinity, alignment: .leading)
                 }
                 .contentShape(.rect)
             }
             .buttonStyle(.plain)
+
             Button {
                 RecentSearchStore.remove(id: entity.id)
+                historyRevision &+= 1
             } label: {
                 Image(systemName: "xmark")
-                    .font(.system(size: 13, weight: .medium))
-                    .foregroundStyle(.secondary)
-                    .frame(width: 32, height: 32)
-                    .contentShape(.rect)
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundStyle(.tertiary)
+                    .frame(width: 28, height: 28)
+                    .contentShape(Circle())
             }
             .buttonStyle(.plain)
             .accessibilityLabel("Remove \(entity.title) from recent searches")
         }
-        .padding(.vertical, 4)
+        .padding(.horizontal, 12)
+        .padding(.vertical, 10)
+        .frame(width: recentCardWidth, alignment: .leading)
+        .background(Color.primary.opacity(0.055), in: RoundedRectangle(cornerRadius: 13, style: .continuous))
+    }
+
+    private var browseCategories: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            Text("Browse Categories")
+                .font(.title3.weight(.bold))
+
+            switch categories.phase {
+            case .loading:
+                LazyVGrid(columns: categoryColumns, spacing: 12) {
+                    ForEach(0..<10, id: \.self) { _ in
+                        RoundedRectangle(cornerRadius: 12, style: .continuous)
+                            .fill(.quaternary)
+                            .aspectRatio(1.75, contentMode: .fit)
+                            .redacted(reason: .placeholder)
+                    }
+                }
+            case .failed(let message):
+                HStack(spacing: 12) {
+                    Text("Categories could not load. \(message)")
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                    Spacer(minLength: 8)
+                    Button("Retry") { Task { await categories.load(force: true) } }
+                        .buttonStyle(.bordered)
+                }
+                .padding(16)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(.quaternary.opacity(0.5), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+            case .loaded(let sections):
+                let items = sections.flatMap(\.items)
+                if items.isEmpty {
+                    Text("No categories are available right now.")
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                        .padding(.vertical, 8)
+                } else {
+                    LazyVGrid(columns: categoryColumns, spacing: 12) {
+                        ForEach(items) { category in
+                            NavigationLink {
+                                MoodGenrePlaylistsView(category: category)
+                            } label: {
+                                SearchCategoryTile(category: category)
+                            }
+                            .buttonStyle(.plain)
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    private var categoryColumns: [GridItem] {
+        #if os(macOS)
+        let minimum: CGFloat = 210
+        #else
+        let minimum: CGFloat = horizontalSizeClass == .regular ? 180 : 145
+        #endif
+        return [GridItem(.adaptive(minimum: minimum, maximum: 280), spacing: 12)]
+    }
+
+    private var landingHorizontalInset: CGFloat {
+        #if os(macOS)
+        28
+        #else
+        horizontalSizeClass == .regular ? 28 : 16
+        #endif
+    }
+
+    private var recentCardWidth: CGFloat {
+        #if os(macOS)
+        292
+        #else
+        horizontalSizeClass == .regular ? 280 : 252
+        #endif
     }
 
     /// Tapping a history entity navigates or plays without re-logging it —
@@ -779,5 +879,71 @@ struct SearchView: View {
         }
         searchTask = task
         _ = await task.value
+    }
+}
+
+/// Wide, image-led tiles are easier to scan in a discovery grid than the compact
+/// sleeve tiles used by Explore. Category identity and destination stay shared.
+private struct SearchCategoryTile: View {
+    let category: MoodGenre
+
+    private var accent: Color {
+        let palette: [Color] = [
+            Color(red: 0.91, green: 0.18, blue: 0.35),
+            Color(red: 0.98, green: 0.47, blue: 0.12),
+            Color(red: 0.91, green: 0.67, blue: 0.04),
+            Color(red: 0.17, green: 0.59, blue: 0.47),
+            Color(red: 0.08, green: 0.55, blue: 0.74),
+            Color(red: 0.38, green: 0.40, blue: 0.83),
+            Color(red: 0.66, green: 0.31, blue: 0.68),
+            Color(red: 0.78, green: 0.23, blue: 0.19),
+        ]
+        let hash = category.title.utf16.reduce(Int32(0)) { $0 &* 31 &+ Int32($1) }
+        return palette[Int((UInt32(bitPattern: hash) & 0x7fff_ffff) % UInt32(palette.count))]
+    }
+
+    var body: some View {
+        GeometryReader { geometry in
+            ZStack(alignment: .bottomLeading) {
+                if let url = category.thumbnailUrl, let imageURL = URL(string: url) {
+                    AsyncImage(url: imageURL) { phase in
+                        if let image = phase.image {
+                            image.resizable().scaledToFill()
+                        } else {
+                            Rectangle().fill(accent.gradient)
+                        }
+                    }
+                    .frame(width: geometry.size.width, height: geometry.size.height)
+                    .clipped()
+                } else {
+                    Rectangle().fill(accent.gradient)
+                }
+
+                accent.opacity(0.24)
+                LinearGradient(
+                    colors: [.clear, .black.opacity(0.62)],
+                    startPoint: .center,
+                    endPoint: .bottom
+                )
+
+                Text(category.title)
+                    .font(.headline.weight(.semibold))
+                    .foregroundStyle(.white)
+                    .lineLimit(2)
+                    .multilineTextAlignment(.leading)
+                    .shadow(color: .black.opacity(0.28), radius: 2, y: 1)
+                    .padding(14)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottomLeading)
+            }
+            .frame(width: geometry.size.width, height: geometry.size.height)
+            .clipShape(RoundedRectangle(cornerRadius: 13, style: .continuous))
+            .overlay {
+                RoundedRectangle(cornerRadius: 13, style: .continuous)
+                    .strokeBorder(.white.opacity(0.12), lineWidth: 0.5)
+            }
+            .contentShape(RoundedRectangle(cornerRadius: 13, style: .continuous))
+        }
+        .aspectRatio(1.75, contentMode: .fit)
+        .accessibilityLabel(category.title)
     }
 }

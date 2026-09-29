@@ -158,6 +158,9 @@ struct PlaybackPill: View {
             .foregroundStyle(.secondary)
             .help("Lyrics")
 
+            playerActionsButton
+            queueButton
+
             if !controller.hideVolumeBar {
                 PillSlider(volume: Binding(
                     get: { controller.volume },
@@ -299,6 +302,54 @@ struct PlaybackPill: View {
         return count > 1 ? "Listening together · \(count)" : "Listening together"
     }
 
+    /// Track actions open as a native menu anchored to this button. It stays tied
+    /// to the mini player instead of becoming a detached player-sized overlay.
+    @ViewBuilder
+    private var playerActionsButton: some View {
+        #if os(macOS)
+        Menu { playerActionItems } label: { playerActionLabel }
+            .menuStyle(.borderlessButton)
+            .menuIndicator(.hidden)
+            .disabled(controller.current == nil)
+        #else
+        Menu { playerActionItems } label: { playerActionLabel }
+            .disabled(controller.current == nil)
+        #endif
+    }
+
+    @ViewBuilder
+    private var playerActionItems: some View {
+        if let current = controller.current {
+            SongActionButtons(entry: current, showSleepTimer: false)
+        }
+    }
+
+    private var playerActionLabel: some View {
+        Image(systemName: "ellipsis")
+            .font(.system(size: 15, weight: .semibold))
+            .frame(width: 32, height: 32)
+            .contentShape(Circle())
+            .foregroundStyle(.secondary)
+    }
+
+    private var queueButton: some View {
+        Button {
+            PlatformSettings.shared.putString(key: "last_player_screen", value: "QUEUE")
+            appModel.nowPlayingPresented = true
+        } label: {
+            Image(.bchQueue)
+                .resizable()
+                .scaledToFit()
+                .frame(width: 16, height: 16)
+                .frame(width: 32, height: 32)
+                .contentShape(Circle())
+        }
+        .buttonStyle(.plain)
+        .foregroundStyle(.secondary)
+        .help("Queue")
+        .accessibilityLabel("Queue")
+    }
+
     private var reduceBlur: Bool {
         PlatformSettings.shared.getBoolean(key: "reduce_dynamic_blur", default: false)
     }
@@ -424,6 +475,8 @@ struct PlaybackPill: View {
 
     private var padTrailingControls: some View {
         HStack(spacing: 6) {
+            playerActionsButton
+
             Button {
                 appModel.nowPlayingPresented = true
                 PlatformSettings.shared.putString(key: "last_player_screen", value: "LYRICS")
@@ -438,6 +491,8 @@ struct PlaybackPill: View {
             .buttonStyle(.plain)
             .foregroundStyle(.secondary)
             .accessibilityLabel("Lyrics")
+
+            queueButton
 
             AirPlayRouteButton()
                 .frame(width: 22, height: 22)

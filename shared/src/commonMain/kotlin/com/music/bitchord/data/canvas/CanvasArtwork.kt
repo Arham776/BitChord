@@ -14,18 +14,32 @@ data class CanvasArtworkDto(
     val fallbackUrl: String? = null,
 ) {
     fun matches(wantTitle: String, wantArtist: String, wantAlbum: String?): Boolean {
-        val titleOk = title == null || wantTitle.isBlank() ||
-            title.normalizeForMatch() == wantTitle.normalizeForMatch()
+        val titleOk = title == null || wantTitle.isBlank() || when (source) {
+            // Community entries include featured artists in the song title,
+            // while YouTube Music may report them as separate credits.
+            "community" -> title.communityTitleKey() == wantTitle.communityTitleKey()
+            else -> title.normalizeForMatch() == wantTitle.normalizeForMatch()
+        }
         val titleArtists = splitArtists(wantArtist)
         val ourArtists = splitArtists(artist.orEmpty())
-        val artistOk = artist == null || wantArtist.isBlank() ||
-            (titleArtists.isNotEmpty() && ourArtists.isNotEmpty() &&
-                titleArtists.all { want -> ourArtists.any { it == want } })
+        val artistOk = artist == null || wantArtist.isBlank() || when (source) {
+            // The community index credits the primary artist, not necessarily
+            // every featured performer listed by the playing source.
+            "community" -> titleArtists.isNotEmpty() && ourArtists.isNotEmpty() &&
+                titleArtists.any { want -> ourArtists.any { it == want } }
+            else -> titleArtists.isNotEmpty() && ourArtists.isNotEmpty() &&
+                titleArtists.all { want -> ourArtists.any { it == want } }
+        }
         val albumOk = album.isNullOrBlank() || wantAlbum.isNullOrBlank() ||
             album.normalizeForMatch() == wantAlbum.normalizeForMatch()
         return titleOk && artistOk && albumOk
     }
 }
+
+/** Community song names sometimes append featured performers to the title. */
+internal fun String.communityTitleKey(): String = normalizeForMatch()
+    .replace(Regex("\\s+(?:feat|featuring|ft)\\s+.+$"), "")
+    .trim()
 
 internal const val CANVAS_UA =
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) " +

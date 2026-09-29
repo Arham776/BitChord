@@ -520,7 +520,7 @@ struct TrackLogSheet: View {
 struct SpotifyCanvasSettingsView: View {
     @State private var cookie = PlatformSettings.shared.getString(key: "spotify_spdc_token", default: "")
     @State private var autoHide = PlatformSettings.shared.getBoolean(key: "canvas_autohide", default: false)
-    @State private var prioritizeSpotify = PlatformSettings.shared.getBoolean(key: "canvas_prioritize_spotify", default: true)
+    @State private var prioritizeSpotify = PlatformSettings.shared.getBoolean(key: "prioritize_spotify_canvas", default: false)
 
     /// Whether motion art should play over this track right now.
     ///
@@ -560,6 +560,6 @@ struct SpotifyCanvasSettingsView: View {
         #endif
         .onChange(of: cookie) { _, value in AppSettings.shared.setSpotifySpdc(value: value) }
         .onChange(of: autoHide) { _, value in PlatformSettings.shared.putBoolean(key: "canvas_autohide", value: value) }
-        .onChange(of: prioritizeSpotify) { _, value in PlatformSettings.shared.putBoolean(key: "canvas_prioritize_spotify", value: value) }
+        .onChange(of: prioritizeSpotify) { _, value in PlatformSettings.shared.putBoolean(key: "prioritize_spotify_canvas", value: value) }
     }
 }

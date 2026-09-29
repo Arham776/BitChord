@@ -8,27 +8,33 @@ import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 
 /**
  * Community-curated looping video index (upstream CommunityCanvas).
  */
 object CommunityCanvas {
     private const val MANIFEST = "https://vivimusicanvas.mkmdevilmi.workers.dev/canvas.json"
+    private const val TTL_MS = 30L * 60 * 1000
     private val json = Json { ignoreUnknownKeys = true; isLenient = true }
-    @kotlin.concurrent.Volatile private var cached: List<Entry> = emptyList()
+    private val lock = Mutex()
+    private var cached: List<Entry> = emptyList()
+    private var fetchedAtMs = 0L
 
     private data class Entry(val song: String, val artist: String, val album: String, val url: String)
 
     suspend fun search(title: String, artist: String, album: String?): CanvasArtworkDto? {
         val index = manifest()
-        val wantTitle = title.normalize()
-        val wantArtist = artist.normalize()
         val wantAlbum = album?.normalize()
         val hit = index.firstOrNull { entry ->
-            val song = entry.song.normalize()
-            val credited = entry.artist.normalize()
-            val titleOk = song.isNotBlank() && (wantTitle.contains(song) || song.contains(wantTitle))
-            val artistOk = credited.isNotBlank() && (wantArtist.contains(credited) || credited.contains(wantArtist))
+            val song = entry.song.communityTitleKey()
+            val requested = title.communityTitleKey()
+            val creditedArtists = splitArtists(entry.artist)
+            val requestedArtists = splitArtists(artist)
+            val titleOk = song.isNotBlank() && song == requested
+            val artistOk = creditedArtists.isNotEmpty() && requestedArtists.isNotEmpty() &&
+                creditedArtists.any { it in requestedArtists }
             val albumOk = entry.album.isBlank() || wantAlbum.isNullOrBlank() || entry.album.normalize() == wantAlbum
             titleOk && artistOk && albumOk
         } ?: return null
@@ -61,26 +67,34 @@ object CommunityCanvas {
         )
     }
 
-    private suspend fun manifest(): List<Entry> {
-        if (cached.isNotEmpty()) return cached
-        val body = runCatching { Http.getText(MANIFEST, timeoutMillis = 8_000) }.getOrNull() ?: return emptyList()
-        val root = json.parseToJsonElement(body)
-        val array: JsonArray = when (root) {
-            is JsonArray -> root
-            is JsonObject -> root["canvas"]?.jsonArray ?: root["data"]?.jsonArray ?: return emptyList()
-            else -> return emptyList()
+    private suspend fun manifest(): List<Entry> = lock.withLock {
+        val now = canvasNowMs()
+        if (cached.isNotEmpty() && now - fetchedAtMs < TTL_MS) return@withLock cached
+
+        val body = runCatching { Http.getText(MANIFEST, timeoutMillis = 8_000) }.getOrNull()
+        if (body == null) {
+            fetchedAtMs = now
+            return@withLock cached
         }
-        cached = array.mapNotNull { el ->
-            val o = el as? JsonObject ?: return@mapNotNull null
-            val url = o.str("url") ?: o.str("canvas") ?: o.str("video") ?: return@mapNotNull null
-            Entry(
-                song = o.str("song") ?: o.str("title") ?: "",
-                artist = o.str("artist") ?: "",
-                album = o.str("album") ?: "",
-                url = url,
-            )
-        }
-        return cached
+
+        val parsed = runCatching {
+            val root = json.parseToJsonElement(body).jsonObject
+            val array: JsonArray = root["items"]?.jsonArray ?: return@runCatching emptyList()
+            array.mapNotNull { el ->
+                val o = el as? JsonObject ?: return@mapNotNull null
+                val url = o.str("url") ?: return@mapNotNull null
+                Entry(
+                    song = o.str("song") ?: return@mapNotNull null,
+                    artist = o.str("artist") ?: return@mapNotNull null,
+                    album = o.str("album").orEmpty(),
+                    url = url,
+                )
+            }
+        }.getOrNull()
+
+        if (!parsed.isNullOrEmpty()) cached = parsed
+        fetchedAtMs = now
+        cached
     }
 
     private fun JsonObject.str(key: String): String? =

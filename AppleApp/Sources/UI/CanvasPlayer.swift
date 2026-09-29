@@ -7,8 +7,8 @@ import UIKit
 import AppKit
 #endif
 
-/// One silent, looping decoder per visible cover. Playback follows visibility,
-/// not the song's pause state, matching upstream CanvasArtworkPlayer.
+/// One silent, looping decoder per visible cover. Playback follows visibility
+/// and the song's transport state, matching upstream CanvasArtworkPlayer.
 struct CanvasPlayer: View {
     let url: URL
     var fallbackURL: URL? = nil
@@ -23,7 +23,8 @@ struct CanvasPlayer: View {
 
     var body: some View {
         CanvasPlayerLayer(configuration: CanvasConfiguration(
-            url: url, fallback: fallbackURL, active: visible && scenePhase == .active,
+            url: url, fallback: fallbackURL,
+            active: visible && scenePhase == .active && isPlaying,
             fitPortrait: fitPortrait, sampleFrames: sampleFrames,
             onAspect: onAspect, onRendered: onRendered, onFrame: onFrame
         ))
@@ -75,8 +76,10 @@ final class CanvasVideoView: PlatformCanvasView {
     private let playerLayer = AVPlayerLayer()
     private var configuration: CanvasConfiguration?
     private var currentURL: URL?
+    private var cachedRemoteRetryURL: URL?
     private var generation = 0
     private var triedFallback = false
+    private var triedCachedRemoteRetry = false
     private var readyObserver: NSKeyValueObservation?
     private var statusObserver: NSKeyValueObservation?
     private var sizeObserver: NSKeyValueObservation?
@@ -109,13 +112,15 @@ final class CanvasVideoView: PlatformCanvasView {
             generation += 1
             let requestGeneration = generation
             triedFallback = false
+            triedCachedRemoteRetry = false
+            cachedRemoteRetryURL = nil
             clearItem()
             value.onRendered(false)
             value.onAspect(0)
             Task { [weak self] in
                 let local = value.url.isFileURL ? value.url : await CanvasFileCache.shared.cachedFile(for: value.url)
                 guard let self, self.generation == requestGeneration else { return }
-                self.mount(local)
+                self.mount(local, cachedRemoteRetryURL: local == value.url ? nil : value.url)
             }
         }
         layoutVideo()
@@ -136,6 +141,7 @@ final class CanvasVideoView: PlatformCanvasView {
         frameTimer = nil
         clearItem()
         currentURL = nil
+        cachedRemoteRetryURL = nil
         configuration = nil
     }
 
@@ -156,7 +162,8 @@ final class CanvasVideoView: PlatformCanvasView {
         lastSampleTime = -.infinity
     }
 
-    private func mount(_ url: URL) {
+    private func mount(_ url: URL, cachedRemoteRetryURL: URL? = nil) {
+        self.cachedRemoteRetryURL = cachedRemoteRetryURL
         clearItem()
         let item = AVPlayerItem(url: url)
         let output = AVPlayerItemVideoOutput(pixelBufferAttributes: [
@@ -212,8 +219,18 @@ final class CanvasVideoView: PlatformCanvasView {
     }
 
     private func useFallback() {
+        let error = player.currentItem?.error?.localizedDescription ?? "unknown playback error"
+        NSLog("[BitChord] animated artwork video failed at %@: %@",
+              currentURL?.host ?? "local cache", error)
         configuration?.onRendered(false)
         playerLayer.opacity = 0
+        if !triedCachedRemoteRetry, let remote = cachedRemoteRetryURL {
+            triedCachedRemoteRetry = true
+            NSLog("[BitChord] retrying animated artwork directly from %@ after cached playback failed",
+                  remote.host ?? "remote host")
+            mount(remote)
+            return
+        }
         guard !triedFallback, let fallback = configuration?.fallback else {
             player.pause()
             return

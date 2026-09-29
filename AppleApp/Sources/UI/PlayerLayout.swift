@@ -50,6 +50,14 @@ enum PlayerLayout {
     /// screen with something in it.
     static let landscapeMaxWidth: CGFloat = 1100
 
+    /// The tablet player uses the available iPad page more fully than the
+    /// compact phone-shaped landscape player.
+    static let ipadLandscapeMaxWidth: CGFloat = 1280
+
+    /// Desktop windows need room for both the player deck and a wide lyric or
+    /// queue column. This is intentionally separate from the iPad page width.
+    static let macLandscapeMaxWidth: CGFloat = 1440
+
     /// Gutter either side of the columns, in a landscape window.
     static let landscapeGutter: CGFloat = 30
     static let landscapeGutterCompact: CGFloat = 20
@@ -84,16 +92,26 @@ enum PlayerLayout {
     static let sleeveCollapsedSide: CGFloat = 56
 
     /// The largest square artwork that fits a portrait stage, given the gutters the
-    /// player keeps around it.
+    /// player keeps around it and an optional platform-specific ceiling.
     ///
     /// Floored rather than allowed to reach zero: a stage too short to hold a
     /// square should show a small one, not disappear. The floor is also below the
     /// collapsed size, so a nearly-collapsed stage does not jump *up* as it is
     /// squeezed.
-    static func portraitArtworkSide(stageWidth: CGFloat, stageHeight: CGFloat) -> CGFloat {
-        let fitted = min(stageWidth - 48, stageHeight - 20)
+    static func portraitArtworkSide(
+        stageWidth: CGFloat,
+        stageHeight: CGFloat,
+        maximumSide: CGFloat? = nil
+    ) -> CGFloat {
+        let widthLimit = min(stageWidth - 48, maximumSide ?? .greatestFiniteMagnitude)
+        let fitted = min(widthLimit, stageHeight - 20)
         return max(sleeveCollapsedSide, fitted)
     }
+
+    /// A contained iPad portrait sleeve should read as a centered album cover,
+    /// not as a full-width banner.
+    static let ipadPortraitArtworkMaxSide: CGFloat = 600
+    static let ipadPortraitArtworkWidthFraction: CGFloat = 0.62
 
     // ---- full-bleed artwork --------------------------------------------------
 
@@ -105,9 +123,9 @@ enum PlayerLayout {
     /// `TABLET_PLAYER_MIN_WIDTH`: a 360pt page beside a 340pt pane.
     static let tabletMinWidth: CGFloat = 700
 
-    /// Whether this window can use the full-bleed art treatment: phone-width
-    /// windows use it as their main-player shape, while tablet-sized windows
-    /// can opt into it. Mirrors upstream `fullBleedArtworkAvailable`.
+    /// The geometry-only full-bleed availability rule. The iPad page chooses a
+    /// contained sleeve in `NowPlayingView`; this remains useful for the phone
+    /// preference and for testing the shape boundary independently of device type.
     static func fullBleedArtworkAvailable(width: CGFloat) -> Bool {
         width <= fullBleedMaxWidth || width >= tabletMinWidth
     }
@@ -117,13 +135,4 @@ enum PlayerLayout {
         preferenceEnabled && fullBleedArtworkAvailable(width: width)
     }
 
-    // ---- iPad panel drawer ---------------------------------------------------
-
-    /// Whether an open lyrics/queue panel presents as a bottom drawer: iPad
-    /// portrait — regular width of at least 560pt in a portrait shape — where
-    /// a full-height panel would leave the collapsed sleeve floating in a tall
-    /// column. Mirrors upstream `PlayerDrawer`'s tablet treatment.
-    static func presentsPanelDrawer(width: CGFloat, height: CGFloat) -> Bool {
-        width >= landscapeMinWidth && height > width
-    }
 }

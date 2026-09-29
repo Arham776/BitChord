@@ -1,5 +1,8 @@
 import SwiftUI
 import BitChordShared
+#if os(iOS)
+import UIKit
+#endif
 
 /// Root navigation shell — one `TabView` with `.sidebarAdaptable` (UI spec §2):
 /// bottom tab bar on iOS, Apple Music's leading sidebar on macOS, from a
@@ -444,6 +447,11 @@ struct PlaybackPillMount: ViewModifier {
         if #available(iOS 26.0, *) {
             content.tabViewBottomAccessory {
                 PlaybackPill()
+                    // Keep the iPad player centered and compact at landscape
+                    // widths; on iPhone the proposal remains narrower and fills.
+                    .frame(maxWidth: 720)
+                    .padding(.horizontal, 10)
+                    .frame(maxWidth: .infinity)
             }
         } else {
             fallbackMount(content)
@@ -463,6 +471,7 @@ struct PlaybackPillMount: ViewModifier {
                 .frame(maxWidth: 720)
                 .padding(.horizontal, 10)
                 .padding(.bottom, 8)
+                .frame(maxWidth: .infinity)
         }
     }
 }
@@ -474,8 +483,10 @@ struct MacPlaybackChrome: ViewModifier {
     func body(content: Content) -> some View {
         content.safeAreaInset(edge: .bottom, spacing: 0) {
             PlaybackPill()
+                .frame(maxWidth: 900)
                 .padding(.horizontal, 18)
                 .padding(.bottom, 12)
+                .frame(maxWidth: .infinity)
         }
     }
 }
@@ -498,13 +509,19 @@ struct NowPlayingTakeover: ViewModifier {
 }
 
 private struct NowPlayingSheetSizing: ViewModifier {
-    @Environment(\.horizontalSizeClass) private var sizeClass
-
+    @ViewBuilder
     func body(content: Content) -> some View {
-        content
-            .presentationDetents([.large])
-            .presentationDragIndicator(.visible)
-            .presentationCornerRadius(24)
+        if UIDevice.current.userInterfaceIdiom == .pad {
+            content
+                .presentationDetents([.large])
+                .presentationSizing(.page)
+                .presentationDragIndicator(.visible)
+        } else {
+            content
+                .presentationDetents([.large])
+                .presentationDragIndicator(.visible)
+                .presentationCornerRadius(24)
+        }
     }
 }
 
