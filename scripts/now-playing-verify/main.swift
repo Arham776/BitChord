@@ -95,6 +95,47 @@ func until(_ label: String, _ predicate: () -> Bool) async {
 struct Verify {
     @MainActor
     static func main() async {
+        // A native snapshot uses one coherent state/position/time anchor.
+        let anchor = Date(timeIntervalSince1970: 100)
+        let playingSnapshot = NowPlayingPlaybackState(rate: 1, position: 12, timestamp: anchor)
+        let pausedSnapshot = playingSnapshot.updating(rate: 0, position: 13, at: anchor.addingTimeInterval(1))
+        precondition(pausedSnapshot.rate == 0 && pausedSnapshot.position == 13)
+        precondition(pausedSnapshot.timestamp == anchor.addingTimeInterval(1))
+        precondition(pausedSnapshot.updating(rate: 0) == pausedSnapshot)
+        let resumedSnapshot = pausedSnapshot.updating(rate: 1, preparing: false, at: anchor.addingTimeInterval(10))
+        precondition(resumedSnapshot.position == 13 && resumedSnapshot.rate == 1 && !resumedSnapshot.preparing)
+        precondition(resumedSnapshot.timestamp == anchor.addingTimeInterval(10))
+        precondition(resumedSnapshot.updating(rate: .nan, position: .infinity).position == 13)
+
+        // A native Play cannot report success before activation/load finishes,
+        // or after a newer pause/stop/selection invalidates the command.
+        for interruption in ["none", "pause", "stop", "selection", "activation failure", "cancellation"] {
+            var completion: CheckedContinuation<Void, Error>?
+            var current = true
+            var acknowledged = false
+            let command = Task { @MainActor in
+                do {
+                    try await NowPlayingCommandCompletion.perform(action: {
+                        try await withCheckedThrowingContinuation { completion = $0 }
+                    }, stillCurrent: { current })
+                    acknowledged = true
+                    return true
+                } catch { return false }
+            }
+            await until("native command waiting for playback") { completion != nil }
+            precondition(!acknowledged)
+            if interruption == "activation failure" {
+                completion!.resume(throwing: Failure.transient)
+            } else {
+                current = interruption == "none" || interruption == "cancellation"
+                if interruption == "cancellation" { command.cancel() }
+                completion!.resume()
+            }
+            let succeeded = await command.value
+            precondition(succeeded == (interruption == "none"))
+            precondition(acknowledged == succeeded)
+        }
+
         // Control real readiness transitions while activation is blocked on a
         // worker, as it is when AVAudioSession talks to the audio daemon.
         let readiness = AudioSessionReadiness()
@@ -147,7 +188,7 @@ struct Verify {
         prepared.lifecycle.update(contentID: "prepared-track", playing: false)
         prepared.ready = false
         prepared.lifecycle.prepare()
-        precondition(prepared.created == 0)
+        precondition(prepared.created == 0 && !prepared.lifecycle.hasSession)
         prepared.ready = true
         prepared.lifecycle.prepare()
         precondition(prepared.created == 1)
@@ -157,6 +198,10 @@ struct Verify {
         prepared.play("prepared-track")
         await until("prepared playback published") { prepared.sessions[0].promotions == 1 }
         precondition(prepared.created == 1)
+        prepared.pause()
+        precondition(prepared.lifecycle.hasSession)
+        prepared.lifecycle.prepare()
+        precondition(prepared.created == 1 && prepared.sessions[0].publications == 1)
 
         // Pause during an uncooperative system call blocks the next request.
         let pause = Harness()
@@ -170,7 +215,7 @@ struct Verify {
         precondition(pausedDriver.promotions == 0)
         pause.play()
         await until("resume uses retained session") { pausedDriver.promotions == 1 }
-        precondition(pause.created == 1)
+        precondition(pause.created == 1 && pause.lifecycle.hasSession)
 
         // Resuming before an uncancellable publication finishes reuses it.
         let overlap = Harness()
@@ -323,6 +368,6 @@ struct Verify {
                         sleeping, invalidation, eligibility, background, backgroundDuringPublication, lostAudio] {
             harness.lifecycle.stop()
         }
-        print("PASS: readiness, stale completions, retained sessions, bounded retries, invalidation, identity and foreground-only takeover")
+        print("PASS: native command completion, readiness, stale completions, retained sessions, bounded retries, invalidation, identity and foreground-only takeover")
     }
 }

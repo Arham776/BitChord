@@ -10,6 +10,9 @@ import BitChordShared
 #if os(iOS)
 import NowPlaying
 import AVFoundation
+#if DEBUG
+import Synchronization
+#endif
 #endif
 
 /// Lock-screen / media-key / Bluetooth controls (spec §3.2 NowPlayingController).
@@ -81,6 +84,9 @@ final class NowPlayingController {
     }
 
     var onPlay: (() -> Void)?
+#if os(iOS)
+    var onPlayAsync: (() async throws -> Void)?
+#endif
     var onPause: (() -> Void)?
     var onToggle: (() -> Void)?
     var onNext: (() -> Void)?
@@ -94,6 +100,12 @@ final class NowPlayingController {
         model.delegate = self
         modern = model
     }
+#if DEBUG
+    func verifyModernObservation() -> [String: Bool] {
+        if #available(iOS 27, *) { return ModernNowPlaying.verifyObservation() }
+        return [:]
+    }
+#endif
 #endif
 
     /// Called only for an explicit play intent, after activation and a paused
@@ -181,7 +193,7 @@ final class NowPlayingController {
     func update(position: Double) {
 #if os(iOS)
         if #available(iOS 27, *), let model = modern as? ModernNowPlaying {
-            model.position = position
+            model.updatePosition(position)
             return
         }
 #endif
@@ -313,17 +325,19 @@ private final class ModernNowPlaying: MediaSessionRepresentable {
     var title = ""
     var artist = ""
     var duration: Double = 0
-    var position: Double = 0 { didSet { timestamp = Date() } }
-    var timestamp = Date()
-    var rate: Double = 0 { didSet { timestamp = Date() } }
+    @ObservationIgnored private var playback = NowPlayingPlaybackState()
+    // Observe the actual framework value. Getters must not mutate diagnostic
+    // state or accidentally make command availability depend on playback.
+    private(set) var playbackSnapshot: MediaPlaybackSnapshot?
+    var position: Double { playback.position }
+    var rate: Double { playback.rate }
+    var preparing: Bool { playback.preparing }
     var artworkData: Data?
     var artworkURL: String?
     var canNext = false
     var canPrevious = false
     var canSeek = false
     var contentID: String?
-    var preparing = false
-    @ObservationIgnored private var lastCommandDescription: String?
     @ObservationIgnored private var lastSnapshotState: String?
     @ObservationIgnored private lazy var lifecycle = NowPlayingLifecycle(
         makeSession: { [weak self] in
@@ -362,27 +376,30 @@ private final class ModernNowPlaying: MediaSessionRepresentable {
         )
     }
 
-    var playbackSnapshot: MediaPlaybackSnapshot? {
-        guard contentID != nil else { return nil }
-        let state = preparing ? "buffering" : (rate > 0 ? "playing" : "paused")
+    private func publishPlayback(_ value: NowPlayingPlaybackState) {
+        playback = value
+        guard contentID != nil else {
+            playbackSnapshot = nil
+            return
+        }
+        let state = value.preparing ? "buffering" : (value.rate > 0 ? "playing" : "paused")
+        let snapshot = MediaPlaybackSnapshot(
+            state: value.preparing ? .buffering : (value.rate > 0 ? .playing(rate: Float(value.rate)) : .paused),
+            elapsedTime: value.position, timestamp: value.timestamp
+        )
+        if playbackSnapshot != snapshot { playbackSnapshot = snapshot }
         if lastSnapshotState != state {
             lastSnapshotState = state
-            record("snapshot read state=\(state)")
+            record("snapshot published state=\(state) position=\(value.position)")
         }
-        return MediaPlaybackSnapshot(
-            state: preparing ? .buffering : (rate > 0 ? .playing(rate: Float(rate)) : .paused),
-            elapsedTime: position, timestamp: timestamp
-        )
     }
 
     var commands: [MediaCommand] {
-        let description = "next=\(canNext) previous=\(canPrevious) seek=\(canSeek)"
-        if lastCommandDescription != description {
-            lastCommandDescription = description
-            record("commands read play=true pause=true \(description)")
-        }
         return [
-            .play { [weak self] in try self?.perform("play", action: self?.delegate?.onPlay) },
+            .play { [weak self] in
+                guard let self else { throw CancellationError() }
+                try await self.performPlay()
+            },
             .pause { [weak self] in try self?.perform("pause", action: self?.delegate?.onPause) },
             .next { [weak self] in try self?.perform("next", action: self?.delegate?.onNext) }.enabled(canNext),
             .previous { [weak self] in try self?.perform("previous", action: self?.delegate?.onPrevious) }.enabled(canPrevious),
@@ -391,6 +408,22 @@ private final class ModernNowPlaying: MediaSessionRepresentable {
                 try self.perform("seek position=\(seconds)", action: self.delegate?.onSeek.map { seek in { seek(seconds) } })
             }.enabled(canSeek),
         ]
+    }
+
+    private func performPlay() async throws {
+        guard let contentID, let action = delegate?.onPlayAsync else {
+            throw CancellationError()
+        }
+        record("command received play")
+        do {
+            try await NowPlayingCommandCompletion.perform(action: action) {
+                self.contentID == contentID && self.rate > 0 && !self.preparing
+            }
+            record("command completed play")
+        } catch {
+            record("command failed play: \(error)")
+            throw error
+        }
     }
 
     private func perform(_ command: String, action: (() -> Void)?) throws {
@@ -419,12 +452,14 @@ private final class ModernNowPlaying: MediaSessionRepresentable {
         self.canNext = canNext
         self.canPrevious = canPrevious
         self.canSeek = canSeek
-        preparing = true
+        // Ordinary resume keeps the published paused snapshot until playback
+        // actually starts. A buffering snapshot is only needed for registration.
+        publishPlayback(playback.updating(preparing: !lifecycle.hasSession))
         lifecycle.prepare()
     }
 
     func playbackDidStart() {
-        preparing = false
+        publishPlayback(playback.updating(preparing: false))
         lifecycle.update(contentID: contentID, playing: rate > 0)
         record("audio playback started")
     }
@@ -432,11 +467,7 @@ private final class ModernNowPlaying: MediaSessionRepresentable {
     func update(id: String, title: String, artist: String, duration: Double,
                 artworkData: Data?, thumbnailUrl: String?, isPlaying: Bool,
                 position: Double?) {
-        if contentID != id {
-            self.position = position ?? 0
-        } else if let position {
-            self.position = position
-        }
+        let elapsed = position ?? (contentID == id ? nil : 0)
         contentID = id
         self.title = title
         self.artist = artist
@@ -444,16 +475,19 @@ private final class ModernNowPlaying: MediaSessionRepresentable {
         self.artworkData = artworkData
         self.artworkURL = thumbnailUrl
         let speed = Double(PlatformSettings.shared.getFloat(key: "playback_speed", default: 1))
-        updateRate(isPlaying ? speed : 0)
+        updateRate(isPlaying ? speed : 0, position: elapsed)
     }
 
     func updateRate(_ rate: Double, position: Double? = nil) {
         let validRate = rate.isFinite ? max(0, rate) : 0
-        // Artwork/metadata refreshes must not re-anchor an unchanged snapshot.
-        if self.rate != validRate { self.rate = validRate }
-        if validRate == 0 { preparing = false }
-        if let position { self.position = position }
+        // One write publishes a consistent state/time pair. Unchanged metadata
+        // keeps the original timestamp instead of restarting native progress.
+        publishPlayback(playback.updating(rate: validRate, position: position))
         lifecycle.update(contentID: contentID, playing: self.rate > 0)
+    }
+
+    func updatePosition(_ position: Double) {
+        publishPlayback(playback.updating(position: position))
     }
 
     func requestPrimaryIfPossible(reason: String) {
@@ -466,11 +500,52 @@ private final class ModernNowPlaying: MediaSessionRepresentable {
 
     func stop() {
         lifecycle.stop()
-        rate = 0
-        preparing = false
+        playback = NowPlayingPlaybackState()
+        playbackSnapshot = nil
         title = ""
         contentID = nil
     }
+
+#if DEBUG
+    /// Exercise the actual SDK adapter's observation dependencies, without
+    /// creating another media session or touching the user's audio session.
+    static func verifyObservation() -> [String: Bool] {
+        let model = ModernNowPlaying()
+        model.update(id: "observation-fixture", title: "Fixture", artist: "Fixture", duration: 40,
+                     artworkData: nil, thumbnailUrl: nil, isPlaying: true, position: 2)
+        let snapshotChanged = Mutex(false)
+        let commandsChanged = Mutex(false)
+        withObservationTracking { _ = model.playbackSnapshot } onChange: {
+            snapshotChanged.withLock { $0 = true }
+        }
+        withObservationTracking { _ = model.commands } onChange: {
+            commandsChanged.withLock { $0 = true }
+        }
+        model.updateRate(0, position: 2)
+        var checks = [
+            "observation.pauseSnapshot": snapshotChanged.withLock { $0 },
+            "observation.pauseKeepsCommands": !commandsChanged.withLock { $0 },
+            "observation.pausedValue": model.playbackSnapshot == MediaPlaybackSnapshot(
+                state: .paused, elapsedTime: 2, timestamp: model.playback.timestamp)
+        ]
+        let positionChangedCommands = Mutex(false)
+        withObservationTracking { _ = model.commands } onChange: {
+            positionChangedCommands.withLock { $0 = true }
+        }
+        model.updatePosition(3)
+        checks["observation.positionKeepsCommands"] = !positionChangedCommands.withLock { $0 }
+        let resumedSnapshot = Mutex(false)
+        withObservationTracking { _ = model.playbackSnapshot } onChange: {
+            resumedSnapshot.withLock { $0 = true }
+        }
+        model.updateRate(1, position: 3)
+        checks["observation.resumeSnapshot"] = resumedSnapshot.withLock { $0 }
+        checks["observation.playingValue"] = model.playbackSnapshot == MediaPlaybackSnapshot(
+            state: .playing(), elapsedTime: 3, timestamp: model.playback.timestamp)
+        checks["observation.noPublication"] = !model.lifecycle.hasSession
+        return checks
+    }
+#endif
 }
 
 /// Keep framework-specific observation and errors outside the tested policy.

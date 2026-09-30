@@ -69,7 +69,6 @@ struct SettingsView: View {
     @State private var playbackSpeed = Double(PlatformSettings.shared.getFloat(key: "playback_speed", default: 1))
     @State private var jiosaavn = PlatformSettings.shared.getBoolean(key: "jiosaavn_enabled", default: true)
     @State private var stopBackground = PlatformSettings.shared.getBoolean(key: "stop_when_backgrounded", default: false)
-    @State private var mixWithOtherAudio = PlatformSettings.shared.getBoolean(key: "mix_with_other_audio", default: true)
     @State private var syllableSync = PlatformSettings.shared.getBoolean(key: "prioritize_syllable_sync", default: true)
     @State private var language = PlatformSettings.shared.getString(key: "app_language", default: "")
     @State private var spotifyCookie = PlatformSettings.shared.getString(key: "spotify_spdc_token", default: "")
@@ -138,7 +137,6 @@ struct SettingsView: View {
             controller: controller,
             crossfade: $crossfade,
             spatial: $spatial,
-            mixWithOtherAudio: $mixWithOtherAudio,
             automix: $automix,
             automixSequence: $automixSequence,
             automixPerf: $automixPerf,
@@ -708,8 +706,11 @@ struct SettingsView: View {
             SettingsToggleLine(
                 glyph: .musicOnly,
                 title: "Play Alongside Other Apps",
-                subtitle: "Keep other apps audible alongside BitChord, in the foreground and background. iOS decides which app's native Now Playing controls appear. Takes effect on the next play.",
-                isOn: $mixWithOtherAudio
+                subtitle: "Keep other apps audible alongside BitChord. This can prevent iOS Lock Screen, Control Center and headphone controls from controlling BitChord. Turn off to give BitChord audio priority. Applies immediately while playing, or on the next play.",
+                isOn: Binding(
+                    get: { controller.mixWithOtherAudio },
+                    set: { controller.setMixWithOtherAudio($0) }
+                )
             )
 #endif
             NavigationLink {
@@ -2211,7 +2212,6 @@ private struct SettingsPlaybackPersist: ViewModifier {
     var controller: PlaybackController
     @Binding var crossfade: Int
     @Binding var spatial: Bool
-    @Binding var mixWithOtherAudio: Bool
     @Binding var automix: Bool
     @Binding var automixSequence: Bool
     @Binding var automixPerf: String
@@ -2231,9 +2231,6 @@ private struct SettingsPlaybackPersist: ViewModifier {
             .onChange(of: spatial) { _, value in
                 AppSettings.shared.setSpatialAudio(value: value)
                 controller.updateSpatial(enabled: value)
-            }
-            .onChange(of: mixWithOtherAudio) { _, value in
-                PlatformSettings.shared.putBoolean(key: "mix_with_other_audio", value: value)
             }
             .onChange(of: automix) { _, value in
                 AppSettings.shared.setSmartFadeEnabled(value: value)

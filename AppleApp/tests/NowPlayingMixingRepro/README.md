@@ -17,6 +17,12 @@ and run `NowPlayingMixingRepro` on a physical device. Press **Play mixed tone**,
 open Control Center, and try Pause/Play and seeking. Repeat after locking and
 unlocking, and with a different audio app playing before and after the tone.
 The optional launch argument `--play-mixed-tone` starts the test automatically.
+Use `--state-sync --exclusive` to compare transport-state synchronization with
+an exclusive `AVAudioPlayer`: the tone starts, then pauses from the app after
+four seconds, retaining its session. Open Control Center and the Lock Screen
+after it pauses; both should show Play and the first tap should resume. Native
+command logs include the player state before handling the command. BitChord's
+saved mixing preference is not changed by this standalone probe.
 Add `--generic-content` to use `GenericContent` instead of `MusicContent`, keeping
 the player, duration and audio options identical. The probe checks prominence
 on foreground entry and once 300 ms after publication, without periodic retries.

@@ -569,7 +569,8 @@ pub struct OutputDeviceRec {
 }
 
 /// Monotonic output counters for a device playback trace. Compare deltas while
-/// a track is playing; the output callback also runs while the queue is idle.
+/// a track is playing. iOS stops rendering during an ordinary pause; other
+/// platforms may keep the output callback running while the queue is idle.
 #[derive(uniffi::Record, Debug, Clone)]
 pub struct OutputHealthRec {
     pub buffered_frames: u64,
@@ -779,7 +780,10 @@ impl PlayerEngine {
 
     pub fn load_track(&self, request: LoadRequest) -> Result<TrackInfoRec, EngineError> {
         self.output_paused.store(false, Ordering::Release);
-        self.load_track_paused(request)
+        let info = self.load_track_paused(request)?;
+        #[cfg(target_os = "ios")]
+        self.play()?;
+        Ok(info)
     }
 
     /// Loads without releasing the transport mute. The session owner commits
@@ -1062,18 +1066,29 @@ impl PlayerEngine {
     }
 
     pub fn play(&self) -> Result<(), EngineError> {
+        #[cfg(target_os = "ios")]
+        self.set_ios_output_running(true)?;
+        #[cfg(not(target_os = "ios"))]
         self.output_paused.store(false, Ordering::Release);
         self.send(Command::Play)
     }
 
     pub fn pause(&self) -> Result<(), EngineError> {
         self.output_paused.store(true, Ordering::Release);
-        self.send(Command::Pause)
+        self.send(Command::Pause)?;
+        #[cfg(target_os = "ios")]
+        self.set_ios_output_running(false)?;
+        Ok(())
     }
 
     pub fn stop(&self) -> Result<(), EngineError> {
+        #[cfg(target_os = "ios")]
+        self.output_paused.store(true, Ordering::Release);
         self.bail_flush.store(true, Ordering::Release);
-        self.send(Command::Stop)
+        self.send(Command::Stop)?;
+        #[cfg(target_os = "ios")]
+        self.set_ios_output_running(false)?;
+        Ok(())
     }
 
     /// Moves the playhead. Returns as soon as the request is queued.
@@ -1473,6 +1488,29 @@ impl PlayerEngine {
 }
 
 impl PlayerEngine {
+    /// On iOS a running RemoteIO unit is still active audio playback even when
+    /// its callback writes zeroes. Stop rendering on Pause while retaining the
+    /// AVAudioSession and decoded ring; Resume starts that same unit again.
+    #[cfg(target_os = "ios")]
+    fn set_ios_output_running(&self, running: bool) -> Result<(), EngineError> {
+        let output = self.stream.lock().unwrap();
+        let stream = output.as_ref().ok_or(EngineError::NotStarted)?;
+        let result = if running {
+            stream.play()
+        } else {
+            stream.pause()
+        };
+        result.map_err(|e| EngineError::StreamInit(e.to_string()))?;
+        // Publish the transport flag before releasing the stream lock so a
+        // simultaneous rebuild cannot install a paused unit after Resume.
+        self.output_paused.store(!running, Ordering::Release);
+        log::info!(
+            "iOS output rendering {}",
+            if running { "started" } else { "paused" }
+        );
+        Ok(())
+    }
+
     fn send(&self, cmd: Command) -> Result<(), EngineError> {
         self.commands.send(cmd).map_err(|_| EngineError::NotStarted)
     }
@@ -1748,8 +1786,14 @@ impl OutputControl {
         stream
             .play()
             .map_err(|e| EngineError::StreamInit(e.to_string()))?;
+        #[cfg(target_os = "ios")]
+        if self.output_paused.load(Ordering::Acquire) {
+            stream
+                .pause()
+                .map_err(|e| EngineError::StreamInit(e.to_string()))?;
+        }
 
-        // From here the swap cannot fail. Mute both units for the handover so
+        // Mute both units for the handover so
         // the outgoing ring's backlog — seconds of it — cannot double the
         // incoming audio while it drains.
         let _hold = OutputHold::new(&self.output_holds);
@@ -1785,7 +1829,23 @@ impl OutputControl {
             let _ = self.commands.send(Command::SetBitPerfect(false));
         }
         // Hand the new stream in and drop the old one, whose device has gone.
-        let previous = self.stream.lock().unwrap().replace(stream);
+        #[cfg(target_os = "ios")]
+        let transport_result;
+        let previous = {
+            let mut output = self.stream.lock().unwrap();
+            // Reconcile under the same lock as Play/Pause: a route rebuild
+            // must not restart output for playback paused during its setup.
+            #[cfg(target_os = "ios")]
+            {
+                let result = if self.output_paused.load(Ordering::Acquire) {
+                    stream.pause()
+                } else {
+                    stream.play()
+                };
+                transport_result = result.map_err(|e| EngineError::StreamInit(e.to_string()));
+            }
+            output.replace(stream)
+        };
         drop(previous);
         self.output_rate.store(rate, Ordering::Relaxed);
         self.output_channels
@@ -1802,6 +1862,10 @@ impl OutputControl {
         *self.device_name.lock().unwrap() = device.to_string();
         self.output_rebuilds.fetch_add(1, Ordering::Relaxed);
         log::info!("output rebuilt: {device} — {rate} Hz, {channels} ch");
+        // The mixer has already switched rings. Keep its matching consumer
+        // installed even if the route rejects the final transport operation.
+        #[cfg(target_os = "ios")]
+        transport_result?;
         Ok(())
     }
 }

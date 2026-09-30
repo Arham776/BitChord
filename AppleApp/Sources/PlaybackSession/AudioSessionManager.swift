@@ -108,7 +108,8 @@ enum AudioSessionManager {
                 }
                 if PlatformSettings.shared.getBoolean(
                     key: "match_source_sample_rate", default: true
-                ), let preferredSampleRate, preferredSampleRate > 0 {
+                ), let preferredSampleRate, preferredSampleRate > 0,
+                   session.preferredSampleRate != preferredSampleRate {
                     // A preference is a request, not a promise: read sampleRate
                     // after activation and give that actual value to the engine.
                     do {
@@ -166,21 +167,21 @@ enum AudioSessionManager {
 
     /// Deactivates the playback session and notifies other audio apps that
     /// they may resume or take back exclusive hardware access.
-    static func deactivate() async {
+    static func deactivate(notifyOthers: Bool = true) async {
         await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
             sessionQueue.async {
-                deactivateSynchronously()
+                deactivateSynchronously(notifyOthers: notifyOthers)
                 continuation.resume()
             }
         }
     }
 
-    private static func deactivateSynchronously() {
+    private static func deactivateSynchronously(notifyOthers: Bool) {
 #if os(iOS)
         readiness.invalidate()
         do {
-            try AVAudioSession.sharedInstance().setActive(false, options: [.notifyOthersOnDeactivation])
-            record("deactivated (.notifyOthersOnDeactivation)")
+            try AVAudioSession.sharedInstance().setActive(false, options: notifyOthers ? [.notifyOthersOnDeactivation] : [])
+            record(notifyOthers ? "deactivated (.notifyOthersOnDeactivation)" : "deactivated (without notification)")
         } catch {
             record("deactivation failed: \(error)")
         }

@@ -1,0 +1,179 @@
+{
+  "checks": {
+    "m4a_0_monotonic": true,
+    "m4a_0_no_rebuild": true,
+    "m4a_0_resume_progress": false,
+    "m4a_0_retained_activation": false,
+    "m4a_0_stable_pause": true,
+    "m4a_1_monotonic": true,
+    "m4a_1_no_rebuild": true,
+    "m4a_1_resume_progress": false,
+    "m4a_1_retained_activation": true,
+    "m4a_1_stable_pause": false,
+    "m4a_2_monotonic": true,
+    "m4a_2_no_rebuild": true,
+    "m4a_2_resume_progress": false,
+    "m4a_2_retained_activation": false,
+    "m4a_2_stable_pause": true,
+    "m4a_initial_progress": true,
+    "wav_0_monotonic": true,
+    "wav_0_no_rebuild": true,
+    "wav_0_resume_progress": false,
+    "wav_0_retained_activation": false,
+    "wav_0_stable_pause": true,
+    "wav_1_monotonic": true,
+    "wav_1_no_rebuild": true,
+    "wav_1_resume_progress": false,
+    "wav_1_retained_activation": true,
+    "wav_1_stable_pause": false,
+    "wav_2_monotonic": true,
+    "wav_2_no_rebuild": true,
+    "wav_2_resume_progress": false,
+    "wav_2_retained_activation": false,
+    "wav_2_stable_pause": true,
+    "wav_initial_progress": true
+  },
+  "passed": false,
+  "samples": [
+    {
+      "audioActive": true,
+      "buffered": 12288,
+      "label": "wav initial",
+      "peak": 0.006399990990757942,
+      "position": 2.015,
+      "rebuilds": 1,
+      "state": "playing",
+      "underruns": 0
+    },
+    {
+      "audioActive": false,
+      "buffered": 12288,
+      "label": "wav paused 0",
+      "peak": 0,
+      "position": 2.005,
+      "rebuilds": 1,
+      "state": "paused",
+      "underruns": 0
+    },
+    {
+      "audioActive": true,
+      "buffered": 12288,
+      "label": "wav resumed 0",
+      "peak": 0,
+      "position": 2.005,
+      "rebuilds": 1,
+      "state": "playing",
+      "underruns": 0
+    },
+    {
+      "audioActive": true,
+      "buffered": 12288,
+      "label": "wav paused 1",
+      "peak": 0,
+      "position": 2.005,
+      "rebuilds": 1,
+      "state": "playing",
+      "underruns": 0
+    },
+    {
+      "audioActive": true,
+      "buffered": 12288,
+      "label": "wav resumed 1",
+      "peak": 0,
+      "position": 2.005,
+      "rebuilds": 1,
+      "state": "playing",
+      "underruns": 0
+    },
+    {
+      "audioActive": false,
+      "buffered": 12288,
+      "label": "wav paused 2",
+      "peak": 0,
+      "position": 2.005,
+      "rebuilds": 1,
+      "state": "paused",
+      "underruns": 0
+    },
+    {
+      "audioActive": true,
+      "buffered": 12288,
+      "label": "wav resumed 2",
+      "peak": 0,
+      "position": 2.005,
+      "rebuilds": 1,
+      "state": "playing",
+      "underruns": 0
+    },
+    {
+      "audioActive": true,
+      "buffered": 12288,
+      "label": "m4a initial",
+      "peak": 0.006429677829146385,
+      "position": 2.037,
+      "rebuilds": 2,
+      "state": "playing",
+      "underruns": 0
+    },
+    {
+      "audioActive": false,
+      "buffered": 11264,
+      "label": "m4a paused 0",
+      "peak": 0,
+      "position": 2.048,
+      "rebuilds": 2,
+      "state": "paused",
+      "underruns": 0
+    },
+    {
+      "audioActive": true,
+      "buffered": 12288,
+      "label": "m4a resumed 0",
+      "peak": 0,
+      "position": 2.058,
+      "rebuilds": 2,
+      "state": "playing",
+      "underruns": 0
+    },
+    {
+      "audioActive": true,
+      "buffered": 12288,
+      "label": "m4a paused 1",
+      "peak": 0,
+      "position": 2.048,
+      "rebuilds": 2,
+      "state": "playing",
+      "underruns": 0
+    },
+    {
+      "audioActive": true,
+      "buffered": 12288,
+      "label": "m4a resumed 1",
+      "peak": 0,
+      "position": 2.048,
+      "rebuilds": 2,
+      "state": "playing",
+      "underruns": 0
+    },
+    {
+      "audioActive": false,
+      "buffered": 12288,
+      "label": "m4a paused 2",
+      "peak": 0,
+      "position": 2.048,
+      "rebuilds": 2,
+      "state": "paused",
+      "underruns": 0
+    },
+    {
+      "audioActive": true,
+      "buffered": 12288,
+      "label": "m4a resumed 2",
+      "peak": 0,
+      "position": 2.048,
+      "rebuilds": 2,
+      "state": "playing",
+      "underruns": 0
+    }
+  ]
+}

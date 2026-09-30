@@ -2,6 +2,9 @@ import Foundation
 import BitChordShared
 #if os(iOS)
 import UIKit
+#if DEBUG
+import AVFoundation
+#endif
 #else
 import AppKit
 #endif
@@ -209,6 +212,44 @@ final class PlaybackController {
 
     var isPlaying: Bool { state == .playing }
     var isBuffering: Bool { state == .buffering }
+#if os(iOS)
+    private(set) var mixWithOtherAudio = PlatformSettings.shared.getBoolean(
+        key: "mix_with_other_audio", default: true
+    )
+    private var mixingPreferenceGeneration: UInt64 = 0
+
+    /// Explicit listener choice; app transitions never change this policy.
+    func setMixWithOtherAudio(_ enabled: Bool) {
+        guard mixWithOtherAudio != enabled else { return }
+        mixWithOtherAudio = enabled
+        PlatformSettings.shared.putBoolean(key: "mix_with_other_audio", value: enabled)
+        mixingPreferenceGeneration &+= 1
+        nowPlaying.audioSessionUnavailable()
+        guard started, isPlaying || isBuffering || AudioSessionManager.isActive else { return }
+        let preference = mixingPreferenceGeneration
+        let selection = playGeneration
+        let intent = resumeGeneration
+        Task { [weak self] in
+            guard let self, self.mixingPreferenceGeneration == preference,
+                  self.playGeneration == selection, self.resumeGeneration == intent,
+                  self.isPlaying || self.isBuffering || AudioSessionManager.isActive else { return }
+            do {
+                // AudioSessionManager owns the serial worker queue. Awaiting
+                // here does not configure AVAudioSession on the main thread.
+                _ = try await AudioSessionManager.activate()
+                guard self.mixingPreferenceGeneration == preference,
+                      self.playGeneration == selection, self.resumeGeneration == intent,
+                      self.isPlaying else { return }
+                self.nowPlaying.updateRate(self.playbackRate, position: self.engine.positionSeconds())
+                self.nowPlaying.requestPrimaryIfPossible(reason: "mixing preference changed")
+            } catch {
+                guard self.mixingPreferenceGeneration == preference,
+                      self.playGeneration == selection, self.resumeGeneration == intent else { return }
+                self.audioActivationFailed(error)
+            }
+        }
+    }
+#endif
     var canPlayPrevious: Bool {
         playingIndex > 0 || (repeatMode == .all && !queue.isEmpty)
     }
@@ -435,6 +476,9 @@ final class PlaybackController {
     /// Invalidates an in-flight audio-session reactivation when another
     /// transport command arrives before it finishes.
     private var resumeGeneration: UInt64 = 0
+#if os(iOS)
+    @ObservationIgnored private var playbackStartTask: Task<Void, Never>?
+#endif
     private let nowPlaying = NowPlayingController()
     private let widgetPublisher = WidgetStatePublisher()
     private let headTracker = HeadTracker()
@@ -472,7 +516,7 @@ final class PlaybackController {
                     guard let self else { return }
                     NSLog("[BitChord] Audio interruption began")
                     if self.isPlaying || self.isBuffering {
-                        self.pausePlayback()
+                        self.pausePlayback(releaseAudioSession: true)
                         self.wasInterrupted = true
                     }
                 }
@@ -526,6 +570,17 @@ final class PlaybackController {
             }
             self.togglePlayPause()
         }
+#if os(iOS)
+        nowPlaying.onPlayAsync = { [weak self] in
+            guard let self else { throw CancellationError() }
+            self.nowPlaying.onPlay?()
+            let intent = self.resumeGeneration
+            let selection = self.playGeneration
+            await self.playbackStartTask?.value
+            guard self.resumeGeneration == intent, self.playGeneration == selection,
+                  self.isPlaying else { throw CancellationError() }
+        }
+#endif
         nowPlaying.onPause = { [weak self] in
             guard let self, self.isPlaying || self.isBuffering else { return }
             self.pausePlayback()
@@ -662,7 +717,7 @@ final class PlaybackController {
 
     private func audioActivationFailed(_ error: Error) {
         nowPlaying.audioSessionUnavailable()
-        if isPlaying || isBuffering { pausePlayback() }
+        if isPlaying || isBuffering { pausePlayback(releaseAudioSession: true) }
         lastError = "Audio session could not activate: \(error)"
     }
 
@@ -1097,7 +1152,10 @@ final class PlaybackController {
             // Reflect intent immediately so a second tap cancels this resume.
             state = .playing
             let engine = self.engine
-            Task.detached(priority: .userInitiated) { [weak self] in
+#if os(iOS)
+            let retainedActiveSession = AudioSessionManager.isActive
+#endif
+            let task = Task.detached(priority: .userInitiated) { [weak self] in
                 // The engine still owns the loaded source here. Its current
                 // format snapshot is enough to prepare the output after the
                 // audio session has been reactivated.
@@ -1122,6 +1180,21 @@ final class PlaybackController {
                 }
                 do {
                     _ = try gate.performIfCurrent(generation: selection) {
+#if os(iOS)
+                        // Keep RemoteIO's buffered audio and decoder history
+                        // when the activated hardware format still agrees;
+                        // rebuilding would discard that ring and re-seek AAC.
+                        let output = engine.outputDevice()
+                        if retainedActiveSession, AudioSessionManager.isActive,
+                           let sessionFormat, output.started,
+                           Double(output.sampleRate) == sessionFormat.rate,
+                           output.channels == sessionFormat.channels {
+                            let message = "resume retained output \(output.sampleRate) Hz / \(output.channels) ch"
+                            PlaybackDebugLog.shared.record(message)
+                            NSLog("[BitChord] %@", message)
+                            return
+                        }
+#endif
                         try engine.prepareTrackOutput(
                             sourceRate: sourceFormat.sampleRate,
                             sourceChannels: sourceFormat.channels,
@@ -1159,10 +1232,15 @@ final class PlaybackController {
                     }
                 }
             }
+#if os(iOS)
+            playbackStartTask = task
+#else
+            _ = task
+#endif
         }
     }
 
-    private func pausePlayback() {
+    private func pausePlayback(releaseAudioSession: Bool = false) {
         resumeGeneration &+= 1
         wasInterrupted = false
         let loading = state == .buffering
@@ -1178,7 +1256,18 @@ final class PlaybackController {
         }
         nowPlaying.updateRate(0, position: position)
         persistSession()
+#if os(iOS)
+        // Ordinary pause is a resumable media session. Deactivation drops
+        // native eligibility and invalidates RemoteIO; retain activation until
+        // playback is abandoned or another app interrupts this session.
+        if releaseAudioSession || loading {
+            deactivateAudioSessionIfIdle()
+        } else {
+            debugLog.record("paused playback retains audio session active=\(AudioSessionManager.isActive)")
+        }
+#else
         deactivateAudioSessionIfIdle()
+#endif
     }
 
     private func deactivateAudioSessionIfIdle() {
@@ -1655,7 +1744,7 @@ final class PlaybackController {
                     await MainActor.run { [weak self] in
                         guard let self, self.sleepDeadline == deadline else { return }
                         self.sleepDeadline = nil; self.sleepSecondsRemaining = nil; self.sleepTask = nil
-                        self.pausePlayback()
+                        self.pausePlayback(releaseAudioSession: true)
                         self.debugLog.record("sleep deadline expired; output paused and gain restored")
                     }
                     return
@@ -1819,7 +1908,7 @@ final class PlaybackController {
         let loadSubmissionGate = self.loadSubmissionGate
         let prefs = ResolvePrefs.current()
         let resume = startAt ?? 0
-        Task.detached(priority: .utility) {
+        let task = Task.detached(priority: .utility) {
             do {
                 // In particular, after a cold restore the output task and the
                 // track resolver used to race. A quick local/cache resolve
@@ -1927,6 +2016,11 @@ final class PlaybackController {
                 }
             }
         }
+#if os(iOS)
+        playbackStartTask = task
+#else
+        _ = task
+#endif
     }
 
     /// Resolves the entry's source to an engine-loadable string. Local paths
@@ -2763,6 +2857,13 @@ final class PlaybackController {
         if state == .buffering && (newState == .playing || newState == .stopped) { return }
         // A stale natural-end/stop for a superseded source must not wipe the
         // new selection either; the gate owns that call.
+#if os(iOS)
+        // Transport intent is updated synchronously. Rust delivers Play/Pause
+        // acknowledgments later; an older acknowledgment must not reverse a
+        // newer tap or publish a contradictory native button state.
+        if (state == .paused && newState == .playing)
+            || (state == .playing && newState == .paused) { return }
+#endif
         state = newState
         if let current {
             nowPlaying.update(
@@ -2863,7 +2964,7 @@ final class PlaybackController {
         if !source.isEmpty, let loaded = loadedSourcePath, loaded != source { return }
         if sleepAfterTrack {
             sleepAfterTrack = false
-            pausePlayback()
+            pausePlayback(releaseAudioSession: true)
             try? engine.holdTrackEnd(hold: false)
             try? engine.setSleepGain(gain: 1)
             return
@@ -4208,6 +4309,154 @@ private final class AutoPlayAdapter: AutoPlayBridgeAutoPlayCallback {
 
 #if DEBUG
 extension PlaybackController {
+#if os(iOS)
+    /// An explicit diagnostic launch exercises the real controller, RemoteIO,
+    /// decoder and published MediaSession. User queue/preferences are restored.
+    func verifyNativeResumeBehavior() async {
+        let engine = self.engine
+        let savedQueue = UserDefaults.standard.data(forKey: "bitchord_last_played")
+        let savedContext = PlatformSettings.shared.getString(key: "last_playback_context", default: "")
+        let savedMixing = mixWithOtherAudio
+        let savedAutomix = automixEnabled
+        let savedVolume = volume
+        let background = UIApplication.shared.beginBackgroundTask(withName: "native resume verification")
+        defer {
+            UIApplication.shared.endBackgroundTask(background)
+            setMixWithOtherAudio(savedMixing)
+            setAutomixEnabled(savedAutomix)
+            volume = savedVolume
+            if let savedQueue { UserDefaults.standard.set(savedQueue, forKey: "bitchord_last_played") }
+            else { UserDefaults.standard.removeObject(forKey: "bitchord_last_played") }
+            PlatformSettings.shared.putString(key: "last_playback_context", value: savedContext)
+            restoreSession()
+        }
+        var checks: [String: Bool] = nowPlaying.verifyModernObservation()
+        var samples: [[String: Any]] = []
+        func sample(_ label: String) {
+            let health = engine.outputHealth()
+            let row: [String: Any] = ["label": label, "position": engine.positionSeconds(),
+                "state": String(describing: state), "audioActive": AudioSessionManager.isActive,
+                "rebuilds": health.outputRebuilds, "buffered": health.bufferedFrames,
+                "underruns": health.callbackUnderruns, "peak": health.outputPeak]
+            samples.append(row)
+            debugLog.record("native resume verification \(row)")
+        }
+        do {
+            let directory = FileManager.default.temporaryDirectory
+            let wav = directory.appendingPathComponent("native-resume-fixture.wav")
+            let aac = directory.appendingPathComponent("native-resume-fixture.m4a")
+            let format = AVAudioFormat(standardFormatWithSampleRate: 44100, channels: 2)!
+            let count: AVAudioFrameCount = 44100 * 40
+            let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: count)!
+            buffer.frameLength = count
+            for channel in 0..<2 {
+                for frame in 0..<Int(count) {
+                    // Vary the signal with time so a repeated output segment is
+                    // distinguishable from an ordinary steady test tone.
+                    let seconds = Double(frame) / 44100
+                    buffer.floatChannelData![channel][frame] = Float(sin(2 * .pi * (220 * seconds + 3 * seconds * seconds)) * 0.08)
+                }
+            }
+            do {
+                let pcm = try AVAudioFile(forWriting: wav, settings: format.settings)
+                try pcm.write(from: buffer)
+            }
+            do {
+                let compressed = try AVAudioFile(forWriting: aac, settings: [
+                    AVFormatIDKey: kAudioFormatMPEG4AAC, AVSampleRateKey: 44100,
+                    AVNumberOfChannelsKey: 2, AVEncoderBitRateKey: 128000
+                ], commonFormat: .pcmFormatFloat32, interleaved: false)
+                try compressed.write(from: buffer)
+            }
+            setMixWithOtherAudio(false)
+            setAutomixEnabled(false)
+            volume = 0.08
+            for fixture in [wav, aac] {
+                let name = fixture.pathExtension
+                let entry = QueueEntry(id: "native-resume-\(name)", title: "Resume verification", artist: "BitChord", source: fixture.path, durationText: "0:40", isLocal: true)
+                play([entry])
+                await playbackStartTask?.value
+                try await Task.sleep(for: .seconds(2))
+                checks["\(name)_initial_progress"] = isPlaying && engine.positionSeconds() > 1
+                sample("\(name) initial")
+                for (cycle, delay) in [0.3, 10.0, 0.3].enumerated() {
+                    nowPlaying.onPause?()
+                    let pausedPosition = engine.positionSeconds()
+                    let rebuilds = engine.outputHealth().outputRebuilds
+                    try await Task.sleep(for: .seconds(delay))
+                    checks["\(name)_\(cycle)_stable_pause"] = state == .paused && abs(engine.positionSeconds() - pausedPosition) < 0.1
+                    checks["\(name)_\(cycle)_retained_activation"] = AudioSessionManager.isActive
+                    sample("\(name) paused \(cycle)")
+                    try await nowPlaying.onPlayAsync?()
+                    var positions: [Double] = []
+                    for _ in 0..<12 {
+                        try await Task.sleep(for: .milliseconds(200))
+                        positions.append(engine.positionSeconds())
+                    }
+                    checks["\(name)_\(cycle)_resume_progress"] = positions.last! > pausedPosition + 1.5
+                    checks["\(name)_\(cycle)_monotonic"] = zip(positions, positions.dropFirst()).allSatisfy { $1 + 0.02 >= $0 }
+                    checks["\(name)_\(cycle)_no_rebuild"] = engine.outputHealth().outputRebuilds == rebuilds
+                    checks["\(name)_\(cycle)_audible_output"] = engine.outputHealth().outputPeak > 0.00001
+                    sample("\(name) resumed \(cycle)")
+                }
+                // The output must NOT be reused after an interruption or an
+                // explicit session release, even if its hardware format agrees.
+                pausePlayback()
+                // Model an inactive output without asking a previously
+                // interrupted competing app to resume halfway through this
+                // controlled recovery measurement.
+                await AudioSessionManager.deactivate(notifyOthers: false)
+                let interruptedPosition = engine.positionSeconds()
+                let interruptedRebuilds = engine.outputHealth().outputRebuilds
+                try await nowPlaying.onPlayAsync?()
+                try await Task.sleep(for: .seconds(2))
+                checks["\(name)_released_session_recovers"] = isPlaying && engine.positionSeconds() > interruptedPosition + 1 && engine.outputHealth().outputRebuilds > interruptedRebuilds
+                checks["\(name)_released_session_audible"] = engine.outputHealth().outputPeak > 0.00001
+                sample("\(name) released-session recovery")
+
+                // Pause during an unfinished native Play must win. A later
+                // fresh Play must remain usable after the cancelled completion.
+                nowPlaying.onPause?()
+                let cancelledPosition = engine.positionSeconds()
+                let pendingPlay = Task { @MainActor in try await self.nowPlaying.onPlayAsync?() }
+                await Task.yield()
+                nowPlaying.onPause?()
+                _ = try? await pendingPlay.value
+                try await Task.sleep(for: .milliseconds(500))
+                checks["\(name)_rapid_pause_wins"] = state == .paused && abs(engine.positionSeconds() - cancelledPosition) < 0.15
+                try await nowPlaying.onPlayAsync?()
+                try await Task.sleep(for: .seconds(2))
+                checks["\(name)_fresh_play_after_cancellation"] = isPlaying && engine.positionSeconds() > cancelledPosition + 1
+                sample("\(name) fresh play after cancellation")
+                nowPlaying.onPause?()
+                let mixingPosition = engine.positionSeconds()
+                setMixWithOtherAudio(true)
+                _ = try await AudioSessionManager.activate()
+                checks["\(name)_paused_mixing_on"] = !isPlaying && AVAudioSession.sharedInstance().categoryOptions.contains(.mixWithOthers)
+                setMixWithOtherAudio(false)
+                _ = try await AudioSessionManager.activate()
+                checks["\(name)_paused_mixing_off"] = !isPlaying && !AVAudioSession.sharedInstance().categoryOptions.contains(.mixWithOthers)
+                checks["\(name)_paused_mixing_keeps_position"] = abs(engine.positionSeconds() - mixingPosition) < 0.15
+            }
+        } catch {
+            checks["runtime_error"] = false
+            debugLog.record("native resume verification error: \(error)")
+        }
+        pausePlayback()
+        playGeneration &+= 1
+        resumeGeneration &+= 1
+        loadSubmissionGate.advance(to: playGeneration) { try? engine.stop() }
+        nowPlaying.stop()
+        await AudioSessionManager.deactivate()
+        let result: [String: Any] = ["checks": checks, "samples": samples,
+            "passed": !checks.isEmpty && checks.values.allSatisfy { $0 }]
+        let report = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0].appendingPathComponent("native-resume-verification.json")
+        if let data = try? JSONSerialization.data(withJSONObject: result, options: [.prettyPrinted, .sortedKeys]) { try? data.write(to: report, options: .atomic) }
+        debugLog.record("native resume verification result \(checks)")
+        print("NATIVE RESUME VERIFICATION \(checks)")
+    }
+#endif
+
     /// Runs only on an explicit validation launch in a separate app container.
     func verifySleepBehavior() async {
         #if os(iOS)

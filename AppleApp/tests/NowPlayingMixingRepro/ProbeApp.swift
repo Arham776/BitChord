@@ -13,8 +13,8 @@ struct ProbeApp: App {
     var body: some Scene {
         WindowGroup {
             VStack(spacing: 20) {
-                Text("Now Playing mixing reproduction").font(.title2)
-                Text("A quiet 220 Hz tone uses playback + mixWithOthers.")
+                Text("Now Playing API reproduction").font(.title2)
+                Text(model.exclusive ? "A quiet tone uses exclusive playback." : "A quiet tone uses playback + mixWithOthers.")
                 Button(model.playing ? "Pause" : "Play mixed tone") {
                     Task {
                         if model.playing { model.pause() }
@@ -27,8 +27,13 @@ struct ProbeApp: App {
                 Spacer()
             }.padding()
                 .task {
-                    if ProcessInfo.processInfo.arguments.contains("--play-mixed-tone") {
+                    if ProcessInfo.processInfo.arguments.contains("--play-mixed-tone")
+                        || ProcessInfo.processInfo.arguments.contains("--state-sync") {
                         await model.play()
+                        if ProcessInfo.processInfo.arguments.contains("--state-sync") {
+                            try? await Task.sleep(for: .seconds(4))
+                            model.pause()
+                        }
                     }
                 }
                 .onChange(of: scenePhase) { _, phase in
@@ -52,6 +57,7 @@ final class ProbePlayer: MediaSessionRepresentable {
     @ObservationIgnored private var generation = 0
     @ObservationIgnored private var promoting = false
     private let usesGenericContent = ProcessInfo.processInfo.arguments.contains("--generic-content")
+    let exclusive = ProcessInfo.processInfo.arguments.contains("--exclusive")
 
     var content: (any MediaContentRepresentable)? {
         guard player != nil else { return nil }
@@ -72,8 +78,8 @@ final class ProbePlayer: MediaSessionRepresentable {
     }
 
     var commands: [MediaCommand] { [
-        .play { await self.play() },
-        .pause { self.pause() },
+        .play { self.record("native play before=\(self.playing)"); await self.play() },
+        .pause { self.record("native pause before=\(self.playing)"); self.pause() },
         .seekToPosition { seconds in
             self.player?.currentTime = min(max(seconds, 0), 8)
             self.elapsed = self.player?.currentTime ?? 0
@@ -86,9 +92,10 @@ final class ProbePlayer: MediaSessionRepresentable {
         generation += 1
         let intent = generation
         do {
+            let options: AVAudioSession.CategoryOptions = exclusive ? [] : [.mixWithOthers]
             try await Task.detached {
                 let audio = AVAudioSession.sharedInstance()
-                try audio.setCategory(.playback, mode: .default, options: [.mixWithOthers])
+                try audio.setCategory(.playback, mode: .default, options: options)
                 try audio.setActive(true)
                 NSLog("[NowPlayingProbe] activation category=%@ options=%lu otherAudio=%d",
                       audio.category.rawValue, audio.categoryOptions.rawValue, audio.isOtherAudioPlaying)

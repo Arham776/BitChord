@@ -35,8 +35,32 @@ Device verification (iOS/iPadOS 27):
    Stop the competing app and verify system arbitration while BitChord stays
    in the background. Apple controls which session receives prominence.
    Repeat with mixing disabled as an explicitly chosen exclusive-mode control.
+   While playing, change Play Alongside Other Apps in Settings: the effective
+   options must follow that explicit choice immediately and the publication log
+   must identify `mixing preference changed`. Changing it while paused must not
+   resume playback. An ordinary iOS pause retains its active session so native
+   controls remain available; changing mode during that pause must apply the
+   choice without playing audio or requesting takeover. Native controls are not guaranteed for a mixable session;
+   Apple's WWDC22 eligibility guidance requires nonmixable audio.
+   The main-pane pill must show Audio Output, the waveform mixing toggle, then
+   Listen Together. Highlighted waveform means mixing enabled. Verify its value
+   agrees with Settings, survives relaunch, and follows rapid toggles while
+   playing or loading. Pause or stop during activation: late completion must
+   not promote or restart playback. Check portrait/landscape and iPad; the queue
+   pill keeps its four controls, lyrics keeps the existing two, and macOS has
+   no mixing button or new preference-update logic.
 4. Repeat next/back/pause from the Lock Screen, Control Center, Dynamic Island
    and headphones. Repeat on iPad (without Dynamic Island).
+   Native Pause/Play must settle on the actual state without oscillating. Resume
+   quickly and after a longer pause: audio must continue cleanly at the paused
+   position. An unchanged iOS output format should log `resume retained output`
+   without an output rebuild/decoder seek only while activation stayed valid.
+   On iOS, Pause must log `iOS output rendering paused` while retaining session
+   activation; Resume must log `iOS output rendering started`. A silent but
+   continuously running RemoteIO callback is not a transport pause.
+   Deactivation/interruption requires recovery even if the format is unchanged.
+   Change routes while paused and repeat
+   to check recovery, then rapidly alternate Pause/Play during activation.
 5. Enable Automix and allow a natural handoff. Only the intended transition may
    overlap. Skip during the blend: the outgoing voices must stop. Pause/resume
    during the blend: neither track may continue during the pause.

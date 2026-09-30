@@ -1023,13 +1023,41 @@ struct NowPlayingView: View {
                 Image(systemName: "headphones")
                     .font(.system(size: 23, weight: .regular))
                     .foregroundStyle(.white.opacity(0.88))
-                    .frame(width: 64, height: 44)
+                    .frame(width: outputPartyButtonWidth, height: 44)
                     .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
             .accessibilityLabel("Audio output")
 
             pillDivider
+
+#if os(iOS)
+            if pane == .main {
+                Button {
+                    let enabled = !controller.mixWithOtherAudio
+                    Haptics.play(enabled ? .toggleOn : .toggleOff)
+                    controller.setMixWithOtherAudio(enabled)
+                } label: {
+                    Image(systemName: "waveform")
+                        .font(.system(size: 23, weight: .regular))
+                        .foregroundStyle(.white.opacity(controller.mixWithOtherAudio ? 1 : 0.75))
+                        .frame(width: outputPartyButtonWidth, height: 44)
+                        .background(.white.opacity(controller.mixWithOtherAudio ? 0.14 : 0))
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .accessibilityIdentifier("player.audioMixing")
+                .accessibilityLabel("Mix with Other Apps")
+                .accessibilityValue(controller.mixWithOtherAudio ? "On" : "Off")
+                .accessibilityHint(controller.mixWithOtherAudio
+                    ? "Turn off to give BitChord audio priority. Other apps may pause."
+                    : "Turn on to keep other apps audible.")
+                .accessibilityAddTraits(controller.mixWithOtherAudio ? .isSelected : [])
+                .help(controller.mixWithOtherAudio ? "Mixing on" : "BitChord audio priority")
+
+                pillDivider
+            }
+#endif
 
             Button {
                 Haptics.play(.tap)
@@ -1042,7 +1070,7 @@ struct NowPlayingView: View {
                 Image(systemName: "person.fill")
                     .font(.system(size: 22, weight: .regular))
                     .foregroundStyle(.white.opacity(party.inParty ? 1 : 0.75))
-                    .frame(width: 64, height: 44)
+                    .frame(width: outputPartyButtonWidth, height: 44)
                     .background(.white.opacity(party.inParty ? 0.14 : 0))
                     .contentShape(Rectangle())
             }
@@ -1052,6 +1080,14 @@ struct NowPlayingView: View {
         .background(.white.opacity(0.12))
         .clipShape(Capsule())
         .accessibilityElement(children: .contain)
+    }
+
+    private var outputPartyButtonWidth: CGFloat {
+#if os(iOS)
+        pane == .main ? 52 : 64
+#else
+        64
+#endif
     }
 
     /// The phone queue keeps its established shuffle/repeat/AutoPlay pill.

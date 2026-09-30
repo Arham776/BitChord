@@ -39,6 +39,7 @@ final class NowPlayingLifecycle {
     private var recreated = false
     private var playing = false
     private(set) var contentID: String?
+    var hasSession: Bool { session != nil }
 
     init(makeSession: @escaping () -> (any NowPlayingSessionDriver)?,
          audioReady: @escaping () -> Bool,
@@ -221,5 +222,34 @@ final class NowPlayingLifecycle {
             + "eligible=\(session?.canBecomeApplicationPrimary.description ?? "none") "
             + "applicationPrimary=\(session?.isApplicationPrimary.description ?? "none") "
             + "systemPrimary=\(session?.isSystemPrimary.description ?? "none")")
+    }
+}
+
+/// Native command success must follow the asynchronous playback start. A
+/// delayed activation/load may finish after Pause, Stop, or a newer selection.
+@MainActor
+enum NowPlayingCommandCompletion {
+    static func perform(action: () async throws -> Void,
+                        stillCurrent: () -> Bool) async throws {
+        try await action()
+        guard !Task.isCancelled, stillCurrent() else { throw CancellationError() }
+    }
+}
+
+/// Publish rate, elapsed time and timestamp as one observable value. Updating
+/// them independently lets native UI read a mixture of old and new transport.
+struct NowPlayingPlaybackState: Equatable {
+    var rate: Double = 0
+    var position: Double = 0
+    var preparing = false
+    var timestamp = Date()
+
+    func updating(rate: Double? = nil, position: Double? = nil,
+                  preparing: Bool? = nil, at timestamp: Date = Date()) -> Self {
+        let nextRate = rate.map { $0.isFinite ? max(0, $0) : 0 } ?? self.rate
+        let nextPosition = position.flatMap { $0.isFinite ? max(0, $0) : nil } ?? self.position
+        let nextPreparing = preparing ?? (rate != nil && nextRate == 0 ? false : self.preparing)
+        guard nextRate != self.rate || nextPosition != self.position || nextPreparing != self.preparing else { return self }
+        return Self(rate: nextRate, position: nextPosition, preparing: nextPreparing, timestamp: timestamp)
     }
 }

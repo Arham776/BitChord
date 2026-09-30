@@ -33,6 +33,12 @@ struct BitChordApp: App {
                 .environment(party)
                 .task {
                     #if DEBUG
+                    #if os(iOS)
+                    if ProcessInfo.processInfo.arguments.contains("--verify-native-resume") {
+                        await controller.verifyNativeResumeBehavior()
+                        return
+                    }
+                    #endif
                     if ProcessInfo.processInfo.arguments.contains("--verify-sleep") {
                         await controller.verifySleepBehavior()
                         return
