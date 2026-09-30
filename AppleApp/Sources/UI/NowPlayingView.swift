@@ -455,7 +455,10 @@ struct NowPlayingView: View {
             if pane != .main {
                 Group {
                     if pane == .queue {
-                        UpNextPane(showsCurrentTrackHeader: false)
+                        UpNextPane(
+                            showsCurrentTrackHeader: false,
+                            onOpenLyrics: { pane = .lyrics }
+                        )
                             .transition(.opacity)
                     } else {
                         desktopLyricsPane
@@ -1569,112 +1572,26 @@ private struct UpNextPane: View {
     var onOpenLyrics: () -> Void = {}
     @State private var hasScrolledOnce = false
 
-    private var usesExpandedQueueLayout: Bool {
-        #if os(macOS)
-        true
-        #else
-        UIDevice.current.userInterfaceIdiom == .pad
-        #endif
-    }
-
+    /// The queue list, one layout on every platform: "Queue" with Clear, a
+    /// "Now playing" section for the current track, "Up next" with drag
+    /// handles left and remove buttons right, the AutoPlay section, and a
+    /// Lyrics link at the foot. iPad and mac used to render a separate
+    /// "Continue Playing" list (no sections, swipe-only delete); the two
+    /// layouts disagreed about what a queue is, so there is one now.
     @ViewBuilder
     var body: some View {
-        if usesExpandedQueueLayout {
-            expandedQueue
-        } else {
-            legacyPhoneQueue
-        }
+        queueList
     }
 
-    private var expandedQueue: some View {
-        VStack(alignment: .leading, spacing: 0) {
+    private var queueList: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            // The big current-track header (artwork, like, menu) only where
+            // the artwork column is absent. iPad landscape and mac show all
+            // of that on the left already; repeating it here doubles the
+            // song, the like and the menu.
             if showsCurrentTrackHeader {
                 queueHeader
-                    .padding(.top, 8)
-                    .padding(.bottom, 14)
             }
-
-            if showsCurrentTrackHeader {
-                queueTitleAndClear
-                    .padding(.horizontal, 24)
-                    .padding(.bottom, 8)
-            } else {
-                queueTitleAndClear
-                    .padding(.horizontal, 24)
-                    .padding(.bottom, 8)
-            }
-
-            if controller.current == nil && manualUpcoming.isEmpty && autoplayUpcoming.isEmpty {
-                Text("Nothing playing.")
-                    .font(.callout)
-                    .foregroundStyle(.white.opacity(0.58))
-                    .padding(.top, 12)
-                    .padding(.horizontal, 24)
-                Spacer(minLength: 0)
-            } else if manualUpcoming.isEmpty && autoplayUpcoming.isEmpty {
-                Text("No upcoming songs")
-                    .font(.callout)
-                    .foregroundStyle(.white.opacity(0.58))
-                    .padding(.top, 12)
-                    .padding(.horizontal, 24)
-                Spacer(minLength: 0)
-            } else {
-                ScrollViewReader { proxy in
-                    List {
-                        ForEach(Array(manualUpcoming.enumerated()), id: \.element.id) { localIndex, item in
-                            queueRow(item, section: 0, index: localIndex, rows: manualUpcoming)
-                                .id(localIndex == 0 ? "queueListTop" : item.id)
-                        }
-                        .onMove { source, dest in
-                            move(source, dest, rows: manualUpcoming)
-                        }
-                        .onDelete { offsets in
-                            remove(offsets, rows: manualUpcoming)
-                        }
-
-                        ForEach(Array(autoplayUpcoming.enumerated()), id: \.element.id) { localIndex, item in
-                            queueRow(item, section: 1, index: localIndex, rows: autoplayUpcoming)
-                                .id(manualUpcoming.isEmpty && localIndex == 0 ? "queueListTop" : item.id)
-                        }
-                        .onMove { source, dest in
-                            move(source, dest, rows: autoplayUpcoming)
-                        }
-                        .onDelete { offsets in
-                            remove(offsets, rows: autoplayUpcoming)
-                        }
-                    }
-                    .listStyle(.plain)
-                    .scrollContentBackground(.hidden)
-                    // Keep the first row fully legible; fade only where the list
-                    // reaches the pinned transport at the bottom.
-                    .mask(alignment: .bottom) {
-                        LinearGradient(
-                            stops: [
-                                .init(color: .black, location: 0),
-                                .init(color: .black, location: 0.88),
-                                .init(color: .clear, location: 1),
-                            ],
-                            startPoint: .top, endPoint: .bottom
-                        )
-                    }
-                    .animation(.easeOut(duration: 0.2), value: queueSignature)
-                    .onChange(of: controller.playingIndex) { _, _ in
-                        if hasScrolledOnce {
-                            withAnimation { proxy.scrollTo("queueListTop", anchor: .top) }
-                        } else {
-                            proxy.scrollTo("queueListTop", anchor: .top)
-                            hasScrolledOnce = true
-                        }
-                    }
-                }
-            }
-        }
-        .padding(.top, 8)
-    }
-
-    private var legacyPhoneQueue: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            queueHeader
             HStack(alignment: .firstTextBaseline) {
                 Text("Queue")
                     .font(.title2.weight(.bold))
@@ -1708,7 +1625,7 @@ private struct UpNextPane: View {
                                 .listRowBackground(Color.clear)
                                 .listRowSeparator(.hidden)
                                 .listRowInsets(EdgeInsets(top: 12, leading: 24, bottom: 6, trailing: 24))
-                            legacyCurrentRow
+                            currentQueueRow
                         }
                         if !manualUpcoming.isEmpty {
                             Text("Up next")
@@ -1719,7 +1636,7 @@ private struct UpNextPane: View {
                                 .listRowSeparator(.hidden)
                                 .listRowInsets(EdgeInsets(top: 16, leading: 24, bottom: 6, trailing: 24))
                             ForEach(Array(manualUpcoming.enumerated()), id: \.element.id) { localIndex, item in
-                                legacyPhoneQueueRow(item, section: 0, index: localIndex, rows: manualUpcoming)
+                                queueListRow(item, section: 0, index: localIndex, rows: manualUpcoming)
                             }
                             .onMove { source, dest in move(source, dest, rows: manualUpcoming) }
                             .onDelete { offsets in remove(offsets, rows: manualUpcoming) }
@@ -1748,7 +1665,7 @@ private struct UpNextPane: View {
                             .listRowInsets(EdgeInsets(top: 14, leading: 24, bottom: 14, trailing: 24))
                             if !autoplayUpcoming.isEmpty {
                                 ForEach(Array(autoplayUpcoming.enumerated()), id: \.element.id) { localIndex, item in
-                                    legacyPhoneQueueRow(item, section: 1, index: localIndex, rows: autoplayUpcoming)
+                                    queueListRow(item, section: 1, index: localIndex, rows: autoplayUpcoming)
                                 }
                                 .onMove { source, dest in move(source, dest, rows: autoplayUpcoming) }
                                 .onDelete { offsets in remove(offsets, rows: autoplayUpcoming) }
@@ -1803,7 +1720,7 @@ private struct UpNextPane: View {
         .padding(.top, 8)
     }
 
-    private var legacyCurrentRow: some View {
+    private var currentQueueRow: some View {
         Button {
             let at = controller.playingIndex
             if controller.queue.indices.contains(at) {
@@ -1836,7 +1753,7 @@ private struct UpNextPane: View {
         .listRowSeparator(.hidden)
     }
 
-    private func legacyPhoneQueueRow(_ item: QueueRow, section: Int, index: Int, rows: [QueueRow]) -> some View {
+    private func queueListRow(_ item: QueueRow, section: Int, index: Int, rows: [QueueRow]) -> some View {
         HStack(spacing: 10) {
             Image(systemName: "line.3.horizontal")
                 .font(.body.weight(.medium))
@@ -1883,34 +1800,6 @@ private struct UpNextPane: View {
         .onDrop(of: [.text], delegate: QueueReorderDelegate(section: section, rows: rows, destIndex: index) { from, dest in
             move(IndexSet(integer: from), dest, rows: rows)
         })
-    }
-
-    private var queueTitleAndClear: some View {
-        HStack(alignment: .firstTextBaseline, spacing: 12) {
-            VStack(alignment: .leading, spacing: 2) {
-                Text("Continue Playing")
-                    .font(.title2.weight(.bold))
-                    .foregroundStyle(.white)
-                    .lineLimit(1)
-                if let context = controller.playbackContext, !context.isEmpty {
-                    Text("From \(context)")
-                        .font(.caption)
-                        .foregroundStyle(.white.opacity(0.62))
-                        .lineLimit(1)
-                }
-            }
-            Spacer(minLength: 0)
-            if !manualUpcoming.isEmpty || !autoplayUpcoming.isEmpty {
-                Button("Clear") { controller.clearUpcoming() }
-                    .buttonStyle(.plain)
-                    .font(.callout.weight(.semibold))
-                    #if os(macOS)
-                    .foregroundStyle(.red)
-                    #else
-                    .foregroundStyle(Color.accentColor)
-                    #endif
-            }
-        }
     }
 
     private var autoplayStart: Int { controller.autoplaySectionStart }
@@ -1974,112 +1863,6 @@ private struct UpNextPane: View {
     /// else does.
     private var queueSignature: String {
         (manualUpcoming.map(\.id) + autoplayUpcoming.map(\.id)).joined(separator: "|")
-    }
-
-    private func queueRow(_ item: QueueRow, section: Int, index: Int, rows: [QueueRow]) -> some View {
-        #if os(macOS)
-        let artworkSide: CGFloat = 36
-        let rowInsets = EdgeInsets(top: 5, leading: 16, bottom: 5, trailing: 16)
-        let titleFont: Font = .system(size: 14, weight: .medium)
-        let detailFont: Font = .system(size: 12)
-        #else
-        let artworkSide: CGFloat = 44
-        let rowInsets = EdgeInsets(top: 6, leading: 24, bottom: 6, trailing: 20)
-        let titleFont: Font = .body.weight(.medium)
-        let detailFont: Font = .caption
-        #endif
-
-        return HStack(spacing: 10) {
-            Button {
-                controller.playQueueItem(at: item.index)
-            } label: {
-                HStack(spacing: 12) {
-                    ArtworkView(entry: item.entry, side: artworkSide)
-                        .clipShape(.rect(cornerRadius: 6, style: .continuous))
-                    VStack(alignment: .leading, spacing: 2) {
-                        HStack(spacing: 5) {
-                            Text(item.entry.title)
-                                .font(titleFont)
-                                .foregroundStyle(.white)
-                                .lineLimit(1)
-                            if item.entry.isExplicit == true {
-                                Text("E")
-                                    .font(.system(size: 9, weight: .heavy))
-                                    .foregroundStyle(.white.opacity(0.85))
-                                    .padding(.horizontal, 3)
-                                    .padding(.vertical, 1)
-                                    .background(.white.opacity(0.22), in: RoundedRectangle(cornerRadius: 2))
-                            }
-                        }
-                        Text(queueDetail(for: item.entry))
-                            .font(detailFont)
-                            .foregroundStyle(.white.opacity(0.66))
-                            .lineLimit(1)
-                    }
-                    Spacer(minLength: 0)
-                }
-                .contentShape(.rect)
-            }
-            .buttonStyle(.plain)
-
-            #if os(macOS)
-            Menu {
-                Button("Play") { controller.playQueueItem(at: item.index) }
-                Button("Remove from Queue", role: .destructive) {
-                    controller.removeFromQueue(at: IndexSet(integer: item.index))
-                }
-            } label: {
-                Image(systemName: "ellipsis")
-                    .font(.system(size: 13, weight: .semibold))
-                    .foregroundStyle(.white.opacity(0.65))
-                    .frame(width: 34, height: 40)
-                    .contentShape(.rect)
-            }
-            .menuStyle(.borderlessButton)
-            .menuIndicator(.hidden)
-            .accessibilityLabel("Actions for \(item.entry.title)")
-            #else
-            Image(systemName: "line.3.horizontal")
-                .font(.body.weight(.medium))
-                .foregroundStyle(.white.opacity(0.4))
-                .frame(width: 32, height: 44)
-                .contentShape(.rect)
-                .onDrag { NSItemProvider(object: "\(section):\(index)" as NSString) }
-                .accessibilityLabel("Reorder \(item.entry.title)")
-            #endif
-        }
-        .overlay(alignment: .bottom) {
-            Rectangle()
-                .fill(.white.opacity(0.12))
-                .frame(height: 1)
-                .padding(.leading, artworkSide + 14)
-        }
-        .listRowBackground(Color.clear)
-        .listRowSeparator(.hidden)
-        .listRowInsets(rowInsets)
-        .onDrop(of: [.text], delegate: QueueReorderDelegate(section: section, rows: rows, destIndex: index) { from, dest in
-            move(IndexSet(integer: from), dest, rows: rows)
-        })
-        #if os(macOS)
-        .onDrag { NSItemProvider(object: "\(section):\(index)" as NSString) }
-        .contextMenu {
-            Button("Play") { controller.playQueueItem(at: item.index) }
-            Button("Remove from Queue", role: .destructive) {
-                controller.removeFromQueue(at: IndexSet(integer: item.index))
-            }
-        }
-        #else
-        .swipeActions(edge: .trailing, allowsFullSwipe: true) {
-            Button("Remove", systemImage: "xmark", role: .destructive) {
-                controller.removeFromQueue(at: IndexSet(integer: item.index))
-            }
-        }
-        #endif
-    }
-
-    private func queueDetail(for entry: QueueEntry) -> String {
-        guard let album = entry.albumName, !album.isEmpty else { return entry.artist }
-        return "\(entry.artist) — \(album)"
     }
 
     private func move(_ source: IndexSet, _ dest: Int, rows: [QueueRow]) {
