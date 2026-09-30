@@ -1865,10 +1865,11 @@ final class PlaybackController {
             let source = try await Self.resolveYouTube(videoId: videoId, prefs: prefs)
             return ResolveOutcome(source: source, leftover: nil)
         }
-        if let cached = await StreamFileCache.shared.path(for: videoId) {
+        if let cached = await StreamFileCache.shared.path(for: videoId, maxKbps: prefs.maxKbps, requireLossless: prefs.wantLossless) {
+            let metadata = await StreamFileCache.shared.metadata(at: cached)
             return ResolveOutcome(
                 source: ResolvedSource(
-                    source: cached, headers: [:], kbps: 0, origin: .cache
+                    source: cached, headers: [:], kbps: metadata?.kbps ?? 0, loudnessDb: metadata?.relativeLoudnessDb, origin: .cache
                 ),
                 leftover: nil
             )
@@ -1981,7 +1982,7 @@ final class PlaybackController {
         }
         do {
             let localPath = try await streamViaKtor(
-                videoId: videoId, url: stream.url, headers: stream.headers)
+                videoId: videoId, url: stream.url, headers: stream.headers, codec: stream.mimeType.lowercased().contains("opus") ? "Opus" : "AAC", kbps: stream.kbps, relativeLoudnessDb: stream.loudnessDb)
             return ResolvedSource(
                 source: localPath, headers: [:], kbps: stream.kbps,
                 loudnessDb: stream.loudnessDb, origin: .youtube
@@ -2000,7 +2001,7 @@ final class PlaybackController {
                 )
                 do {
                     let localPath = try await streamViaKtor(
-                        videoId: videoId, url: fresh.url, headers: fresh.headers)
+                        videoId: videoId, url: fresh.url, headers: fresh.headers, codec: fresh.mimeType.lowercased().contains("opus") ? "Opus" : "AAC", kbps: fresh.kbps, relativeLoudnessDb: fresh.loudnessDb)
                     return ResolvedSource(
                         source: localPath, headers: [:], kbps: fresh.kbps,
                         loudnessDb: fresh.loudnessDb, origin: .youtube
@@ -2146,6 +2147,8 @@ final class PlaybackController {
         /// Path of a download that has its first bytes, set before the
         /// downloader's continuation resumes so a second resolve cannot miss it.
         var growing: [String: String] = [:]
+        var growingQuality: [String: String] = [:]
+        var growingKbps: [String: Int] = [:]
     }
 
     private static let streamGate = StreamGate()
@@ -2155,32 +2158,34 @@ final class PlaybackController {
     /// appending; [StreamFileCache] is filled when the last one lands so a
     /// re-tap does not fetch again.
     private static func streamViaKtor(
-        videoId: String, url: String, headers: [String: String]
+        videoId: String, url: String, headers: [String: String], codec: String = "unknown", kbps: Int = 0, relativeLoudnessDb: Double? = nil
     ) async throws -> String {
+        let taskKey = videoId + "|" + StreamFileCache.qualityIdentity + "|" + DiskCache.hashName(url)
         let task: Task<String, Error> = streamGate.lock.withLock {
-            if let existing = streamGate.tasks[videoId] { return existing }
-            let created = Task { try await streamViaKtorOnce(videoId: videoId, url: url, headers: headers) }
-            streamGate.tasks[videoId] = created
+            if let existing = streamGate.tasks[taskKey] { return existing }
+            let created = Task { try await streamViaKtorOnce(videoId: videoId, url: url, headers: headers, codec: codec, kbps: kbps, relativeLoudnessDb: relativeLoudnessDb) }
+            streamGate.tasks[taskKey] = created
             return created
         }
         do {
             let path = try await task.value
             streamGate.lock.withLock {
-                if streamGate.tasks[videoId] != nil { streamGate.tasks[videoId] = nil }
+                if streamGate.tasks[taskKey] != nil { streamGate.tasks[taskKey] = nil }
             }
             return path
         } catch {
             streamGate.lock.withLock {
-                if streamGate.tasks[videoId] != nil { streamGate.tasks[videoId] = nil }
+                if streamGate.tasks[taskKey] != nil { streamGate.tasks[taskKey] = nil }
             }
             throw error
         }
     }
 
     private static func streamViaKtorOnce(
-        videoId: String, url: String, headers: [String: String]
+        videoId: String, url: String, headers: [String: String], codec: String = "unknown", kbps: Int = 0, relativeLoudnessDb: Double? = nil
     ) async throws -> String {
-        try await withCheckedThrowingContinuation { continuation in
+        let qualityIdentity = StreamFileCache.qualityIdentity
+        return try await withCheckedThrowingContinuation { continuation in
             let lock = NSLock()
             var resumed = false
             StreamDownloadBridge.shared.streamToFile(
@@ -2192,8 +2197,8 @@ final class PlaybackController {
                     guard !resumed else { return }
                     resumed = true
                     if let path {
-                        streamGate.lock.withLock { streamGate.growing[videoId] = path }
-                        Task { await StreamFileCache.shared.noteGrowing(videoId: videoId, path: path) }
+                        streamGate.lock.withLock { streamGate.growing[videoId] = path; streamGate.growingQuality[videoId] = qualityIdentity; streamGate.growingKbps[videoId] = kbps }
+                        Task { await StreamFileCache.shared.noteGrowing(videoId: videoId, path: path, kbps: kbps, quality: qualityIdentity, relativeLoudnessDb: relativeLoudnessDb) }
                         continuation.resume(returning: path)
                     } else {
                         continuation.resume(throwing: InnertubeStreamResolver.StreamError(
@@ -2202,7 +2207,7 @@ final class PlaybackController {
                 },
                 done: DownloadCallbackAdapter { path, message in
                     if let path {
-                        Task { await StreamFileCache.shared.store(videoId, path: path) }
+                        Task { await StreamFileCache.shared.store(videoId, path: path, sourceIdentity: DiskCache.hashName(url), codec: codec, kbps: kbps, quality: qualityIdentity, relativeLoudnessDb: relativeLoudnessDb) }
                     } else if let message {
                         print("[Playback] stream tail failed for \(videoId): \(message)")
                         streamGate.lock.withLock { streamGate.growing[videoId] = nil }

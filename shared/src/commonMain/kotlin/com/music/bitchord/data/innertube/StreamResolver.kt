@@ -744,30 +744,28 @@ object StreamResolver {
 
     // ---- Formats ------------------------------------------------------------
 
-    private class AudioFormat(
+    internal class AudioFormat(
         val url: String?,
         val signatureCipher: String?,
         val mimeType: String,
         val kbps: Int,
     )
 
-    /**
-     * Formats in the order they are worth attempting: unciphered first, then by
-     * descending bitrate within the ceiling.
-     *
-     * Unciphered goes first outright once the solver is known broken, because a
-     * ciphered format is then not merely more expensive but unplayable, and ranking
-     * it first would spend the client's turn on a certainty. A rung over budget
-     * still beats no audio at all, and the cheapest such rung is the least wrong,
-     * so anything above the ceiling is kept ascending behind the in-budget formats.
+    /** Playable renditions within the selected data budget, ranked by codec tier.
+     * Broken cipher solving makes unciphered formats preferable within that
+     * budget; it never authorizes silently downloading an over-budget stream.
      */
-    private fun rankForPlayback(response: JsonObject, maxKbps: Int): List<AudioFormat> {
-        val candidates = audioFormats(response)
+    internal fun rankForPlayback(response: JsonObject, maxKbps: Int, signatureBroken: Boolean = SignatureSolver.isBroken): List<AudioFormat> {
+        val within = audioFormats(response).filter {
+            (it.kbps > 0 && it.kbps <= maxKbps) || (it.kbps == 0 && maxKbps == Int.MAX_VALUE)
+        }
         val uncipheredFirst = compareByDescending<AudioFormat> { it.url != null }
-        if (SignatureSolver.isBroken) return candidates.sortedWith(uncipheredFirst)
-        val (within, over) = candidates.partition { it.kbps <= maxKbps }
-        return within.sortedWith(compareByDescending<AudioFormat> { it.kbps }.then(uncipheredFirst)) +
-            over.sortedWith(compareBy<AudioFormat> { it.kbps }.then(uncipheredFirst))
+        val fidelity = compareByDescending<AudioFormat> {
+            if (it.mimeType.contains("opus", ignoreCase = true) && it.kbps >= 128) 2
+            else if (it.kbps >= 192) 2 else if (it.kbps >= 96) 1 else 0
+        }.thenByDescending { it.mimeType.contains("opus", ignoreCase = true) }
+            .thenByDescending { it.kbps }.then(uncipheredFirst)
+        return within.sortedWith(if (signatureBroken) uncipheredFirst.then(fidelity) else fidelity)
     }
 
     private fun audioFormats(response: JsonObject): List<AudioFormat> {
@@ -800,32 +798,13 @@ object StreamResolver {
         val audioOnly = mime.startsWith("audio/")
         val muxedAac = mime.startsWith("video/mp4") && mime.contains("mp4a", ignoreCase = true)
         if (!audioOnly && !muxedAac) return null
-        // Opus is offered, and cannot be decoded.
-        //
-        // symphonia 0.6 ships no Opus codec, so an Opus-in-WebM rendition is not
-        // a lower-quality copy of the track — it is silence. `native-core/src/decode/mod.rs`
-        // says so outright ("Opus-in-WebM is the documented residual gap"), and the
-        // "retrying as AAC-LC" path there is a reconfiguration of *AAC*, so it cannot
-        // rescue a stream that is not AAC: the rejection became silence.
-        //
-        // Worse, it was ranked *first*. Ranking is by bitrate, and Opus at 146 kbps
-        // beats AAC at 128, so the resolver spent the client's turn on the one format
-        // the mixer is guaranteed to refuse — and a track that had a perfectly good
-        // AAC rendition alongside it played nothing at all. That is the whole of the
-        // "this song does not play" report, and the client in the log had in fact
-        // offered both.
-        //
-        // Dropped rather than ranked last: the caller treats an empty list as "this
-        // client offered nothing" and moves to the next client (`firstPlayable`
-        // returning null), which is how the AAC rendition gets found. A track with no
-        // playable format anywhere now says so instead of playing silence.
-        if (mime.contains("opus", ignoreCase = true)) return null
+        // AAC and Opus are both supported by the Apple native decoder.
         val url = (get("url") as? JsonPrimitive)?.contentOrNull?.takeIf { it.isNotBlank() }
         val cipher = (get("signatureCipher") as? JsonPrimitive)?.contentOrNull
             ?: (get("cipher") as? JsonPrimitive)?.contentOrNull
         if (url == null && cipher == null) return null
         val bps = (get("bitrate") as? JsonPrimitive)?.intOrNull ?: 0
-        return AudioFormat(url, cipher, mime, (bps / 1000).coerceAtLeast(1))
+        return AudioFormat(url, cipher, mime, (bps / 1000).coerceAtLeast(0))
     }
 
     // ---- Constants ----------------------------------------------------------

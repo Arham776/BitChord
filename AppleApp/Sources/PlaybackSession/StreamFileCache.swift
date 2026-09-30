@@ -10,26 +10,98 @@ actor StreamFileCache {
     static let shared = StreamFileCache()
 
     private static let defaultLimit: Int64 = 512 * 1024 * 1024
-    private static let extensions = ["m4a", "mp4", "webm", "m4v", "aac", "flac"]
+    private static let extensions = ["m4a", "mp4", "webm", "m4v", "aac", "flac", "ogg", "opus", "mp3", "wav", "aiff"]
 
-    private var inFlight: [String: String] = [:]
+    struct Manifest: Codable {
+        var version: Int = 1
+        var codec: String
+        var kbps: Int
+        var quality: String
+        var sourceIdentity: String
+        var recordingIdentity: String
+        var complete: Bool
+        var bytes: Int64
+        var sha256: String
+        var relativeLoudnessDb: Double? = nil
+    }
+    private var inFlight: [String: (path: String, quality: String, kbps: Int, loudnessDb: Double?)] = [:]
+    nonisolated static var qualityIdentity: String {
+        let wifi = PlatformSettings.shared.getString(key: "audio_quality_wifi", default: "LOSSLESS")
+        let cellular = PlatformSettings.shared.getString(key: "audio_quality_cellular", default: "LOSSLESS")
+        let musicOnly = PlatformSettings.shared.getBoolean(key: "prefer_music_only", default: false)
+        return "\(wifi)|\(cellular)|\(musicOnly)"
+    }
+    private func manifestURL(_ path: String) -> URL { URL(fileURLWithPath: path).appendingPathExtension("json") }
+    private func hashFile(_ path: String) -> String? {
+        guard let file = FileHandle(forReadingAtPath: path) else { return nil }
+        defer { try? file.close() }
+        var hash = SHA256()
+        do { while true { let data = try file.read(upToCount: 65536) ?? Data(); if data.isEmpty { break }; hash.update(data: data) } } catch { return nil }
+
+        return hash.finalize().map { String(format: "%02x", $0) }.joined()
+    }
 
     var folder: URL { DiskCache.cachesSubfolder("audio") }
 
-    func path(for videoId: String) -> String? {
-        if let path = inFlight[videoId], FileManager.default.fileExists(atPath: path) {
-            return path
-        }
-        let dest = cachedURL(for: videoId)
-        guard FileManager.default.fileExists(atPath: dest.path) else { return nil }
+    func path(for videoId: String, maxKbps: Int = Int.max, requireLossless: Bool = false) -> String? {
+        if let active = inFlight[videoId], active.quality == Self.qualityIdentity,
+           FileManager.default.fileExists(atPath: active.path),
+           !requireLossless, active.kbps <= maxKbps { return active.path }
+        for ext in Self.extensions {
+        let dest = cachedURL(for: videoId, ext: ext)
+        guard let data = try? Data(contentsOf: manifestURL(dest.path)),
+              let manifest = try? JSONDecoder().decode(Manifest.self, from: data),
+              manifest.version == 1, manifest.complete, manifest.codec != "unknown",
+              manifest.recordingIdentity == videoId,
+              manifest.quality == Self.qualityIdentity,
+              manifest.kbps <= maxKbps,
+              !requireLossless || ["FLAC", "ALAC", "PCM"].contains(manifest.codec),
+              let bytes = (try? FileManager.default.attributesOfItem(atPath: dest.path)[.size]) as? NSNumber,
+              bytes.int64Value == manifest.bytes,
+              hashFile(dest.path) == manifest.sha256 else { continue }
+        // A legacy entry needs a fresh resolution: its quality and completion
+        // cannot be established from a file extension. Keep its bytes for any
+        // active reader while the new rendition is resolved.
+
         DiskCache.touch(dest)
         return dest.path
+        }
+        return nil
+    }
+
+    private struct LoudnessCache: Codable {
+        var sourceSHA256: String
+        var measurementVersion: String
+        var trackLufs: Double
+        var truePeakDbtp: Double?
+    }
+    func measuredLoudness(at path: String) -> LoudnessMeasurement? {
+        let url = URL(fileURLWithPath: path).appendingPathExtension("loudness.json")
+        guard let data = try? Data(contentsOf: url), let entry = try? JSONDecoder().decode(LoudnessCache.self, from: data),
+              entry.measurementVersion == "ebur128-0.1.10-stereo", entry.sourceSHA256 == hashFile(path) else { return nil }
+        return LoudnessMeasurement(trackLufs: entry.trackLufs, albumLufs: nil, truePeakDbtp: entry.truePeakDbtp)
+    }
+    func storeMeasurement(_ measurement: LoudnessMeasurement, at path: String) {
+        guard let hash = hashFile(path) else { return }
+        let entry = LoudnessCache(sourceSHA256: hash, measurementVersion: "ebur128-0.1.10-stereo", trackLufs: measurement.trackLufs, truePeakDbtp: measurement.truePeakDbtp)
+        guard let data = try? JSONEncoder().encode(entry) else { return }
+        try? data.write(to: URL(fileURLWithPath: path).appendingPathExtension("loudness.json"), options: .atomic)
+    }
+
+    func metadata(at path: String) -> Manifest? {
+        if let data = try? Data(contentsOf: manifestURL(path)) {
+            return try? JSONDecoder().decode(Manifest.self, from: data)
+        }
+        if let entry = inFlight.first(where: { $0.value.path == path }) {
+            return Manifest(codec: "unknown", kbps: entry.value.kbps, quality: entry.value.quality, sourceIdentity: "growing", recordingIdentity: entry.key, complete: false, bytes: 0, sha256: "", relativeLoudnessDb: entry.value.loudnessDb)
+        }
+        return nil
     }
 
     /// The download has its first bytes. Later resolves of the same track must
     /// join this file instead of starting a second fetch at the handoff.
-    func noteGrowing(videoId: String, path: String) {
-        inFlight[videoId] = path
+    func noteGrowing(videoId: String, path: String, kbps: Int = 0, quality: String? = nil, relativeLoudnessDb: Double? = nil) {
+        inFlight[videoId] = (path, quality ?? Self.qualityIdentity, kbps, relativeLoudnessDb)
     }
 
     /// The download failed before it finished. Drop the pointer so the next
@@ -38,8 +110,8 @@ actor StreamFileCache {
         inFlight.removeValue(forKey: videoId)
     }
 
-    func store(_ videoId: String, path: String) {
-        inFlight[videoId] = path
+    func store(_ videoId: String, path: String, sourceIdentity: String = "unknown", codec: String = "unknown", kbps: Int = 0, quality: String? = nil, relativeLoudnessDb: Double? = nil) {
+        inFlight[videoId] = (path, quality ?? Self.qualityIdentity, kbps, relativeLoudnessDb)
         let dest = cachedURL(for: videoId, ext: URL(fileURLWithPath: path).pathExtension)
         let fm = FileManager.default
         if dest.path != path {
@@ -47,7 +119,11 @@ actor StreamFileCache {
             try? fm.copyItem(atPath: path, toPath: dest.path)
             // Leave `path` in place: the decoder may still be reading that file.
         }
-        inFlight[videoId] = dest.path
+        guard let bytes = (try? fm.attributesOfItem(atPath: dest.path)[.size]) as? NSNumber,
+              let hash = hashFile(dest.path), bytes.int64Value > 0 else { return }
+        let manifest = Manifest(codec: codec, kbps: kbps, quality: quality ?? Self.qualityIdentity, sourceIdentity: sourceIdentity, recordingIdentity: videoId, complete: true, bytes: bytes.int64Value, sha256: hash, relativeLoudnessDb: relativeLoudnessDb)
+        guard let data = try? JSONEncoder().encode(manifest), (try? data.write(to: manifestURL(dest.path), options: .atomic)) != nil else { return }
+        inFlight.removeValue(forKey: videoId)
         DiskCache.touch(dest)
         trim(keeping: videoId)
     }
@@ -71,10 +147,10 @@ actor StreamFileCache {
         let fm = FileManager.default
         for ext in Self.extensions {
             let url = folder.appendingPathComponent("\(Self.sanitized(videoId)).\(ext)")
-            if fm.fileExists(atPath: url.path) { try? fm.removeItem(at: url) }
+            if fm.fileExists(atPath: url.path) { try? fm.removeItem(at: url); try? fm.removeItem(at: manifestURL(url.path)) }
         }
-        if let growing, growing != folder.path {
-            try? fm.removeItem(atPath: growing)
+        if let growing, growing.path != folder.path {
+            try? fm.removeItem(atPath: growing.path)
         }
     }
 
