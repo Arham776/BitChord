@@ -1,0 +1,30 @@
+{
+  "active_stages" : [
+    "Rate conversion (libsoxr HQ)",
+    "Application volume",
+    "Enhanced clarity (4× exciter)",
+    "True-peak protection"
+  ],
+  "application_gain" : 0,
+  "callback_underruns" : 0,
+  "core_revision" : "6659a8ee32f7+8f191f5e93ee",
+  "device" : "MacBook Air Speakers",
+  "device_xruns" : 0,
+  "duration_seconds" : 1801.8734769821167,
+  "errors" : [
+
+  ],
+  "final_position_seconds" : 1811.8579999999999,
+  "initial_device" : "MacBook Air Speakers",
+  "initial_position_seconds" : 10.000999999999999,
+  "minimum_sampled_queue_frames" : 10752,
+  "negotiated_rate" : 44100,
+  "output_rebuilds" : 0,
+  "passed" : true,
+  "protection_interventions" : 77964103,
+  "route_events" : [
+
+  ],
+  "scope" : "macOS physical output, local adequate source, concurrent compiler load; inaudible; no listening claim",
+  "warmup_seconds" : 10
+}

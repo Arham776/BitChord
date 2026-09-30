@@ -1,0 +1,23 @@
+{
+  "application_gain" : 0,
+  "callback_underruns" : 0,
+  "capture_limit_seconds" : 30,
+  "core_revision" : "6659a8ee32f7+c567f9a8945a",
+  "device" : "MacBook Air Speakers",
+  "device_xruns" : 0,
+  "encoded_bytes" : 706560044,
+  "errors" : [
+
+  ],
+  "final_position_seconds" : 40.024000000000001,
+  "finish_seconds" : 2.0106090307235718,
+  "initial_position_seconds" : 6.0069999999999997,
+  "passed" : true,
+  "scope" : "30-second three-stage capture and whole-file hashes during physical Enhanced playback; inaudible; no listening claim",
+  "source_fingerprints_match" : true,
+  "stage_frames" : {
+    "decoder" : 1440000,
+    "protected" : 1323000,
+    "voice" : 1323000
+  }
+}

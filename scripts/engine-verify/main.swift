@@ -98,6 +98,7 @@ print("engine: real output device, real mixer thread")
 let engine = PlayerEngine()
 let rec = Recorder()
 engine.registerCallback(callback: rec)
+engine.setVolume(gain: 0.01)
 
 do {
     // 1. The device's own figures, exactly what macOS has no opinion about.
@@ -130,7 +131,10 @@ do {
 //    caught the activation race: a unit the daemon never pulls leaves the
 //    position pinned at zero forever while everything above reports success.
 let first = readPosition(after: engine, 0.6)
+let firstHealth = engine.outputHealth()
 let second = readPosition(after: engine, 0.6)
+let secondHealth = engine.outputHealth()
+print("  playback counters: queued=\(firstHealth.bufferedFrames)→\(secondHealth.bufferedFrames), underruns=\(firstHealth.callbackUnderruns)→\(secondHealth.callbackUnderruns), rebuilds=\(secondHealth.outputRebuilds), peak=\(secondHealth.outputPeak)")
 check("playhead advances", second > first && first > 0,
       "\(String(format: "%.3f", first)) -> \(String(format: "%.3f", second))")
 check("playhead advances at roughly real time",
@@ -160,9 +164,7 @@ check("a seek with nothing playing is reported, not dropped",
       idleRec.errorList.contains { $0.contains("nothing playing") },
       idleRec.errorList.joined(separator: " | "))
 
-// 6. A second start must be a no-op, and must honour an explicit format when
-//    the platform has one. 48 kHz/2 is what the Mac's device reports, so asking
-//    for it exercises the override path end to end.
+// 6. A second start is a no-op; it retains the already negotiated format.
 do {
     try engine.start(rate: 48_000, channels: 2)
     check("a repeated start is a no-op", true)
@@ -195,11 +197,10 @@ check("an engine that was never started has no rate to report",
 let device = engine.outputDevice()
 check("a started engine reports its device", device.started && !device.name.isEmpty,
       "\(device.name) at \(device.sampleRate) Hz / \(device.channels) ch")
-check("the reported rate is the rate it is playing at",
-      device.sampleRate == 48_000, "\(device.sampleRate) Hz")
-check("the reported rate is not the source rate",
-      device.sampleRate != 44_100,
-      "source is 44100, output is \(device.sampleRate) — the resampler is real")
+check("the negotiated rate is valid", device.sampleRate >= 8_000 && device.sampleRate <= 384_000, "\(device.sampleRate) Hz")
+check("converter activation agrees with negotiated rates",
+      engine.nerdStats().activeStages.contains("Rate conversion (libsoxr HQ)") == (device.sampleRate != 44_100),
+      "source is 44100, negotiated output is \(device.sampleRate)")
 check("a started engine reports its channel count", device.channels > 0, "\(device.channels)")
 
 // 8. The readout has to be stable while nothing is changing, or the panel would
@@ -231,6 +232,19 @@ do {
 //     would apply (-loudnessDb clamped to -15...0 dB); a load without one
 //     reports none; the switch reports off without a reload.
 do {
+    try engine.setSoundMode(mode: .transparent)
+    try engine.setLoudnessMode(mode: .track)
+    try engine.loadTrack(request: LoadRequest(
+        source: wav, title: "transparent", artist: "harness",
+        startSeconds: 0, plan: nil, headers: nil, claimedKbps: 0, loudnessDb: 7.0,
+        durationSeconds: nil
+    ))
+    Thread.sleep(forTimeInterval: 0.1)
+    let transparent = engine.nerdStats()
+    check("Transparent bypasses selected normalization", transparent.loudnessGainDb == nil)
+    check("Transparent has no clarity or protection stage", !transparent.activeStages.contains { $0.contains("clarity") || $0.contains("True-peak") })
+    try engine.setSoundMode(mode: .enhanced)
+    try engine.setLoudnessMode(mode: .track)
     try engine.loadTrack(request: LoadRequest(
         source: wav, title: "tone", artist: "harness",
         startSeconds: 0, plan: nil, headers: nil, claimedKbps: 0, loudnessDb: -7.0,

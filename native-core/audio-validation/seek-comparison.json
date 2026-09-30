@@ -1,0 +1,225 @@
+[
+  {
+    "fixture": "aac-lc.m4a",
+    "seek_seconds": 0.5,
+    "frames": 24000,
+    "baseline_remaining_frames": 24000,
+    "output_rate": 48000,
+    "pull_sizes": [
+      7,
+      4096
+    ],
+    "samples_identical_between_pull_sizes": true,
+    "first_2048_frames_max_difference": 0.0,
+    "after_100ms_max_difference": 0.0,
+    "engine": "AAC: 48000 Hz, 2 channels \u2192 48000 Hz; Transparent\n24000 frames; NerdSnapshot { codec: \"AAC\", sample_rate: 48000, bit_depth: 0, channels: 2, kbps: 0, loudness_gain_db: None, swap_correlation: None, active_stages: [], converter_delay_frames: 0.0, protection_reduction_db: 0.0, protection_interventions: 0, build_revision: \"6659a8ee32f7+c567f9a8945a\", decoder_implementation: \"Advanced Audio Coding\", decoded_layout: \"Some(Positioned(Position(FRONT_LEFT | FRONT_RIGHT)))\", queued_target_ms: 250, loudness_origin: \"No measurement\" }",
+    "reference_gate": 1e-06,
+    "comparison": "continuous production decode"
+  },
+  {
+    "fixture": "he-aac.m4a",
+    "seek_seconds": 0.5,
+    "frames": 24000,
+    "baseline_remaining_frames": 24000,
+    "output_rate": 48000,
+    "pull_sizes": [
+      7,
+      4096
+    ],
+    "samples_identical_between_pull_sizes": true,
+    "first_2048_frames_max_difference": 0.14876543823865873,
+    "after_100ms_max_difference": 0.15728225000202656,
+    "engine": "AAC: 48000 Hz, 2 channels \u2192 48000 Hz; Transparent\n24000 frames; NerdSnapshot { codec: \"AAC\", sample_rate: 48000, bit_depth: 0, channels: 2, kbps: 0, loudness_gain_db: None, swap_correlation: None, active_stages: [], converter_delay_frames: 0.0, protection_reduction_db: 0.0, protection_interventions: 0, build_revision: \"6659a8ee32f7+c567f9a8945a\", decoder_implementation: \"Apple AudioToolbox AAC\", decoded_layout: \"Some(Positioned(Position(FRONT_LEFT | FRONT_RIGHT)))\", queued_target_ms: 250, loudness_origin: \"No measurement\" }",
+    "independent_apple_seek_max_difference": 0.0,
+    "reference_gate": 1e-06,
+    "comparison": "ExtAudioFile seek; continuous SBR/PS state differs after reset"
+  },
+  {
+    "fixture": "he-aac-v2.m4a",
+    "seek_seconds": 0.5,
+    "frames": 24000,
+    "baseline_remaining_frames": 24000,
+    "output_rate": 48000,
+    "pull_sizes": [
+      7,
+      4096
+    ],
+    "samples_identical_between_pull_sizes": true,
+    "first_2048_frames_max_difference": 0.1487145548699118,
+    "after_100ms_max_difference": 0.15720931916848713,
+    "engine": "AAC: 48000 Hz, 2 channels \u2192 48000 Hz; Transparent\n24000 frames; NerdSnapshot { codec: \"AAC\", sample_rate: 48000, bit_depth: 0, channels: 2, kbps: 0, loudness_gain_db: None, swap_correlation: None, active_stages: [], converter_delay_frames: 0.0, protection_reduction_db: 0.0, protection_interventions: 0, build_revision: \"6659a8ee32f7+c567f9a8945a\", decoder_implementation: \"Apple AudioToolbox AAC\", decoded_layout: \"Some(Positioned(Position(FRONT_LEFT | FRONT_RIGHT)))\", queued_target_ms: 250, loudness_origin: \"No measurement\" }",
+    "independent_apple_seek_max_difference": 0.0,
+    "reference_gate": 1e-06,
+    "comparison": "ExtAudioFile seek; continuous SBR/PS state differs after reset"
+  },
+  {
+    "fixture": "opus.ogg",
+    "seek_seconds": 0.5,
+    "frames": 1254720,
+    "baseline_remaining_frames": 1254720,
+    "output_rate": 48000,
+    "pull_sizes": [
+      7,
+      4096
+    ],
+    "samples_identical_between_pull_sizes": true,
+    "first_2048_frames_max_difference": 0.0,
+    "after_100ms_max_difference": 0.0,
+    "engine": "Opus: 48000 Hz, 2 channels \u2192 48000 Hz; Transparent\n1254720 frames; NerdSnapshot { codec: \"Opus\", sample_rate: 48000, bit_depth: 0, channels: 2, kbps: 0, loudness_gain_db: None, swap_correlation: None, active_stages: [], converter_delay_frames: 0.0, protection_reduction_db: 0.0, protection_interventions: 0, build_revision: \"6659a8ee32f7+c567f9a8945a\", decoder_implementation: \"Opus\", decoded_layout: \"Some(Positioned(Position(FRONT_LEFT | FRONT_RIGHT)))\", queued_target_ms: 250, loudness_origin: \"No measurement\" }",
+    "reference_gate": 1e-06,
+    "comparison": "continuous production decode"
+  },
+  {
+    "fixture": "opus.mka",
+    "seek_seconds": 0.5,
+    "frames": 1254720,
+    "baseline_remaining_frames": 1254720,
+    "output_rate": 48000,
+    "pull_sizes": [
+      7,
+      4096
+    ],
+    "samples_identical_between_pull_sizes": true,
+    "first_2048_frames_max_difference": 0.0,
+    "after_100ms_max_difference": 0.0,
+    "engine": "Opus: 48000 Hz, 2 channels \u2192 48000 Hz; Transparent\n1254720 frames; NerdSnapshot { codec: \"Opus\", sample_rate: 48000, bit_depth: 0, channels: 2, kbps: 0, loudness_gain_db: None, swap_correlation: None, active_stages: [], converter_delay_frames: 0.0, protection_reduction_db: 0.0, protection_interventions: 0, build_revision: \"6659a8ee32f7+c567f9a8945a\", decoder_implementation: \"Opus\", decoded_layout: \"Some(Positioned(Position(FRONT_LEFT | FRONT_RIGHT)))\", queued_target_ms: 250, loudness_origin: \"No measurement\" }",
+    "reference_gate": 1e-06,
+    "comparison": "continuous production decode"
+  },
+  {
+    "fixture": "opus.webm",
+    "seek_seconds": 0.5,
+    "frames": 1254720,
+    "baseline_remaining_frames": 1254720,
+    "output_rate": 48000,
+    "pull_sizes": [
+      7,
+      4096
+    ],
+    "samples_identical_between_pull_sizes": true,
+    "first_2048_frames_max_difference": 0.0,
+    "after_100ms_max_difference": 0.0,
+    "engine": "Opus: 48000 Hz, 2 channels \u2192 48000 Hz; Transparent\n1254720 frames; NerdSnapshot { codec: \"Opus\", sample_rate: 48000, bit_depth: 0, channels: 2, kbps: 0, loudness_gain_db: None, swap_correlation: None, active_stages: [], converter_delay_frames: 0.0, protection_reduction_db: 0.0, protection_interventions: 0, build_revision: \"6659a8ee32f7+c567f9a8945a\", decoder_implementation: \"Opus\", decoded_layout: \"Some(Positioned(Position(FRONT_LEFT | FRONT_RIGHT)))\", queued_target_ms: 250, loudness_origin: \"No measurement\" }",
+    "reference_gate": 1e-06,
+    "comparison": "continuous production decode"
+  },
+  {
+    "fixture": "surround8.m4a",
+    "seek_seconds": 0.5,
+    "frames": 648704,
+    "baseline_remaining_frames": 648704,
+    "output_rate": 48000,
+    "pull_sizes": [
+      7,
+      4096
+    ],
+    "samples_identical_between_pull_sizes": true,
+    "first_2048_frames_max_difference": 0.0,
+    "after_100ms_max_difference": 0.0,
+    "engine": "AAC: 48000 Hz, 8 channels \u2192 48000 Hz; Transparent\n648704 frames; NerdSnapshot { codec: \"AAC\", sample_rate: 48000, bit_depth: 0, channels: 8, kbps: 0, loudness_gain_db: None, swap_correlation: None, active_stages: [\"Channel mapping\"], converter_delay_frames: 0.0, protection_reduction_db: 0.0, protection_interventions: 0, build_revision: \"6659a8ee32f7+c567f9a8945a\", decoder_implementation: \"Apple AudioToolbox AAC\", decoded_layout: \"Some(Positioned(Position(FRONT_LEFT | FRONT_RIGHT | FRONT_CENTER | LFE1 | REAR_LEFT | REAR_RIGHT | FRONT_LEFT_CENTER | FRONT_RIGHT_CENTER)))\", queued_target_ms: 250, loudness_origin: \"No measurement\" }",
+    "reference_gate": 1e-06,
+    "comparison": "continuous production decode"
+  },
+  {
+    "fixture": "mp3.mp3",
+    "seek_seconds": 0.5,
+    "frames": 676062,
+    "baseline_remaining_frames": 676062,
+    "output_rate": 44100,
+    "pull_sizes": [
+      7,
+      4096
+    ],
+    "samples_identical_between_pull_sizes": true,
+    "first_2048_frames_max_difference": 0.0,
+    "after_100ms_max_difference": 0.0,
+    "engine": "MP3: 44100 Hz, 2 channels \u2192 44100 Hz; Transparent\n676062 frames; NerdSnapshot { codec: \"MP3\", sample_rate: 44100, bit_depth: 0, channels: 2, kbps: 0, loudness_gain_db: None, swap_correlation: None, active_stages: [], converter_delay_frames: 0.0, protection_reduction_db: 0.0, protection_interventions: 0, build_revision: \"6659a8ee32f7+c567f9a8945a\", decoder_implementation: \"MPEG Audio Layer 3\", decoded_layout: \"Some(Positioned(Position(FRONT_LEFT | FRONT_RIGHT)))\", queued_target_ms: 250, loudness_origin: \"No measurement\" }",
+    "reference_gate": 1e-06,
+    "comparison": "continuous production decode"
+  },
+  {
+    "fixture": "opus.ogg",
+    "seek_seconds": 5.0,
+    "frames": 1038720,
+    "baseline_remaining_frames": 1038720,
+    "output_rate": 48000,
+    "pull_sizes": [
+      7,
+      4096
+    ],
+    "samples_identical_between_pull_sizes": true,
+    "first_2048_frames_max_difference": 0.0,
+    "after_100ms_max_difference": 0.0,
+    "engine": "Opus: 48000 Hz, 2 channels \u2192 48000 Hz; Transparent\n1038720 frames; NerdSnapshot { codec: \"Opus\", sample_rate: 48000, bit_depth: 0, channels: 2, kbps: 0, loudness_gain_db: None, swap_correlation: None, active_stages: [], converter_delay_frames: 0.0, protection_reduction_db: 0.0, protection_interventions: 0, build_revision: \"6659a8ee32f7+c567f9a8945a\", decoder_implementation: \"Opus\", decoded_layout: \"Some(Positioned(Position(FRONT_LEFT | FRONT_RIGHT)))\", queued_target_ms: 250, loudness_origin: \"No measurement\" }",
+    "reference_gate": 1e-06,
+    "comparison": "continuous production decode"
+  },
+  {
+    "fixture": "opus.mka",
+    "seek_seconds": 5.0,
+    "frames": 1038720,
+    "baseline_remaining_frames": 1038720,
+    "output_rate": 48000,
+    "pull_sizes": [
+      7,
+      4096
+    ],
+    "samples_identical_between_pull_sizes": true,
+    "first_2048_frames_max_difference": 0.0,
+    "after_100ms_max_difference": 0.0,
+    "engine": "Opus: 48000 Hz, 2 channels \u2192 48000 Hz; Transparent\n1038720 frames; NerdSnapshot { codec: \"Opus\", sample_rate: 48000, bit_depth: 0, channels: 2, kbps: 0, loudness_gain_db: None, swap_correlation: None, active_stages: [], converter_delay_frames: 0.0, protection_reduction_db: 0.0, protection_interventions: 0, build_revision: \"6659a8ee32f7+c567f9a8945a\", decoder_implementation: \"Opus\", decoded_layout: \"Some(Positioned(Position(FRONT_LEFT | FRONT_RIGHT)))\", queued_target_ms: 250, loudness_origin: \"No measurement\" }",
+    "reference_gate": 1e-06,
+    "comparison": "continuous production decode"
+  },
+  {
+    "fixture": "opus.webm",
+    "seek_seconds": 5.0,
+    "frames": 1038720,
+    "baseline_remaining_frames": 1038720,
+    "output_rate": 48000,
+    "pull_sizes": [
+      7,
+      4096
+    ],
+    "samples_identical_between_pull_sizes": true,
+    "first_2048_frames_max_difference": 0.0,
+    "after_100ms_max_difference": 0.0,
+    "engine": "Opus: 48000 Hz, 2 channels \u2192 48000 Hz; Transparent\n1038720 frames; NerdSnapshot { codec: \"Opus\", sample_rate: 48000, bit_depth: 0, channels: 2, kbps: 0, loudness_gain_db: None, swap_correlation: None, active_stages: [], converter_delay_frames: 0.0, protection_reduction_db: 0.0, protection_interventions: 0, build_revision: \"6659a8ee32f7+c567f9a8945a\", decoder_implementation: \"Opus\", decoded_layout: \"Some(Positioned(Position(FRONT_LEFT | FRONT_RIGHT)))\", queued_target_ms: 250, loudness_origin: \"No measurement\" }",
+    "reference_gate": 1e-06,
+    "comparison": "continuous production decode"
+  },
+  {
+    "fixture": "surround8.m4a",
+    "seek_seconds": 5.0,
+    "frames": 432704,
+    "baseline_remaining_frames": 432704,
+    "output_rate": 48000,
+    "pull_sizes": [
+      7,
+      4096
+    ],
+    "samples_identical_between_pull_sizes": true,
+    "first_2048_frames_max_difference": 0.0,
+    "after_100ms_max_difference": 0.0,
+    "engine": "AAC: 48000 Hz, 8 channels \u2192 48000 Hz; Transparent\n432704 frames; NerdSnapshot { codec: \"AAC\", sample_rate: 48000, bit_depth: 0, channels: 8, kbps: 0, loudness_gain_db: None, swap_correlation: None, active_stages: [\"Channel mapping\"], converter_delay_frames: 0.0, protection_reduction_db: 0.0, protection_interventions: 0, build_revision: \"6659a8ee32f7+c567f9a8945a\", decoder_implementation: \"Apple AudioToolbox AAC\", decoded_layout: \"Some(Positioned(Position(FRONT_LEFT | FRONT_RIGHT | FRONT_CENTER | LFE1 | REAR_LEFT | REAR_RIGHT | FRONT_LEFT_CENTER | FRONT_RIGHT_CENTER)))\", queued_target_ms: 250, loudness_origin: \"No measurement\" }",
+    "reference_gate": 1e-06,
+    "comparison": "continuous production decode"
+  },
+  {
+    "fixture": "mp3.mp3",
+    "seek_seconds": 5.0,
+    "frames": 477612,
+    "baseline_remaining_frames": 477612,
+    "output_rate": 44100,
+    "pull_sizes": [
+      7,
+      4096
+    ],
+    "samples_identical_between_pull_sizes": true,
+    "first_2048_frames_max_difference": 0.0,
+    "after_100ms_max_difference": 0.0,
+    "engine": "MP3: 44100 Hz, 2 channels \u2192 44100 Hz; Transparent\n477612 frames; NerdSnapshot { codec: \"MP3\", sample_rate: 44100, bit_depth: 0, channels: 2, kbps: 0, loudness_gain_db: None, swap_correlation: None, active_stages: [], converter_delay_frames: 0.0, protection_reduction_db: 0.0, protection_interventions: 0, build_revision: \"6659a8ee32f7+c567f9a8945a\", decoder_implementation: \"MPEG Audio Layer 3\", decoded_layout: \"Some(Positioned(Position(FRONT_LEFT | FRONT_RIGHT)))\", queued_target_ms: 250, loudness_origin: \"No measurement\" }",
+    "reference_gate": 1e-06,
+    "comparison": "continuous production decode"
+  }
+]

@@ -1,0 +1,16 @@
+{
+  "fixture_sha256": "fa035245e6aae36794e1ef94bda4888a92eac76de9246d97b4c2f72dc5ba64fc",
+  "frames": 144000,
+  "samples_exactly_identical": true,
+  "elapsed_seconds": {
+    "before": 2.3900854999999996,
+    "after": 2.2222742079999995
+  },
+  "speedup": 1.0755133148717173,
+  "note": "production decoder+mixer Enhanced; three-second hot stereo float fixture; total elapsed time includes setup/drain",
+  "hot_master_constraint_pruning": {
+    "frames": 240128,
+    "samples_exactly_identical": true,
+    "source": "1.8\u00d7997 Hz + 0.3\u00d719 kHz hot stereo stress fixture"
+  }
+}

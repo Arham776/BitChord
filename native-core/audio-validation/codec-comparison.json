@@ -1,0 +1,183 @@
+[
+  {
+    "fixture": "aac-lc.m4a",
+    "encoded_sha256": "65ef5dba064e3e696a2e55cc636f97304ae1a57cade557962f4eb6952831b68e",
+    "frames": 48000,
+    "output_rate": 48000,
+    "pull_sizes": [
+      7,
+      4096
+    ],
+    "samples_identical": true,
+    "engine": "AAC: 48000 Hz, 2 channels \u2192 48000 Hz; Transparent\n48000 frames; NerdSnapshot { codec: \"AAC\", sample_rate: 48000, bit_depth: 0, channels: 2, kbps: 0, loudness_gain_db: None, swap_correlation: None, active_stages: [], converter_delay_frames: 0.0, protection_reduction_db: 0.0, protection_interventions: 0, build_revision: \"6659a8ee32f7+c567f9a8945a\", decoder_implementation: \"Advanced Audio Coding\", decoded_layout: \"Some(Positioned(Position(FRONT_LEFT | FRONT_RIGHT)))\", queued_target_ms: 250, loudness_origin: \"No measurement\" }",
+    "reference_frames": 48000,
+    "reference_max_sample_difference": 1.1920928955078125e-07,
+    "apple_fallback_reference_max_difference": 0.0,
+    "apple_fallback_engine": "AAC: 48000 Hz, 2 channels \u2192 48000 Hz; Transparent\n48000 frames; NerdSnapshot { codec: \"AAC\", sample_rate: 48000, bit_depth: 0, channels: 2, kbps: 0, loudness_gain_db: None, swap_correlation: None, active_stages: [], converter_delay_frames: 0.0, protection_reduction_db: 0.0, protection_interventions: 0, build_revision: \"6659a8ee32f7+c567f9a8945a\", decoder_implementation: \"Apple AudioToolbox AAC\", decoded_layout: \"Some(Positioned(Position(FRONT_LEFT | FRONT_RIGHT)))\", queued_target_ms: 250, loudness_origin: \"No measurement\" }"
+  },
+  {
+    "fixture": "alac.m4a",
+    "encoded_sha256": "c75ecb10933eac1e3b3e2b5ae078b3c574814c150511a0dd0b52e129593156c6",
+    "frames": 48000,
+    "output_rate": 48000,
+    "pull_sizes": [
+      7,
+      4096
+    ],
+    "samples_identical": true,
+    "engine": "ALAC: 48000 Hz, 2 channels \u2192 48000 Hz; Transparent\n48000 frames; NerdSnapshot { codec: \"ALAC\", sample_rate: 48000, bit_depth: 0, channels: 2, kbps: 0, loudness_gain_db: None, swap_correlation: None, active_stages: [], converter_delay_frames: 0.0, protection_reduction_db: 0.0, protection_interventions: 0, build_revision: \"6659a8ee32f7+c567f9a8945a\", decoder_implementation: \"Apple Lossless Audio Codec\", decoded_layout: \"Some(Positioned(Position(FRONT_LEFT | FRONT_RIGHT)))\", queued_target_ms: 250, loudness_origin: \"No measurement\" }",
+    "reference_frames": 48000,
+    "reference_max_sample_difference": 0.0,
+    "apple_fallback_reference_max_difference": 0.0,
+    "apple_fallback_engine": "ALAC: 48000 Hz, 2 channels \u2192 48000 Hz; Transparent\n48000 frames; NerdSnapshot { codec: \"ALAC\", sample_rate: 48000, bit_depth: 0, channels: 2, kbps: 0, loudness_gain_db: None, swap_correlation: None, active_stages: [], converter_delay_frames: 0.0, protection_reduction_db: 0.0, protection_interventions: 0, build_revision: \"6659a8ee32f7+c567f9a8945a\", decoder_implementation: \"Apple Lossless Audio Codec\", decoded_layout: \"Some(Positioned(Position(FRONT_LEFT | FRONT_RIGHT)))\", queued_target_ms: 250, loudness_origin: \"No measurement\" }"
+  },
+  {
+    "fixture": "he-aac-v2.m4a",
+    "encoded_sha256": "c007d89b84fe67c956dca98b29596fe060ae2293b48d8426725f5efe39c4c33c",
+    "frames": 48000,
+    "output_rate": 48000,
+    "pull_sizes": [
+      7,
+      4096
+    ],
+    "samples_identical": true,
+    "engine": "AAC: 48000 Hz, 2 channels \u2192 48000 Hz; Transparent\n48000 frames; NerdSnapshot { codec: \"AAC\", sample_rate: 48000, bit_depth: 0, channels: 2, kbps: 0, loudness_gain_db: None, swap_correlation: None, active_stages: [], converter_delay_frames: 0.0, protection_reduction_db: 0.0, protection_interventions: 0, build_revision: \"6659a8ee32f7+c567f9a8945a\", decoder_implementation: \"Apple AudioToolbox AAC\", decoded_layout: \"Some(Positioned(Position(FRONT_LEFT | FRONT_RIGHT)))\", queued_target_ms: 250, loudness_origin: \"No measurement\" }",
+    "reference_frames": 48000,
+    "reference_max_sample_difference": 0.0,
+    "apple_fallback_reference_max_difference": 0.0,
+    "apple_fallback_engine": "AAC: 48000 Hz, 2 channels \u2192 48000 Hz; Transparent\n48000 frames; NerdSnapshot { codec: \"AAC\", sample_rate: 48000, bit_depth: 0, channels: 2, kbps: 0, loudness_gain_db: None, swap_correlation: None, active_stages: [], converter_delay_frames: 0.0, protection_reduction_db: 0.0, protection_interventions: 0, build_revision: \"6659a8ee32f7+c567f9a8945a\", decoder_implementation: \"Apple AudioToolbox AAC\", decoded_layout: \"Some(Positioned(Position(FRONT_LEFT | FRONT_RIGHT)))\", queued_target_ms: 250, loudness_origin: \"No measurement\" }"
+  },
+  {
+    "fixture": "he-aac.m4a",
+    "encoded_sha256": "b2e2009858e591427a95da32ed69f9458ad6b8f31894204e71dff6436a32e056",
+    "frames": 48000,
+    "output_rate": 48000,
+    "pull_sizes": [
+      7,
+      4096
+    ],
+    "samples_identical": true,
+    "engine": "AAC: 48000 Hz, 2 channels \u2192 48000 Hz; Transparent\n48000 frames; NerdSnapshot { codec: \"AAC\", sample_rate: 48000, bit_depth: 0, channels: 2, kbps: 0, loudness_gain_db: None, swap_correlation: None, active_stages: [], converter_delay_frames: 0.0, protection_reduction_db: 0.0, protection_interventions: 0, build_revision: \"6659a8ee32f7+c567f9a8945a\", decoder_implementation: \"Apple AudioToolbox AAC\", decoded_layout: \"Some(Positioned(Position(FRONT_LEFT | FRONT_RIGHT)))\", queued_target_ms: 250, loudness_origin: \"No measurement\" }",
+    "reference_frames": 48000,
+    "reference_max_sample_difference": 0.0,
+    "apple_fallback_reference_max_difference": 0.0,
+    "apple_fallback_engine": "AAC: 48000 Hz, 2 channels \u2192 48000 Hz; Transparent\n48000 frames; NerdSnapshot { codec: \"AAC\", sample_rate: 48000, bit_depth: 0, channels: 2, kbps: 0, loudness_gain_db: None, swap_correlation: None, active_stages: [], converter_delay_frames: 0.0, protection_reduction_db: 0.0, protection_interventions: 0, build_revision: \"6659a8ee32f7+c567f9a8945a\", decoder_implementation: \"Apple AudioToolbox AAC\", decoded_layout: \"Some(Positioned(Position(FRONT_LEFT | FRONT_RIGHT)))\", queued_target_ms: 250, loudness_origin: \"No measurement\" }"
+  },
+  {
+    "fixture": "lossless.flac",
+    "encoded_sha256": "e4abef741ed394c134823d9528e399d2bdbf6f296bb5e284bafc24307766c601",
+    "frames": 48000,
+    "output_rate": 48000,
+    "pull_sizes": [
+      7,
+      4096
+    ],
+    "samples_identical": true,
+    "engine": "FLAC: 48000 Hz, 2 channels \u2192 48000 Hz; Transparent\n48000 frames; NerdSnapshot { codec: \"FLAC\", sample_rate: 48000, bit_depth: 16, channels: 2, kbps: 0, loudness_gain_db: None, swap_correlation: None, active_stages: [], converter_delay_frames: 0.0, protection_reduction_db: 0.0, protection_interventions: 0, build_revision: \"6659a8ee32f7+c567f9a8945a\", decoder_implementation: \"Free Lossless Audio Codec\", decoded_layout: \"Some(Positioned(Position(FRONT_LEFT | FRONT_RIGHT)))\", queued_target_ms: 250, loudness_origin: \"No measurement\" }",
+    "reference_frames": 48000,
+    "reference_max_sample_difference": 0.0
+  },
+  {
+    "fixture": "mp3.mp3",
+    "encoded_sha256": "7c72e328ad3fe508ba244d8a20bac3d2c646ceca42341dcb7dc4fbf7bb3badeb",
+    "frames": 759850,
+    "output_rate": 48000,
+    "pull_sizes": [
+      7,
+      4096
+    ],
+    "samples_identical": true,
+    "engine": "MP3: 44100 Hz, 2 channels \u2192 48000 Hz; Transparent\n759850 frames; NerdSnapshot { codec: \"MP3\", sample_rate: 44100, bit_depth: 0, channels: 2, kbps: 0, loudness_gain_db: None, swap_correlation: None, active_stages: [\"Rate conversion (libsoxr HQ)\"], converter_delay_frames: 0.0, protection_reduction_db: 0.0, protection_interventions: 0, build_revision: \"6659a8ee32f7+c567f9a8945a\", decoder_implementation: \"MPEG Audio Layer 3\", decoded_layout: \"Some(Positioned(Position(FRONT_LEFT | FRONT_RIGHT)))\", queued_target_ms: 250, loudness_origin: \"No measurement\" }"
+  },
+  {
+    "fixture": "opus.mka",
+    "encoded_sha256": "d2a089e4e3c8062c9b1a6884a159b80e5233b29359def67e89e7d97236aa2c24",
+    "frames": 1278720,
+    "output_rate": 48000,
+    "pull_sizes": [
+      7,
+      4096
+    ],
+    "samples_identical": true,
+    "engine": "Opus: 48000 Hz, 2 channels \u2192 48000 Hz; Transparent\n1278720 frames; NerdSnapshot { codec: \"Opus\", sample_rate: 48000, bit_depth: 0, channels: 2, kbps: 0, loudness_gain_db: None, swap_correlation: None, active_stages: [], converter_delay_frames: 0.0, protection_reduction_db: 0.0, protection_interventions: 0, build_revision: \"6659a8ee32f7+c567f9a8945a\", decoder_implementation: \"Opus\", decoded_layout: \"Some(Positioned(Position(FRONT_LEFT | FRONT_RIGHT)))\", queued_target_ms: 250, loudness_origin: \"No measurement\" }"
+  },
+  {
+    "fixture": "opus.ogg",
+    "encoded_sha256": "411f7a6108c72d32116143903e4042a3ea836a8e2b40a753c2ddcb836c9083fc",
+    "frames": 1278720,
+    "output_rate": 48000,
+    "pull_sizes": [
+      7,
+      4096
+    ],
+    "samples_identical": true,
+    "engine": "Opus: 48000 Hz, 2 channels \u2192 48000 Hz; Transparent\n1278720 frames; NerdSnapshot { codec: \"Opus\", sample_rate: 48000, bit_depth: 0, channels: 2, kbps: 0, loudness_gain_db: None, swap_correlation: None, active_stages: [], converter_delay_frames: 0.0, protection_reduction_db: 0.0, protection_interventions: 0, build_revision: \"6659a8ee32f7+c567f9a8945a\", decoder_implementation: \"Opus\", decoded_layout: \"Some(Positioned(Position(FRONT_LEFT | FRONT_RIGHT)))\", queued_target_ms: 250, loudness_origin: \"No measurement\" }"
+  },
+  {
+    "fixture": "opus.webm",
+    "encoded_sha256": "34f5a771047077673d7a7985d3f0da4a786c87cc2b0f39b2b5f90b3bde666037",
+    "frames": 1278720,
+    "output_rate": 48000,
+    "pull_sizes": [
+      7,
+      4096
+    ],
+    "samples_identical": true,
+    "engine": "Opus: 48000 Hz, 2 channels \u2192 48000 Hz; Transparent\n1278720 frames; NerdSnapshot { codec: \"Opus\", sample_rate: 48000, bit_depth: 0, channels: 2, kbps: 0, loudness_gain_db: None, swap_correlation: None, active_stages: [], converter_delay_frames: 0.0, protection_reduction_db: 0.0, protection_interventions: 0, build_revision: \"6659a8ee32f7+c567f9a8945a\", decoder_implementation: \"Opus\", decoded_layout: \"Some(Positioned(Position(FRONT_LEFT | FRONT_RIGHT)))\", queued_target_ms: 250, loudness_origin: \"No measurement\" }"
+  },
+  {
+    "fixture": "pcm.aiff",
+    "encoded_sha256": "2f1e62127f265b979461757249cf2362bf5733c81c8e6f04b0f439fd9c5662c3",
+    "frames": 48000,
+    "output_rate": 48000,
+    "pull_sizes": [
+      7,
+      4096
+    ],
+    "samples_identical": true,
+    "engine": "PCM: 48000 Hz, 2 channels \u2192 48000 Hz; Transparent\n48000 frames; NerdSnapshot { codec: \"PCM\", sample_rate: 48000, bit_depth: 16, channels: 2, kbps: 0, loudness_gain_db: None, swap_correlation: None, active_stages: [], converter_delay_frames: 0.0, protection_reduction_db: 0.0, protection_interventions: 0, build_revision: \"6659a8ee32f7+c567f9a8945a\", decoder_implementation: \"PCM Signed 16-bit Big-Endian Interleaved\", decoded_layout: \"Some(Positioned(Position(FRONT_LEFT | FRONT_RIGHT)))\", queued_target_ms: 250, loudness_origin: \"No measurement\" }",
+    "reference_frames": 48000,
+    "reference_max_sample_difference": 0.0
+  },
+  {
+    "fixture": "pcm.wav",
+    "encoded_sha256": "ba29d3f6976716a07a739cfa2a0c8057dafd4d55735da01736376e194df9f330",
+    "frames": 48000,
+    "output_rate": 48000,
+    "pull_sizes": [
+      7,
+      4096
+    ],
+    "samples_identical": true,
+    "engine": "PCM: 48000 Hz, 2 channels \u2192 48000 Hz; Transparent\n48000 frames; NerdSnapshot { codec: \"PCM\", sample_rate: 48000, bit_depth: 16, channels: 2, kbps: 0, loudness_gain_db: None, swap_correlation: None, active_stages: [], converter_delay_frames: 0.0, protection_reduction_db: 0.0, protection_interventions: 0, build_revision: \"6659a8ee32f7+c567f9a8945a\", decoder_implementation: \"PCM Signed 16-bit Little-Endian Interleaved\", decoded_layout: \"Some(Positioned(Position(FRONT_LEFT | FRONT_RIGHT)))\", queued_target_ms: 250, loudness_origin: \"No measurement\" }",
+    "transparent_pcm_exact": true
+  },
+  {
+    "fixture": "surround.wav",
+    "encoded_sha256": "a3e29652e70560f153774ce6de2a21a7f3401d84bdce2c39638e841a46ef4e0c",
+    "frames": 4800,
+    "output_rate": 48000,
+    "pull_sizes": [
+      7,
+      4096
+    ],
+    "samples_identical": true,
+    "engine": "PCM: 48000 Hz, 6 channels \u2192 48000 Hz; Transparent\n4800 frames; NerdSnapshot { codec: \"PCM\", sample_rate: 48000, bit_depth: 16, channels: 6, kbps: 0, loudness_gain_db: None, swap_correlation: None, active_stages: [\"Channel mapping\"], converter_delay_frames: 0.0, protection_reduction_db: 0.0, protection_interventions: 0, build_revision: \"6659a8ee32f7+c567f9a8945a\", decoder_implementation: \"PCM Signed 16-bit Little-Endian Interleaved\", decoded_layout: \"Some(Positioned(Position(FRONT_LEFT | FRONT_RIGHT | FRONT_CENTER | LFE1 | REAR_LEFT | REAR_RIGHT)))\", queued_target_ms: 250, loudness_origin: \"No measurement\" }"
+  },
+  {
+    "fixture": "surround8.m4a",
+    "encoded_sha256": "9a3ba6b6b7c56082e495e816a728b1813854537c354dae3bfdc0a08ee8a61119",
+    "frames": 672704,
+    "output_rate": 48000,
+    "pull_sizes": [
+      7,
+      4096
+    ],
+    "samples_identical": true,
+    "engine": "AAC: 48000 Hz, 8 channels \u2192 48000 Hz; Transparent\n672704 frames; NerdSnapshot { codec: \"AAC\", sample_rate: 48000, bit_depth: 0, channels: 8, kbps: 0, loudness_gain_db: None, swap_correlation: None, active_stages: [\"Channel mapping\"], converter_delay_frames: 0.0, protection_reduction_db: 0.0, protection_interventions: 0, build_revision: \"6659a8ee32f7+c567f9a8945a\", decoder_implementation: \"Apple AudioToolbox AAC\", decoded_layout: \"Some(Positioned(Position(FRONT_LEFT | FRONT_RIGHT | FRONT_CENTER | LFE1 | REAR_LEFT | REAR_RIGHT | FRONT_LEFT_CENTER | FRONT_RIGHT_CENTER)))\", queued_target_ms: 250, loudness_origin: \"No measurement\" }",
+    "reference_frames": 672704,
+    "reference_max_sample_difference": 1.0258614818736689e-08,
+    "apple_fallback_reference_max_difference": 1.0258614818736689e-08,
+    "apple_fallback_engine": "AAC: 48000 Hz, 8 channels \u2192 48000 Hz; Transparent\n672704 frames; NerdSnapshot { codec: \"AAC\", sample_rate: 48000, bit_depth: 0, channels: 8, kbps: 0, loudness_gain_db: None, swap_correlation: None, active_stages: [\"Channel mapping\"], converter_delay_frames: 0.0, protection_reduction_db: 0.0, protection_interventions: 0, build_revision: \"6659a8ee32f7+c567f9a8945a\", decoder_implementation: \"Apple AudioToolbox AAC\", decoded_layout: \"Some(Positioned(Position(FRONT_LEFT | FRONT_RIGHT | FRONT_CENTER | LFE1 | REAR_LEFT | REAR_RIGHT | FRONT_LEFT_CENTER | FRONT_RIGHT_CENTER)))\", queued_target_ms: 250, loudness_origin: \"No measurement\" }"
+  }
+]

@@ -1,0 +1,161 @@
+{
+  "pitch_preserving_speed": {
+    "source_hz": 997,
+    "measured_hz": 996.2498124906245,
+    "pitch_error_cents": -1.30314846899704,
+    "pitch_gate_cents": 3,
+    "speed": 1.25,
+    "source_seconds": 35,
+    "output_seconds": 28.005666666666666,
+    "expected_seconds": 28,
+    "engine": "PCM: 48000 Hz, 2 channels \u2192 48000 Hz; Transparent\n1344272 frames; NerdSnapshot { codec: \"PCM\", sample_rate: 48000, bit_depth: 16, channels: 2, kbps: 0, loudness_gain_db: None, swap_correlation: None, active_stages: [\"Pitch-preserving speed\"], converter_delay_frames: 0.0, protection_reduction_db: 0.0, protection_interventions: 0, build_revision: \"6659a8ee32f7+c567f9a8945a\", decoder_implementation: \"PCM Signed 16-bit Little-Endian Interleaved\", decoded_layout: \"Some(Positioned(Position(FRONT_LEFT | FRONT_RIGHT)))\", queued_target_ms: 250, loudness_origin: \"No measurement\" }"
+  },
+  "bounded_capture": {
+    "stage_frames": {
+      "decoder": 1440000,
+      "voice": 1440000,
+      "protected": 1440000
+    },
+    "capture_limit_seconds": 30,
+    "metadata": {
+      "active_stages": [
+        "Enhanced clarity (4\u00d7 exciter)",
+        "True-peak protection"
+      ],
+      "build_revision": "6659a8ee32f7+c567f9a8945a",
+      "capture_limit_seconds": 30.0,
+      "codec": "PCM",
+      "converter_delay_frames": 0.0,
+      "decoded_channels": 2,
+      "decoded_layout": "Some(Positioned(Position(FRONT_LEFT | FRONT_RIGHT)))",
+      "decoded_rate": 48000,
+      "decoder": "PCM Signed 16-bit Little-Endian Interleaved",
+      "encoded_bytes_at_finish": 6720044,
+      "output_rate": 48000,
+      "peaks": [
+        0.199981689453125,
+        0.199981689453125,
+        0.20122945308685303
+      ],
+      "protection_interventions": 0,
+      "protection_reduction_db": -0.0,
+      "queue_target_ms": 250,
+      "settings_at_finish": {
+        "application_volume": 1.0,
+        "bit_perfect": false,
+        "clarity_preset": "Reference",
+        "clarity_trims_db": [
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0
+        ],
+        "clarity_wet": 1.0,
+        "crossfade_seconds": 0.0,
+        "head_yaw": 0.0,
+        "loudness_mode": "Off",
+        "manual_eq": {
+          "balance": 0.0,
+          "enabled": false,
+          "gains_db": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "preamp_db": 0.0,
+          "qs": [
+            0.7070000171661377,
+            0.7070000171661377,
+            0.7070000171661377,
+            0.7070000171661377,
+            0.7070000171661377,
+            0.7070000171661377,
+            0.7070000171661377,
+            0.7070000171661377,
+            0.7070000171661377,
+            0.7070000171661377
+          ]
+        },
+        "playback_speed": 1.0,
+        "skip_silence": false,
+        "sound_mode": "Enhanced",
+        "spatial_enabled": false,
+        "underruns": null
+      },
+      "settings_history": [
+        {
+          "output_seconds": 0.0,
+          "settings": {
+            "application_volume": 1.0,
+            "bit_perfect": false,
+            "clarity_preset": "Reference",
+            "clarity_trims_db": [
+              0.0,
+              0.0,
+              0.0,
+              0.0,
+              0.0,
+              0.0,
+              0.0,
+              0.0
+            ],
+            "clarity_wet": 1.0,
+            "crossfade_seconds": 0.0,
+            "head_yaw": 0.0,
+            "loudness_mode": "Off",
+            "manual_eq": {
+              "balance": 0.0,
+              "enabled": false,
+              "gains_db": [
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0
+              ],
+              "preamp_db": 0.0,
+              "qs": [
+                0.7070000171661377,
+                0.7070000171661377,
+                0.7070000171661377,
+                0.7070000171661377,
+                0.7070000171661377,
+                0.7070000171661377,
+                0.7070000171661377,
+                0.7070000171661377,
+                0.7070000171661377,
+                0.7070000171661377
+              ]
+            },
+            "playback_speed": 1.0,
+            "skip_silence": false,
+            "sound_mode": "Enhanced",
+            "spatial_enabled": false,
+            "underruns": null
+          }
+        }
+      ],
+      "source": "/var/folders/zs/5v7glytd5xv610h16ppx1glw0000gn/T/bitchord-pipeline-9f7bcy_q/tone.wav",
+      "source_complete_at_capture_finish": true,
+      "source_complete_at_capture_start": true,
+      "source_sha256": "926a0e1853094c9334e249fc7a1cdb112a61aae67f63d6211bf7e1cfe41f6c78",
+      "source_sha256_at_start": "926a0e1853094c9334e249fc7a1cdb112a61aae67f63d6211bf7e1cfe41f6c78"
+    }
+  }
+}

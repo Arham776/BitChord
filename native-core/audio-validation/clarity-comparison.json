@@ -1,0 +1,1239 @@
+{
+  "reference_revision": "ec11a430fcf6e7f06bbae450e768d48f1d97d161",
+  "rust_sound_sha256": "728a491e41963e862e45d841f05285c54562affc912e9b96cc16f706ec4b32af",
+  "max_deviation_db": 0.08632472813733298,
+  "results": [
+    {
+      "preset": "reference",
+      "rate": 44100,
+      "signal": "mid",
+      "hz": 40,
+      "delta_db": -1.2809594477225552e-05
+    },
+    {
+      "preset": "reference",
+      "rate": 44100,
+      "signal": "mid",
+      "hz": 72,
+      "delta_db": -1.9366791967099747e-05
+    },
+    {
+      "preset": "reference",
+      "rate": 44100,
+      "signal": "mid",
+      "hz": 130,
+      "delta_db": -7.68249915984485e-05
+    },
+    {
+      "preset": "reference",
+      "rate": 44100,
+      "signal": "mid",
+      "hz": 280,
+      "delta_db": -0.0005297712048747628
+    },
+    {
+      "preset": "reference",
+      "rate": 44100,
+      "signal": "mid",
+      "hz": 750,
+      "delta_db": -0.002833125043726285
+    },
+    {
+      "preset": "reference",
+      "rate": 44100,
+      "signal": "mid",
+      "hz": 1000,
+      "delta_db": -0.004093576771011522
+    },
+    {
+      "preset": "reference",
+      "rate": 44100,
+      "signal": "mid",
+      "hz": 3400,
+      "delta_db": -0.0008194345332898107
+    },
+    {
+      "preset": "reference",
+      "rate": 44100,
+      "signal": "mid",
+      "hz": 6000,
+      "delta_db": 1.3321128263271528e-06
+    },
+    {
+      "preset": "reference",
+      "rate": 44100,
+      "signal": "mid",
+      "hz": 10500,
+      "delta_db": -0.07830958753994735
+    },
+    {
+      "preset": "reference",
+      "rate": 44100,
+      "signal": "mid",
+      "hz": 16000,
+      "delta_db": -0.055248062296054244
+    },
+    {
+      "preset": "reference",
+      "rate": 44100,
+      "signal": "mid",
+      "hz": 19000,
+      "delta_db": -0.06860463364908478
+    },
+    {
+      "preset": "reference",
+      "rate": 44100,
+      "signal": "side",
+      "hz": 40,
+      "delta_db": -1.3033590790543018e-05
+    },
+    {
+      "preset": "reference",
+      "rate": 44100,
+      "signal": "side",
+      "hz": 72,
+      "delta_db": -1.9545107567239943e-05
+    },
+    {
+      "preset": "reference",
+      "rate": 44100,
+      "signal": "side",
+      "hz": 130,
+      "delta_db": -7.701966686229457e-05
+    },
+    {
+      "preset": "reference",
+      "rate": 44100,
+      "signal": "side",
+      "hz": 280,
+      "delta_db": -0.0005299282268788832
+    },
+    {
+      "preset": "reference",
+      "rate": 44100,
+      "signal": "side",
+      "hz": 750,
+      "delta_db": -0.0028333421715814786
+    },
+    {
+      "preset": "reference",
+      "rate": 44100,
+      "signal": "side",
+      "hz": 1000,
+      "delta_db": -0.004093787688145798
+    },
+    {
+      "preset": "reference",
+      "rate": 44100,
+      "signal": "side",
+      "hz": 3400,
+      "delta_db": -0.0008195902667997805
+    },
+    {
+      "preset": "reference",
+      "rate": 44100,
+      "signal": "side",
+      "hz": 6000,
+      "delta_db": 1.122263033298518e-06
+    },
+    {
+      "preset": "reference",
+      "rate": 44100,
+      "signal": "side",
+      "hz": 10500,
+      "delta_db": -0.0783098250326687
+    },
+    {
+      "preset": "reference",
+      "rate": 44100,
+      "signal": "side",
+      "hz": 16000,
+      "delta_db": -0.05524826129846891
+    },
+    {
+      "preset": "reference",
+      "rate": 44100,
+      "signal": "side",
+      "hz": 19000,
+      "delta_db": -0.06860483112954138
+    },
+    {
+      "preset": "reference",
+      "rate": 48000,
+      "signal": "mid",
+      "hz": 40,
+      "delta_db": -1.6010393727105413e-06
+    },
+    {
+      "preset": "reference",
+      "rate": 48000,
+      "signal": "mid",
+      "hz": 72,
+      "delta_db": -1.3468739473409005e-05
+    },
+    {
+      "preset": "reference",
+      "rate": 48000,
+      "signal": "mid",
+      "hz": 130,
+      "delta_db": -6.417699578093506e-05
+    },
+    {
+      "preset": "reference",
+      "rate": 48000,
+      "signal": "mid",
+      "hz": 280,
+      "delta_db": -0.0004484326850065385
+    },
+    {
+      "preset": "reference",
+      "rate": 48000,
+      "signal": "mid",
+      "hz": 750,
+      "delta_db": -0.0023946284477879584
+    },
+    {
+      "preset": "reference",
+      "rate": 48000,
+      "signal": "mid",
+      "hz": 1000,
+      "delta_db": -0.003454048854974732
+    },
+    {
+      "preset": "reference",
+      "rate": 48000,
+      "signal": "mid",
+      "hz": 3400,
+      "delta_db": -0.000459951205748821
+    },
+    {
+      "preset": "reference",
+      "rate": 48000,
+      "signal": "mid",
+      "hz": 6000,
+      "delta_db": -8.026448639449333e-07
+    },
+    {
+      "preset": "reference",
+      "rate": 48000,
+      "signal": "mid",
+      "hz": 10500,
+      "delta_db": -0.06641002587704373
+    },
+    {
+      "preset": "reference",
+      "rate": 48000,
+      "signal": "mid",
+      "hz": 16000,
+      "delta_db": -0.04774136247452322
+    },
+    {
+      "preset": "reference",
+      "rate": 48000,
+      "signal": "mid",
+      "hz": 19000,
+      "delta_db": -0.04572859387945175
+    },
+    {
+      "preset": "reference",
+      "rate": 48000,
+      "signal": "side",
+      "hz": 40,
+      "delta_db": -1.8356236762169126e-06
+    },
+    {
+      "preset": "reference",
+      "rate": 48000,
+      "signal": "side",
+      "hz": 72,
+      "delta_db": -1.3685841961414964e-05
+    },
+    {
+      "preset": "reference",
+      "rate": 48000,
+      "signal": "side",
+      "hz": 130,
+      "delta_db": -6.437313883442508e-05
+    },
+    {
+      "preset": "reference",
+      "rate": 48000,
+      "signal": "side",
+      "hz": 280,
+      "delta_db": -0.00044865759889430615
+    },
+    {
+      "preset": "reference",
+      "rate": 48000,
+      "signal": "side",
+      "hz": 750,
+      "delta_db": -0.002395118888257246
+    },
+    {
+      "preset": "reference",
+      "rate": 48000,
+      "signal": "side",
+      "hz": 1000,
+      "delta_db": -0.003454384243782434
+    },
+    {
+      "preset": "reference",
+      "rate": 48000,
+      "signal": "side",
+      "hz": 3400,
+      "delta_db": -0.00046018707966898265
+    },
+    {
+      "preset": "reference",
+      "rate": 48000,
+      "signal": "side",
+      "hz": 6000,
+      "delta_db": -9.699033739786499e-07
+    },
+    {
+      "preset": "reference",
+      "rate": 48000,
+      "signal": "side",
+      "hz": 10500,
+      "delta_db": -0.06641029511213595
+    },
+    {
+      "preset": "reference",
+      "rate": 48000,
+      "signal": "side",
+      "hz": 16000,
+      "delta_db": -0.047741663839694776
+    },
+    {
+      "preset": "reference",
+      "rate": 48000,
+      "signal": "side",
+      "hz": 19000,
+      "delta_db": -0.04572862481401905
+    },
+    {
+      "preset": "speaker",
+      "rate": 44100,
+      "signal": "mid",
+      "hz": 40,
+      "delta_db": -1.368589576325775e-05
+    },
+    {
+      "preset": "speaker",
+      "rate": 44100,
+      "signal": "mid",
+      "hz": 72,
+      "delta_db": -2.2494948809561814e-05
+    },
+    {
+      "preset": "speaker",
+      "rate": 44100,
+      "signal": "mid",
+      "hz": 130,
+      "delta_db": -8.364802635082381e-05
+    },
+    {
+      "preset": "speaker",
+      "rate": 44100,
+      "signal": "mid",
+      "hz": 280,
+      "delta_db": -0.0005365271839429305
+    },
+    {
+      "preset": "speaker",
+      "rate": 44100,
+      "signal": "mid",
+      "hz": 750,
+      "delta_db": -0.0028095973572469205
+    },
+    {
+      "preset": "speaker",
+      "rate": 44100,
+      "signal": "mid",
+      "hz": 1000,
+      "delta_db": -0.004057648250277954
+    },
+    {
+      "preset": "speaker",
+      "rate": 44100,
+      "signal": "mid",
+      "hz": 3400,
+      "delta_db": -0.0010249914225770062
+    },
+    {
+      "preset": "speaker",
+      "rate": 44100,
+      "signal": "mid",
+      "hz": 6000,
+      "delta_db": 1.3077277155216923e-06
+    },
+    {
+      "preset": "speaker",
+      "rate": 44100,
+      "signal": "mid",
+      "hz": 10500,
+      "delta_db": -0.08359215796847089
+    },
+    {
+      "preset": "speaker",
+      "rate": 44100,
+      "signal": "mid",
+      "hz": 16000,
+      "delta_db": -0.06138204789168408
+    },
+    {
+      "preset": "speaker",
+      "rate": 44100,
+      "signal": "mid",
+      "hz": 19000,
+      "delta_db": -0.07402954138571059
+    },
+    {
+      "preset": "speaker",
+      "rate": 44100,
+      "signal": "side",
+      "hz": 40,
+      "delta_db": -1.3974922983075631e-05
+    },
+    {
+      "preset": "speaker",
+      "rate": 44100,
+      "signal": "side",
+      "hz": 72,
+      "delta_db": -2.266747936384583e-05
+    },
+    {
+      "preset": "speaker",
+      "rate": 44100,
+      "signal": "side",
+      "hz": 130,
+      "delta_db": -8.385853107611188e-05
+    },
+    {
+      "preset": "speaker",
+      "rate": 44100,
+      "signal": "side",
+      "hz": 280,
+      "delta_db": -0.0005367251517659359
+    },
+    {
+      "preset": "speaker",
+      "rate": 44100,
+      "signal": "side",
+      "hz": 750,
+      "delta_db": -0.0028097766830125826
+    },
+    {
+      "preset": "speaker",
+      "rate": 44100,
+      "signal": "side",
+      "hz": 1000,
+      "delta_db": -0.004057840524207167
+    },
+    {
+      "preset": "speaker",
+      "rate": 44100,
+      "signal": "side",
+      "hz": 3400,
+      "delta_db": -0.0010251939719280456
+    },
+    {
+      "preset": "speaker",
+      "rate": 44100,
+      "signal": "side",
+      "hz": 6000,
+      "delta_db": 9.968652491324617e-07
+    },
+    {
+      "preset": "speaker",
+      "rate": 44100,
+      "signal": "side",
+      "hz": 10500,
+      "delta_db": -0.08359245016232567
+    },
+    {
+      "preset": "speaker",
+      "rate": 44100,
+      "signal": "side",
+      "hz": 16000,
+      "delta_db": -0.061382250956626014
+    },
+    {
+      "preset": "speaker",
+      "rate": 44100,
+      "signal": "side",
+      "hz": 19000,
+      "delta_db": -0.07402971296914726
+    },
+    {
+      "preset": "speaker",
+      "rate": 48000,
+      "signal": "mid",
+      "hz": 40,
+      "delta_db": -2.2782267803838374e-06
+    },
+    {
+      "preset": "speaker",
+      "rate": 48000,
+      "signal": "mid",
+      "hz": 72,
+      "delta_db": -1.608405297368603e-05
+    },
+    {
+      "preset": "speaker",
+      "rate": 48000,
+      "signal": "mid",
+      "hz": 130,
+      "delta_db": -6.999320624818148e-05
+    },
+    {
+      "preset": "speaker",
+      "rate": 48000,
+      "signal": "mid",
+      "hz": 280,
+      "delta_db": -0.0004541441162505576
+    },
+    {
+      "preset": "speaker",
+      "rate": 48000,
+      "signal": "mid",
+      "hz": 750,
+      "delta_db": -0.002374809228413473
+    },
+    {
+      "preset": "speaker",
+      "rate": 48000,
+      "signal": "mid",
+      "hz": 1000,
+      "delta_db": -0.0034241223445968714
+    },
+    {
+      "preset": "speaker",
+      "rate": 48000,
+      "signal": "mid",
+      "hz": 3400,
+      "delta_db": -0.0006422916800730265
+    },
+    {
+      "preset": "speaker",
+      "rate": 48000,
+      "signal": "mid",
+      "hz": 6000,
+      "delta_db": -1.1237176602600999e-07
+    },
+    {
+      "preset": "speaker",
+      "rate": 48000,
+      "signal": "mid",
+      "hz": 10500,
+      "delta_db": -0.07078771352447961
+    },
+    {
+      "preset": "speaker",
+      "rate": 48000,
+      "signal": "mid",
+      "hz": 16000,
+      "delta_db": -0.05319954921804558
+    },
+    {
+      "preset": "speaker",
+      "rate": 48000,
+      "signal": "mid",
+      "hz": 19000,
+      "delta_db": -0.0502647385656119
+    },
+    {
+      "preset": "speaker",
+      "rate": 48000,
+      "signal": "side",
+      "hz": 40,
+      "delta_db": -2.6258575193413156e-06
+    },
+    {
+      "preset": "speaker",
+      "rate": 48000,
+      "signal": "side",
+      "hz": 72,
+      "delta_db": -1.6308967462099633e-05
+    },
+    {
+      "preset": "speaker",
+      "rate": 48000,
+      "signal": "side",
+      "hz": 130,
+      "delta_db": -7.020538274395267e-05
+    },
+    {
+      "preset": "speaker",
+      "rate": 48000,
+      "signal": "side",
+      "hz": 280,
+      "delta_db": -0.00045435219002208974
+    },
+    {
+      "preset": "speaker",
+      "rate": 48000,
+      "signal": "side",
+      "hz": 750,
+      "delta_db": -0.002374999365922108
+    },
+    {
+      "preset": "speaker",
+      "rate": 48000,
+      "signal": "side",
+      "hz": 1000,
+      "delta_db": -0.0034242381785796975
+    },
+    {
+      "preset": "speaker",
+      "rate": 48000,
+      "signal": "side",
+      "hz": 3400,
+      "delta_db": -0.000642473357048334
+    },
+    {
+      "preset": "speaker",
+      "rate": 48000,
+      "signal": "side",
+      "hz": 6000,
+      "delta_db": 8.072786378992172e-09
+    },
+    {
+      "preset": "speaker",
+      "rate": 48000,
+      "signal": "side",
+      "hz": 10500,
+      "delta_db": -0.07078787834409359
+    },
+    {
+      "preset": "speaker",
+      "rate": 48000,
+      "signal": "side",
+      "hz": 16000,
+      "delta_db": -0.053200034371967166
+    },
+    {
+      "preset": "speaker",
+      "rate": 48000,
+      "signal": "side",
+      "hz": 19000,
+      "delta_db": -0.05026491691397288
+    },
+    {
+      "preset": "headphone",
+      "rate": 44100,
+      "signal": "mid",
+      "hz": 40,
+      "delta_db": -1.310892307108475e-05
+    },
+    {
+      "preset": "headphone",
+      "rate": 44100,
+      "signal": "mid",
+      "hz": 72,
+      "delta_db": -2.0381503180831417e-05
+    },
+    {
+      "preset": "headphone",
+      "rate": 44100,
+      "signal": "mid",
+      "hz": 130,
+      "delta_db": -7.909895830945346e-05
+    },
+    {
+      "preset": "headphone",
+      "rate": 44100,
+      "signal": "mid",
+      "hz": 280,
+      "delta_db": -0.0005333237619932863
+    },
+    {
+      "preset": "headphone",
+      "rate": 44100,
+      "signal": "mid",
+      "hz": 750,
+      "delta_db": -0.0028950865998065346
+    },
+    {
+      "preset": "headphone",
+      "rate": 44100,
+      "signal": "mid",
+      "hz": 1000,
+      "delta_db": -0.0042668017029050456
+    },
+    {
+      "preset": "headphone",
+      "rate": 44100,
+      "signal": "mid",
+      "hz": 3400,
+      "delta_db": -0.0007700132602301912
+    },
+    {
+      "preset": "headphone",
+      "rate": 44100,
+      "signal": "mid",
+      "hz": 6000,
+      "delta_db": 1.630074730167816e-06
+    },
+    {
+      "preset": "headphone",
+      "rate": 44100,
+      "signal": "mid",
+      "hz": 10500,
+      "delta_db": -0.07571021332996854
+    },
+    {
+      "preset": "headphone",
+      "rate": 44100,
+      "signal": "mid",
+      "hz": 16000,
+      "delta_db": -0.05259788126421598
+    },
+    {
+      "preset": "headphone",
+      "rate": 44100,
+      "signal": "mid",
+      "hz": 19000,
+      "delta_db": -0.06700588338811214
+    },
+    {
+      "preset": "headphone",
+      "rate": 44100,
+      "signal": "side",
+      "hz": 40,
+      "delta_db": -1.3324618655882047e-05
+    },
+    {
+      "preset": "headphone",
+      "rate": 44100,
+      "signal": "side",
+      "hz": 72,
+      "delta_db": -2.0634168864934767e-05
+    },
+    {
+      "preset": "headphone",
+      "rate": 44100,
+      "signal": "side",
+      "hz": 130,
+      "delta_db": -7.928550393778192e-05
+    },
+    {
+      "preset": "headphone",
+      "rate": 44100,
+      "signal": "side",
+      "hz": 280,
+      "delta_db": -0.0005335575941140054
+    },
+    {
+      "preset": "headphone",
+      "rate": 44100,
+      "signal": "side",
+      "hz": 750,
+      "delta_db": -0.002895226556982322
+    },
+    {
+      "preset": "headphone",
+      "rate": 44100,
+      "signal": "side",
+      "hz": 1000,
+      "delta_db": -0.004266978984900363
+    },
+    {
+      "preset": "headphone",
+      "rate": 44100,
+      "signal": "side",
+      "hz": 3400,
+      "delta_db": -0.0007702406680122922
+    },
+    {
+      "preset": "headphone",
+      "rate": 44100,
+      "signal": "side",
+      "hz": 6000,
+      "delta_db": 1.3877770159777249e-06
+    },
+    {
+      "preset": "headphone",
+      "rate": 44100,
+      "signal": "side",
+      "hz": 10500,
+      "delta_db": -0.07571020465133045
+    },
+    {
+      "preset": "headphone",
+      "rate": 44100,
+      "signal": "side",
+      "hz": 16000,
+      "delta_db": -0.052598087330725525
+    },
+    {
+      "preset": "headphone",
+      "rate": 44100,
+      "signal": "side",
+      "hz": 19000,
+      "delta_db": -0.06700610130000606
+    },
+    {
+      "preset": "headphone",
+      "rate": 48000,
+      "signal": "mid",
+      "hz": 40,
+      "delta_db": -1.8134199747401862e-06
+    },
+    {
+      "preset": "headphone",
+      "rate": 48000,
+      "signal": "mid",
+      "hz": 72,
+      "delta_db": -1.4293061078984378e-05
+    },
+    {
+      "preset": "headphone",
+      "rate": 48000,
+      "signal": "mid",
+      "hz": 130,
+      "delta_db": -6.613062283629211e-05
+    },
+    {
+      "preset": "headphone",
+      "rate": 48000,
+      "signal": "mid",
+      "hz": 280,
+      "delta_db": -0.00045152451620946577
+    },
+    {
+      "preset": "headphone",
+      "rate": 48000,
+      "signal": "mid",
+      "hz": 750,
+      "delta_db": -0.0024476155704710395
+    },
+    {
+      "preset": "headphone",
+      "rate": 48000,
+      "signal": "mid",
+      "hz": 1000,
+      "delta_db": -0.0036014791718616455
+    },
+    {
+      "preset": "headphone",
+      "rate": 48000,
+      "signal": "mid",
+      "hz": 3400,
+      "delta_db": -0.000388953441024377
+    },
+    {
+      "preset": "headphone",
+      "rate": 48000,
+      "signal": "mid",
+      "hz": 6000,
+      "delta_db": 7.725645046859105e-08
+    },
+    {
+      "preset": "headphone",
+      "rate": 48000,
+      "signal": "mid",
+      "hz": 10500,
+      "delta_db": -0.06426943833715999
+    },
+    {
+      "preset": "headphone",
+      "rate": 48000,
+      "signal": "mid",
+      "hz": 16000,
+      "delta_db": -0.04523944997680178
+    },
+    {
+      "preset": "headphone",
+      "rate": 48000,
+      "signal": "mid",
+      "hz": 19000,
+      "delta_db": -0.0438498047921502
+    },
+    {
+      "preset": "headphone",
+      "rate": 48000,
+      "signal": "side",
+      "hz": 40,
+      "delta_db": -2.080464817489963e-06
+    },
+    {
+      "preset": "headphone",
+      "rate": 48000,
+      "signal": "side",
+      "hz": 72,
+      "delta_db": -1.4493395786358509e-05
+    },
+    {
+      "preset": "headphone",
+      "rate": 48000,
+      "signal": "side",
+      "hz": 130,
+      "delta_db": -6.634215194916855e-05
+    },
+    {
+      "preset": "headphone",
+      "rate": 48000,
+      "signal": "side",
+      "hz": 280,
+      "delta_db": -0.0004517512450106097
+    },
+    {
+      "preset": "headphone",
+      "rate": 48000,
+      "signal": "side",
+      "hz": 750,
+      "delta_db": -0.0024477074071682812
+    },
+    {
+      "preset": "headphone",
+      "rate": 48000,
+      "signal": "side",
+      "hz": 1000,
+      "delta_db": -0.0036016488256835825
+    },
+    {
+      "preset": "headphone",
+      "rate": 48000,
+      "signal": "side",
+      "hz": 3400,
+      "delta_db": -0.0003891314842320991
+    },
+    {
+      "preset": "headphone",
+      "rate": 48000,
+      "signal": "side",
+      "hz": 6000,
+      "delta_db": 2.4045831287905924e-08
+    },
+    {
+      "preset": "headphone",
+      "rate": 48000,
+      "signal": "side",
+      "hz": 10500,
+      "delta_db": -0.06426953070374998
+    },
+    {
+      "preset": "headphone",
+      "rate": 48000,
+      "signal": "side",
+      "hz": 16000,
+      "delta_db": -0.045239842199810004
+    },
+    {
+      "preset": "headphone",
+      "rate": 48000,
+      "signal": "side",
+      "hz": 19000,
+      "delta_db": -0.04384989312507452
+    },
+    {
+      "preset": "dac",
+      "rate": 44100,
+      "signal": "mid",
+      "hz": 40,
+      "delta_db": -1.2428889925474121e-05
+    },
+    {
+      "preset": "dac",
+      "rate": 44100,
+      "signal": "mid",
+      "hz": 72,
+      "delta_db": -1.7592292260808403e-05
+    },
+    {
+      "preset": "dac",
+      "rate": 44100,
+      "signal": "mid",
+      "hz": 130,
+      "delta_db": -6.852433471898136e-05
+    },
+    {
+      "preset": "dac",
+      "rate": 44100,
+      "signal": "mid",
+      "hz": 280,
+      "delta_db": -0.0004722543216332573
+    },
+    {
+      "preset": "dac",
+      "rate": 44100,
+      "signal": "mid",
+      "hz": 750,
+      "delta_db": -0.0025361213222247895
+    },
+    {
+      "preset": "dac",
+      "rate": 44100,
+      "signal": "mid",
+      "hz": 1000,
+      "delta_db": -0.0036798252590906797
+    },
+    {
+      "preset": "dac",
+      "rate": 44100,
+      "signal": "mid",
+      "hz": 3400,
+      "delta_db": -0.001665336683782915
+    },
+    {
+      "preset": "dac",
+      "rate": 44100,
+      "signal": "mid",
+      "hz": 6000,
+      "delta_db": 7.938942999246933e-07
+    },
+    {
+      "preset": "dac",
+      "rate": 44100,
+      "signal": "mid",
+      "hz": 10500,
+      "delta_db": -0.0863244061633531
+    },
+    {
+      "preset": "dac",
+      "rate": 44100,
+      "signal": "mid",
+      "hz": 16000,
+      "delta_db": -0.06846123982575522
+    },
+    {
+      "preset": "dac",
+      "rate": 44100,
+      "signal": "mid",
+      "hz": 19000,
+      "delta_db": -0.07820634375156338
+    },
+    {
+      "preset": "dac",
+      "rate": 44100,
+      "signal": "side",
+      "hz": 40,
+      "delta_db": -1.268040847394643e-05
+    },
+    {
+      "preset": "dac",
+      "rate": 44100,
+      "signal": "side",
+      "hz": 72,
+      "delta_db": -1.7854873335423892e-05
+    },
+    {
+      "preset": "dac",
+      "rate": 44100,
+      "signal": "side",
+      "hz": 130,
+      "delta_db": -6.87410297686623e-05
+    },
+    {
+      "preset": "dac",
+      "rate": 44100,
+      "signal": "side",
+      "hz": 280,
+      "delta_db": -0.00047249154549865234
+    },
+    {
+      "preset": "dac",
+      "rate": 44100,
+      "signal": "side",
+      "hz": 750,
+      "delta_db": -0.0025363937506193974
+    },
+    {
+      "preset": "dac",
+      "rate": 44100,
+      "signal": "side",
+      "hz": 1000,
+      "delta_db": -0.003680071123738832
+    },
+    {
+      "preset": "dac",
+      "rate": 44100,
+      "signal": "side",
+      "hz": 3400,
+      "delta_db": -0.001665525156189763
+    },
+    {
+      "preset": "dac",
+      "rate": 44100,
+      "signal": "side",
+      "hz": 6000,
+      "delta_db": 6.382536860903928e-07
+    },
+    {
+      "preset": "dac",
+      "rate": 44100,
+      "signal": "side",
+      "hz": 10500,
+      "delta_db": -0.08632472813733298
+    },
+    {
+      "preset": "dac",
+      "rate": 44100,
+      "signal": "side",
+      "hz": 16000,
+      "delta_db": -0.06846148217407681
+    },
+    {
+      "preset": "dac",
+      "rate": 44100,
+      "signal": "side",
+      "hz": 19000,
+      "delta_db": -0.07820654027568931
+    },
+    {
+      "preset": "dac",
+      "rate": 48000,
+      "signal": "mid",
+      "hz": 40,
+      "delta_db": -1.2573178149083535e-06
+    },
+    {
+      "preset": "dac",
+      "rate": 48000,
+      "signal": "mid",
+      "hz": 72,
+      "delta_db": -1.1922619650739449e-05
+    },
+    {
+      "preset": "dac",
+      "rate": 48000,
+      "signal": "mid",
+      "hz": 130,
+      "delta_db": -5.713676240699995e-05
+    },
+    {
+      "preset": "dac",
+      "rate": 48000,
+      "signal": "mid",
+      "hz": 280,
+      "delta_db": -0.00039969989727529063
+    },
+    {
+      "preset": "dac",
+      "rate": 48000,
+      "signal": "mid",
+      "hz": 750,
+      "delta_db": -0.002144039385923529
+    },
+    {
+      "preset": "dac",
+      "rate": 48000,
+      "signal": "mid",
+      "hz": 1000,
+      "delta_db": -0.0031063515448350376
+    },
+    {
+      "preset": "dac",
+      "rate": 48000,
+      "signal": "mid",
+      "hz": 3400,
+      "delta_db": -0.0012240513836110022
+    },
+    {
+      "preset": "dac",
+      "rate": 48000,
+      "signal": "mid",
+      "hz": 6000,
+      "delta_db": -9.488082894478108e-08
+    },
+    {
+      "preset": "dac",
+      "rate": 48000,
+      "signal": "mid",
+      "hz": 10500,
+      "delta_db": -0.07289178779293722
+    },
+    {
+      "preset": "dac",
+      "rate": 48000,
+      "signal": "mid",
+      "hz": 16000,
+      "delta_db": -0.059632134061256045
+    },
+    {
+      "preset": "dac",
+      "rate": 48000,
+      "signal": "mid",
+      "hz": 19000,
+      "delta_db": -0.05507432057536139
+    },
+    {
+      "preset": "dac",
+      "rate": 48000,
+      "signal": "side",
+      "hz": 40,
+      "delta_db": -1.2823604240834838e-06
+    },
+    {
+      "preset": "dac",
+      "rate": 48000,
+      "signal": "side",
+      "hz": 72,
+      "delta_db": -1.2096762463689353e-05
+    },
+    {
+      "preset": "dac",
+      "rate": 48000,
+      "signal": "side",
+      "hz": 130,
+      "delta_db": -5.7370320287419567e-05
+    },
+    {
+      "preset": "dac",
+      "rate": 48000,
+      "signal": "side",
+      "hz": 280,
+      "delta_db": -0.0003999218105571085
+    },
+    {
+      "preset": "dac",
+      "rate": 48000,
+      "signal": "side",
+      "hz": 750,
+      "delta_db": -0.0021440827704337947
+    },
+    {
+      "preset": "dac",
+      "rate": 48000,
+      "signal": "side",
+      "hz": 1000,
+      "delta_db": -0.003106646876401111
+    },
+    {
+      "preset": "dac",
+      "rate": 48000,
+      "signal": "side",
+      "hz": 3400,
+      "delta_db": -0.0012242731154716335
+    },
+    {
+      "preset": "dac",
+      "rate": 48000,
+      "signal": "side",
+      "hz": 6000,
+      "delta_db": -2.534485185934448e-07
+    },
+    {
+      "preset": "dac",
+      "rate": 48000,
+      "signal": "side",
+      "hz": 10500,
+      "delta_db": -0.07289184535671017
+    },
+    {
+      "preset": "dac",
+      "rate": 48000,
+      "signal": "side",
+      "hz": 16000,
+      "delta_db": -0.059632506230787787
+    },
+    {
+      "preset": "dac",
+      "rate": 48000,
+      "signal": "side",
+      "hz": 19000,
+      "delta_db": -0.05507462201707294
+    }
+  ]
+}

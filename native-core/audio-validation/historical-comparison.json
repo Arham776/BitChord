@@ -1,0 +1,29 @@
+{
+  "before_revision": "1859a643f7bf1f625367254cf582921fc88629ea",
+  "after_revision": "8e8e44a8dc07ea625ac08abbb0ab5c1ca547bba0",
+  "fixture_sha256": "fa035245e6aae36794e1ef94bda4888a92eac76de9246d97b4c2f72dc5ba64fc",
+  "output_rate": 48000,
+  "frames": 144000,
+  "settings": "unity gain, flat EQ, spatial/normalization/crossfade off; same stereo float input",
+  "changed_samples": 1022,
+  "max_difference": 0.07499667257070541,
+  "guard_gain_discontinuities": [
+    {
+      "frame": 11776,
+      "gain_step": -0.37500000851422255,
+      "sample_difference_from_before": 0.043061114847660065
+    },
+    {
+      "frame": 12288,
+      "gain_step": 0.3749999482580897,
+      "sample_difference_from_before": 0.0
+    }
+  ],
+  "repaired_transparent_matches_before": true,
+  "engine_logs": {
+    "before": "PCM: 48000 Hz, 2 channels \u2192 48000 Hz\n144000 frames; NerdSnapshot { codec: \"PCM\", sample_rate: 48000, bit_depth: 16, channels: 2, kbps: 0, loudness_gain_db: None, swap_correlation: None }",
+    "after": "PCM Float: 48000 Hz, 2 channels \u2192 48000 Hz\n144000 frames; NerdSnapshot { codec: \"PCM Float\", sample_rate: 48000, bit_depth: 0, channels: 2, kbps: 0, loudness_gain_db: None, swap_correlation: None }",
+    "repaired": "PCM Float: 48000 Hz, 2 channels \u2192 48000 Hz; Transparent\n144000 frames; NerdSnapshot { codec: \"PCM Float\", sample_rate: 48000, bit_depth: 0, channels: 2, kbps: 0, loudness_gain_db: None, swap_correlation: None, active_stages: [], converter_delay_frames: 0.0, protection_reduction_db: 0.0, protection_interventions: 2, build_revision: \"6659a8ee32f7+677cf034c722\", decoder_implementation: \"PCM 32-bit Little-Endian Floating Point Interleaved\", decoded_layout: \"Some(Positioned(Position(FRONT_LEFT | FRONT_RIGHT)))\", queued_target_ms: 250, loudness_origin: \"No measurement\" }"
+  },
+  "scope": "synthetic overload establishes block-guard regression; does not identify the cause in Nerve"
+}

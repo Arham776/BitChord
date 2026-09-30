@@ -1,0 +1,88 @@
+{
+  "date": "2026-09-30",
+  "core_revision": "6659a8ee32f7+c567f9a8945a",
+  "native_tests": {
+    "passed": 145,
+    "failed": 0
+  },
+  "shared_rendition_tests": {
+    "passed": 2,
+    "failed": 0
+  },
+  "builds": {
+    "native_xcframework": [
+      "macos-arm64",
+      "ios-arm64",
+      "ios-arm64-simulator"
+    ],
+    "shared_xcframework": [
+      "iosArm64",
+      "iosSimulatorArm64",
+      "macosArm64"
+    ],
+    "apps": [
+      "generic macOS Debug",
+      "generic iOS/iPadOS Debug"
+    ],
+    "generated_bindings": [
+      "Swift",
+      "Kotlin"
+    ]
+  },
+  "references": {
+    "bitchord": "fe198ac0bde052f8b84cfd84b1d271f8f1fcc7b2",
+    "lastwave": "ec11a430fcf6e7f06bbae450e768d48f1d97d161",
+    "libsoxr": "0.1.3",
+    "ebur128": "0.1.10"
+  },
+  "remaining_gates": [
+    "exact selected Nerve rendition, independent decoder and level-matched listening",
+    "iPhone/iPad, USB/wired, Bluetooth/AirPods hardware matrix",
+    "in-app UI and analysis load stress"
+  ],
+  "mac_hardware_checks": {
+    "passed": 39,
+    "failed": 0,
+    "application_gain": 0.01,
+    "scope": "actual default Mac output, including seek, pause, negotiated formats, concurrent rebuilds, mode/normalization and stale source upgrades",
+    "core_revision": "6659a8ee32f7+c567f9a8945a"
+  },
+  "limitations": [
+    "Automatic whole-album loudness scanning is not implemented; album metadata/explicit measurement is supported with Track fallback."
+  ],
+  "mac_stress": {
+    "report": "mac-output-stress.json",
+    "passed": true,
+    "duration_seconds": 1801.8734769821167,
+    "callback_underruns": 0,
+    "device_xruns": 0,
+    "output_rebuilds": 0,
+    "device": "MacBook Air Speakers",
+    "application_gain": 0,
+    "concurrent_analysis": {
+      "measurements": 140,
+      "source_duration_seconds": 1840,
+      "workload_duration_seconds": 600
+    },
+    "scope": "actual negotiated 44.1 kHz output, 48 kHz hot stereo source; compile and production loudness-analysis load; no listening evidence"
+  },
+  "compressed_seek_checks": {
+    "passed": 13,
+    "failed": 0,
+    "report": "seek-comparison.json",
+    "scope": "early and mid-file seeks; pull-size independence, exact lengths; HE-AAC matches independent ExtAudioFile seek; AAC-LC, positioned AAC, Opus and MP3 match continuous PCM within 1e-6"
+  },
+  "mac_capture_continuity": {
+    "passed": true,
+    "report": "mac-capture-continuity.json",
+    "callback_underruns": 0,
+    "device_xruns": 0,
+    "finish_seconds": 2.0106090307235718,
+    "encoded_bytes": 706560044,
+    "stage_frames": {
+      "decoder": 1440000,
+      "voice": 1323000,
+      "protected": 1323000
+    }
+  }
+}

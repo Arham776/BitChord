@@ -1,0 +1,23 @@
+{
+  "active_stages" : [
+    "Application volume",
+    "Enhanced clarity (4× exciter)",
+    "True-peak protection"
+  ],
+  "application_gain" : 0,
+  "callback_underruns" : 1268,
+  "core_revision" : "6659a8ee32f7+677cf034c722",
+  "device" : "AirPods Pro",
+  "device_xruns" : 0,
+  "duration_seconds" : 1801.6352870464325,
+  "errors" : [
+
+  ],
+  "minimum_sampled_queue_frames" : 0,
+  "negotiated_rate" : 48000,
+  "output_rebuilds" : 1,
+  "passed" : false,
+  "protection_interventions" : 46162812,
+  "scope" : "macOS physical output, local adequate source, concurrent compiler load; inaudible; no listening claim",
+  "warmup_seconds" : 10
+}
