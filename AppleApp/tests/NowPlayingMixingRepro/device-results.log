@@ -1,0 +1,36 @@
+No competing audio
+activation category=AVAudioSessionCategoryPlayback options=1 otherAudio=0
+playing before publication
+eligible=true applicationPrimary=false systemPrimary=false
+status changed
+eligible=true applicationPrimary=true systemPrimary=false
+publication completed
+eligible=true applicationPrimary=true systemPrimary=false
+prominence error internalFailure
+eligible=true applicationPrimary=true systemPrimary=false
+
+Other audio active
+activation category=AVAudioSessionCategoryPlayback options=1 otherAudio=1
+playing before publication
+eligible=true applicationPrimary=false systemPrimary=false
+status changed
+eligible=true applicationPrimary=true systemPrimary=false
+publication completed
+eligible=true applicationPrimary=true systemPrimary=false
+prominence error internalFailure
+eligible=true applicationPrimary=true systemPrimary=false
+
+GenericContent comparison, other audio active (09:09:40)
+activation category=AVAudioSessionCategoryPlayback options=1 otherAudio=1
+playing before publication content=GenericContent
+eligible=true applicationPrimary=false systemPrimary=false appState=1
+publication completed
+eligible=true applicationPrimary=true systemPrimary=false appState=1
+prominence requested on active foreground entry
+eligible=true applicationPrimary=true systemPrimary=false appState=0
+prominence error internalFailure
+eligible=true applicationPrimary=true systemPrimary=false appState=0
+prominence requested 300 ms after publication
+eligible=true applicationPrimary=true systemPrimary=false appState=0
+prominence error internalFailure
+eligible=true applicationPrimary=true systemPrimary=false appState=0

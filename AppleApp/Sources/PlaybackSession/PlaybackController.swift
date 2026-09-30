@@ -409,9 +409,6 @@ final class PlaybackController {
     private var lastPersistAt = Date.distantPast
 
     private var positionTimer: Timer?
-    /// The system-primary check only needs to run every few seconds while the
-    /// app is visible, even though transport position is sampled four times a second.
-    @ObservationIgnored private var lastNowPlayingClaimCheck = Date.distantPast
     private var started = false
     /// The output stream must exist before a restored track is loaded into the
     /// engine. Keeping the startup task lets each load await that one boot
@@ -482,19 +479,39 @@ final class PlaybackController {
             }
         )
         // Log secondary audio events and media reset notifications
-        routeObservers += AudioSessionManager.observeSessionEvents { event in
+        routeObservers += AudioSessionManager.observeSessionEvents { [weak self] event in
+            PlaybackDebugLog.shared.record(event)
             NSLog("[BitChord] %@", event)
+            if event == "audio media services were reset" {
+                Task { @MainActor in
+                    self?.nowPlaying.audioSessionUnavailable()
+                    self?.outputRouteChanged()
+                }
+            }
         }
         // And the one session signal that asks for an action rather than a line
         // in the log: another app wants the primary audio slot. Duck, don't
         // pause — the music is the thing this app promises not to take away, and
         // the prompt is the thing that has to be heard over it.
         routeObservers += AudioSessionManager.observeSecondaryAudioSilence { [weak self] shouldSilence in
-            Task { @MainActor in self?.applyDuck(shouldSilence) }
+            Task { @MainActor in
+                self?.applyDuck(shouldSilence)
+                if !shouldSilence {
+                    self?.nowPlaying.requestPrimaryIfPossible(reason: "other audio ended")
+                }
+            }
         }
         nowPlaying.onToggle = { [weak self] in self?.togglePlayPause() }
         nowPlaying.onPlay = { [weak self] in
-            guard let self, !self.isPlaying, !self.isBuffering else { return }
+            guard let self, !self.isBuffering else { return }
+            if self.isPlaying {
+                // Selecting a secondary native card can send Play while the
+                // engine is already playing. Re-anchor its actual snapshot and
+                // honor that focus request without toggling playback off.
+                self.nowPlaying.updateRate(self.playbackRate, position: self.engine.positionSeconds())
+                self.reactivateAudioSessionAfterForeground(reason: "native play")
+                return
+            }
             self.togglePlayPause()
         }
         nowPlaying.onPause = { [weak self] in
@@ -533,7 +550,7 @@ final class PlaybackController {
                 // The session has to be up before the output stream exists, and
                 // the iOS session owns the hardware format — so this is awaited,
                 // and its answer is what the engine is told to open at.
-                let format = await AudioSessionManager.activate()
+                let format = try await AudioSessionManager.activate()
                 // Configure device choice and sample format before opening the
                 // stream. Applying them just after start caused a second output
                 // build while the first track could already be playing.
@@ -587,10 +604,6 @@ final class PlaybackController {
                 self.position = self.engine.positionSeconds()
                 self.positionSampledAt = Date()
                 self.nowPlaying.update(position: self.position)
-                if Date().timeIntervalSince(self.lastNowPlayingClaimCheck) >= 2 {
-                    self.lastNowPlayingClaimCheck = Date()
-                    self.nowPlaying.reclaimAfterOtherAudioStops()
-                }
                 // The periodic output-health NSLog that used to sit here is
                 // gone: every figure it carried — buffered frames, silent
                 // callbacks, rebuilds, xruns and the output peak — is on the
@@ -612,15 +625,32 @@ final class PlaybackController {
     /// A running output can survive in the background while iOS temporarily
     /// deactivates its audio session. Reassert playback activation on return
     /// only when actively playing; do not hijack audio when paused or idle.
-    func reactivateAudioSessionAfterForeground() {
+    func reactivateAudioSessionAfterForeground(reason: String = "foreground") {
         guard started, state == .playing else { return }
+        let selection = playGeneration
+        let intent = resumeGeneration
         Task.detached(priority: .userInitiated) { [weak self] in
-            _ = await AudioSessionManager.activate()
-            await MainActor.run { [weak self] in
-                guard let self, self.state == .playing else { return }
-                self.nowPlaying.requestPrimaryIfPossible()
+            do {
+                _ = try await AudioSessionManager.activate()
+                await MainActor.run { [weak self] in
+                    guard let self, self.state == .playing,
+                          self.playGeneration == selection, self.resumeGeneration == intent else { return }
+                    self.nowPlaying.requestPrimaryIfPossible(reason: reason)
+                }
+            } catch {
+                await MainActor.run { [weak self] in
+                    guard let self, self.playGeneration == selection,
+                          self.resumeGeneration == intent else { return }
+                    self.audioActivationFailed(error)
+                }
             }
         }
+    }
+
+    private func audioActivationFailed(_ error: Error) {
+        nowPlaying.audioSessionUnavailable()
+        if isPlaying || isBuffering { pausePlayback() }
+        lastError = "Audio session could not activate: \(error)"
     }
 
     /// The output route moved under us — AirPods put down, a device connected,
@@ -639,13 +669,29 @@ final class PlaybackController {
     ///    even if CoreAudio's own rebuild beat us to it.
     private func outputRouteChanged() {
         guard started, state == .playing else { return }
+        let selection = playGeneration
+        let intent = resumeGeneration
         let engine = self.engine
-        Task.detached(priority: .userInitiated) {
-            _ = await AudioSessionManager.activate()
+        Task.detached(priority: .userInitiated) { [weak self] in
             do {
-                try engine.requestOutputRebuild(force: true)
+                _ = try await AudioSessionManager.activate()
             } catch {
-                NSLog("[BitChord] output rebuild after route change failed: \(error)")
+                await MainActor.run { [weak self] in
+                    guard let self, self.playGeneration == selection,
+                          self.resumeGeneration == intent else { return }
+                    self.audioActivationFailed(error)
+                }
+                return
+            }
+            await MainActor.run { [weak self] in
+                guard let self, self.isPlaying, self.playGeneration == selection,
+                      self.resumeGeneration == intent else { return }
+                do {
+                    try engine.requestOutputRebuild(force: true)
+                    self.nowPlaying.requestPrimaryIfPossible(reason: "route activation")
+                } catch {
+                    NSLog("[BitChord] output rebuild after route change failed: \(error)")
+                }
             }
         }
     }
@@ -864,7 +910,7 @@ final class PlaybackController {
         state = .paused
         if let entry = current {
             nowPlaying.update(
-                title: entry.title, artist: entry.artist,
+                id: entry.id, title: entry.title, artist: entry.artist,
                 duration: duration, artworkData: entry.artworkData,
                 thumbnailUrl: entry.thumbnailUrl, isPlaying: false, position: position
             )
@@ -1046,11 +1092,21 @@ final class PlaybackController {
                 let matchRate = PlatformSettings.shared.getBoolean(
                     key: "match_source_sample_rate", default: true
                 )
-                let sessionFormat = await AudioSessionManager.activate(
-                    preferredSampleRate: matchRate
-                        ? (sourceFormat.sampleRate > 0 ? Double(sourceFormat.sampleRate) : nil)
-                        : nil
-                )
+                let sessionFormat: AudioSessionManager.Format?
+                do {
+                    sessionFormat = try await AudioSessionManager.activate(
+                        preferredSampleRate: matchRate
+                            ? (sourceFormat.sampleRate > 0 ? Double(sourceFormat.sampleRate) : nil)
+                            : nil
+                    )
+                } catch {
+                    await MainActor.run { [weak self] in
+                        guard let self, self.resumeGeneration == generation,
+                              self.playGeneration == selection else { return }
+                        self.audioActivationFailed(error)
+                    }
+                    return
+                }
                 do {
                     _ = try gate.performIfCurrent(generation: selection) {
                         try engine.prepareTrackOutput(
@@ -1071,16 +1127,20 @@ final class PlaybackController {
                     guard let self,
                           self.resumeGeneration == generation,
                           self.playGeneration == selection, self.isPlaying,
-                          self.current?.id == self.engineLoadedId
+                          self.current?.id == self.engineLoadedId,
+                          let entry = self.current
                     else { return }
                     do {
+                        self.prepareNowPlayingForPlayback(entry: entry, duration: self.duration, position: self.position)
                         try engine.play()
                         self.state = .playing
                         let speed = Double(PlatformSettings.shared.getFloat(key: "playback_speed", default: 1))
                         self.playbackRate = speed.isFinite ? min(max(speed, 0.5), 2.0) : 1.0
                         self.positionSampledAt = Date()
                         self.nowPlaying.updateRate(speed, position: self.position)
+                        self.nowPlaying.playbackDidStart()
                     } catch {
+                        self.nowPlaying.updateRate(0, position: self.position)
                         self.state = .paused
                         self.lastError = "Audio output could not resume: \(error)"
                     }
@@ -1119,8 +1179,18 @@ final class PlaybackController {
             // pulls the session out from under a playing engine and strands
             // it on a dead unit — "paused, never reengages". Come back up
             // whenever the intent moved on or anything is audible.
-            if self.resumeGeneration != intent || self.isPlaying || self.isBuffering {
-                _ = await AudioSessionManager.activate()
+            if self.isPlaying || self.isBuffering {
+                let recoveryIntent = self.resumeGeneration
+                let selection = self.playGeneration
+                do {
+                    _ = try await AudioSessionManager.activate()
+                    if self.resumeGeneration == recoveryIntent, self.playGeneration == selection, self.isPlaying {
+                        self.nowPlaying.requestPrimaryIfPossible(reason: "deactivation recovery")
+                    }
+                } catch {
+                    guard self.resumeGeneration == recoveryIntent, self.playGeneration == selection else { return }
+                    self.audioActivationFailed(error)
+                }
             }
         }
     }
@@ -1152,7 +1222,12 @@ final class PlaybackController {
     /// the engine: only the picked track may be promoted, never whatever
     /// happens to be armed (repeat-one arms the current track itself).
     private func trySkipToArmed(_ target: Int) -> Bool {
+        // A paused/inactive output must take the load path, which awaits
+        // activation. Instant promotion is reserved for an audible session.
         guard queue.indices.contains(target) else { return false }
+        #if os(iOS)
+        guard isPlaying, AudioSessionManager.isActive else { return false }
+        #endif
         let entry = queue[target]
         guard let queued = engine.pendingTrack(),
               queued.title == entry.title, queued.artist == entry.artist
@@ -1169,10 +1244,12 @@ final class PlaybackController {
             loadCurrent(target)
             return true
         }
-        // A paused output stays muted across the promote — the mixer flag is
-        // separate from the transport — so unmute explicitly. Idempotent when
-        // already playing.
-        try? engine.play()
+        // Ensure the promoted output is unmuted; this is idempotent for an
+        // already playing session.
+        do { try engine.play() } catch {
+            loadCurrent(target)
+            return true
+        }
         let headers = sourceHeadersByPath.removeValue(forKey: info.source) ?? [:]
         loadDidSucceed(entry: entry, index: target, info: info, startAt: 0, headers: headers)
         return true
@@ -1291,7 +1368,7 @@ final class PlaybackController {
         playbackRate = rate.isFinite ? min(max(rate, 0.5), 2.0) : 1.0
         position = sampledPosition
         positionSampledAt = sampledAt
-        nowPlaying.updateRate(isPlaying ? Double(speed) : 0)
+        nowPlaying.updateRate(isPlaying ? Double(speed) : 0, position: sampledPosition)
     }
 
     func updateSkipSilence(enabled: Bool) {
@@ -1637,7 +1714,7 @@ final class PlaybackController {
         loadedSourceHeaders = [:]
         sourceHeadersByPath.removeAll(keepingCapacity: true)
         nowPlaying.update(
-            title: entry.title, artist: entry.artist,
+            id: entry.id, title: entry.title, artist: entry.artist,
             duration: 0, artworkData: entry.artworkData,
             thumbnailUrl: entry.thumbnailUrl, isPlaying: false, position: position
         )
@@ -1696,7 +1773,7 @@ final class PlaybackController {
                 let matchRate = PlatformSettings.shared.getBoolean(
                     key: "match_source_sample_rate", default: true
                 )
-                let sessionFormat = await AudioSessionManager.activate(
+                let sessionFormat = try await AudioSessionManager.activate(
                     preferredSampleRate: matchRate
                         ? sourceFormat.map { Double($0.sampleRate) }
                         : nil
@@ -1745,12 +1822,17 @@ final class PlaybackController {
                 }), let info else { return }
                 await MainActor.run { [weak self] in
                     guard let self, self.playGeneration == generation else { return }
-                    try? engine.play()
-                    self.currentLoudnessDb = resolved.loudnessDb
-                    self.loadDidSucceed(
-                        entry: entry, index: index, info: info,
-                        startAt: resume, headers: resolved.headers
-                    )
+                    do {
+                        self.prepareNowPlayingForPlayback(entry: entry, duration: info.durationSeconds, position: resume)
+                        try engine.play()
+                        self.currentLoudnessDb = resolved.loudnessDb
+                        self.loadDidSucceed(
+                            entry: entry, index: index, info: info,
+                            startAt: resume, headers: resolved.headers
+                        )
+                    } catch {
+                        self.loadDidFail(entry: entry, error: error)
+                    }
                 }
             } catch {
                 await MainActor.run { [weak self] in
@@ -2285,6 +2367,16 @@ final class PlaybackController {
         }
     }
 
+    private func prepareNowPlayingForPlayback(entry: QueueEntry, duration: Double, position: Double) {
+        nowPlaying.prepareForPlayback(
+            id: entry.id, title: entry.title, artist: entry.artist,
+            duration: duration, artworkData: entry.artworkData,
+            thumbnailUrl: entry.thumbnailUrl, position: position,
+            canNext: playingIndex + 1 < queue.count || repeatMode == .all,
+            canPrevious: true, canSeek: duration > 0
+        )
+    }
+
     private func loadDidSucceed(
         entry: QueueEntry,
         index: Int,
@@ -2320,10 +2412,11 @@ final class PlaybackController {
             durationSec: Swift.Int32(info.durationSeconds), positionMs: Swift.Int64(0)
         )
         nowPlaying.update(
-            title: entry.title, artist: entry.artist,
+            id: entry.id, title: entry.title, artist: entry.artist,
             duration: info.durationSeconds, artworkData: entry.artworkData,
             thumbnailUrl: entry.thumbnailUrl, isPlaying: isPlaying, position: position
         )
+        nowPlaying.playbackDidStart()
         widgetPublisher.publish(entry: entry, isPlaying: true,
                                 canNext: playingIndex + 1 < queue.count,
                                 canPrevious: index > 0)
@@ -2578,7 +2671,7 @@ final class PlaybackController {
         state = newState
         if let current {
             nowPlaying.update(
-                title: current.title, artist: current.artist,
+                id: current.id, title: current.title, artist: current.artist,
                 duration: duration, artworkData: current.artworkData,
                 thumbnailUrl: current.thumbnailUrl,
                 isPlaying: newState == .playing
@@ -2652,7 +2745,7 @@ final class PlaybackController {
             }
             publishPresence()
             nowPlaying.update(
-                title: entry.title, artist: entry.artist,
+                id: entry.id, title: entry.title, artist: entry.artist,
                 duration: info.durationSeconds, artworkData: entry.artworkData,
                 thumbnailUrl: entry.thumbnailUrl, isPlaying: isPlaying, position: position
             )
@@ -3923,7 +4016,7 @@ final class PlaybackController {
                     self.queue[i].artworkData = data
                 }
                 self.nowPlaying.update(
-                    title: entry.title, artist: entry.artist,
+                    id: entry.id, title: entry.title, artist: entry.artist,
                     duration: self.duration, artworkData: data,
                     thumbnailUrl: entry.thumbnailUrl, isPlaying: self.isPlaying, position: self.position
                 )

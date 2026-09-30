@@ -1,0 +1,27 @@
+name: NowPlayingMixingRepro
+options:
+  deploymentTarget:
+    iOS: "27.0"
+settings:
+  base:
+    SWIFT_VERSION: "6.0"
+    DEVELOPMENT_TEAM: "YOUR_TEAM_ID"
+targets:
+  NowPlayingMixingRepro:
+    type: application
+    platform: iOS
+    sources:
+      - ProbeApp.swift
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.example.bitchord.nowplayingprobe
+        CODE_SIGN_STYLE: Automatic
+        TARGETED_DEVICE_FAMILY: "1,2"
+    info:
+      path: Info.plist
+      properties:
+        CFBundleDisplayName: Now Playing Probe
+        UILaunchScreen: {}
+        UIBackgroundModes: [audio]
+        UIApplicationSceneManifest:
+          UIApplicationSupportsMultipleScenes: false

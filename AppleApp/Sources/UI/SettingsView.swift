@@ -693,7 +693,7 @@ struct SettingsView: View {
             SettingsToggleLine(
                 glyph: .musicOnly,
                 title: "Play Alongside Other Apps",
-                subtitle: "Keeps other music and podcasts playing. On iOS 18–26, system Now Playing controls may favor the other app. Takes effect on the next play.",
+                subtitle: "Keep other apps audible alongside BitChord, in the foreground and background. iOS decides which app's native Now Playing controls appear. Takes effect on the next play.",
                 isOn: $mixWithOtherAudio
             )
 #endif

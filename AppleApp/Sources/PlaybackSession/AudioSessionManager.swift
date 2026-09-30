@@ -28,6 +28,29 @@ import BitChordShared
 /// session's own numbers makes the two agree by construction.
 enum AudioSessionManager {
     private static let sessionQueue = DispatchQueue(label: "com.example.bitchord.audio-session")
+    private static let readiness = AudioSessionReadiness()
+
+    /// Successful activation, invalidated on deactivation/interruption/reset.
+    /// A valid hardware format alone does not mean the session is active.
+    static var isActive: Bool {
+        #if os(iOS)
+        readiness.isActive
+        #else
+        true
+        #endif
+    }
+
+    private static func record(_ event: String) {
+        #if os(iOS)
+        let session = AVAudioSession.sharedInstance()
+        let message = "audio session \(event) category=\(session.category.rawValue) "
+            + "mode=\(session.mode.rawValue) options=\(session.categoryOptions.rawValue) "
+            + "active=\(isActive) otherAudio=\(session.isOtherAudioPlaying)"
+        PlaybackDebugLog.shared.record(message)
+        NSLog("[BitChord] %@", message)
+        #endif
+    }
+
     /// The format the session settled on, or `nil` on macOS (where cpal's device
     /// choice stands) and on iOS when the session reported an unusable format.
     struct Format: Equatable {
@@ -49,54 +72,57 @@ enum AudioSessionManager {
     /// before it can push its first buffer is a queue that stutters on the first
     /// track after a cold start. Every caller reaches here from a detached task,
     /// so the work is never on the main thread in the first place.
+    /// Coexistence is determined only by the user's mixing preference. Native
+    /// Now Playing prominence must never silently change the audio policy.
     @discardableResult
-    static func activate(preferredSampleRate: Double? = nil) async -> Format? {
-        await withCheckedContinuation { continuation in
+    static func activate(preferredSampleRate: Double? = nil) async throws -> Format? {
+        return try await withCheckedThrowingContinuation { continuation in
             sessionQueue.async {
-                continuation.resume(returning: activateSynchronously(preferredSampleRate: preferredSampleRate))
+                do {
+                    continuation.resume(returning: try activateSynchronously(
+                        preferredSampleRate: preferredSampleRate
+                    ))
+                } catch {
+                    continuation.resume(throwing: error)
+                }
             }
         }
     }
 
-    private static func activateSynchronously(preferredSampleRate: Double?) -> Format? {
+    private static func activateSynchronously(preferredSampleRate: Double?) throws -> Format? {
 #if os(iOS)
         let session = AVAudioSession.sharedInstance()
         do {
-            // Playback is mixable by default so starting BitChord does not stop
-            // another music app. Deactivation on pause is still necessary to
-            // release the output session promptly. The setting permits an
-            // exclusive session when the listener explicitly wants one.
-            let mixing = PlatformSettings.shared.getBoolean(
-                key: "mix_with_other_audio", default: true
-            )
-            // `.playback` already routes to AirPlay and Bluetooth A2DP, and
-            // iOS 27 rejects the call (OSStatus -50) if those options are set
-            // on it. `allowAirPlay` is only valid for play-and-record. A
-            // rejected category is why Now Playing then answered
-            // `internalFailure` to every claim.
-            var options: AVAudioSession.CategoryOptions = []
-            if mixing {
-                options.insert(.mixWithOthers)
-            }
-            if session.category != .playback || session.mode != .default || session.categoryOptions != options {
-                try session.setCategory(.playback, mode: .default, options: options)
-            }
-            if PlatformSettings.shared.getBoolean(
-                key: "match_source_sample_rate", default: true
-            ), let preferredSampleRate, preferredSampleRate > 0 {
-                // A preference is a request, not a promise: read sampleRate
-                // after activation and give that actual value to the engine.
-                do {
-                    try session.setPreferredSampleRate(preferredSampleRate)
-                } catch {
-                    NSLog("[BitChord] preferred output rate \(preferredSampleRate) Hz was not accepted: \(error.localizedDescription)")
+            try readiness.activate {
+                // Playback already supports AirPlay and Bluetooth A2DP without
+                // the category options intended for play-and-record sessions.
+                let mixing = PlatformSettings.shared.getBoolean(
+                    key: "mix_with_other_audio", default: true
+                )
+                var options: AVAudioSession.CategoryOptions = []
+                if mixing {
+                    options.insert(.mixWithOthers)
                 }
+                if session.category != .playback || session.mode != .default || session.categoryOptions != options {
+                    try session.setCategory(.playback, mode: .default, options: options)
+                }
+                if PlatformSettings.shared.getBoolean(
+                    key: "match_source_sample_rate", default: true
+                ), let preferredSampleRate, preferredSampleRate > 0 {
+                    // A preference is a request, not a promise: read sampleRate
+                    // after activation and give that actual value to the engine.
+                    do {
+                        try session.setPreferredSampleRate(preferredSampleRate)
+                    } catch {
+                        record("preferred output rate \(preferredSampleRate) Hz rejected (nonfatal): \(error)")
+                    }
+                }
+                try session.setActive(true)
             }
-            try session.setActive(true)
+            record("activation succeeded")
         } catch {
-            // Worth surfacing: a session that will not activate is a session with
-            // no background audio at all. Nothing actionable beyond the log.
-            NSLog("[BitChord] audio session would not activate: \(error.localizedDescription)")
+            record("activation failed: \(error)")
+            throw error
         }
         // `currentRoute` rather than the session: the session has no channel
         // count of its own, the output it is currently routed through does, and
@@ -151,11 +177,12 @@ enum AudioSessionManager {
 
     private static func deactivateSynchronously() {
 #if os(iOS)
+        readiness.invalidate()
         do {
             try AVAudioSession.sharedInstance().setActive(false, options: [.notifyOthersOnDeactivation])
-            NSLog("[BitChord] audio session deactivated (.notifyOthersOnDeactivation)")
+            record("deactivated (.notifyOthersOnDeactivation)")
         } catch {
-            NSLog("[BitChord] audio session deactivation failed: \(error.localizedDescription)")
+            record("deactivation failed: \(error)")
         }
 #endif
     }
@@ -232,6 +259,8 @@ enum AudioSessionManager {
             else { return }
             switch type {
             case .began:
+                readiness.invalidate()
+                record("interrupted")
                 began()
             case .ended:
                 let optionRaw = note.userInfo?[AVAudioSessionInterruptionOptionKey] as? UInt ?? 0
@@ -325,6 +354,8 @@ enum AudioSessionManager {
             object: nil,
             queue: .main
         ) { _ in
+            readiness.invalidate()
+            record("media services were reset")
             handler("audio media services were reset")
         })
 
