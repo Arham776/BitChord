@@ -22,9 +22,10 @@ actor StreamFileCache {
         var complete: Bool
         var bytes: Int64
         var sha256: String
+        var youtubeVideoId: String? = nil
         var relativeLoudnessDb: Double? = nil
     }
-    private var inFlight: [String: (path: String, quality: String, kbps: Int, loudnessDb: Double?)] = [:]
+    private var inFlight: [String: (path: String, quality: String, kbps: Int, loudnessDb: Double?, youtubeVideoId: String?)] = [:]
     nonisolated static var qualityIdentity: String {
         let wifi = PlatformSettings.shared.getString(key: "audio_quality_wifi", default: "LOSSLESS")
         let cellular = PlatformSettings.shared.getString(key: "audio_quality_cellular", default: "LOSSLESS")
@@ -69,6 +70,23 @@ actor StreamFileCache {
         return nil
     }
 
+    /// Downloads can adopt verified completed YouTube bytes, independent of
+    /// streaming network ceilings. Substitute renditions need their own identity.
+    func completedDownloadPath(videoId: String, requireLossless: Bool, minimumKbps: Int) -> String? {
+        for ext in Self.extensions {
+            let dest = cachedURL(for: videoId, ext: ext)
+            guard let data = try? Data(contentsOf: manifestURL(dest.path)),
+                  let manifest = try? JSONDecoder().decode(Manifest.self, from: data),
+                  manifest.complete, manifest.recordingIdentity == videoId,
+                  manifest.youtubeVideoId == videoId, manifest.kbps >= minimumKbps,
+                  !requireLossless || ["FLAC", "ALAC", "PCM"].contains(manifest.codec.uppercased()),
+                  let bytes = (try? FileManager.default.attributesOfItem(atPath: dest.path)[.size]) as? NSNumber,
+                  bytes.int64Value == manifest.bytes, hashFile(dest.path) == manifest.sha256 else { continue }
+            return dest.path
+        }
+        return nil
+    }
+
     private struct LoudnessCache: Codable {
         var sourceSHA256: String
         var measurementVersion: String
@@ -93,15 +111,15 @@ actor StreamFileCache {
             return try? JSONDecoder().decode(Manifest.self, from: data)
         }
         if let entry = inFlight.first(where: { $0.value.path == path }) {
-            return Manifest(codec: "unknown", kbps: entry.value.kbps, quality: entry.value.quality, sourceIdentity: "growing", recordingIdentity: entry.key, complete: false, bytes: 0, sha256: "", relativeLoudnessDb: entry.value.loudnessDb)
+            return Manifest(codec: "unknown", kbps: entry.value.kbps, quality: entry.value.quality, sourceIdentity: "growing", recordingIdentity: entry.key, complete: false, bytes: 0, sha256: "", youtubeVideoId: entry.value.youtubeVideoId, relativeLoudnessDb: entry.value.loudnessDb)
         }
         return nil
     }
 
     /// The download has its first bytes. Later resolves of the same track must
     /// join this file instead of starting a second fetch at the handoff.
-    func noteGrowing(videoId: String, path: String, kbps: Int = 0, quality: String? = nil, relativeLoudnessDb: Double? = nil) {
-        inFlight[videoId] = (path, quality ?? Self.qualityIdentity, kbps, relativeLoudnessDb)
+    func noteGrowing(videoId: String, path: String, kbps: Int = 0, quality: String? = nil, relativeLoudnessDb: Double? = nil, youtubeVideoId: String? = nil) {
+        inFlight[videoId] = (path, quality ?? Self.qualityIdentity, kbps, relativeLoudnessDb, youtubeVideoId)
     }
 
     /// The download failed before it finished. Drop the pointer so the next
@@ -110,8 +128,8 @@ actor StreamFileCache {
         inFlight.removeValue(forKey: videoId)
     }
 
-    func store(_ videoId: String, path: String, sourceIdentity: String = "unknown", codec: String = "unknown", kbps: Int = 0, quality: String? = nil, relativeLoudnessDb: Double? = nil) {
-        inFlight[videoId] = (path, quality ?? Self.qualityIdentity, kbps, relativeLoudnessDb)
+    func store(_ videoId: String, path: String, sourceIdentity: String = "unknown", codec: String = "unknown", kbps: Int = 0, quality: String? = nil, relativeLoudnessDb: Double? = nil, youtubeVideoId: String? = nil) {
+        inFlight[videoId] = (path, quality ?? Self.qualityIdentity, kbps, relativeLoudnessDb, youtubeVideoId)
         let dest = cachedURL(for: videoId, ext: URL(fileURLWithPath: path).pathExtension)
         let fm = FileManager.default
         if dest.path != path {
@@ -121,7 +139,7 @@ actor StreamFileCache {
         }
         guard let bytes = (try? fm.attributesOfItem(atPath: dest.path)[.size]) as? NSNumber,
               let hash = hashFile(dest.path), bytes.int64Value > 0 else { return }
-        let manifest = Manifest(codec: codec, kbps: kbps, quality: quality ?? Self.qualityIdentity, sourceIdentity: sourceIdentity, recordingIdentity: videoId, complete: true, bytes: bytes.int64Value, sha256: hash, relativeLoudnessDb: relativeLoudnessDb)
+        let manifest = Manifest(codec: codec, kbps: kbps, quality: quality ?? Self.qualityIdentity, sourceIdentity: sourceIdentity, recordingIdentity: videoId, complete: true, bytes: bytes.int64Value, sha256: hash, youtubeVideoId: youtubeVideoId, relativeLoudnessDb: relativeLoudnessDb)
         guard let data = try? JSONEncoder().encode(manifest), (try? data.write(to: manifestURL(dest.path), options: .atomic)) != nil else { return }
         inFlight.removeValue(forKey: videoId)
         DiskCache.touch(dest)

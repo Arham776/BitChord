@@ -995,7 +995,7 @@ object AppSettings {
     fun exportPrefsJson(): String {
         val keys = listOf(
             "crossfade_seconds", "smart_fade_enabled", "spatial_audio", "autoplay",
-            "skip_silence", "playback_speed", "audio_quality_wifi", "audio_quality_cellular",
+            "skip_silence", "trim_edge_silence", "skip_non_music", "playback_speed", "audio_quality_wifi", "audio_quality_cellular",
             "download_quality", "wifi_only_downloads", "show_nerd_stats", "animated_canvas",
             "canvas_over_cellular", "prioritize_spotify_canvas", "theme_mode", "reduce_dynamic_blur", "reduce_animation",
             "full_bleed_artwork", "synced_lyrics", "convert_video_to_audio", "swipe_to_play_next",
@@ -1025,7 +1025,7 @@ object AppSettings {
                     settings.getInt(key, 0).toString()
                 "audio_cache_limit_bytes" -> settings.getLong(key, DEFAULT_CACHE_LIMIT_BYTES).toString()
                 "clarity_wet", "scrobble_delay_percent", "playback_speed" -> settings.getFloat(key, 0f).toString()
-                "smart_fade_enabled", "spatial_audio", "autoplay", "skip_silence",
+                "smart_fade_enabled", "spatial_audio", "autoplay", "skip_silence", "trim_edge_silence", "skip_non_music",
                 "wifi_only_downloads", "show_nerd_stats", "animated_canvas", "canvas_over_cellular",
                 "prioritize_spotify_canvas",
                 "reduce_dynamic_blur", "reduce_animation", "full_bleed_artwork", "synced_lyrics",

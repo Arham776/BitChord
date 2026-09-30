@@ -1,0 +1,13 @@
+{
+  "checks" : {
+    "after_song_blocks_repeat_autoplay_next" : true,
+    "background_deadline" : true,
+    "cancel_restores_volume" : true,
+    "deadline_pauses" : true,
+    "deadline_restores_volume" : true,
+    "six_second_fade" : true,
+    "started_audio" : true
+  },
+  "passed" : true,
+  "snapshot" : "engine=NerdStatsRec(codec: \"PCM\", sampleRate: 44100, bitDepth: 16, channels: 2, kbps: 0, loudnessGainDb: nil, swapCorrelation: nil, activeStages: [\"Rate conversion (libsoxr HQ)\", \"Application volume\"], converterDelayFrames: 0.0, protectionReductionDb: 0.0, protectionInterventions: 0, buildRevision: \"5ac73bb7c48c+1a64e56c7a1a\", decoderImplementation: \"PCM Signed 16-bit Little-Endian Interleaved\", decodedLayout: \"Some(Positioned(Position(FRONT_LEFT | FRONT_RIGHT)))\", queuedTargetMs: 250, loudnessOrigin: \"No measurement\")\nroute=OutputDeviceRec(name: \"Default Device\", sampleRate: 48000, channels: 2, started: true, sampleFormat: \"FLOAT_32\", bitPerfectActive: false, bitPerfectReason: \"Bit-perfect output is off\")\ntrim_edges=false skip_non_music=false\noutput=OutputHealthRec(bufferedFrames: 0, callbackUnderruns: 0, outputRebuilds: 2, outputXruns: 0, outputPeak: 0.0)\nstate=paused automix=false volume=0.03"
+}

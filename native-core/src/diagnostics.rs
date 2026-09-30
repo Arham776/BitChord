@@ -220,3 +220,19 @@ mod tests {
         assert!(!complete_file(&source));
     }
 }
+
+// A bounded memory handoff. Never wait for the writer or disk on render threads.
+fn technical_events() -> &'static std::sync::Mutex<std::collections::VecDeque<String>> {
+    static EVENTS: std::sync::OnceLock<std::sync::Mutex<std::collections::VecDeque<String>>> = std::sync::OnceLock::new();
+    EVENTS.get_or_init(|| std::sync::Mutex::new(std::collections::VecDeque::new()))
+}
+pub fn technical_event(event: String) {
+    if let Ok(mut events) = technical_events().try_lock() {
+        if events.len() >= 1024 { events.pop_front(); }
+        events.push_back(event.chars().take(2048).collect());
+    }
+}
+#[uniffi::export]
+pub fn drain_technical_events() -> Vec<String> {
+    technical_events().lock().unwrap().drain(..).collect()
+}

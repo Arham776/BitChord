@@ -8,7 +8,7 @@ import AppKit
 
 /// One playable entry in the queue. Wraps either a local file path or a
 /// resolved stream URL; metadata mirrors upstream's `Song` row.
-struct QueueEntry: Identifiable, Hashable, Sendable {
+struct QueueEntry: Identifiable, Hashable, Sendable, Codable {
     let id: String
     var title: String
     var artist: String
@@ -297,7 +297,9 @@ final class PlaybackController {
     /// noticed; `0` means the track started at the top, which is the ordinary
     /// case now that the planner enters a record at the head of its own intro.
     private(set) var automixCueSeconds: Double?
-    private(set) var sleepUntil: Date?
+    private var sleepDeadline: ContinuousClock.Instant?
+    private var sleepTask: Task<Void, Never>?
+    private var sleepSecondsRemaining: Int?
     private(set) var sleepAfterTrack = false
     private(set) var autoplayEnabled = PlatformSettings.shared.getBoolean(key: "autoplay", default: true)
     private(set) var automixEnabled = PlatformSettings.shared.getBoolean(key: "smart_fade_enabled", default: false)
@@ -355,10 +357,10 @@ final class PlaybackController {
 
     /// Song-menu sleep-timer trailing string (`"3:21"` / `"After this song"`).
     var sleepTimerStatus: String? {
-        if let sleepUntil {
-            let remaining = sleepUntil.timeIntervalSinceNow
+        if let sleepDeadline {
+            let remaining = sleepRemaining(sleepDeadline)
             guard remaining > 0 else { return nil }
-            let seconds = Int(remaining.rounded())
+            let seconds = sleepSecondsRemaining ?? Int(remaining.rounded())
             return String(format: "%d:%02d", seconds / 60, seconds % 60)
         }
         return sleepAfterTrack ? "After this song" : nil
@@ -366,6 +368,7 @@ final class PlaybackController {
 
     /// Last resolve/upgrade/source decisions, for a UI "Debug log" action.
     var debugLogText: String { debugLog.dump() }
+    var diagnosticSnapshot: String { "engine=\(String(describing: engine.nerdStats()))\nroute=\(String(describing: engine.outputDevice()))\ntrim_edges=\(PlatformSettings.shared.getBoolean(key: "trim_edge_silence", default: false)) skip_non_music=\(PlatformSettings.shared.getBoolean(key: "skip_non_music", default: false))\noutput=\(String(describing: engine.outputHealth()))\nstate=\(state) automix=\(automixEnabled) volume=\(volume)" }
 
     private let debugLog = PlaybackDebugLog.shared
     private var pendingAutomixPlan: TransitionPlanRec?
@@ -385,9 +388,18 @@ final class PlaybackController {
     /// reached. Skipping the plan (as the load path does when it cannot get a
     /// path) is also wrong — it forgoes the cue and the arm — so the path is
     /// remembered instead.
+    private var regionTasks: [String: Task<Void, Never>] = [:]
+    private var resolvedVideoIds: [String: String] = [:]
+    private var preparedRegionSources: Set<String> = []
     private var loudnessMeasurementTask: Task<Void, Never>?
     private var loadedSourcePath: String? {
-        didSet { if oldValue != loadedSourcePath { scheduleLoudnessMeasurement() } }
+        didSet { if oldValue != loadedSourcePath {
+            scheduleLoudnessMeasurement()
+            if let source = loadedSourcePath {
+                DownloadStore.shared.retainPlayback(paths: Set([source] + Array(sourceHeadersByPath.keys)))
+                prepareRegions(source: source, videoId: resolvedVideoIds[source] ?? DownloadStore.shared.provenance(for: source))
+            } else { DownloadStore.shared.retainPlayback(paths: Set(sourceHeadersByPath.keys)) }
+        } }
     }
     /// Request credentials travel with a source for both playback and analysis.
     /// Prefetched headers are held by source until the mixer reports handoff.
@@ -599,6 +611,7 @@ final class PlaybackController {
         positionTimer = Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { [weak self] _ in
             Task { @MainActor in
                 guard let self else { return }
+                for event in drainTechnicalEvents() { self.debugLog.record(event) }
                 self.pollWidgetCommands()
                 guard self.state == .playing else { return }
                 self.position = self.engine.positionSeconds()
@@ -1385,6 +1398,36 @@ final class PlaybackController {
         }
     }
 
+    func refreshPlaybackRegions() {
+        for task in regionTasks.values { task.cancel() }; regionTasks = [:]; preparedRegionSources = []
+        if let source = loadedSourcePath { prepareRegions(source: source, videoId: resolvedVideoIds[source] ?? DownloadStore.shared.provenance(for: source)) }
+        syncEngineQueueNext()
+    }
+    private func prepareRegions(source: String, videoId: String?) {
+        guard !preparedRegionSources.contains(source), regionTasks[source] == nil else { return }
+        let generation = playGeneration, revision = queueNextRevision
+        let trim = automixEnabled || PlatformSettings.shared.getBoolean(key: "trim_edge_silence", default: false)
+        let skip = automixEnabled || PlatformSettings.shared.getBoolean(key: "skip_non_music", default: false)
+        let engine = self.engine
+        regionTasks[source] = Task { [weak self] in
+            for _ in 0..<300 {
+                let regions = await PlaybackRegionStore.shared.regions(path: source, videoId: videoId, trimEdges: trim, skipSegments: skip)
+                guard !Task.isCancelled, let self, self.playGeneration == generation,
+                      self.loadedSourcePath == source || self.queueNextRevision == revision else { break }
+                try? engine.setPlaybackRegions(source: source, regions: regions)
+                let complete = !FileManager.default.fileExists(atPath: source + ".grow") || FileManager.default.fileExists(atPath: source + ".complete")
+                if complete || !trim {
+                    self.preparedRegionSources.insert(source); self.regionTasks[source] = nil
+                    self.debugLog.record("playback regions start=\(regions.audibleStartSeconds) end=\(String(describing: regions.audibleEndSeconds)) excluded=\(regions.excluded.count)")
+                    // The mixer updates waiting plans without discarding armed voices.
+                    return
+                }
+                try? await Task.sleep(for: .seconds(1))
+            }
+            self?.regionTasks[source] = nil
+        }
+    }
+
     private func scheduleLoudnessMeasurement() {
         loudnessMeasurementTask?.cancel()
         guard soundMode == "ENHANCED", loudnessMode != "OFF", let path = loadedSourcePath,
@@ -1589,19 +1632,61 @@ final class PlaybackController {
         )
     }
 
-    func startSleep(minutes: Int) {
-        sleepAfterTrack = false
-        sleepUntil = Date().addingTimeInterval(TimeInterval(minutes * 60))
+    private func sleepRemaining(_ deadline: ContinuousClock.Instant) -> Double {
+        let parts = ContinuousClock.now.duration(to: deadline).components
+        return Double(parts.seconds) + Double(parts.attoseconds) / 1e18
     }
-
+    func startSleep(minutes: Int) { armSleep(seconds: Double(max(0, minutes)) * 60) }
+    private func armSleep(seconds: Double) {
+        cancelSleep()
+        let deadline = ContinuousClock.now.advanced(by: .seconds(max(0, seconds)))
+        sleepDeadline = deadline; sleepSecondsRemaining = Int(seconds.rounded(.up))
+        let engine = self.engine
+        sleepTask = Task.detached(priority: .userInitiated) { [weak self, engine] in
+            var displayedSeconds = -1
+            while !Task.isCancelled {
+                let parts = ContinuousClock.now.duration(to: deadline).components
+                let remaining = Double(parts.seconds) + Double(parts.attoseconds) / 1e18
+                guard !Task.isCancelled else { return }
+                if remaining <= 0 {
+                    // Output muting does not wait behind a busy UI actor.
+                    try? engine.pause()
+                    try? engine.setSleepGain(gain: 1)
+                    await MainActor.run { [weak self] in
+                        guard let self, self.sleepDeadline == deadline else { return }
+                        self.sleepDeadline = nil; self.sleepSecondsRemaining = nil; self.sleepTask = nil
+                        self.pausePlayback()
+                        self.debugLog.record("sleep deadline expired; output paused and gain restored")
+                    }
+                    return
+                }
+                try? engine.setSleepGain(gain: Float(min(1, remaining / 6)))
+                let whole = Int(remaining.rounded(.up))
+                if whole != displayedSeconds {
+                    displayedSeconds = whole
+                    Task { @MainActor [weak self] in
+                        guard let self, self.sleepDeadline == deadline else { return }
+                        self.sleepSecondsRemaining = whole
+                    }
+                }
+                try? await Task.sleep(for: .milliseconds(100), clock: .continuous)
+            }
+        }
+    }
     func startSleepAfterTrack() {
-        sleepUntil = nil
+        cancelSleep()
         sleepAfterTrack = true
+        queueNextRevision &+= 1
+        try? engine.holdTrackEnd(hold: true)
+        debugLog.record("sleep armed after effective track end")
     }
-
     func cancelSleep() {
-        sleepUntil = nil
+        sleepTask?.cancel(); sleepTask = nil
+        sleepDeadline = nil; sleepSecondsRemaining = nil
         sleepAfterTrack = false
+        try? engine.setSleepGain(gain: 1)
+        try? engine.holdTrackEnd(hold: false)
+        syncEngineQueueNext()
     }
 
     func downloadCurrent() -> DownloadStore.RequestResult? {
@@ -1647,6 +1732,7 @@ final class PlaybackController {
         guard automixEnabled != enabled else { return }
         automixEnabled = enabled
         AppSettings.shared.setSmartFadeEnabled(value: enabled)
+        refreshPlaybackRegions()
         syncEngineQueueNext()
     }
 
@@ -1868,6 +1954,7 @@ final class PlaybackController {
         /// normalization stage with the load.
         var loudnessDb: Double? = nil
         var origin: Origin = .other
+        var youtubeVideoId: String? = nil
 
         enum Origin: Sendable { case local, cache, youtube, substitute, other }
 
@@ -1966,6 +2053,10 @@ final class PlaybackController {
     }
 
     private static func resolveSource(_ entry: QueueEntry, prefs: ResolvePrefs) async throws -> ResolveOutcome {
+        if let asset = await DownloadStore.shared.asset(for: entry) {
+            return ResolveOutcome(source: ResolvedSource(source: asset.path, headers: [:], kbps: asset.kbps,
+                lossless: asset.lossless, origin: .local, youtubeVideoId: asset.youtubeVideoId), leftover: nil)
+        }
         if entry.source.hasPrefix("saavn:") || entry.id.hasPrefix("saavn:") {
             let id = entry.source.hasPrefix("saavn:") ? String(entry.source.dropFirst(6)) : String(entry.id.dropFirst(6))
             if let hit = await JioSaavn.streamURL(for: id) {
@@ -2018,7 +2109,7 @@ final class PlaybackController {
             let metadata = await StreamFileCache.shared.metadata(at: cached)
             return ResolveOutcome(
                 source: ResolvedSource(
-                    source: cached, headers: [:], kbps: metadata?.kbps ?? 0, loudnessDb: metadata?.relativeLoudnessDb, origin: .cache
+                    source: cached, headers: [:], kbps: metadata?.kbps ?? 0, loudnessDb: metadata?.relativeLoudnessDb, origin: .cache, youtubeVideoId: metadata?.youtubeVideoId
                 ),
                 leftover: nil
             )
@@ -2131,10 +2222,10 @@ final class PlaybackController {
         }
         do {
             let localPath = try await streamViaKtor(
-                videoId: videoId, url: stream.url, headers: stream.headers, codec: stream.mimeType.lowercased().contains("opus") ? "Opus" : "AAC", kbps: stream.kbps, relativeLoudnessDb: stream.loudnessDb)
+                videoId: videoId, url: stream.url, headers: stream.headers, codec: stream.mimeType.lowercased().contains("opus") ? "Opus" : "AAC", kbps: stream.kbps, relativeLoudnessDb: stream.loudnessDb, youtubeVideoId: videoId)
             return ResolvedSource(
                 source: localPath, headers: [:], kbps: stream.kbps,
-                loudnessDb: stream.loudnessDb, origin: .youtube
+                loudnessDb: stream.loudnessDb, origin: .youtube, youtubeVideoId: videoId
             )
         } catch {
             let reason = (error as? InnertubeStreamResolver.StreamError)?.message
@@ -2150,10 +2241,10 @@ final class PlaybackController {
                 )
                 do {
                     let localPath = try await streamViaKtor(
-                        videoId: videoId, url: fresh.url, headers: fresh.headers, codec: fresh.mimeType.lowercased().contains("opus") ? "Opus" : "AAC", kbps: fresh.kbps, relativeLoudnessDb: fresh.loudnessDb)
+                        videoId: videoId, url: fresh.url, headers: fresh.headers, codec: fresh.mimeType.lowercased().contains("opus") ? "Opus" : "AAC", kbps: fresh.kbps, relativeLoudnessDb: fresh.loudnessDb, youtubeVideoId: videoId)
                     return ResolvedSource(
                         source: localPath, headers: [:], kbps: fresh.kbps,
-                        loudnessDb: fresh.loudnessDb, origin: .youtube
+                        loudnessDb: fresh.loudnessDb, origin: .youtube, youtubeVideoId: videoId
                     )
                 } catch {
                     // Refused again, or never served. Say so rather than handing
@@ -2167,7 +2258,7 @@ final class PlaybackController {
             DebugLog.shared.d(message: "\(videoId): stream failed: \(reason ?? "\(error)")")
             return ResolvedSource(
                 source: stream.url, headers: stream.headers, kbps: stream.kbps,
-                loudnessDb: stream.loudnessDb, origin: .youtube
+                loudnessDb: stream.loudnessDb, origin: .youtube, youtubeVideoId: videoId
             )
         }
     }
@@ -2307,12 +2398,12 @@ final class PlaybackController {
     /// appending; [StreamFileCache] is filled when the last one lands so a
     /// re-tap does not fetch again.
     private static func streamViaKtor(
-        videoId: String, url: String, headers: [String: String], codec: String = "unknown", kbps: Int = 0, relativeLoudnessDb: Double? = nil
+        videoId: String, url: String, headers: [String: String], codec: String = "unknown", kbps: Int = 0, relativeLoudnessDb: Double? = nil, youtubeVideoId: String? = nil
     ) async throws -> String {
         let taskKey = videoId + "|" + StreamFileCache.qualityIdentity + "|" + DiskCache.hashName(url)
         let task: Task<String, Error> = streamGate.lock.withLock {
             if let existing = streamGate.tasks[taskKey] { return existing }
-            let created = Task { try await streamViaKtorOnce(videoId: videoId, url: url, headers: headers, codec: codec, kbps: kbps, relativeLoudnessDb: relativeLoudnessDb) }
+            let created = Task { try await streamViaKtorOnce(videoId: videoId, url: url, headers: headers, codec: codec, kbps: kbps, relativeLoudnessDb: relativeLoudnessDb, youtubeVideoId: youtubeVideoId) }
             streamGate.tasks[taskKey] = created
             return created
         }
@@ -2331,7 +2422,7 @@ final class PlaybackController {
     }
 
     private static func streamViaKtorOnce(
-        videoId: String, url: String, headers: [String: String], codec: String = "unknown", kbps: Int = 0, relativeLoudnessDb: Double? = nil
+        videoId: String, url: String, headers: [String: String], codec: String = "unknown", kbps: Int = 0, relativeLoudnessDb: Double? = nil, youtubeVideoId: String? = nil
     ) async throws -> String {
         let qualityIdentity = StreamFileCache.qualityIdentity
         return try await withCheckedThrowingContinuation { continuation in
@@ -2347,7 +2438,7 @@ final class PlaybackController {
                     resumed = true
                     if let path {
                         streamGate.lock.withLock { streamGate.growing[videoId] = path; streamGate.growingQuality[videoId] = qualityIdentity; streamGate.growingKbps[videoId] = kbps }
-                        Task { await StreamFileCache.shared.noteGrowing(videoId: videoId, path: path, kbps: kbps, quality: qualityIdentity, relativeLoudnessDb: relativeLoudnessDb) }
+                        Task { await StreamFileCache.shared.noteGrowing(videoId: videoId, path: path, kbps: kbps, quality: qualityIdentity, relativeLoudnessDb: relativeLoudnessDb, youtubeVideoId: youtubeVideoId) }
                         continuation.resume(returning: path)
                     } else {
                         continuation.resume(throwing: InnertubeStreamResolver.StreamError(
@@ -2356,7 +2447,7 @@ final class PlaybackController {
                 },
                 done: DownloadCallbackAdapter { path, message in
                     if let path {
-                        Task { await StreamFileCache.shared.store(videoId, path: path, sourceIdentity: DiskCache.hashName(url), codec: codec, kbps: kbps, quality: qualityIdentity, relativeLoudnessDb: relativeLoudnessDb) }
+                        Task { await StreamFileCache.shared.store(videoId, path: path, sourceIdentity: DiskCache.hashName(url), codec: codec, kbps: kbps, quality: qualityIdentity, relativeLoudnessDb: relativeLoudnessDb, youtubeVideoId: youtubeVideoId) }
                     } else if let message {
                         print("[Playback] stream tail failed for \(videoId): \(message)")
                         streamGate.lock.withLock { streamGate.growing[videoId] = nil }
@@ -2457,6 +2548,7 @@ final class PlaybackController {
     /// must not arm the next song — the current track seeks to 0 at EOS.
     /// Repeat-one *with* Automix arms a self-mix into the same track.
     private func syncEngineQueueNext() {
+        guard !sleepAfterTrack else { return }
         nowPlaying.updateCommands(canNext: playingIndex + 1 < queue.count || repeatMode == .all, canPrevious: current != nil,
                                   canSeek: engineLoadedId != nil && duration > 0)
         queueNextRevision &+= 1
@@ -2517,7 +2609,8 @@ final class PlaybackController {
                 await MainActor.run { [weak self] in
                     guard let self, self.playGeneration == generation, self.queueNextRevision == revision else { return }
                     self.noteResolved(next, outcome: outcome, prefs: prefs)
-                    self.sourceHeadersByPath[outcome.source.source] = outcome.source.headers
+                    self.sourceHeadersByPath = [outcome.source.source: outcome.source.headers]
+                    DownloadStore.shared.retainPlayback(paths: Set([outcome.source.source, self.loadedSourcePath ?? ""]))
                     // The better copy has to be in hand before the blend arms.
                     // Waiting until this track becomes current means the upgrade
                     // arrives during the ramp and cuts it. Skip for self-mix —
@@ -2550,13 +2643,14 @@ final class PlaybackController {
                 // Queue a real overlap as soon as the source is resolved. Beat
                 // and vocal analysis can take seconds and must not be on the
                 // critical path to hearing the next record under this one.
-                let safetyPlan: TransitionPlanRec? = automix ? TransitionPlanRec(
+                let initialSafetyPlan: TransitionPlanRec? = automix ? TransitionPlanRec(
                     style: .equalPower, bassSwap: false, bassSwapFraction: 0.7,
                     filterSweep: 0, vocalOverlap: 0, fadeSeconds: safetyFade,
                     transitionEndSeconds: 0, cueSeconds: 0, playbackRate: 1,
                     bedFraction: 0, bedGainDb: 0, dipDepth: 0, dipWidth: 0,
                     postGlideSeconds: 0, outgoingDurationSeconds: outgoingDuration
                 ) : nil
+                let safetyPlan = initialSafetyPlan.map { constrainAutomixPlanForSources(plan: $0, outgoingSource: currentSource, incomingSource: resolved.source, outgoingDuration: outgoingDuration, incomingDuration: incomingDuration) }
                 guard try gate.performIfCurrent(generation: generation, revision: revision, {
                     try engine.queueNextIfCurrent(request: LoadRequest(
                     source: resolved.source, title: next.title, artist: next.artist,
@@ -2606,7 +2700,7 @@ final class PlaybackController {
                             )
                         }
                     }
-                    let plan = engine.planAutomix(
+                    let rawPlan = engine.planAutomix(
                         outgoingPath: currentSource,
                         incomingPath: resolved.source,
                         outgoingText: currentText,
@@ -2618,6 +2712,7 @@ final class PlaybackController {
                         outgoingHeaders: currentSourceHeaders,
                         incomingHeaders: resolved.headers
                     )
+                    let plan = constrainAutomixPlanForSources(plan: rawPlan, outgoingSource: currentSource, incomingSource: resolved.source, outgoingDuration: outgoingDuration, incomingDuration: incomingDuration)
                     guard try gate.performIfCurrent(generation: generation, revision: revision, {
                         try engine.queueNextIfCurrent(request: LoadRequest(
                             source: resolved.source,
@@ -2769,6 +2864,8 @@ final class PlaybackController {
         if sleepAfterTrack {
             sleepAfterTrack = false
             pausePlayback()
+            try? engine.holdTrackEnd(hold: false)
+            try? engine.setSleepGain(gain: 1)
             return
         }
         if let current, current.source.hasPrefix("yt:") {
@@ -3077,10 +3174,6 @@ final class PlaybackController {
     }
 
     private func tickSleep() {
-        if let sleepUntil, Date() >= sleepUntil {
-            self.sleepUntil = nil
-            pausePlayback()
-        }
         if let mixFadeUntil, Date() >= mixFadeUntil {
             self.mixFadeUntil = nil
             smartMixInProgress = false
@@ -3440,6 +3533,9 @@ final class PlaybackController {
 
     private func noteResolved(_ entry: QueueEntry, outcome: ResolveOutcome, prefs: ResolvePrefs) {
         resolvedOrigin[entry.id] = outcome.source.origin
+        if let videoId = outcome.source.youtubeVideoId { resolvedVideoIds[outcome.source.source] = videoId }
+        prepareRegions(source: outcome.source.source, videoId: outcome.source.youtubeVideoId)
+
         debugLog.record(
             "resolved \(outcome.source.origin) \(outcome.source.format.summary)",
             about: entry.id
@@ -4043,6 +4139,7 @@ final class EngineCallbacks: EngineCallback, @unchecked Sendable {
     }
 
     func onError(message: String) {
+        PlaybackDebugLog.shared.record("engine error: \(message)")
         Task { @MainActor in controller?.handleError(message) }
     }
 
@@ -4108,3 +4205,71 @@ private final class AutoPlayAdapter: AutoPlayBridgeAutoPlayCallback {
     init(_ handler: @escaping (String?, String?) -> Void) { self.handler = handler }
     func onResult(json: String?, message: String?) { handler(json, message) }
 }
+
+#if DEBUG
+extension PlaybackController {
+    /// Runs only on an explicit validation launch in a separate app container.
+    func verifySleepBehavior() async {
+        #if os(iOS)
+        let token = UIApplication.shared.beginBackgroundTask(withName: "sleep validation")
+        defer { UIApplication.shared.endBackgroundTask(token) }
+        #endif
+        let root = FileManager.default.temporaryDirectory
+        let path = root.appendingPathComponent("sleep-validation.wav")
+        let rate: UInt32 = 44100, count = 44100 * 16
+        func word<T: FixedWidthInteger>(_ value: T) -> Data {
+            var v = value.littleEndian; return withUnsafeBytes(of: &v) { Data($0) }
+        }
+        var audio = Data("RIFF".utf8); audio.append(word(UInt32(36 + count * 4)))
+        audio.append(Data("WAVEfmt ".utf8)); audio.append(word(UInt32(16)))
+        audio.append(word(UInt16(1))); audio.append(word(UInt16(2))); audio.append(word(rate))
+        audio.append(word(rate * 4)); audio.append(word(UInt16(4))); audio.append(word(UInt16(16)))
+        audio.append(Data("data".utf8)); audio.append(word(UInt32(count * 4)))
+        for frame in 0..<count {
+            let value = Int16(sin(Double(frame) * 2 * .pi * 440 / Double(rate)) * 3000)
+            audio.append(word(value)); audio.append(word(value))
+        }
+        var checks: [String: Bool] = [:]
+        do {
+            try audio.write(to: path)
+            let secondPath = root.appendingPathComponent("sleep-second.wav"); try audio.write(to: secondPath)
+            volume = 0.03
+            setAutomixEnabled(true)
+            let first = QueueEntry(id: "sleep-first", title: "Sleep fixture", artist: "Validation", source: path.path, durationText: "0:16", isLocal: true)
+            let second = QueueEntry(id: "sleep-second", title: "Second fixture", artist: "Validation", source: secondPath.path, durationText: "0:16", isLocal: true)
+            play([first, second])
+            for _ in 0..<100 { if isPlaying { break }; try await Task.sleep(for: .milliseconds(100)) }
+            checks["started_audio"] = isPlaying
+            armSleep(seconds: 8)
+            try await Task.sleep(for: .seconds(4))
+            checks["six_second_fade"] = engine.applicationOutputGain() < Float(volume) * 0.9
+            cancelSleep()
+            checks["cancel_restores_volume"] = abs(engine.applicationOutputGain() - Float(volume)) < 0.0001
+            armSleep(seconds: 8)
+            try await Task.sleep(for: .seconds(9))
+            let stoppedPosition = engine.positionSeconds()
+            try await Task.sleep(for: .milliseconds(500))
+            #if os(iOS)
+            checks["background_deadline"] = UIApplication.shared.applicationState == .background
+            #endif
+            checks["deadline_pauses"] = state == .paused && abs(engine.positionSeconds() - stoppedPosition) < 0.15
+            checks["deadline_restores_volume"] = abs(engine.applicationOutputGain() - Float(volume)) < 0.0001
+            cancelSleep(); setAutomixEnabled(false)
+            play([first, second])
+            for _ in 0..<100 { if isPlaying { break }; try await Task.sleep(for: .milliseconds(100)) }
+            repeatMode = .one; autoplayEnabled = true
+            startSleepAfterTrack()
+            if let source = loadedSourcePath {
+                try engine.setPlaybackRegions(source: source, regions: PlaybackRegions(audibleStartSeconds: 0, audibleEndSeconds: 2, excluded: []))
+            }
+            try await Task.sleep(for: .seconds(4))
+            checks["after_song_blocks_repeat_autoplay_next"] = state == .paused && current?.id == first.id
+        } catch { debugLog.record("sleep validation error: \(error)"); checks["runtime_error"] = false }
+        let result: [String: Any] = ["checks": checks, "passed": checks.values.allSatisfy { $0 }, "snapshot": PlaybackDebugLog.sanitize(diagnosticSnapshot)]
+        let report = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0].appendingPathComponent("sleep-validation.json")
+        if let data = try? JSONSerialization.data(withJSONObject: result, options: [.prettyPrinted, .sortedKeys]) { try? data.write(to: report, options: .atomic) }
+        print("SLEEP VALIDATION \(checks)")
+        debugLog.record("sleep validation \(checks)")
+    }
+}
+#endif

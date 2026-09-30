@@ -1,5 +1,8 @@
 package com.music.bitchord.data.lyrics
 
+import kotlin.concurrent.atomics.AtomicReference
+import kotlin.concurrent.atomics.ExperimentalAtomicApi
+
 /**
  * Which mirrors to try, in what order, and which to skip for now.
  *
@@ -27,20 +30,26 @@ package com.music.bitchord.data.lyrics
  * retries anyway: a host that is still down costs one timed-out request once
  * every few minutes, which is nothing next to a wall of log noise.
  */
+@OptIn(ExperimentalAtomicApi::class)
 internal class MirrorHealth(
     private val now: () -> Long = { kotlin.time.TimeSource.Monotonic.markNow().let { _ -> clockMs() } },
 ) {
     private data class Host(val host: String, val failures: Int, val retryAfterMs: Long)
 
-    private val hosts = mutableListOf<Host>()
+    private data class State(val hosts: List<Host> = emptyList(), val lastGood: String? = null)
+    private val state = AtomicReference(State())
 
-    /** The host that last answered, tried first next time. */
-    var lastGood: String? = null
-        private set
-
-    /** How many hosts are currently being skipped, for the harness to assert on. */
-    val skippedCount: Int
-        get() = hosts.count { it.retryAfterMs > 0L }
+    // Playback prefetch and two download workers can query mirrors at once.
+    // Publish immutable snapshots so a failure never mutates another request's list.
+    private fun update(transform: (State) -> State): State {
+        while (true) {
+            val current = state.load()
+            val next = transform(current)
+            if (state.compareAndSet(current, next)) return next
+        }
+    }
+    val lastGood: String? get() = state.load().lastGood
+    val skippedCount: Int get() = state.load().hosts.count { it.retryAfterMs > 0L }
 
     /**
      * The hosts to try, best first, with the skipped ones left out.
@@ -51,13 +60,14 @@ internal class MirrorHealth(
      */
     fun order(mirrors: List<String>): List<String> {
         val now = now()
-        hosts.retainAll { it.host in mirrors }
+        val snapshot = update { it.copy(hosts = it.hosts.filter { host -> host.host in mirrors }) }
+        val hosts = snapshot.hosts
         val due = hosts.filter { it.retryAfterMs <= now }.map { it.host }.toSet()
         // Due hosts are retried, and hosts never seen before are always due: a
         // host that has never been asked cannot be written off.
         val eligible = mirrors.filter { it in due || hosts.none { h -> h.host == it } }
         val live = if (eligible.isEmpty()) mirrors else eligible
-        return lastGood?.let { good ->
+        return snapshot.lastGood?.let { good ->
             buildList {
                 if (live.contains(good)) add(good)
                 addAll(live.filterNot { it == good })
@@ -67,8 +77,7 @@ internal class MirrorHealth(
 
     /** The host answered. Its penalty is cleared and it becomes the first try. */
     fun answered(host: String) {
-        hosts.removeAll { it.host == host }
-        lastGood = host
+        update { it.copy(hosts = it.hosts.filterNot { item -> item.host == host }, lastGood = host) }
     }
 
     /** The host answered but has nothing for this track. Not a fault of the host. */
@@ -86,21 +95,18 @@ internal class MirrorHealth(
      * makes the *second* failure start to matter.
      */
     fun unreachable(host: String) {
-        val previous = hosts.firstOrNull { it.host == host }
-        val failures = (previous?.failures ?: 0) + 1
-        val delay = (BASE_BACKOFF_MS shl (failures - 1).coerceAtMost(6))
-            .coerceAtMost(MAX_BACKOFF_MS)
-        hosts.removeAll { it.host == host }
-        hosts.add(Host(host, failures, now() + delay))
-        // A host that has just failed hard is not the one to try first, whatever
-        // it was last time.
-        if (lastGood == host) lastGood = null
+        update { current ->
+            val previous = current.hosts.firstOrNull { it.host == host }
+            val failures = (previous?.failures ?: 0) + 1
+            val delay = (BASE_BACKOFF_MS shl (failures - 1).coerceAtMost(6)).coerceAtMost(MAX_BACKOFF_MS)
+            current.copy(
+                hosts = current.hosts.filterNot { it.host == host } + Host(host, failures, now() + delay),
+                lastGood = current.lastGood.takeUnless { it == host },
+            )
+        }
     }
 
-    fun reset() {
-        hosts.clear()
-        lastGood = null
-    }
+    fun reset() { state.store(State()) }
 
     private companion object {
         const val BASE_BACKOFF_MS = 30_000L

@@ -326,7 +326,7 @@ struct SleepTimerMenu: View {
             Button("Sleep 45 min") { controller.startSleep(minutes: 45) }
             Button("Sleep 60 min") { controller.startSleep(minutes: 60) }
             Button("Stop after this track") { controller.startSleepAfterTrack() }
-            if controller.sleepUntil != nil || controller.sleepAfterTrack {
+            if controller.sleepTimerStatus != nil {
                 Button("Cancel timer", role: .destructive) { controller.cancelSleep() }
             }
         } label: {

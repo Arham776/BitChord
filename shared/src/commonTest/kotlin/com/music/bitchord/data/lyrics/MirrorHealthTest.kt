@@ -1,5 +1,7 @@
 package com.music.bitchord.data.lyrics
 
+import kotlinx.coroutines.async
+
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertNull
@@ -194,4 +196,24 @@ class MirrorHealthTest {
         assertEquals(mirrors, h.order(mirrors))
         assertNull(h.lastGood)
     }
+    @Test
+    fun concurrentRequestsShareSafeSnapshots() = kotlinx.coroutines.runBlocking {
+        val health = MirrorHealth { 0L }
+        val mirrors = listOf("a", "b", "c")
+        val workers = List(8) { worker ->
+            async(kotlinx.coroutines.Dispatchers.Default) {
+                repeat(200) { iteration ->
+                    val host = mirrors[(worker + iteration) % mirrors.size]
+                    health.unreachable(host)
+                    assertTrue(health.order(mirrors).isNotEmpty())
+                    health.answered(host)
+                }
+            }
+        }
+        workers.forEach { it.await() }
+        health.reset()
+        assertEquals(0, health.skippedCount)
+        assertEquals(mirrors, health.order(mirrors))
+    }
+
 }

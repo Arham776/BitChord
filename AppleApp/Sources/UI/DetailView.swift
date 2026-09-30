@@ -72,6 +72,7 @@ struct DetailView: View {
                 loadedPage(page)
             }
         }
+        .refreshable { await load() }
         .navigationTitle(scrolledPastHeader ? (page?.title.isEmpty == false ? page!.title : initialTitle) : "")
         #if os(iOS)
         .navigationBarTitleDisplayMode(.inline)
@@ -867,6 +868,7 @@ struct DetailView: View {
             self.error = error.localizedDescription
         }
         loading = false
+        if error == nil { await DownloadStore.shared.syncIfOwned(browseId: browseId) }
     }
 
     private func loadMore() async {

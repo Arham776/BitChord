@@ -7,12 +7,16 @@ import BitChordShared
 final class NetworkQuality {
     static let shared = NetworkQuality()
     private(set) var metered = false
+    private(set) var connected = true
     private let monitor = NWPathMonitor()
 
     init() {
         monitor.pathUpdateHandler = { [weak self] path in
             let expensive = path.isExpensive || path.isConstrained
-            Task { @MainActor in self?.metered = expensive }
+            Task { @MainActor in
+                self?.metered = expensive; self?.connected = path.status == .satisfied
+                DownloadStore.shared.networkPolicyChanged()
+            }
         }
         monitor.start(queue: DispatchQueue.global(qos: .utility))
     }

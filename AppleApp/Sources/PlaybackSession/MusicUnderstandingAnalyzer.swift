@@ -74,6 +74,12 @@ enum MusicUnderstandingAnalyzer {
     /// Returns true when an overlay was seeded.
     @discardableResult
     static func analyzeAndSeed(filePath: String) async -> Bool {
+        #if DEBUG
+        // Isolate native timer/mixer validation from the system GPU models.
+        // A device run exposed a StructuralFeaturesModel MPS assertion on the
+        // synthetic tone fixture; that assertion aborts outside Swift errors.
+        if ProcessInfo.processInfo.arguments.contains("--verify-sleep") { return false }
+        #endif
         guard isAvailable else {
             return AutomixOverlayCache.seedCached(forFilePath: filePath)
         }

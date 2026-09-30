@@ -60,6 +60,8 @@ mod qos {
     pub fn raise_current_thread() {}
 }
 mod loudness;
+pub mod playback_regions;
+pub use playback_regions::{PlaybackInterval, PlaybackRegions};
 pub mod metadata;
 pub mod sound;
 pub use sound::{ClarityPreset, ClarityTuning, LoudnessMeasurement, LoudnessMode, SoundMode};
@@ -166,6 +168,33 @@ impl From<TransitionPlanRec> for TransitionPlan {
             dip_width: rec.dip_width,
             post_glide_seconds: rec.post_glide_seconds,
             outgoing_duration_seconds: rec.outgoing_duration_seconds,
+        }
+    }
+}
+
+impl From<TransitionPlan> for TransitionPlanRec {
+    fn from(plan: TransitionPlan) -> Self {
+        Self {
+            style: match plan.style {
+                TransitionStyle::Gapless => TransitionStyleRec::Gapless,
+                TransitionStyle::EqualPower => TransitionStyleRec::EqualPower,
+                TransitionStyle::DjFilter => TransitionStyleRec::DjFilter,
+                TransitionStyle::DjBlend => TransitionStyleRec::DjBlend,
+            },
+            bass_swap: plan.bass_swap,
+            bass_swap_fraction: plan.bass_swap_fraction,
+            filter_sweep: plan.filter_sweep,
+            vocal_overlap: plan.vocal_overlap,
+            fade_seconds: plan.fade_seconds,
+            transition_end_seconds: plan.transition_end_seconds,
+            cue_seconds: plan.cue_seconds,
+            playback_rate: plan.playback_rate,
+            bed_fraction: plan.bed_fraction,
+            bed_gain_db: plan.bed_gain_db,
+            dip_depth: plan.dip_depth,
+            dip_width: plan.dip_width,
+            post_glide_seconds: plan.post_glide_seconds,
+            outgoing_duration_seconds: plan.outgoing_duration_seconds,
         }
     }
 }
@@ -385,6 +414,8 @@ pub struct PlayerEngine {
     output_peak: Arc<AtomicU32>,
     position_ms: Arc<AtomicU64>,
     duration_ms: Arc<AtomicU64>,
+    user_volume_bits: AtomicU32,
+    sleep_gain_bits: Arc<AtomicU32>,
     volume_bits: Arc<AtomicU32>,
     flush_ring: Arc<AtomicBool>,
     bail_flush: Arc<AtomicBool>,
@@ -565,6 +596,8 @@ impl PlayerEngine {
             output_peak: Arc::new(AtomicU32::new(0.0f32.to_bits())),
             position_ms: Arc::new(AtomicU64::new(0)),
             duration_ms: Arc::new(AtomicU64::new(0)),
+            user_volume_bits: AtomicU32::new(1.0f32.to_bits()),
+            sleep_gain_bits: Arc::new(AtomicU32::new(1.0f32.to_bits())),
             volume_bits: Arc::new(AtomicU32::new(1.0f32.to_bits())),
             flush_ring: Arc::new(AtomicBool::new(false)),
             bail_flush: Arc::new(AtomicBool::new(false)),
@@ -605,6 +638,11 @@ impl PlayerEngine {
     /// everywhere else.
     pub fn start(&self, rate: Option<f64>, channels: Option<u32>) -> Result<(), EngineError> {
         let _ = env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
+            .format(|buf, record| {
+                use std::io::Write;
+                diagnostics::technical_event(format!("{} {}", record.level(), record.args()));
+                writeln!(buf, "{} {}", record.level(), record.args())
+            })
             .try_init();
         if self.started.swap(true, Ordering::SeqCst) {
             return Ok(());
@@ -700,6 +738,7 @@ impl PlayerEngine {
             requested_channels: self.requested_channels.clone(),
             device_name: self.device_name.clone(),
             volume_bits: self.volume_bits.clone(),
+            sleep_gain_bits: self.sleep_gain_bits.clone(),
             buffered: self.buffered_frames.clone(),
             callback_underruns: self.callback_underruns.clone(),
             output_rebuilds: self.output_rebuilds.clone(),
@@ -1078,7 +1117,8 @@ impl PlayerEngine {
             started: self.started.load(Ordering::Relaxed)
                 && self.output_rate.load(Ordering::Relaxed) > 0,
             sample_format: format.to_string(),
-            bit_perfect_active: bit_perfect_depth > 0,
+            bit_perfect_active: bit_perfect_depth > 0
+                && f32::from_bits(self.sleep_gain_bits.load(Ordering::Relaxed)) == 1.0,
             bit_perfect_reason: self.bit_perfect_reason.lock().unwrap().clone(),
         }
     }
@@ -1120,14 +1160,45 @@ impl PlayerEngine {
         self.duration_ms.load(Ordering::Relaxed) as f64 / 1000.0
     }
 
+    pub fn set_playback_regions(
+        &self,
+        source: String,
+        regions: PlaybackRegions,
+    ) -> Result<(), EngineError> {
+        playback_regions::put(source.clone(), regions.clone());
+        self.send(Command::SetPlaybackRegions { source, regions })
+    }
+    pub fn set_sleep_gain(&self, gain: f32) -> Result<(), EngineError> {
+        let gain = if gain.is_finite() {
+            gain.clamp(0.0, 1.0)
+        } else {
+            1.0
+        };
+        self.sleep_gain_bits
+            .store(gain.to_bits(), Ordering::Relaxed);
+        let volume = f32::from_bits(self.user_volume_bits.load(Ordering::Relaxed));
+        self.volume_bits
+            .store((volume * gain).to_bits(), Ordering::Relaxed);
+        self.send(Command::SetSleepGain(gain))
+    }
+    pub fn application_output_gain(&self) -> f32 {
+        f32::from_bits(self.volume_bits.load(Ordering::Relaxed))
+    }
+    pub fn hold_track_end(&self, hold: bool) -> Result<(), EngineError> {
+        self.send(Command::HoldTrackEnd(hold))
+    }
+
     pub fn set_volume(&self, gain: f32) {
         let gain = if gain.is_finite() {
             gain.clamp(0.0, 1.0)
         } else {
             1.0
         };
+        self.user_volume_bits
+            .store(gain.to_bits(), Ordering::Relaxed);
+        let sleep_gain = f32::from_bits(self.sleep_gain_bits.load(Ordering::Relaxed));
         self.volume_bits
-            .store(gain.clamp(0.0, 1.0).to_bits(), Ordering::Relaxed);
+            .store((gain * sleep_gain).to_bits(), Ordering::Relaxed);
         let _ = self.commands.send(Command::SetVolume(gain.clamp(0.0, 1.0)));
     }
 
@@ -1437,6 +1508,7 @@ struct OutputControl {
     requested_channels: Arc<AtomicU32>,
     device_name: Arc<Mutex<String>>,
     volume_bits: Arc<AtomicU32>,
+    sleep_gain_bits: Arc<AtomicU32>,
     buffered: Arc<AtomicU64>,
     callback_underruns: Arc<AtomicU64>,
     output_rebuilds: Arc<AtomicU64>,
@@ -2366,6 +2438,7 @@ fn open_output_stream(
         buffer_size: cpal::BufferSize::Default,
     };
     let volume = control.volume_bits.clone();
+    let sleep_gain = control.sleep_gain_bits.clone();
     let buffered = control.buffered.clone();
     let callback_underruns = control.callback_underruns.clone();
     let output_peak = control.output_peak.clone();
@@ -2400,7 +2473,9 @@ fn open_output_stream(
                         &mut scratch[..data.len()],
                     );
                     for (out, sample) in data.iter_mut().zip(&scratch) {
-                        *out = exact_f32_to_i16(*sample);
+                        *out = exact_f32_to_i16(
+                            *sample * f32::from_bits(sleep_gain.load(Ordering::Relaxed)),
+                        );
                     }
                 },
                 move |err| err_ctrl.on_stream_error(err),
@@ -2434,7 +2509,9 @@ fn open_output_stream(
                         &mut scratch[..data.len()],
                     );
                     for (out, sample) in data.iter_mut().zip(&scratch) {
-                        *out = cpal::I24::new_unchecked(exact_f32_to_i24(*sample));
+                        *out = cpal::I24::new_unchecked(exact_f32_to_i24(
+                            *sample * f32::from_bits(sleep_gain.load(Ordering::Relaxed)),
+                        ));
                     }
                 },
                 move |err| err_ctrl.on_stream_error(err),
@@ -3440,4 +3517,61 @@ mod tests {
 
         assert!(consumer.pop().is_err());
     }
+    #[test]
+    fn sleep_gain_does_not_replace_user_volume() {
+        use std::sync::atomic::Ordering;
+        let engine = super::PlayerEngine::new();
+        engine.set_volume(0.7);
+        let _ = engine.set_sleep_gain(0.5);
+        assert!((engine.application_output_gain() - 0.35).abs() < 0.0001);
+        engine.set_volume(0.4);
+        assert!((engine.application_output_gain() - 0.2).abs() < 0.0001);
+        let _ = engine.set_sleep_gain(1.0);
+        assert!((engine.application_output_gain() - 0.4).abs() < 0.0001);
+        assert_eq!(
+            f32::from_bits(engine.user_volume_bits.load(Ordering::Relaxed)),
+            0.4
+        );
+    }
+}
+
+#[uniffi::export]
+pub fn detect_playback_regions(
+    source: String,
+    complete: bool,
+) -> Result<PlaybackRegions, EngineError> {
+    playback_regions::detect(&source, complete).map_err(|message| EngineError::LoadFailed(message))
+}
+#[uniffi::export]
+pub fn constrain_automix_plan(
+    plan: TransitionPlanRec,
+    outgoing: PlaybackRegions,
+    incoming: PlaybackRegions,
+    outgoing_duration: f64,
+    incoming_duration: f64,
+) -> TransitionPlanRec {
+    playback_regions::constrain(
+        plan,
+        outgoing,
+        incoming,
+        outgoing_duration,
+        incoming_duration,
+    )
+}
+
+#[uniffi::export]
+pub fn constrain_automix_plan_for_sources(
+    plan: TransitionPlanRec,
+    outgoing_source: String,
+    incoming_source: String,
+    outgoing_duration: f64,
+    incoming_duration: f64,
+) -> TransitionPlanRec {
+    playback_regions::constrain(
+        plan,
+        playback_regions::get(&outgoing_source),
+        playback_regions::get(&incoming_source),
+        outgoing_duration,
+        incoming_duration,
+    )
 }

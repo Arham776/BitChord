@@ -18,6 +18,21 @@ struct DownloadManagerView: View {
                     Text("No downloads yet. Save a track from Now Playing or a collection menu.")
                         .foregroundStyle(.secondary)
                 }
+                if !store.collections.isEmpty {
+                    Section("Downloaded collections") {
+                        ForEach(store.collections) { owner in
+                            VStack(alignment: .leading) {
+                                Text(owner.title)
+                                Text(store.progress(owner)).font(.caption).foregroundStyle(.secondary)
+                                HStack {
+                                    Button("Refresh") { Task { if let id = owner.browseId { _ = await store.downloadCollection(browseId: id) } } }
+                                    Button("Retry") { store.retryOwner(owner) }
+                                    Button("Remove", role: .destructive) { store.removeOwner(owner.id) }
+                                }.buttonStyle(.borderless)
+                            }
+                        }
+                    }
+                }
                 if !store.jobs.isEmpty {
                     Section("In progress") {
                         ForEach(store.jobs) { job in
@@ -74,8 +89,7 @@ struct DownloadManagerView: View {
                                         message: "“\(item.title)” will be removed from this device. The stream stays in your library.",
                                         confirm: "Delete Download"
                                     ) {
-                                        try? FileManager.default.removeItem(atPath: item.path)
-                                        store.refresh()
+                                        store.delete(item.path)
                                     })
                                 } label: {
                                     Image(systemName: "trash")
@@ -99,8 +113,8 @@ struct DownloadManagerView: View {
                     } else if store.jobs.contains(where: { $0.status == .done || $0.status == .failed }) || !store.items.isEmpty {
                         Menu("Clear") {
                             if store.jobs.contains(where: { $0.status == .done || $0.status == .failed }) {
-                                Button("Clear finished & failed") {
-                                    store.jobs.removeAll { $0.status == .done || $0.status == .failed }
+                                Button("Clear completed jobs") {
+                                    store.clearFinishedJobs()
                                 }
                             }
                             if !store.items.isEmpty {

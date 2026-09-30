@@ -231,6 +231,12 @@ pub enum Command {
         seconds: f64,
     },
     SetVolume(f32),
+    SetSleepGain(f32),
+    HoldTrackEnd(bool),
+    SetPlaybackRegions {
+        source: String,
+        regions: crate::PlaybackRegions,
+    },
     /// Enables the unprocessed single-voice path. The output stream is
     /// separately rebuilt to a matching integer format before this is sent.
     SetBitPerfect(bool),
@@ -561,6 +567,11 @@ fn ride_filters(
 const CHUNK_FRAMES: usize = 512;
 
 struct Voice {
+    _source_lease: crate::playback_regions::SourceLease,
+    head_trim_allowed: bool,
+    region_fade_in: usize,
+    regions: crate::PlaybackRegions,
+    skipped_regions: Vec<bool>,
     decoder: SymphoniaDecoder,
     resampler: StreamResampler,
     user_stretch: Option<TimeStretch>,
@@ -644,6 +655,7 @@ impl Voice {
         skip_silence: bool,
         cue: bool,
     ) -> Result<Voice, String> {
+        let source_lease = crate::playback_regions::SourceLease::new(&request.source);
         let kind = SourceKind::parse(&request.source);
         let mut decoder =
             SymphoniaDecoder::open(&kind, &request.headers).map_err(|e| e.to_string())?;
@@ -666,11 +678,17 @@ impl Voice {
         if source_still_growing(&request.source) && request.duration_seconds > duration + 1.0 {
             duration = request.duration_seconds;
         }
+        let regions = crate::playback_regions::get(&request.source).normalized(duration);
         let start = if cue {
             let cleared = clamp_start_seconds(request.start_seconds, duration);
             bound_mix_in_depth(cleared, &request.plan, duration)
         } else {
             request.start_seconds.max(0.0)
+        };
+        let start = if request.start_seconds <= 0.0 || cue {
+            regions.next_allowed(start)
+        } else {
+            start
         };
         if start > 0.0 {
             decoder.seek_seconds(start).map_err(|e| e.to_string())?;
@@ -702,6 +720,11 @@ impl Voice {
         // glide has a number to walk from.
         let effective = (playback_speed as f64).clamp(0.5, 2.0) as f32;
         Ok(Voice {
+            _source_lease: source_lease,
+            head_trim_allowed: request.start_seconds <= 0.0 || cue,
+            region_fade_in: 0,
+            skipped_regions: vec![false; regions.excluded.len()],
+            regions,
             resampler: StreamResampler::stereo(src_rate, device_rate),
             user_stretch: user_stretcher(device_rate, effective),
             spatial,
@@ -908,6 +931,7 @@ impl Voice {
     }
 
     fn reset_processing(&mut self) {
+        self.region_fade_in = 0;
         self.resampler.reset();
         self.user_stretch = user_stretcher(self.device_rate, self.effective_speed);
         self.stretch = None;
@@ -979,7 +1003,7 @@ impl Voice {
     /// `None` here means "there is no end to schedule against", which is a cut,
     /// not a blend.
     fn remaining_seconds(&self) -> Option<f64> {
-        let total = self.known_duration?;
+        let total = self.regions.effective_end(self.known_duration?);
         Some((total - self.decoder.position_seconds()).max(0.0))
     }
 
@@ -988,7 +1012,12 @@ impl Voice {
     /// returns more than asked: decoded batches overshooting the request are
     /// stashed in `pending_dev` and served on later calls.
     fn pull(&mut self, frames: usize, device_rate: u32) -> Vec<f32> {
-        if self.bit_perfect && device_rate == self.info.sample_rate {
+        if self.bit_perfect
+            && device_rate == self.info.sample_rate
+            && self.regions.excluded.is_empty()
+            && self.regions.audible_start_seconds == 0.0
+            && self.regions.audible_end_seconds.is_none()
+        {
             return self.pull_bitperfect(frames);
         }
         let want = (frames * 2).max(2);
@@ -1030,13 +1059,88 @@ impl Voice {
         }
 
         while out.len() < want && !self.finished {
-            let src = self
-                .decoder
-                .read_stereo(crate::diagnostics::chunk())
-                .unwrap_or_else(|e| {
+            let at = self.decoder.position_seconds();
+            if self.head_trim_allowed && at < self.regions.audible_start_seconds {
+                if self
+                    .decoder
+                    .seek_seconds(self.regions.next_allowed(at))
+                    .is_ok()
+                {
+                    self.reset_processing();
+                    continue;
+                }
+                self.head_trim_allowed = false;
+            }
+            let end = self
+                .regions
+                .effective_end(self.known_duration.unwrap_or(0.0));
+            let reached_end = end > 0.0 && at >= end;
+            if let Some((index, segment)) =
+                self.regions.excluded.iter().enumerate().find(|(i, s)| {
+                    !self.skipped_regions[*i]
+                        && at >= s.start_seconds - 0.0001
+                        && at < s.end_seconds
+                })
+            {
+                let target = segment.end_seconds;
+                self.skipped_regions[index] = true;
+                match self.decoder.seek_seconds(target) {
+                    Ok(()) => {
+                        self.reset_processing();
+                        self.region_fade_in = (self.info.sample_rate as usize / 200).max(1);
+                        log::info!("non-music segment skipped {:.3}..{:.3}", at, target);
+                    }
+                    Err(error) => {
+                        log::warn!("segment seek failed: {error}");
+                    }
+                }
+                continue;
+            }
+            let mut until = if end > 0.0 { end } else { f64::INFINITY };
+            for (i, s) in self.regions.excluded.iter().enumerate() {
+                if !self.skipped_regions[i] && s.start_seconds > at {
+                    until = until.min(s.start_seconds);
+                }
+            }
+            let frames = (((until - at) * self.info.sample_rate as f64).ceil() as usize)
+                .max(1)
+                .min(crate::diagnostics::chunk());
+            let mut src = if reached_end {
+                Vec::new()
+            } else {
+                self.decoder.read_stereo(frames).unwrap_or_else(|e| {
                     self.decode_error = Some(format!("decode failed: {e}"));
                     Vec::new()
-                });
+                })
+            };
+            // Five-millisecond ramps around a policy cut avoid introducing a
+            // discontinuity while leaving the source timeline untouched.
+            let ramp_frames = (self.info.sample_rate as usize / 200).max(1);
+            let soften_cut = self
+                .regions
+                .excluded
+                .iter()
+                .any(|s| s.start_seconds == until)
+                || self.regions.audible_end_seconds == Some(until);
+            if self.region_fade_in > 0 || soften_cut {
+                for (i, frame) in src.chunks_exact_mut(2).enumerate() {
+                    let incoming_gain = if self.region_fade_in > 0 {
+                        let gain = 1.0 - self.region_fade_in as f32 / ramp_frames as f32;
+                        self.region_fade_in -= 1;
+                        gain
+                    } else {
+                        1.0
+                    };
+                    let to_cut = until - (at + i as f64 / self.info.sample_rate as f64);
+                    let outgoing_gain = if soften_cut {
+                        (to_cut / 0.005).clamp(0.0, 1.0) as f32
+                    } else {
+                        1.0
+                    };
+                    frame[0] *= incoming_gain * outgoing_gain;
+                    frame[1] *= incoming_gain * outgoing_gain;
+                }
+            }
             if src.is_empty() {
                 self.finished = true;
                 self.pending_dev = self.resampler.flush();
@@ -1384,6 +1488,8 @@ struct MixerState {
     playing: bool,
     bit_perfect: bool,
     volume: f32,
+    sleep_gain: f32,
+    hold_end: bool,
     crossfade_window_s: f64,
     spatial_enabled: bool,
     head_yaw: f32,
@@ -1578,6 +1684,9 @@ impl MixerState {
 
     /// Gapless: the current track ended and the next file is already queued.
     fn promote_pending(&mut self) {
+        if self.hold_end {
+            return;
+        }
         let Some(request) = self.pending_next.take() else {
             return;
         };
@@ -1770,10 +1879,12 @@ impl MixerState {
         if let Some(end) = analyzed_end {
             // A stale or inaccurate analysis anchor must never schedule the
             // blend past the audio the decoder can actually produce.
-            return decoded_end.map_or(end, |duration| end.min(duration));
+            return decoded_end.map_or(end, |duration| {
+                end.min(current.regions.effective_end(duration))
+            });
         }
         if let Some(duration) = decoded_end {
-            return duration;
+            return current.regions.effective_end(duration);
         }
         if plan.outgoing_duration_seconds.is_finite() && plan.outgoing_duration_seconds > 0.0 {
             return plan.outgoing_duration_seconds;
@@ -1894,7 +2005,11 @@ impl MixerState {
     }
 
     fn consider_arm(&mut self) {
-        if self.transition.is_some() || self.pending_next.is_none() || !self.playing {
+        if self.hold_end
+            || self.transition.is_some()
+            || self.pending_next.is_none()
+            || !self.playing
+        {
             return;
         }
         let Some(current) = &self.current else {
@@ -2003,6 +2118,24 @@ impl MixerState {
     /// that spends most of a short record — the planner chose that length.
     fn blend_seconds(&self, plan_fade: f64, track_seconds: f64) -> f64 {
         let planned = plan_fade.max(0.0);
+        // A region-limited handoff must never be expanded across a skipped interval.
+        let active = self.current.iter().chain(self.incoming.iter()).any(|v| {
+            v.regions.audible_start_seconds > 0.0
+                || v.regions.audible_end_seconds.is_some()
+                || !v.regions.excluded.is_empty()
+        });
+        let pending = self
+            .pending_next
+            .as_ref()
+            .map(|r| crate::playback_regions::get(&r.source))
+            .unwrap_or_default();
+        if active
+            || pending.audible_start_seconds > 0.0
+            || pending.audible_end_seconds.is_some()
+            || !pending.excluded.is_empty()
+        {
+            return planned;
+        }
         if planned == 0.0 || planned >= 4.0 {
             return planned;
         }
@@ -2365,6 +2498,8 @@ pub fn run_mixer(
         playing: false,
         bit_perfect: false,
         volume: 1.0,
+        sleep_gain: 1.0,
+        hold_end: false,
         crossfade_window_s: 0.0,
         spatial_enabled: false,
         head_yaw: 0.0,
@@ -2411,6 +2546,10 @@ pub fn run_mixer(
             let count = counter.load(Ordering::Relaxed);
             if count > state.observed_underruns {
                 state.queue_target_ms = (state.queue_target_ms + 60).min(1000);
+                crate::diagnostics::technical_event(format!(
+                    "output underruns={} queue_target_ms={}",
+                    count, state.queue_target_ms
+                ));
                 state.observed_underruns = count;
             }
         }
@@ -2515,8 +2654,19 @@ fn handle_command(state: &mut MixerState, cmd: Command, ring: &mut Producer<f32>
                 let _ = reply.send(Err(e));
             }
         },
-        Command::QueueNext { request } => {
-            if state.bit_perfect {
+        Command::QueueNext { mut request } => {
+            if let Some(current) = &state.current {
+                request.plan = crate::playback_regions::constrain(
+                    request.plan.into(),
+                    current.regions.clone(),
+                    crate::playback_regions::get(&request.source),
+                    current.info.duration_seconds,
+                    request.duration_seconds,
+                )
+                .into();
+                request.start_seconds = request.plan.cue_seconds;
+            }
+            if state.bit_perfect || state.hold_end {
                 return;
             }
             if request.source.is_empty() {
@@ -2703,6 +2853,12 @@ fn handle_command(state: &mut MixerState, cmd: Command, ring: &mut Producer<f32>
                         Ok(()) => {
                             voice.base_position = 0.0;
                             voice.reset_processing();
+                            voice.head_trim_allowed = false;
+                            for (i, s) in voice.regions.excluded.iter().enumerate() {
+                                if seconds >= s.start_seconds && seconds < s.end_seconds {
+                                    voice.skipped_regions[i] = true;
+                                }
+                            }
                             state.eq.flush();
                             state.clarity.reset();
                             state.protector.reset();
@@ -2720,6 +2876,82 @@ fn handle_command(state: &mut MixerState, cmd: Command, ring: &mut Producer<f32>
                 }
                 None => {
                     state.events.error("seek ignored — nothing playing".into());
+                }
+            }
+        }
+        Command::SetPlaybackRegions { source, regions } => {
+            for voice in state.current.iter_mut().chain(state.incoming.iter_mut()) {
+                if voice.info.source == source {
+                    let regions = regions.clone().normalized(voice.info.duration_seconds);
+                    voice.skipped_regions = regions
+                        .excluded
+                        .iter()
+                        .map(|s| {
+                            voice
+                                .regions
+                                .excluded
+                                .iter()
+                                .position(|old| {
+                                    old.start_seconds == s.start_seconds
+                                        && old.end_seconds == s.end_seconds
+                                })
+                                .map(|i| voice.skipped_regions[i])
+                                .unwrap_or(false)
+                        })
+                        .collect();
+                    voice.regions = regions;
+                }
+            }
+            if let (Some(current), Some(next)) = (&state.current, &mut state.pending_next) {
+                next.plan = crate::playback_regions::constrain(
+                    next.plan.clone().into(),
+                    current.regions.clone(),
+                    crate::playback_regions::get(&next.source),
+                    current.info.duration_seconds,
+                    next.duration_seconds,
+                )
+                .into();
+                next.start_seconds = next.plan.cue_seconds;
+            }
+            if let (Some(current), Some(incoming), Some(transition)) =
+                (&state.current, &mut state.incoming, &mut state.transition)
+            {
+                if !transition.swap && transition.phase == Phase::Arming {
+                    transition.plan = crate::playback_regions::constrain(
+                        transition.plan.clone().into(),
+                        current.regions.clone(),
+                        incoming.regions.clone(),
+                        current.info.duration_seconds,
+                        incoming.info.duration_seconds,
+                    )
+                    .into();
+                    transition.fade_frames =
+                        (transition.plan.fade_seconds * state.device_rate as f64) as u64;
+                    let cue = incoming.regions.next_allowed(transition.plan.cue_seconds);
+                    if incoming.decoder.seek_seconds(cue).is_ok() {
+                        incoming.reset_processing();
+                    }
+                }
+            }
+        }
+        Command::SetSleepGain(gain) => {
+            state.sleep_gain = if gain.is_finite() {
+                gain.clamp(0.0, 1.0)
+            } else {
+                1.0
+            }
+        }
+        Command::HoldTrackEnd(hold) => {
+            state.hold_end = hold;
+            if hold {
+                if state.transition.as_ref().is_some_and(|t| t.handed_off) {
+                    state.current = state.incoming.take();
+                }
+                state.pending_next = None;
+                state.incoming = None;
+                state.transition = None;
+                if let Some(voice) = &mut state.current {
+                    voice.gain = 1.0;
                 }
             }
         }
@@ -3214,7 +3446,7 @@ fn render_available(state: &mut MixerState, ring: &mut Producer<f32>) {
                 if state.transition.is_some() {
                     stages.push("Transition".into());
                 }
-                if state.volume != 1.0 {
+                if state.volume != 1.0 || state.sleep_gain != 1.0 {
                     stages.push("Application volume".into());
                 }
                 if state.clarity.active() {
@@ -4335,6 +4567,8 @@ mod tests {
             playing: true,
             bit_perfect: false,
             volume: 1.0,
+            sleep_gain: 1.0,
+            hold_end: false,
             crossfade_window_s: 4.0,
             spatial_enabled: false,
             head_yaw: 0.0,
@@ -4420,6 +4654,8 @@ mod tests {
             playing: true,
             bit_perfect: false,
             volume: 1.0,
+            sleep_gain: 1.0,
+            hold_end: false,
             crossfade_window_s: 4.0,
             spatial_enabled: false,
             head_yaw: 0.0,
@@ -5642,6 +5878,96 @@ mod tests {
             "Command::Load must not perform an immediate hard flush_ring"
         );
 
+        harness.finish();
+    }
+    #[test]
+    fn a_voice_skips_regions_once_and_releases_its_file_reader() {
+        let path =
+            std::env::temp_dir().join(format!("bitchord-voice-regions-{}.wav", std::process::id()));
+        test_wav(&path, 3.0, 440.0);
+        let source = path.to_string_lossy().to_string();
+        crate::playback_regions::put(
+            source.clone(),
+            crate::PlaybackRegions {
+                excluded: vec![crate::PlaybackInterval {
+                    start_seconds: 1.0,
+                    end_seconds: 2.0,
+                }],
+                ..Default::default()
+            },
+        );
+        let request = TrackSource {
+            source: source.clone(),
+            title: "Fixture".into(),
+            artist: "".into(),
+            start_seconds: 0.0,
+            plan: TransitionPlan::default(),
+            headers: std::collections::HashMap::new(),
+            claimed_kbps: 0,
+            loudness_db: None,
+            duration_seconds: 3.0,
+        };
+        let mut voice = Voice::open(&request, false, 0.0, 44100, 1.0, false, false).unwrap();
+        assert!(crate::playback_regions::source_has_playback_readers(
+            source.clone()
+        ));
+        let mut frames = 0;
+        while !voice.finished || voice.pending_dev_cursor < voice.pending_dev.len() {
+            frames += voice.pull(1024, 44100).len() / 2;
+        }
+        assert!((frames as f64 / 44100.0 - 2.0).abs() < 0.03);
+        assert!(voice.skipped_regions[0]);
+        voice.decoder.seek_seconds(1.2).unwrap();
+        voice.reset_processing();
+        voice.skipped_regions.fill(true);
+        let replay = voice.pull(1024, 44100);
+        assert!(!replay.is_empty());
+        assert!(voice.decoder.position_seconds() < 2.0);
+        drop(voice);
+        assert!(!crate::playback_regions::source_has_playback_readers(
+            source
+        ));
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn after_song_hold_rejects_late_successors() {
+        let (mut harness, low, high) = SwapHarness::new("sleep-hold");
+        let (reply, loaded) = crossbeam_channel::bounded(1);
+        harness
+            .tx
+            .send(Command::Load {
+                request: SwapHarness::source(&low, "First", 96),
+                reply,
+            })
+            .unwrap();
+        loaded
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+            .unwrap();
+        harness
+            .tx
+            .send(Command::QueueNext {
+                request: SwapHarness::source(&high, "Second", 320),
+            })
+            .unwrap();
+        harness.tx.send(Command::HoldTrackEnd(true)).unwrap();
+        harness
+            .tx
+            .send(Command::QueueNext {
+                request: SwapHarness::source(&high, "Late", 320),
+            })
+            .unwrap();
+        let (reply, peeked) = crossbeam_channel::bounded(1);
+        harness.tx.send(Command::PendingTrack { reply }).unwrap();
+        assert!(peeked
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+            .is_none());
+        drain_frames(&mut harness.consumer, &harness.buffered, 44100 * 8);
+        std::thread::sleep(Duration::from_millis(20));
+        assert!(harness.events.handoffs.lock().unwrap().is_empty());
+        assert_eq!(harness.events.ended.lock().unwrap().len(), 1);
         harness.finish();
     }
 }

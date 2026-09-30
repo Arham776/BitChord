@@ -32,6 +32,12 @@ struct BitChordApp: App {
                 .environment(toast)
                 .environment(party)
                 .task {
+                    #if DEBUG
+                    if ProcessInfo.processInfo.arguments.contains("--verify-sleep") {
+                        await controller.verifySleepBehavior()
+                        return
+                    }
+                    #endif
                     CipherUnlockWiring.install()
                     SecretStoreWiring.install()
                     ModuleEngineWiring.install()

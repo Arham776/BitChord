@@ -99,7 +99,8 @@ object SourceBridge {
                 kbps = obj["kbps"]?.jsonPrimitive?.intOrNull ?: 0,
                 bitDepth = obj["bitDepth"]?.jsonPrimitive?.intOrNull ?: 0,
                 sampleRate = obj["sampleRate"]?.jsonPrimitive?.intOrNull ?: 0,
-                lossless = quality == "LOSSLESS" || url.contains("flac", ignoreCase = true),
+                lossless = (obj["codec"]?.jsonPrimitive?.contentOrNull ?: guessCodec(url)).lowercase() in listOf("flac", "alac", "wav", "pcm"),
+                recordingIdentity = obj["recordingIdentity"]?.jsonPrimitive?.contentOrNull ?: obj["id"]?.jsonPrimitive?.contentOrNull,
             )
             callback.onResult(json.encodeToString(StreamHit.serializer(), payload), null)
         }
@@ -176,6 +177,7 @@ object SourceBridge {
         val bitDepth: Int,
         val sampleRate: Int,
         val lossless: Boolean,
+        val recordingIdentity: String? = null,
     )
 
     @Serializable

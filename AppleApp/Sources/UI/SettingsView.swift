@@ -20,6 +20,8 @@ struct SettingsView: View {
     @State private var spatial = PlatformSettings.shared.getBoolean(key: "spatial_audio", default: false)
     @State private var automix = PlatformSettings.shared.getBoolean(key: "smart_fade_enabled", default: false)
     @State private var automixSequence = PlatformSettings.shared.getBoolean(key: "automix_smart_sequence", default: true)
+    @State private var trimEdges = PlatformSettings.shared.getBoolean(key: "trim_edge_silence", default: false)
+    @State private var skipNonMusic = PlatformSettings.shared.getBoolean(key: "skip_non_music", default: false)
     @State private var skipSilence = PlatformSettings.shared.getBoolean(key: "skip_silence", default: false)
     @State private var wifiQuality = PlatformSettings.shared.getString(key: "audio_quality_wifi", default: "LOSSLESS")
     @State private var cellQuality = PlatformSettings.shared.getString(key: "audio_quality_cellular", default: "LOSSLESS")
@@ -668,6 +670,19 @@ struct SettingsView: View {
                     EmptyView()
                 }
             }
+            Toggle("Trim Leading and Trailing Silence", isOn: $trimEdges)
+                .onChange(of: trimEdges) { _, value in
+                    PlatformSettings.shared.putBoolean(key: "trim_edge_silence", value: value)
+                    controller.refreshPlaybackRegions()
+                }
+            Toggle("Skip Non-Music Segments", isOn: $skipNonMusic)
+                .onChange(of: skipNonMusic) { _, value in
+                    PlatformSettings.shared.putBoolean(key: "skip_non_music", value: value)
+                    controller.refreshPlaybackRegions()
+                }
+            Text("Non-music segments and audible boundaries are always used by Automix.")
+                .font(.caption).foregroundStyle(.secondary)
+            NavigationLink("Diagnostic Reports") { DiagnosticReportsView() }
             SettingsToggleLine(
                 glyph: .skipSilence,
                 title: "Skip Silence",
@@ -2260,7 +2275,10 @@ private struct SettingsQualityPersist: ViewModifier {
             .onChange(of: wifiQuality) { _, value in AppSettings.shared.setAudioQualityWifi(value: value) }
             .onChange(of: cellQuality) { _, value in AppSettings.shared.setAudioQualityCellular(value: value) }
             .onChange(of: downloadQuality) { _, value in AppSettings.shared.setDownloadQuality(value: value) }
-            .onChange(of: wifiOnlyDownloads) { _, value in AppSettings.shared.setWifiOnlyDownloads(value: value) }
+            .onChange(of: wifiOnlyDownloads) { _, value in
+                AppSettings.shared.setWifiOnlyDownloads(value: value)
+                DownloadStore.shared.networkPolicyChanged()
+            }
             .onChange(of: outputPcm) { _, value in controller.updateOutputPcmMode(value) }
             .onChange(of: matchSourceRate) { _, value in controller.updateMatchSourceSampleRate(value) }
             .onChange(of: bitPerfect) { _, value in controller.updateBitPerfectOutput(value) }
