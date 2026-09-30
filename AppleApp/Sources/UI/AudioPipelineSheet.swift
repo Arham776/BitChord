@@ -29,6 +29,8 @@ import AppKit
 struct AudioPipelineSheet: View {
     @Environment(PlaybackController.self) private var controller
     @Environment(\.dismiss) private var dismiss
+    @State private var captureRunning = false
+    @State private var captureMessage: String?
 
     var body: some View {
         NavigationStack {
@@ -92,6 +94,21 @@ struct AudioPipelineSheet: View {
                             // is what decides whether that fade is level-flat.
                             // Measured on the blended samples; “—” until one runs.
                             row("Upgrade correlation", upgradeCorrelation)
+                            row("Active Processing", nerd?.activeStages.joined(separator: " · ") ?? "—")
+                            row("Converter Delay", String(format: "%.1f frames", nerd?.converterDelayFrames ?? 0))
+                            row("Protection Reduction", String(format: "%.2f dB", nerd?.protectionReductionDb ?? 0))
+                            row("Protection Interventions", "\(nerd?.protectionInterventions ?? 0)")
+                            row("Decoded Layout", nerd?.decodedLayout ?? "—")
+                            row("Loudness Source", nerd?.loudnessOrigin ?? "—")
+                            row("Queue Target", "\(nerd?.queuedTargetMs ?? 0) ms")
+                            row("Engine Build", nerd?.buildRevision ?? "—")
+                            Button(captureRunning ? "Capturing 30 seconds…" : "Capture 30 seconds") {
+                                capturePlayback()
+                            }
+                            .disabled(captureRunning || controller.current == nil)
+                            .padding(.top, 10)
+                            if let captureMessage { Text(captureMessage).font(.caption).textSelection(.enabled) }
+
                         }
                     }
                     note("Values are read from the engine as it runs. “—” is a figure the system does not report, not one this app chose to hide.")
@@ -109,6 +126,33 @@ struct AudioPipelineSheet: View {
                     }
                 }
             }
+        }
+    }
+
+    private func capturePlayback() {
+        let engine = controller.engine
+        let identity = controller.current?.source ?? "unknown"
+        let recording = controller.current?.id ?? "unknown"
+        let directory = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("AudioDiagnostics", isDirectory: true)
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        captureRunning = true
+        captureMessage = nil
+        Task {
+            do {
+                try engine.startDiagnosticCapture(directory: directory.path, seconds: 30)
+                try await Task.sleep(for: .seconds(30))
+                // The engine writes off the audio callback and acknowledges the
+                // files before this completion message is displayed.
+                try await Task.detached(priority: .utility) { try engine.finishDiagnosticCapture() }.value
+                let details: [String: String] = ["recording_identity": recording, "selected_source": identity]
+                let data = try JSONEncoder().encode(details)
+                try data.write(to: directory.appendingPathComponent("recording.json"), options: .atomic)
+                captureMessage = "Saved capture: \(directory.path)"
+            } catch {
+                captureMessage = "Capture failed: \(error.localizedDescription)"
+            }
+            captureRunning = false
         }
     }
 
@@ -205,7 +249,7 @@ struct AudioPipelineSheet: View {
     /// decoder on every platform, so this row is the one that says which
     /// implementation is actually running — which is the question the codec row
     /// cannot answer.
-    private var decoderName: String { codec == "—" ? "—" : "symphonia" }
+    private var decoderName: String { nerd?.decoderImplementation.isEmpty == false ? nerd!.decoderImplementation : "—" }
 
     private var deviceRate: String {
         device.started && device.sampleRate > 0 ? "\(device.sampleRate) Hz" : "—"
@@ -230,7 +274,7 @@ struct AudioPipelineSheet: View {
     private var resamplerType: String {
         let src = nerd?.sampleRate ?? 0
         guard src > 0, device.sampleRate > 0 else { return "—" }
-        return src == device.sampleRate ? "Bypassed" : "Sinc"
+        return src == device.sampleRate ? "Bypassed" : "libsoxr HQ"
     }
 
     private var resamplerQuality: String {
@@ -265,18 +309,17 @@ struct AudioPipelineSheet: View {
     /// track carries none (local files, substitutes), "+x.x dB" otherwise.
     /// Upstream's panel makes the same three-way distinction.
     private var loudness: String {
-        let enabled = PlatformSettings.shared.getBoolean(key: "loudness_normalization", default: true)
-        guard enabled else { return "Off" }
+        guard nerd?.activeStages.contains("Normalization") == true else { return "Off / no figure" }
         guard let gain = nerd?.loudnessGainDb else { return "No figure" }
         if gain == 0 { return "Unity (0 dB)" }
         return String(format: "%+.1f dB", gain)
     }
 
     private var equalizerEnabled: Bool {
-        PlatformSettings.shared.getBoolean(key: "equalizer_enabled", default: false)
+        nerd?.activeStages.contains("Manual EQ / tone") == true
     }
     private var spatial: Bool {
-        PlatformSettings.shared.getBoolean(key: "spatial_audio", default: false)
+        nerd?.activeStages.contains("Spatial / head tracking") == true
     }
     private var eqPreset: String {
         guard equalizerEnabled else { return "Off" }
@@ -301,7 +344,8 @@ struct AudioPipelineSheet: View {
         }
         let src = nerd?.sampleRate ?? 0
         let resampling = src > 0 && device.sampleRate > 0 && src != device.sampleRate
-        if equalizerEnabled || spatial { return "No — DSP is active" }
+        if nerd?.activeStages.isEmpty == false { return "Processing active: \(nerd!.activeStages.joined(separator: ", "))" }
+        if (nerd?.protectionInterventions ?? 0) > 0 { return "Overload protection intervened" }
         if let gain = nerd?.loudnessGainDb, gain != 0 { return "No — loudness correction active" }
         if device.sampleFormat == "PCM_16" { return "No — 16-bit quantization at the output" }
         if resampling { return "No — resampling \(src) → \(device.sampleRate) Hz" }

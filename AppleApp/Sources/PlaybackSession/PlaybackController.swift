@@ -323,7 +323,11 @@ final class PlaybackController {
     /// Level every track to the same loudness. The engine applies the
     /// catalogue figure per track (upstream's clamp); tracks without one play
     /// at unity and the readout says so.
-    var loudnessNormalization = PlatformSettings.shared.getBoolean(key: "loudness_normalization", default: true)
+    var soundMode = PlatformSettings.shared.getString(key: "sound_mode", default: "TRANSPARENT")
+    var clarityPreset = PlatformSettings.shared.getString(key: "clarity_preset", default: "REFERENCE")
+    var clarityWet = Double(PlatformSettings.shared.getFloat(key: "clarity_wet", default: 1))
+    var loudnessMode = PlatformSettings.shared.getString(key: "loudness_mode", default: PlatformSettings.shared.getBoolean(key: "loudness_normalization", default: false) ? "TRACK" : "OFF")
+    var loudnessNormalization = PlatformSettings.shared.getBoolean(key: "loudness_normalization", default: false)
     /// CPU budget for Automix's background analysis (EFFICIENT / BALANCED /
     /// PERFORMANCE). EFFICIENT skips the vocal model; the 1 / 2 / 4 thread
     /// counts are upstream's ORT numbers, reported for the analysis path.
@@ -381,7 +385,10 @@ final class PlaybackController {
     /// reached. Skipping the plan (as the load path does when it cannot get a
     /// path) is also wrong — it forgoes the cue and the arm — so the path is
     /// remembered instead.
-    private var loadedSourcePath: String?
+    private var loudnessMeasurementTask: Task<Void, Never>?
+    private var loadedSourcePath: String? {
+        didSet { if oldValue != loadedSourcePath { scheduleLoudnessMeasurement() } }
+    }
     /// Request credentials travel with a source for both playback and analysis.
     /// Prefetched headers are held by source until the mixer reports handoff.
     private var loadedSourceHeaders: [String: String] = [:]
@@ -544,6 +551,9 @@ final class PlaybackController {
                     rate: format?.rate,
                     channels: format?.channels
                 )
+                try eng.setSoundMode(mode: PlatformSettings.shared.getString(key: "sound_mode", default: "TRANSPARENT") == "ENHANCED" ? .enhanced : .transparent)
+                try eng.setClarityTuning(tuning: Self.storedClarityTuning())
+                try eng.setLoudnessMode(mode: Self.storedLoudnessMode())
                 try eng.setCrossfadeWindow(seconds: crossfade)
                 try eng.setSpatialEnabled(enabled: spatial)
                 try eng.setSkipSilence(enabled: skip)
@@ -554,10 +564,8 @@ final class PlaybackController {
                     qs: eq.qs,
                     balance: eq.balance
                 )
-                try eng.setLoudnessEnabled(
-                    enabled: PlatformSettings.shared.getBoolean(key: "loudness_normalization", default: true)
-                )
-                if spatial {
+
+                if spatial && PlatformSettings.shared.getString(key: "sound_mode", default: "TRANSPARENT") == "ENHANCED" {
                     await MainActor.run { [weak self] in self?.headTracker.start(engine: eng) }
                 }
             } catch {
@@ -1268,7 +1276,7 @@ final class PlaybackController {
 
     func updateSpatial(enabled: Bool) {
         try? engine.setSpatialEnabled(enabled: enabled)
-        if enabled {
+        if enabled && soundMode == "ENHANCED" {
             headTracker.start(engine: engine)
         } else {
             headTracker.stop()
@@ -1298,6 +1306,67 @@ final class PlaybackController {
         case "PERFORMANCE": return 4
         default: return 2
         }
+    }
+
+    private func scheduleLoudnessMeasurement() {
+        loudnessMeasurementTask?.cancel()
+        guard soundMode == "ENHANCED", loudnessMode != "OFF", let path = loadedSourcePath,
+              !path.hasPrefix("http:"), !path.hasPrefix("https:") else { return }
+        let engine = self.engine
+        loudnessMeasurementTask = Task {
+            do {
+                // Partial downloads cannot yield a whole-recording loudness.
+                for _ in 0..<300 {
+                    try Task.checkCancellation()
+                    if !FileManager.default.fileExists(atPath: path + ".grow") || FileManager.default.fileExists(atPath: path + ".complete") { break }
+                    try await Task.sleep(for: .seconds(1))
+                }
+                try Task.checkCancellation()
+                let cached = await StreamFileCache.shared.measuredLoudness(at: path)
+                let measurement: LoudnessMeasurement
+                if let cached { measurement = cached }
+                else {
+                    measurement = try await Task.detached(priority: .utility) { try engine.measureLoudness(source: path) }.value
+                    await StreamFileCache.shared.storeMeasurement(measurement, at: path)
+                }
+                try Task.checkCancellation()
+                // The native command discards this result if the source changed.
+                try engine.setLoudnessMeasurement(source: path, measurement: measurement)
+            } catch is CancellationError { }
+            catch { NSLog("[BitChord] loudness measurement unavailable: \(error)") }
+        }
+    }
+
+    nonisolated private static func storedClarityTuning() -> ClarityTuning {
+        let raw = PlatformSettings.shared.getString(key: "clarity_preset", default: "REFERENCE")
+        let preset: ClarityPreset = raw == "SPEAKER" ? .speaker : raw == "HEADPHONE" ? .headphone : raw == "DAC" ? .dac : .reference
+        let trims = PlatformSettings.shared.getString(key: "clarity_trims", default: "").split(separator: ",").compactMap { Float($0) }
+        return ClarityTuning(preset: preset, wet: PlatformSettings.shared.getFloat(key: "clarity_wet", default: 1), trimsDb: trims.count == 8 ? trims : Array(repeating: 0, count: 8))
+    }
+    nonisolated private static func storedLoudnessMode() -> LoudnessMode {
+        let legacy = PlatformSettings.shared.getBoolean(key: "loudness_normalization", default: false)
+        let raw = PlatformSettings.shared.getString(key: "loudness_mode", default: legacy ? "TRACK" : "OFF")
+        return raw == "ALBUM" ? .album : raw == "TRACK" ? .track : .off
+    }
+    func updateSoundMode(_ value: String) {
+        soundMode = value == "ENHANCED" ? "ENHANCED" : "TRANSPARENT"
+        PlatformSettings.shared.putString(key: "sound_mode", value: soundMode)
+        try? engine.setSoundMode(mode: soundMode == "ENHANCED" ? .enhanced : .transparent)
+        if soundMode == "ENHANCED", PlatformSettings.shared.getBoolean(key: "spatial_audio", default: false) { headTracker.start(engine: engine) } else { headTracker.stop() }
+        scheduleLoudnessMeasurement()
+    }
+    func updateClarity(preset: String? = nil, wet: Double? = nil) {
+        if let preset { clarityPreset = preset; PlatformSettings.shared.putString(key: "clarity_preset", value: preset) }
+        if let wet { clarityWet = min(max(wet, 0), 1); PlatformSettings.shared.putFloat(key: "clarity_wet", value: Float(clarityWet)) }
+        try? engine.setClarityTuning(tuning: Self.storedClarityTuning())
+    }
+    func updateLoudnessMode(_ value: String) {
+        loudnessMode = ["TRACK", "ALBUM"].contains(value) ? value : "OFF"
+        loudnessNormalization = loudnessMode != "OFF"
+        PlatformSettings.shared.putString(key: "loudness_mode", value: loudnessMode)
+        PlatformSettings.shared.putBoolean(key: "loudness_normalization", value: loudnessNormalization)
+        try? engine.setLoudnessMode(mode: Self.storedLoudnessMode())
+        scheduleLoudnessMeasurement()
     }
 
     func updateOutputPcmMode(_ mode: String) {
@@ -1364,9 +1433,7 @@ final class PlaybackController {
     }
 
     func updateLoudnessNormalization(_ enabled: Bool) {
-        loudnessNormalization = enabled
-        PlatformSettings.shared.putBoolean(key: "loudness_normalization", value: enabled)
-        try? engine.setLoudnessEnabled(enabled: enabled)
+        updateLoudnessMode(enabled ? "TRACK" : "OFF")
     }
 
     func setAutomixPerformanceMode(_ mode: String) {

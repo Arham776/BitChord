@@ -25,6 +25,11 @@ import com.music.bitchord.data.remote.WebDavConfig
  * two therefore have independent settings, and conflating them is what made the
  * port unable to express "lossless when I'm on Wi-Fi" at all.
  */
+enum class SoundMode { TRANSPARENT, ENHANCED }
+enum class ClarityPreset { REFERENCE, SPEAKER, HEADPHONE, DAC }
+enum class LoudnessMode { OFF, TRACK, ALBUM }
+data class ClarityTuning(val preset: ClarityPreset = ClarityPreset.REFERENCE, val wet: Float = 1f, val trimsDb: List<Float> = List(8) { 0f })
+
 enum class AudioQuality(val maxKbps: Int, val label: String) {
     LOW(64, "Low"),
     MEDIUM(Int.MAX_VALUE, "Medium"),
@@ -714,10 +719,30 @@ object AppSettings {
      * mixer avoids positive gain because stream metadata does not include a
      * true-peak ceiling; boosting a full-scale master can clip.
      */
-    private val _loudnessNormalization = MutableStateFlow(settings.getBoolean("loudness_normalization", true))
+    private val _soundMode = MutableStateFlow(SoundMode.entries.firstOrNull { it.name == settings.getString("sound_mode", "TRANSPARENT") } ?: SoundMode.TRANSPARENT)
+    val soundMode: StateFlow<SoundMode> = _soundMode.asStateFlow()
+    fun setSoundMode(value: SoundMode) { _soundMode.value=value;settings.putString("sound_mode",value.name) }
+    private val _clarityTuning = MutableStateFlow(ClarityTuning(
+        preset=ClarityPreset.entries.firstOrNull { it.name == settings.getString("clarity_preset", "REFERENCE") } ?: ClarityPreset.REFERENCE,
+        wet=settings.getFloat("clarity_wet",1f).takeIf { it.isFinite() }?.coerceIn(0f,1f) ?: 1f,
+        trimsDb=settings.getString("clarity_trims", "").split(",").mapNotNull { it.toFloatOrNull()?.takeIf { v -> v.isFinite() }?.coerceIn(-12f,12f) }.takeIf { it.size==8 } ?: List(8) { 0f }
+    ))
+    val clarityTuning: StateFlow<ClarityTuning> = _clarityTuning.asStateFlow()
+    fun setClarityTuning(value: ClarityTuning) {
+        val clean=value.copy(wet=value.wet.takeIf { it.isFinite() }?.coerceIn(0f,1f) ?: 1f,trimsDb=List(8) { i -> value.trimsDb.getOrNull(i)?.takeIf { it.isFinite() }?.coerceIn(-12f,12f) ?: 0f })
+        _clarityTuning.value=clean;settings.putString("clarity_preset",clean.preset.name);settings.putFloat("clarity_wet",clean.wet);settings.putString("clarity_trims",clean.trimsDb.joinToString(","))
+    }
+    // Existing normalization preference is preserved, while a fresh profile starts Off.
+    private val _loudnessMode = MutableStateFlow(LoudnessMode.entries.firstOrNull { it.name == settings.getString("loudness_mode", if(settings.getBoolean("loudness_normalization",false)) "TRACK" else "OFF") } ?: LoudnessMode.OFF)
+    val loudnessMode: StateFlow<LoudnessMode> = _loudnessMode.asStateFlow()
+    fun setLoudnessMode(value: LoudnessMode) { _loudnessMode.value=value;settings.putString("loudness_mode",value.name);setLoudnessNormalization(value!=LoudnessMode.OFF) }
+
+    private val _loudnessNormalization = MutableStateFlow(settings.getBoolean("loudness_normalization", false))
     val loudnessNormalization: StateFlow<Boolean> = _loudnessNormalization.asStateFlow()
     fun setLoudnessNormalization(value: Boolean) {
         _loudnessNormalization.value = value
+        _loudnessMode.value=if(!value) LoudnessMode.OFF else if(_loudnessMode.value==LoudnessMode.OFF) LoudnessMode.TRACK else _loudnessMode.value
+        settings.putString("loudness_mode",_loudnessMode.value.name)
         settings.putBoolean("loudness_normalization", value)
     }
 
@@ -978,6 +1003,7 @@ object AppSettings {
             "audio_cache_limit_bytes",
             "eq_gains", "pinned_playlists", "jiosaavn_enabled", "stop_when_backgrounded",
             "prioritize_syllable_sync", "replay_genres", "scrobble_min_duration", "scrobble_delay_percent",
+            "sound_mode", "clarity_preset", "clarity_wet", "clarity_trims", "loudness_mode",
             "scrobble_delay_seconds", "output_pcm_mode", "prefer_usb_dac", "loudness_normalization",
             "automix_performance", "high_performance_mode", "performance_refresh_rate",
             "export_downloads", "hide_song_status", "prefer_music_only", "smart_version_alignment",
@@ -998,7 +1024,7 @@ object AppSettings {
                 "performance_refresh_rate" ->
                     settings.getInt(key, 0).toString()
                 "audio_cache_limit_bytes" -> settings.getLong(key, DEFAULT_CACHE_LIMIT_BYTES).toString()
-                "scrobble_delay_percent", "playback_speed" -> settings.getFloat(key, 0f).toString()
+                "clarity_wet", "scrobble_delay_percent", "playback_speed" -> settings.getFloat(key, 0f).toString()
                 "smart_fade_enabled", "spatial_audio", "autoplay", "skip_silence",
                 "wifi_only_downloads", "show_nerd_stats", "animated_canvas", "canvas_over_cellular",
                 "prioritize_spotify_canvas",
@@ -1071,6 +1097,11 @@ object AppSettings {
                 "scrobble_delay_seconds" -> setScrobbleDelaySeconds(value.toIntOrNull() ?: 180)
                 "output_pcm_mode" -> setOutputPcmMode(value)
                 "prefer_usb_dac" -> setPreferUsbDac(value.toBoolean())
+                "sound_mode" -> setSoundMode(SoundMode.entries.firstOrNull { it.name==value } ?: SoundMode.TRANSPARENT)
+                "loudness_mode" -> setLoudnessMode(LoudnessMode.entries.firstOrNull { it.name==value } ?: LoudnessMode.OFF)
+                "clarity_preset" -> setClarityTuning(_clarityTuning.value.copy(preset=ClarityPreset.entries.firstOrNull { it.name==value } ?: ClarityPreset.REFERENCE))
+                "clarity_wet" -> setClarityTuning(_clarityTuning.value.copy(wet=value.toFloatOrNull() ?: 1f))
+                "clarity_trims" -> setClarityTuning(_clarityTuning.value.copy(trimsDb=value.split(",").map { it.toFloatOrNull() ?: 0f }))
                 "loudness_normalization" -> setLoudnessNormalization(value.toBoolean())
                 "automix_performance" -> setAutomixPerformanceMode(value)
                 "high_performance_mode" -> setHighPerformanceMode(value.toBoolean())

@@ -44,7 +44,7 @@ struct SettingsView: View {
     @State private var matchSourceRate = PlatformSettings.shared.getBoolean(key: "match_source_sample_rate", default: true)
     @State private var bitPerfect = PlatformSettings.shared.getBoolean(key: "bit_perfect_output", default: false)
     @State private var preferUsbDac = PlatformSettings.shared.getBoolean(key: "prefer_usb_dac", default: false)
-    @State private var loudness = PlatformSettings.shared.getBoolean(key: "loudness_normalization", default: true)
+    @State private var loudness = PlatformSettings.shared.getBoolean(key: "loudness_normalization", default: false)
     @State private var automixPerf = PlatformSettings.shared.getString(key: "automix_performance", default: "BALANCED")
     @State private var highPerf = PlatformSettings.shared.getBoolean(key: "high_performance_mode", default: false)
     @State private var refreshRate: Int = Int(PlatformSettings.shared.getInt(key: "performance_refresh_rate", default: 60))
@@ -465,6 +465,29 @@ struct SettingsView: View {
                     EmptyView()
                 }
             }
+            Picker("Sound Mode", selection: Binding(get: { controller.soundMode }, set: { controller.updateSoundMode($0) })) {
+                Text("Transparent").tag("TRANSPARENT")
+                Text("Enhanced").tag("ENHANCED")
+            }
+            if controller.soundMode == "ENHANCED" {
+                Picker("Clarity Preset", selection: Binding(get: { controller.clarityPreset }, set: { controller.updateClarity(preset: $0) })) {
+                    Text("Reference").tag("REFERENCE")
+                    Text("Speaker").tag("SPEAKER")
+                    Text("Headphone").tag("HEADPHONE")
+                    Text("DAC").tag("DAC")
+                }
+                VStack(alignment: .leading) {
+                    Text("Clarity Mix · \(Int(controller.clarityWet * 100))%")
+                    Slider(value: Binding(get: { controller.clarityWet }, set: { controller.updateClarity(wet: $0) }), in: 0...1)
+                }
+                Picker("Normalization", selection: Binding(get: { controller.loudnessMode }, set: { controller.updateLoudnessMode($0) })) {
+                    Text("Off").tag("OFF")
+                    Text("Track").tag("TRACK")
+                    Text("Album").tag("ALBUM")
+                }
+            }
+            Text(controller.soundMode == "TRANSPARENT" ? "Preserves the recording. Playback speed, Automix and crossfade keep their own settings." : "Reference clarity adds tonal contour, centered bass and gentle width. Manual EQ and spatial remain optional.")
+                .font(.footnote).foregroundStyle(.secondary)
             qualityRow(
                 glyph: .wifi,
                 title: "On Wi-Fi",
@@ -511,12 +534,7 @@ struct SettingsView: View {
             )
             #endif
             SettingsSubToggle(title: "Prefer USB DAC", isOn: $preferUsbDac)
-            SettingsToggleLine(
-                glyph: .loudness,
-                title: "Loudness Normalization",
-                subtitle: "Attenuates loud tracks; avoids boosting masters into clipping",
-                isOn: $loudness
-            )
+
         } header: {
             Text("Audio Quality")
         } footer: {
