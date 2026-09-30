@@ -54,3 +54,34 @@ This file records the Rust dependency metadata and the licenses relevant to the 
 native-audio changes. It is not a replacement for the source notices, build inputs, or
 license inventory belonging to the Android submodule and its platform-specific dependency
 graph.
+
+## Lastwave clarity specifications
+
+`native-core/src/sound.rs` ports the Reference clarity filter specifications and
+preset stage trims from Clash-Projects/LastWave-Native, revision
+`ec11a430fcf6e7f06bbae450e768d48f1d97d161`, `app/src/main/cpp/DspProcessor.cpp`.
+Lastwave is licensed under GPLv3. Its full license is bundled in
+`AppleApp/Resources/AudioLicenses/Lastwave-license.txt`. BitChord adds four-times
+oversampling for the exciter and separate persistent lookahead protection.
+
+## SoX Resampler (libsoxr)
+
+Pinned libsoxr 0.1.3, copyright 2007–2018 Rob Sykes
+<robs@users.sourceforge.net>, distributed under LGPL-2.1-or-later.
+Source archive SHA-256:
+`db6ca1b1e8405c6ef92f8294fc123d910abf0a114003b3f0f13fa57a95fd62d0`.
+Complete source and notices are in `native-core/vendor/soxr-0.1.3`;
+`COPYING.LGPL` and `LICENCE` are bundled in `AppleApp/Resources/AudioLicenses`.
+The source release includes the application's Rust, Swift and Kotlin sources,
+build scripts and pinned dependency specifications, allowing modified libsoxr
+to be rebuilt and relinked using `scripts/build-native-core.sh` followed by the
+Apple app build. Distributors of static binaries must provide the corresponding
+relinkable application materials and installation information required by LGPL.
+The bundled FFT implementation's notices remain in its source files.
+
+## EBU R128 loudness measurement
+
+`ebur128` 0.1.10 (pinned in Cargo.lock) implements gated integrated loudness
+and true-peak measurement for completed local audio. It is distributed under
+the MIT license; its complete notice is bundled in
+`AppleApp/Resources/AudioLicenses/ebur128-MIT.txt`.

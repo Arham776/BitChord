@@ -119,11 +119,10 @@ impl SpatialRenderer {
         }
 
         for chunk in samples.chunks_exact_mut(2) {
-            // Float decoders can overshoot ±1; int16 (upstream's domain) cannot.
-            // A 2.5× side gain on a hot sample hard-clips into hash. Bound the
-            // input the way a short sample is inherently bounded.
-            let left = chunk[0].clamp(-1.0, 1.0);
-            let right = chunk[1].clamp(-1.0, 1.0);
+            // Float decoder/SRC overshoots are legitimate headroom. Clipping
+            // here creates harmonics before final protection can act.
+            let left = chunk[0];
+            let right = chunk[1];
 
             let mid = (left + right) * 0.5;
             let side = (left - right) * 0.5 * self.width_gain;
@@ -173,7 +172,11 @@ impl SpatialRenderer {
         // Head left (az > 0) → image sits to the right of the nose: left
         // ear is the far ear.
         let out_l = read_frac(&self.itd_left, self.itd_index, (az * self.max_itd).max(0.0));
-        let out_r = read_frac(&self.itd_right, self.itd_index, ((-az) * self.max_itd).max(0.0));
+        let out_r = read_frac(
+            &self.itd_right,
+            self.itd_index,
+            ((-az) * self.max_itd).max(0.0),
+        );
         self.itd_index = (self.itd_index + 1) % n;
 
         (
@@ -290,10 +293,7 @@ mod tests {
         assert_eq!(buf.len(), expected.len());
         for (i, (got, want)) in buf.iter().zip(expected.iter()).enumerate() {
             let err = (got - want).abs();
-            assert!(
-                err < 1e-6,
-                "sample {i}: got {got} want {want} err {err}"
-            );
+            assert!(err < 1e-6, "sample {i}: got {got} want {want} err {err}");
         }
     }
 

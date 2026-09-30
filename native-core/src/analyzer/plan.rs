@@ -193,7 +193,9 @@ mod analysis_cache {
     }
 
     pub(super) fn clear() {
-        let mut guard = cache().lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut guard = cache()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         guard.entries.clear();
         guard.order.clear();
     }
@@ -212,9 +214,16 @@ mod analysis_cache {
         duration: f64,
         compute: impl FnOnce() -> Analysis,
     ) -> Arc<Analysis> {
-        let key: Key = (path.to_string(), len_of(path), duration.to_bits(), skip_vocals);
+        let key: Key = (
+            path.to_string(),
+            len_of(path),
+            duration.to_bits(),
+            skip_vocals,
+        );
         // A panic while analysing must not poison the cache for the session.
-        let mut guard = cache().lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut guard = cache()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         if let Some(hit) = guard.entries.get(&key) {
             return hit.clone();
         }
@@ -231,7 +240,9 @@ mod analysis_cache {
 
     pub(super) fn invalidate(path: &str) {
         let norm = path.strip_prefix("file://").unwrap_or(path);
-        let mut guard = cache().lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut guard = cache()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let doomed: Vec<Key> = guard
             .entries
             .keys()
@@ -247,13 +258,20 @@ mod analysis_cache {
         }
     }
 
-    pub(super) fn get_cached_energy_curve(path: &str) -> Option<Vec<super::audio_analysis::EnergyPoint>> {
+    pub(super) fn get_cached_energy_curve(
+        path: &str,
+    ) -> Option<Vec<super::audio_analysis::EnergyPoint>> {
         let norm_path = path.strip_prefix("file://").unwrap_or(path);
-        let guard = cache().lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let guard = cache()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         guard.order.iter().rev().find_map(|key| {
             let key_path = key.0.strip_prefix("file://").unwrap_or(&key.0);
             if key_path == norm_path {
-                guard.entries.get(key).map(|analysis| analysis.energy_curve.clone())
+                guard
+                    .entries
+                    .get(key)
+                    .map(|analysis| analysis.energy_curve.clone())
             } else {
                 None
             }
@@ -348,16 +366,8 @@ mod last_sources {
     }
 
     pub(super) fn set(outgoing: &str, incoming: &str) {
-        let out = if outgoing.is_empty() {
-            "dsp"
-        } else {
-            outgoing
-        };
-        let inc = if incoming.is_empty() {
-            "dsp"
-        } else {
-            incoming
-        };
+        let out = if outgoing.is_empty() { "dsp" } else { outgoing };
+        let inc = if incoming.is_empty() { "dsp" } else { incoming };
         *pair().lock().unwrap_or_else(|p| p.into_inner()) = (out.into(), inc.into());
     }
 
@@ -370,14 +380,15 @@ fn apply_overlay(analysis: &mut Analysis, overlay: &AnalysisOverlay) {
     // Prefer Beat This / DSP tempo when MU reports a clear half/double of an
     // already-trusted grid (common with electronic tracks). Key/structure from
     // MU still apply.
-    let trust_existing_tempo = analysis.beat_confidence >= 0.55
-        && !analysis.downbeats.is_empty()
-        && analysis.bpm > 0.0;
+    let trust_existing_tempo =
+        analysis.beat_confidence >= 0.55 && !analysis.downbeats.is_empty() && analysis.bpm > 0.0;
     let overlay_bpm = overlay.bpm.filter(|b| *b > 0.0);
     let tempo_octave = overlay_bpm.is_some_and(|bpm| {
         let ratio = bpm / analysis.bpm;
-        (ratio - 2.0).abs() < 0.12 || (ratio - 0.5).abs() < 0.06
-            || (ratio - 3.0).abs() < 0.15 || (ratio - 1.0 / 3.0).abs() < 0.05
+        (ratio - 2.0).abs() < 0.12
+            || (ratio - 0.5).abs() < 0.06
+            || (ratio - 3.0).abs() < 0.15
+            || (ratio - 1.0 / 3.0).abs() < 0.05
     });
     let accept_overlay_tempo = !(trust_existing_tempo && tempo_octave);
 
@@ -493,8 +504,16 @@ pub(crate) fn find_next_energy_dip(
 
     let mut local_minima = Vec::new();
     for (idx, p) in &candidates {
-        let left_energy = if *idx > 0 { curve[*idx - 1].energy } else { p.energy };
-        let right_energy = if *idx + 1 < curve.len() { curve[*idx + 1].energy } else { p.energy };
+        let left_energy = if *idx > 0 {
+            curve[*idx - 1].energy
+        } else {
+            p.energy
+        };
+        let right_energy = if *idx + 1 < curve.len() {
+            curve[*idx + 1].energy
+        } else {
+            p.energy
+        };
         if p.energy <= left_energy && p.energy <= right_energy {
             local_minima.push(*p);
         }
@@ -883,7 +902,8 @@ fn analyze(
                 "automix analysis {path}: no beat-model grid — DSP tempo only \
                  ({:.1} bpm, confidence {:.2}). Transitions will be coarser; \
                  install the Automix beat model in Settings.",
-                analysis.bpm, analysis.beat_confidence,
+                analysis.bpm,
+                analysis.beat_confidence,
             );
         }
     }
@@ -981,11 +1001,7 @@ fn split_stereo(interleaved: &[f32]) -> (Vec<f32>, Vec<f32>) {
 
 // ---- Bass-swap placement (upstream `bassSwapFractionFor`) ------------------
 
-fn average_low_energy(
-    curve: &[audio_analysis::EnergyPoint],
-    from: f64,
-    until: f64,
-) -> Option<f64> {
+fn average_low_energy(curve: &[audio_analysis::EnergyPoint], from: f64, until: f64) -> Option<f64> {
     if until <= from {
         return None;
     }
@@ -1074,17 +1090,18 @@ fn bass_swap_fraction_for(
     }
 
     let earliest_fraction = HANDOFF_FRACTION.min(latest_fraction);
-    let earliest_beat =
-        ((earliest_fraction * overlap_beats as f64 - 1e-9).ceil() as usize).clamp(1, overlap_beats - 1);
-    let latest_beat =
-        ((latest_fraction * overlap_beats as f64 + 1e-9).floor() as usize).clamp(earliest_beat, overlap_beats - 1);
+    let earliest_beat = ((earliest_fraction * overlap_beats as f64 - 1e-9).ceil() as usize)
+        .clamp(1, overlap_beats - 1);
+    let latest_beat = ((latest_fraction * overlap_beats as f64 + 1e-9).floor() as usize)
+        .clamp(earliest_beat, overlap_beats - 1);
     let candidates: Vec<usize> = (earliest_beat..=latest_beat).collect();
     // `minWithOrNull`: closest to the prior, then beat-on-a-bar preferred.
     let fallback_beat = match candidates.iter().min_by(|a, b| {
         let da = (**a as f64 / overlap_beats as f64 - prior).abs();
         let db = (**b as f64 / overlap_beats as f64 - prior).abs();
-        da.total_cmp(&db)
-            .then_with(|| (if **a % 4 == 0 { 0 } else { 1 }).cmp(&(if **b % 4 == 0 { 0 } else { 1 })))
+        da.total_cmp(&db).then_with(|| {
+            (if **a % 4 == 0 { 0 } else { 1 }).cmp(&(if **b % 4 == 0 { 0 } else { 1 }))
+        })
     }) {
         Some(beat) => *beat,
         None => return prior,
@@ -1092,12 +1109,10 @@ fn bass_swap_fraction_for(
 
     let outgoing_reference = low_energy_reference(&outgoing.low_energy_curve);
     let incoming_reference = low_energy_reference(&incoming.low_energy_curve);
-    let outgoing_window = outgoing_beat_seconds.max(
-        low_energy_resolution(&outgoing.low_energy_curve) * 1.1,
-    );
-    let incoming_window = incoming_beat_seconds.max(
-        low_energy_resolution(&incoming.low_energy_curve) * 1.1,
-    );
+    let outgoing_window =
+        outgoing_beat_seconds.max(low_energy_resolution(&outgoing.low_energy_curve) * 1.1);
+    let incoming_window =
+        incoming_beat_seconds.max(low_energy_resolution(&incoming.low_energy_curve) * 1.1);
 
     let mut strongest: Option<(usize, f64)> = None;
     for beat in &candidates {
@@ -1141,7 +1156,12 @@ fn bass_swap_fraction_for(
             incoming_at,
             incoming_at + incoming_window,
         );
-        let bass_handoff = match (out_bass_before, out_bass_after, in_bass_before, in_bass_after) {
+        let bass_handoff = match (
+            out_bass_before,
+            out_bass_after,
+            in_bass_before,
+            in_bass_after,
+        ) {
             (Some(ob), Some(oa), Some(ib), Some(ia)) => (ob - oa) + (ia - ib),
             _ => 0.0,
         };
@@ -1236,7 +1256,12 @@ fn audible_seconds_between(
 }
 
 /// Mean of a parallel activity mask over `start`..`end` (same grid as energy).
-fn mask_activity_between(mask: &[f64], curve: &[audio_analysis::EnergyPoint], start: f64, end: f64) -> Option<f64> {
+fn mask_activity_between(
+    mask: &[f64],
+    curve: &[audio_analysis::EnergyPoint],
+    start: f64,
+    end: f64,
+) -> Option<f64> {
     if mask.is_empty() || mask.len() != curve.len() || end <= start {
         return None;
     }
@@ -1374,11 +1399,14 @@ fn key_distance(left: &str, right: &str) -> Option<usize> {
     let right_index = right_index?;
     let pitch = (left_index + 12 - right_index) % 12;
     let pitch = pitch.min((right_index + 12 - left_index) % 12);
-    Some(pitch + if left_mode.is_some() && right_mode.is_some() && left_mode != right_mode {
-        1
-    } else {
-        0
-    })
+    Some(
+        pitch
+            + if left_mode.is_some() && right_mode.is_some() && left_mode != right_mode {
+                1
+            } else {
+                0
+            },
+    )
 }
 
 /// A key the analyzer was not confident about is no key at all.
@@ -1447,8 +1475,7 @@ fn plan_from(outgoing: &Analysis, incoming: &Analysis, fade: f64) -> TransitionP
     let key_distance = key_distance(&trusted_key(outgoing), &trusted_key(incoming));
     let overlap_beats = if long {
         LONG_BLEND_BEATS as f64
-    } else if !vocal_conflict
-        && ((1.0 - ratio).abs() > 0.07 || key_distance.is_some_and(|d| d > 4))
+    } else if !vocal_conflict && ((1.0 - ratio).abs() > 0.07 || key_distance.is_some_and(|d| d > 4))
     {
         16.0
     } else {
@@ -1529,8 +1556,9 @@ fn plan_from(outgoing: &Analysis, incoming: &Analysis, fade: f64) -> TransitionP
     // A Beatmatched pair with a transparent stretch earns DjBlend. Anything
     // else — DjAssisted, far tempo, refused stretch — rides filters so the
     // ear never hears a chipmunk or a slow-mo vocal.
-    let beatmatched_blend =
-        matches!(tier, Tier::Beatmatched) && same_beat && (playback_rate - 1.0).abs() <= MAX_BEATMATCH_STRETCH + 1e-6;
+    let beatmatched_blend = matches!(tier, Tier::Beatmatched)
+        && same_beat
+        && (playback_rate - 1.0).abs() <= MAX_BEATMATCH_STRETCH + 1e-6;
 
     let (transition_start, fade_seconds) = if beatmatched_blend && beat_seconds > 0.0 {
         let intro_span = handoff / playback_rate.max(0.8);
@@ -1652,7 +1680,9 @@ fn mix_shape(
             post_glide_seconds: 0.0,
         };
     }
-    let clash = vocal_overlap.clamp(0.0, 1.0).max(if vocal_conflict { 0.7 } else { 0.0 });
+    let clash = vocal_overlap
+        .clamp(0.0, 1.0)
+        .max(if vocal_conflict { 0.7 } else { 0.0 });
     let dip = if same_beat {
         (0.28 + 0.5 * clash).clamp(0.0, MAX_DUCK_DEPTH)
     } else {
@@ -1688,10 +1718,12 @@ fn long_blend_allowed(outgoing: &Analysis, incoming: &Analysis) -> bool {
 }
 
 fn assess(outgoing: &Analysis, incoming: &Analysis) -> Tier {
-    if !(MIN_BPM..=MAX_BPM).contains(&outgoing.bpm) || !(MIN_BPM..=MAX_BPM).contains(&incoming.bpm) {
+    if !(MIN_BPM..=MAX_BPM).contains(&outgoing.bpm) || !(MIN_BPM..=MAX_BPM).contains(&incoming.bpm)
+    {
         return Tier::Plain;
     }
-    if outgoing.beat_confidence < MIN_DJ_CONFIDENCE && incoming.beat_confidence < MIN_DJ_CONFIDENCE {
+    if outgoing.beat_confidence < MIN_DJ_CONFIDENCE && incoming.beat_confidence < MIN_DJ_CONFIDENCE
+    {
         return Tier::Plain;
     }
     let stretch = outgoing.bpm / align_tempo_octave(outgoing.bpm, incoming.bpm).max(1e-6);
@@ -1860,9 +1892,7 @@ fn beat_seconds_of(analysis: &Analysis) -> f64 {
 /// analysis read.
 fn cap_cue(cue: f64, entry: f64, beat_seconds: f64, duration: f64) -> f64 {
     let in_mix_in_window = |t: f64| {
-        t.is_finite()
-            && t >= 0.0
-            && (duration <= 0.0 || t < duration - MIX_IN_END_MARGIN_SECONDS)
+        t.is_finite() && t >= 0.0 && (duration <= 0.0 || t < duration - MIX_IN_END_MARGIN_SECONDS)
     };
     let cue = if in_mix_in_window(cue) { cue } else { 0.0 };
     let mut cap = MAX_CUE_SECONDS.min(MAX_CUE_BEATS * beat_seconds);
@@ -1919,7 +1949,11 @@ fn incoming_handoff(analysis: &Analysis, max_overlap_s: f64) -> f64 {
 /// Playback starts `overlap * rate` before the handoff, and never more than
 /// eight seconds past the entry.
 fn cue_for(entry: f64, handoff: f64, overlap: f64, rate: f64) -> f64 {
-    let rate = if rate.is_finite() && rate > 0.0 { rate } else { 1.0 };
+    let rate = if rate.is_finite() && rate > 0.0 {
+        rate
+    } else {
+        1.0
+    };
     let raw = if overlap.is_finite() {
         handoff - overlap * rate
     } else {
@@ -1957,9 +1991,19 @@ fn aligned_transition_start(
     let phrase_tolerance = 1.0_f64.max(interval * 4.0);
     let downbeat_tolerance = 0.75_f64.max(interval * 2.0);
     let phrase = if prefer_earlier {
-        timed_near_or_before(&analysis.phrase_boundaries, target, phrase_tolerance, minimum)
+        timed_near_or_before(
+            &analysis.phrase_boundaries,
+            target,
+            phrase_tolerance,
+            minimum,
+        )
     } else {
-        nearest_timed(&analysis.phrase_boundaries, target, phrase_tolerance, minimum)
+        nearest_timed(
+            &analysis.phrase_boundaries,
+            target,
+            phrase_tolerance,
+            minimum,
+        )
     };
     let downbeat = if prefer_earlier {
         timed_near_or_before(&analysis.downbeats, target, downbeat_tolerance, minimum)
@@ -2054,7 +2098,11 @@ fn simultaneous_vocal_fraction(
     if out_end <= out_start {
         return None;
     }
-    let step = if rate.is_finite() && rate > 0.0 { rate } else { 1.0 };
+    let step = if rate.is_finite() && rate > 0.0 {
+        rate
+    } else {
+        1.0
+    };
     let mut in_index = 0usize;
     let mut both = 0usize;
     let mut total = 0usize;
@@ -2250,8 +2298,7 @@ fn plan_wsola_transition(outgoing: &Analysis, incoming: &Analysis) -> Option<Tra
     let audible_start = audible_start_of(incoming);
     let available_fade_beats =
         (incoming_drop_time - audible_start).max(0.0) / incoming_beat_seconds;
-    let capped_by_overlap =
-        ((max_seconds / incoming_beat_seconds).floor() as usize / 4) * 4;
+    let capped_by_overlap = ((max_seconds / incoming_beat_seconds).floor() as usize / 4) * 4;
     if capped_by_overlap < MIN_FADE_BEATS {
         return None;
     }
@@ -2405,7 +2452,10 @@ mod tests {
         let first = analysis_cache::get_or_compute(&key, false, 90.0, &mut compute);
         let second = analysis_cache::get_or_compute(&key, false, 90.0, &mut compute);
         assert_eq!(computed.load(Ordering::SeqCst), 1, "a repeat must be a hit");
-        assert!(Arc::ptr_eq(&first, &second), "a hit returns the same analysis");
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "a hit returns the same analysis"
+        );
 
         let _ = analysis_cache::get_or_compute(&key, false, 91.0, &mut compute);
         assert_eq!(
@@ -2451,9 +2501,12 @@ mod tests {
         // 96% is above the broad coverage ratio but still leaves 0.4 s of a
         // short track undecoded; it must not be interpreted as terminal silence.
         let partial = vec![0.2f32; rate as usize * 96 / 10];
-        let analyzed = analyze("growing-source", true, &|_, _, _, _| {
-            Some((partial.clone(), rate, 0.0))
-        }, 10.0);
+        let analyzed = analyze(
+            "growing-source",
+            true,
+            &|_, _, _, _| Some((partial.clone(), rate, 0.0)),
+            10.0,
+        );
 
         assert_eq!(analyzed.duration, 10.0);
         assert_eq!(analyzed.content_end, 0.0);
@@ -2511,10 +2564,22 @@ mod tests {
     fn vocal_activity_between_averages_the_window() {
         let mut a = analysis(0.0, 200.0, vec![]);
         a.energy_curve = vec![
-            audio_analysis::EnergyPoint { time: 0.0, energy: 1.0 },
-            audio_analysis::EnergyPoint { time: 1.0, energy: 1.0 },
-            audio_analysis::EnergyPoint { time: 2.0, energy: 1.0 },
-            audio_analysis::EnergyPoint { time: 3.0, energy: 1.0 },
+            audio_analysis::EnergyPoint {
+                time: 0.0,
+                energy: 1.0,
+            },
+            audio_analysis::EnergyPoint {
+                time: 1.0,
+                energy: 1.0,
+            },
+            audio_analysis::EnergyPoint {
+                time: 2.0,
+                energy: 1.0,
+            },
+            audio_analysis::EnergyPoint {
+                time: 3.0,
+                energy: 1.0,
+            },
         ];
         a.vocal_activity_mask = vec![0.0, 0.5, 1.0, 0.5];
         // The [0.5, 2.5] window covers times 1.0 and 2.0 → mean of 0.5 and 1.0.
@@ -2717,7 +2782,11 @@ mod tests {
         long.beat_confidence = 0.8;
         // Without the cap, 16 beats at 90 BPM is ~10.7 s.
         let plan = plan_from(&long, &short, 8.0);
-        assert!(plan.fade_seconds <= 30.0 * 0.4 + 1e-6, "fade {}", plan.fade_seconds);
+        assert!(
+            plan.fade_seconds <= 30.0 * 0.4 + 1e-6,
+            "fade {}",
+            plan.fade_seconds
+        );
     }
 
     #[test]
@@ -2776,14 +2845,22 @@ mod tests {
         let mut blind = analysis(0.0, 200.0, vec![0.5, 1.0, 1.5, 2.0]);
         blind.bpm = 0.0;
         blind.beat_interval = 0.0;
-        assert_eq!(incoming_cue(&blind), 0.0, "no tempo must not become a deep cue");
+        assert_eq!(
+            incoming_cue(&blind),
+            0.0,
+            "no tempo must not become a deep cue"
+        );
 
         // A tempo outside the analyser's own range means the read failed, and a
         // failed read must not turn into a 32-beat cue either.
         let mut absurd = analysis(0.0, 200.0, vec![0.5, 1.0, 1.5, 2.0]);
         absurd.bpm = 12.0;
         absurd.beat_interval = 5.0;
-        assert_eq!(incoming_cue(&absurd), 0.0, "an out-of-range tempo is not a grid");
+        assert_eq!(
+            incoming_cue(&absurd),
+            0.0,
+            "an out-of-range tempo is not a grid"
+        );
 
         // A tempo with no downbeats is no grid either.
         let mut no_downbeats = analysis(0.0, 200.0, vec![]);
@@ -2856,7 +2933,9 @@ mod tests {
         let cue = incoming_cue(&analysis(
             0.0,
             180.0,
-            vec![150.0, 154.0, 158.0, 162.0, 166.0, 170.0, 174.0, 176.0, 178.0],
+            vec![
+                150.0, 154.0, 158.0, 162.0, 166.0, 170.0, 174.0, 176.0, 178.0,
+            ],
         ));
         assert_eq!(cue, 0.0, "outro-only grid must not become a mix-in cue");
     }
@@ -2906,7 +2985,10 @@ mod tests {
             "cue {} is the drop, not the entry",
             plan.cue_seconds
         );
-        assert!(plan.bed_fraction > 0.0, "a phrase switch is a bed, not a crossfade");
+        assert!(
+            plan.bed_fraction > 0.0,
+            "a phrase switch is a bed, not a crossfade"
+        );
     }
 
     #[test]
@@ -2962,7 +3044,10 @@ mod tests {
         assert!((start - 168.0).abs() < 1e-6, "start {start}");
 
         let (kept_start, kept_fade) = realized_window(180.0, 168.0, 12.0, AUTO_MIN_SECONDS);
-        assert!((kept_fade - 12.0).abs() < 1e-6, "a good snap stays, got {kept_fade}");
+        assert!(
+            (kept_fade - 12.0).abs() < 1e-6,
+            "a good snap stays, got {kept_fade}"
+        );
         assert!((kept_start - 168.0).abs() < 1e-6);
 
         // The tail is the whole window: do not invent blend time the track
@@ -3001,7 +3086,8 @@ mod tests {
         inc.vocal_activity_mask = mask;
         out.vocal_probability = 0.9;
         inc.vocal_probability = 0.9;
-        let plan = phrase_switch(&out, &inc).expect("a clash shrinks the blend, it does not refuse it");
+        let plan =
+            phrase_switch(&out, &inc).expect("a clash shrinks the blend, it does not refuse it");
         let beats = plan.fade_seconds / 0.5;
         assert!(
             beats <= 8.0,
@@ -3012,11 +3098,26 @@ mod tests {
     #[test]
     fn next_energy_dip_detects_local_valley_in_window() {
         let curve = vec![
-            super::audio_analysis::EnergyPoint { time: 0.0, energy: 0.9 },
-            super::audio_analysis::EnergyPoint { time: 0.5, energy: 0.8 },
-            super::audio_analysis::EnergyPoint { time: 1.0, energy: 0.25 }, // dip
-            super::audio_analysis::EnergyPoint { time: 1.5, energy: 0.75 },
-            super::audio_analysis::EnergyPoint { time: 2.0, energy: 0.85 },
+            super::audio_analysis::EnergyPoint {
+                time: 0.0,
+                energy: 0.9,
+            },
+            super::audio_analysis::EnergyPoint {
+                time: 0.5,
+                energy: 0.8,
+            },
+            super::audio_analysis::EnergyPoint {
+                time: 1.0,
+                energy: 0.25,
+            }, // dip
+            super::audio_analysis::EnergyPoint {
+                time: 1.5,
+                energy: 0.75,
+            },
+            super::audio_analysis::EnergyPoint {
+                time: 2.0,
+                energy: 0.85,
+            },
         ];
         // At position 0.0, window is [0.1, 2.0]. Local minimum at 1.0s.
         let dip = find_next_energy_dip(&curve, 0.0);
@@ -3024,10 +3125,22 @@ mod tests {
 
         // When flat: no dip found
         let flat_curve = vec![
-            super::audio_analysis::EnergyPoint { time: 0.0, energy: 0.9 },
-            super::audio_analysis::EnergyPoint { time: 0.5, energy: 0.91 },
-            super::audio_analysis::EnergyPoint { time: 1.0, energy: 0.92 },
-            super::audio_analysis::EnergyPoint { time: 1.5, energy: 0.90 },
+            super::audio_analysis::EnergyPoint {
+                time: 0.0,
+                energy: 0.9,
+            },
+            super::audio_analysis::EnergyPoint {
+                time: 0.5,
+                energy: 0.91,
+            },
+            super::audio_analysis::EnergyPoint {
+                time: 1.0,
+                energy: 0.92,
+            },
+            super::audio_analysis::EnergyPoint {
+                time: 1.5,
+                energy: 0.90,
+            },
         ];
         assert_eq!(find_next_energy_dip(&flat_curve, 0.0), None);
     }

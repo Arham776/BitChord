@@ -51,6 +51,9 @@ targets:
         optional: true
         type: folder
         buildPhase: resources
+      - path: Resources/AudioLicenses
+        type: folder
+        buildPhase: resources
     dependencies:
       - target: BitChordWidget
         embed: true

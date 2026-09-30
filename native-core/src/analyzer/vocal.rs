@@ -15,8 +15,7 @@ pub const FIXED_FRAMES: usize = 960;
 /// `(FIXED_FRAMES - 2) · hop / rate` (TrackAnalyzer), which lands at 958
 /// frames; the previous 22.8 s window decoded to 982 frames and made
 /// [`track`] reject every normal track, so no vocal mask was ever produced.
-pub const MAX_WINDOW_SECONDS: f64 =
-    (FIXED_FRAMES as f64 - 2.0) * HOP as f64 / SAMPLE_RATE;
+pub const MAX_WINDOW_SECONDS: f64 = (FIXED_FRAMES as f64 - 2.0) * HOP as f64 / SAMPLE_RATE;
 const LOW_HZ: f64 = 200.0;
 const HIGH_HZ: f64 = 4000.0;
 
@@ -155,8 +154,11 @@ fn reduce_to_band_curve(mix: &[f32], target: &[f32], usable_frames: usize) -> Ve
                 count += 1;
             }
         }
-        curve[frame] = if count > 0 { (sum / count as f64) as f32 } else { 0.0 };
+        curve[frame] = if count > 0 {
+            (sum / count as f64) as f32
+        } else {
+            0.0
+        };
     }
     curve
 }
-

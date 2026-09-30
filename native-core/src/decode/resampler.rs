@@ -1,152 +1,178 @@
-//! Stateful windowed-sinc resampler for the playback path.
-//!
-//! Same kernel family as the offline `Resample` port in `analyzer` (32
-//! zero crossings, Blackman window, kernel table) but streaming: it keeps
-//! unconsumed input history across calls so arbitrary-length streams resample
-//! with one continuous phase. Interior samples only render once both kernel
-//! edges are available; `flush` drains the tail with clamped edges (matching
-//! the offline port's edge behavior — no zero-pad ring at track start).
+//! libsoxr 0.1.3 HQ streaming conversion. A single interleaved handle shares
+//! timing across channels; unity-rate streams never touch their samples.
+use std::ffi::{c_char, c_void, CStr};
+use std::ptr;
 
-const ZERO_CROSSINGS: f64 = 32.0;
-const KERNEL_RESOLUTION: f64 = 512.0;
-
-fn sinc(x: f64) -> f64 {
-    if x.abs() < 1e-12 {
-        return 1.0;
-    }
-    let scaled = core::f64::consts::PI * x;
-    scaled.sin() / scaled
-}
-
-fn blackman(position: f64) -> f64 {
-    let two_pi = 2.0 * core::f64::consts::PI;
-    0.42 - 0.5 * (two_pi * position).cos() + 0.08 * (two_pi * 2.0 * position).cos()
+#[link(name = "soxr", kind = "static")]
+unsafe extern "C" {
+    fn soxr_create(
+        input_rate: f64,
+        output_rate: f64,
+        channels: u32,
+        error: *mut *const c_char,
+        io: *const c_void,
+        quality: *const c_void,
+        runtime: *const c_void,
+    ) -> *mut c_void;
+    fn soxr_process(
+        handle: *mut c_void,
+        input: *const c_void,
+        input_frames: usize,
+        consumed: *mut usize,
+        output: *mut c_void,
+        output_frames: usize,
+        produced: *mut usize,
+    ) -> *const c_char;
+    fn soxr_delay(handle: *mut c_void) -> f64;
+    fn soxr_clear(handle: *mut c_void) -> *const c_char;
+    fn soxr_delete(handle: *mut c_void);
 }
 
 pub struct StreamResampler {
-    input_rate: f64,
-    output_rate: f64,
+    handle: *mut c_void,
+    channels: usize,
     ratio: f64,
-    #[allow(dead_code)]
-    cutoff: f64,
-    half_width: f64,
-    kernel: Vec<f64>,
-    /// Unconsumed input samples; `history[0]` sits at absolute input
-    /// position `history_start`.
-    history: Vec<f64>,
-    history_start: i64,
-    /// Absolute input position of the next output sample's centre.
-    next_centre: f64,
-    primed: bool,
+    drained: bool,
 }
-
+// Each handle is exclusively owned and used by one decoder/mixer worker.
+unsafe impl Send for StreamResampler {}
 impl StreamResampler {
     pub fn new(input_rate: u32, output_rate: u32) -> Self {
         Self::with_rates(input_rate as f64, output_rate as f64)
     }
-
-    /// Fractional rates — used for playback-speed / Automix tempo stretch.
+    pub fn stereo(input_rate: u32, output_rate: u32) -> Self {
+        Self::with_channels(input_rate as f64, output_rate as f64, 2)
+    }
     pub fn with_rates(input_rate: f64, output_rate: f64) -> Self {
-        let input_rate = input_rate.max(1.0);
-        let output_rate = output_rate.max(1.0);
-        let ratio = output_rate / input_rate;
-        let cutoff = 0.5 * ratio.min(1.0);
-        let half_width = ZERO_CROSSINGS / (2.0 * cutoff);
-        let table_size = (half_width * KERNEL_RESOLUTION).ceil() as usize + 2;
-        let mut kernel = Vec::with_capacity(table_size);
-        for index in 0..table_size {
-            let offset = index as f64 / KERNEL_RESOLUTION;
-            let window = blackman((offset + half_width) / (2.0 * half_width));
-            kernel.push(2.0 * cutoff * sinc(2.0 * cutoff * offset) * window);
-        }
+        Self::with_channels(input_rate, output_rate, 1)
+    }
+    fn with_channels(input_rate: f64, output_rate: f64, channels: usize) -> Self {
+        assert!(
+            input_rate.is_finite()
+                && output_rate.is_finite()
+                && input_rate > 0.0
+                && output_rate > 0.0
+        );
+        let mut error = ptr::null();
+        let handle = if (input_rate - output_rate).abs() < 1e-6 {
+            ptr::null_mut()
+        } else {
+            // Null specs select float32 interleaved, HQ, one worker in the pinned C API.
+            unsafe {
+                soxr_create(
+                    input_rate,
+                    output_rate,
+                    channels as u32,
+                    &mut error,
+                    ptr::null(),
+                    ptr::null(),
+                    ptr::null(),
+                )
+            }
+        };
+        assert!(error.is_null(), "soxr create: {}", message(error));
+        assert!(
+            !handle.is_null() || (input_rate - output_rate).abs() < 1e-6,
+            "soxr allocation failed"
+        );
         Self {
-            input_rate,
-            output_rate,
-            ratio,
-            cutoff,
-            half_width,
-            kernel,
-            history: Vec::with_capacity((half_width as usize + 1) * 2),
-            history_start: 0,
-            next_centre: 0.0,
-            primed: false,
+            handle,
+            channels,
+            ratio: output_rate / input_rate,
+            drained: false,
         }
     }
-
     pub fn passthrough(&self) -> bool {
-        (self.input_rate - self.output_rate).abs() < 1e-6
+        self.handle.is_null()
     }
-
-    /// Pushes input samples, returns resampled output. Call
-    /// [`StreamResampler::flush`] at end of stream to drain the kernel tail.
+    pub fn delay_frames(&self) -> f64 {
+        if self.passthrough() {
+            0.0
+        } else {
+            unsafe { soxr_delay(self.handle) }
+        }
+    }
+    pub fn reset(&mut self) {
+        if !self.passthrough() {
+            let error = unsafe { soxr_clear(self.handle) };
+            assert!(error.is_null(), "soxr reset: {}", message(error));
+        }
+        self.drained = false;
+    }
     pub fn process(&mut self, input: &[f32]) -> Vec<f32> {
+        assert_eq!(input.len() % self.channels, 0);
         if self.passthrough() {
             return input.to_vec();
         }
-        self.history.extend(input.iter().map(|v| *v as f64));
-        let end = self.history_start + self.history.len() as i64;
-        let mut output = Vec::new();
-        // Render as soon as the kernel's look-ahead fits in history. The
-        // look-behind is always available (history is only dropped up to
-        // next_centre - half_width) *except* at stream start, where
-        // render_at's edge clamp applies — the same semantics as the offline
-        // port's start edge. Gating on look-behind availability here would
-        // stall the first sample forever: nothing exists before position 0.
-        while self.next_centre + self.half_width < end as f64 {
-            let centre = self.next_centre - self.history_start as f64;
-            output.push(self.render_at(&self.history, centre));
-            self.next_centre += 1.0 / self.ratio;
+        assert!(!self.drained, "reset drained converter before reuse");
+        let mut result = Vec::new();
+        let mut cursor = 0;
+        while cursor < input.len() {
+            let frames = (input.len() - cursor) / self.channels;
+            let capacity = (frames as f64 * self.ratio).ceil() as usize + 8192;
+            let mut out = vec![0.0f32; capacity * self.channels];
+            let (mut consumed, mut produced) = (0, 0);
+            let error = unsafe {
+                soxr_process(
+                    self.handle,
+                    input[cursor..].as_ptr().cast(),
+                    frames,
+                    &mut consumed,
+                    out.as_mut_ptr().cast(),
+                    capacity,
+                    &mut produced,
+                )
+            };
+            assert!(error.is_null(), "soxr process: {}", message(error));
+            assert!(consumed > 0 || produced > 0, "soxr made no progress");
+            result.extend_from_slice(&out[..produced * self.channels]);
+            cursor += consumed * self.channels;
         }
-        // Drop history no future centre can look back into.
-        let drop_to = ((self.next_centre - self.half_width).floor() as i64 - self.history_start)
-            .clamp(0, self.history.len() as i64) as usize;
-        self.history.drain(..drop_to);
-        self.history_start += drop_to as i64;
-        self.primed = true;
-        output
+        result
     }
-
-    /// Drains the kernel tail after end-of-stream (clamped edges).
     pub fn flush(&mut self) -> Vec<f32> {
-        if self.passthrough() || !self.primed {
-            self.history.clear();
+        if self.passthrough() || self.drained {
             return Vec::new();
         }
-        let mut output = Vec::new();
-        let end = (self.history_start + self.history.len() as i64 - 1) as f64;
-        while self.next_centre <= end {
-            let centre = self.next_centre - self.history_start as f64;
-            output.push(self.render_at(&self.history, centre));
-            self.next_centre += 1.0 / self.ratio;
-        }
-        self.history.clear();
-        self.primed = false;
-        output
-    }
-
-    fn render_at(&self, full: &[f64], centre: f64) -> f32 {
-        let first_tap = (centre - self.half_width).ceil() as i64;
-        let last_tap = (centre + self.half_width).floor() as i64;
-        let mut sum = 0.0;
-        let mut weight_sum = 0.0;
-        for tap in first_tap..=last_tap {
-            let offset = (centre - tap as f64).abs();
-            let scaled = offset * KERNEL_RESOLUTION;
-            let slot = scaled as usize;
-            if slot + 1 >= self.kernel.len() {
-                continue;
+        self.drained = true;
+        let mut result = Vec::new();
+        loop {
+            let mut out = vec![0.0f32; 8192 * self.channels];
+            let mut produced = 0;
+            let error = unsafe {
+                soxr_process(
+                    self.handle,
+                    ptr::null(),
+                    0,
+                    ptr::null_mut(),
+                    out.as_mut_ptr().cast(),
+                    8192,
+                    &mut produced,
+                )
+            };
+            assert!(error.is_null(), "soxr flush: {}", message(error));
+            result.extend_from_slice(&out[..produced * self.channels]);
+            if produced == 0 {
+                break;
             }
-            let fraction = scaled - slot as f64;
-            let weight = self.kernel[slot] + fraction * (self.kernel[slot + 1] - self.kernel[slot]);
-            let clamped = tap.clamp(0, full.len() as i64 - 1) as usize;
-            sum += weight * full[clamped];
-            weight_sum += weight;
         }
-        if weight_sum != 0.0 {
-            (sum / weight_sum) as f32
-        } else {
-            0.0
+        result
+    }
+}
+impl Drop for StreamResampler {
+    fn drop(&mut self) {
+        if !self.handle.is_null() {
+            unsafe { soxr_delete(self.handle) };
         }
+    }
+}
+fn message(error: *const c_char) -> String {
+    if error.is_null() {
+        String::new()
+    } else {
+        unsafe { CStr::from_ptr(error) }
+            .to_string_lossy()
+            .into_owned()
     }
 }
 
@@ -182,10 +208,16 @@ mod tests {
         // stream start stalled the first sample forever — everything only
         // appeared at flush. Mid-stream calls must produce audio.
         let mut r = StreamResampler::new(44_100, 48_000);
-        let input: Vec<f32> = (0..24_000).map(|i| ((i as f32) * 0.01).sin() * 0.5).collect();
+        let input: Vec<f32> = (0..24_000)
+            .map(|i| ((i as f32) * 0.01).sin() * 0.5)
+            .collect();
         let out = r.process(&input);
         assert!(!out.is_empty(), "process() produced nothing before flush");
-        assert!(out.len() > 20_000, "suspiciously few samples: {}", out.len());
+        assert!(
+            out.len() > 20_000,
+            "suspiciously few samples: {}",
+            out.len()
+        );
     }
 
     #[test]
@@ -233,5 +265,80 @@ mod tests {
             .map(|(x, y)| (x - y).abs())
             .fold(0.0f32, f32::max);
         assert!(max_diff < 1e-4, "max diff {max_diff}");
+    }
+    #[test]
+    fn stereo_chunk_boundaries_and_drain_are_exact() {
+        let input: Vec<f32> = (0..44101)
+            .flat_map(|i| {
+                let s = (i as f32 * 0.093).sin() * 0.2;
+                [s, -s]
+            })
+            .collect();
+        let render = |chunk: usize| {
+            let mut r = StreamResampler::stereo(44100, 48000);
+            let mut out = Vec::new();
+            for b in input.chunks(chunk * 2) {
+                out.extend(r.process(b));
+            }
+            out.extend(r.flush());
+            assert!(r.flush().is_empty());
+            out
+        };
+        let baseline = render(44101);
+        assert_eq!(
+            baseline.len() / 2,
+            (44101f64 * 48000.0 / 44100.0).round() as usize
+        );
+        for chunk in [1, 7, 511, 4096] {
+            let x = render(chunk);
+            assert_eq!(x.len(), baseline.len());
+            assert!(x.iter().zip(&baseline).all(|(a, b)| (a - b).abs() < 2e-7));
+            assert!(x.chunks_exact(2).all(|p| (p[0] + p[1]).abs() < 1e-7));
+        }
+    }
+
+    fn spectral_amplitude(pcm: &[f32], rate: u32, hz: f64) -> f64 {
+        let frames = pcm.len() / 2;
+        let start = rate as usize / 4;
+        let end = (rate as usize * 3 / 4).min(frames);
+        let (mut c, mut s) = (0.0, 0.0);
+        for i in start..end {
+            let phase = 2.0 * std::f64::consts::PI * hz * i as f64 / rate as f64;
+            c += pcm[i * 2] as f64 * phase.cos();
+            s += pcm[i * 2] as f64 * phase.sin();
+        }
+        2.0 * c.hypot(s) / (end - start) as f64
+    }
+    #[test]
+    fn hq_conversion_meets_passband_and_alias_gates() {
+        let tone = |input: u32, output: u32, hz: f64| {
+            let x: Vec<f32> = (0..input)
+                .flat_map(|i| {
+                    let x = (2.0 * std::f64::consts::PI * hz * i as f64 / input as f64).sin()
+                        as f32
+                        * 0.5;
+                    [x, -x]
+                })
+                .collect();
+            let mut r = StreamResampler::stereo(input, output);
+            let mut y = r.process(&x);
+            y.extend(r.flush());
+            y
+        };
+        for (input, output) in [(44100, 48000), (48000, 44100)] {
+            for hz in [100.0, 1000.0, 10000.0, 19000.0, 20000.0] {
+                let y = tone(input, output, hz);
+                let db = 20.0 * (spectral_amplitude(&y, output, hz) / 0.5).log10();
+                assert!(db.abs() <= 0.05, "{input}→{output}, {hz}: {db} dB");
+            }
+        }
+        for (input, output, hz, image) in [
+            (48000, 44100, 23000.0, 21100.0),
+            (44100, 48000, 21500.0, 22600.0),
+        ] {
+            let y = tone(input, output, hz);
+            let db = 20.0 * spectral_amplitude(&y, output, image).max(1e-15).log10();
+            assert!(db <= -100.0, "{input}→{output} image: {db} dBFS");
+        }
     }
 }

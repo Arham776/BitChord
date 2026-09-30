@@ -51,7 +51,12 @@ fn file_duration(path: &str) -> f64 {
 
 /// The planner's decode callback. `mono` asks for a downmix; otherwise the
 /// buffer stays interleaved stereo.
-fn decode_window(path: &str, start: f64, duration: f64, mono: bool) -> Option<(Vec<f32>, u32, f64)> {
+fn decode_window(
+    path: &str,
+    start: f64,
+    duration: f64,
+    mono: bool,
+) -> Option<(Vec<f32>, u32, f64)> {
     let kind = SourceKind::parse(path);
     let mut decoder = SymphoniaDecoder::open(&kind, &HashMap::new()).ok()?;
     if start > 0.0 {
@@ -143,6 +148,8 @@ fn plan_for(outgoing: &str, incoming: &str) -> TransitionPlan {
         "",
         false,
         0.0,
+        file_duration(outgoing),
+        file_duration(incoming),
         false,
         "render",
         decode_window,
@@ -156,12 +163,7 @@ fn score_pair(outgoing: &str, incoming: &str, label: &str) {
     let (out_src, in_src) = native_core::analyzer::last_analysis_sources();
     println!(
         "{label}\tstyle={:?}\trate={:.4}\tsmooth={:.3}\tforced={}\tout_src={}\tin_src={}",
-        plan.style,
-        plan.playback_rate,
-        smooth.score,
-        smooth.forced_stretch,
-        out_src,
-        in_src
+        plan.style, plan.playback_rate, smooth.score, smooth.forced_stretch, out_src, in_src
     );
     if smooth.forced_stretch {
         eprintln!("{label}: FAIL forced_stretch rate={}", plan.playback_rate);
@@ -217,12 +219,7 @@ fn score_dir(dir: &Path) {
         let (out_src, in_src) = native_core::analyzer::last_analysis_sources();
         println!(
             "{label}\tstyle={:?}\trate={:.4}\tsmooth={:.3}\tforced={}\tout_src={}\tin_src={}",
-            plan.style,
-            plan.playback_rate,
-            smooth.score,
-            smooth.forced_stretch,
-            out_src,
-            in_src
+            plan.style, plan.playback_rate, smooth.score, smooth.forced_stretch, out_src, in_src
         );
         if smooth.forced_stretch {
             failures += 1;

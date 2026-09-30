@@ -100,6 +100,104 @@ pub fn looks_like_audio(path: &std::path::Path) -> bool {
             .and_then(|e| e.to_str())
             .map(|e| e.to_ascii_lowercase())
             .as_deref(),
-        Some("mp3" | "flac" | "m4a" | "mp4" | "aac" | "ogg" | "opus" | "wav" | "aiff" | "aif" | "wma" | "webm")
+        Some(
+            "mp3"
+                | "flac"
+                | "m4a"
+                | "mp4"
+                | "aac"
+                | "ogg"
+                | "opus"
+                | "wav"
+                | "aiff"
+                | "aif"
+                | "wma"
+                | "webm"
+        )
     )
+}
+
+/// ReplayGain is a gain referenced to the ReplayGain calibration, not a LUFS
+/// measurement. YouTube's relative loudness never enters this tag path.
+#[derive(Default, Debug, Clone)]
+pub struct ReplayGain {
+    pub track_db: Option<f64>,
+    pub album_db: Option<f64>,
+    pub track_peak: Option<f64>,
+    pub album_peak: Option<f64>,
+}
+pub fn read_replay_gain(path: &str) -> ReplayGain {
+    let Some(tagged) = Probe::open(path).ok().and_then(|p| p.read().ok()) else {
+        return ReplayGain::default();
+    };
+    let Some(tag) = tagged.primary_tag().or_else(|| tagged.first_tag()) else {
+        return ReplayGain::default();
+    };
+    let value = |key| {
+        tag.get_string(key)
+            .and_then(|v| v.trim().trim_end_matches("dB").trim().parse::<f64>().ok())
+            .filter(|v| v.is_finite())
+    };
+    ReplayGain {
+        track_db: value(lofty::tag::ItemKey::ReplayGainTrackGain),
+        album_db: value(lofty::tag::ItemKey::ReplayGainAlbumGain),
+        track_peak: value(lofty::tag::ItemKey::ReplayGainTrackPeak),
+        album_peak: value(lofty::tag::ItemKey::ReplayGainAlbumPeak),
+    }
+}
+impl ReplayGain {
+    pub fn gain_db(&self, mode: crate::LoudnessMode) -> Option<f64> {
+        let (db, peak) = match mode {
+            crate::LoudnessMode::Off => return None,
+            crate::LoudnessMode::Track => (self.track_db, self.track_peak),
+            crate::LoudnessMode::Album => (
+                self.album_db.or(self.track_db),
+                self.album_peak.or(self.track_peak),
+            ),
+        };
+        let mut db = db?.clamp(-15.0, 15.0);
+        if let Some(peak) = peak.filter(|p| *p > 0.0) {
+            db = db.min(-0.5 - 20.0 * peak.log10());
+        }
+        Some(db)
+    }
+}
+
+#[cfg(test)]
+mod loudness_tests {
+    use super::*;
+    use crate::{LoudnessMeasurement, LoudnessMode};
+    #[test]
+    fn album_gain_falls_back_to_track_and_respects_peak() {
+        let tags = ReplayGain {
+            track_db: Some(6.0),
+            track_peak: Some(0.5),
+            ..Default::default()
+        };
+        assert_eq!(tags.gain_db(LoudnessMode::Off), None);
+        let track = tags.gain_db(LoudnessMode::Track).unwrap();
+        assert!((track - 5.520599913).abs() < 1e-6);
+        assert_eq!(tags.gain_db(LoudnessMode::Album), Some(track));
+        let album = ReplayGain {
+            album_db: Some(-3.0),
+            album_peak: Some(1.0),
+            ..tags
+        };
+        assert_eq!(album.gain_db(LoudnessMode::Album), Some(-3.0));
+    }
+    #[test]
+    fn measured_lufs_and_relative_loudness_have_distinct_gain_semantics() {
+        let measurement = LoudnessMeasurement {
+            track_lufs: -20.0,
+            album_lufs: Some(-16.0),
+            true_peak_dbtp: Some(-8.0),
+        };
+        assert_eq!(measurement.gain_db(LoudnessMode::Track), Some(6.0));
+        assert_eq!(measurement.gain_db(LoudnessMode::Album), Some(2.0));
+        assert_eq!(measurement.gain_db(LoudnessMode::Off), None);
+        assert_eq!(
+            crate::mixer::loudness_gain(Some(-20.0), true),
+            (1.0, Some(0.0))
+        );
+    }
 }

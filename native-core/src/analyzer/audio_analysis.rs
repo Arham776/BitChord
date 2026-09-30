@@ -55,7 +55,7 @@ pub(crate) struct AudioAnalysis {
     pub(crate) mix_in_time: f64,
     pub(crate) mix_in_confidence: f64,
     pub(crate) vocal_probability: f64,
-    pub(crate) loudness_lufs: f64,
+    pub(crate) rms_level_dbfs: f64,
     pub(crate) peak_dbfs: f64,
     pub(crate) dynamic_range_db: f64,
     pub(crate) energy_curve: Vec<EnergyPoint>,
@@ -192,7 +192,9 @@ fn analyze_envelope(samples: &[f32], sample_rate: f64, duration: f64) -> Envelop
             .iter()
             .map(|s| (*s as f64) * (*s as f64))
             .sum();
-        result.levels.push((sum / (end - start).max(1) as f64).sqrt());
+        result
+            .levels
+            .push((sum / (end - start).max(1) as f64).sqrt());
         start += window_size;
     }
     if result.levels.is_empty() {
@@ -289,9 +291,11 @@ fn find_mix_out_time(
         return envelope.content_end;
     }
 
-    let silence_threshold = (0.0015f64)
-        .max((envelope.threshold * 0.25).min(envelope.reference * 0.04));
-    let search_start = levels.len().min((duration * 0.55 / WINDOW_SECONDS) as usize);
+    let silence_threshold =
+        (0.0015f64).max((envelope.threshold * 0.25).min(envelope.reference * 0.04));
+    let search_start = levels
+        .len()
+        .min((duration * 0.55 / WINDOW_SECONDS) as usize);
     let context_windows = (2.0 / WINDOW_SECONDS) as usize;
     let recovery_windows = (3.0 / WINDOW_SECONDS).round().max(1.0) as usize;
     let mut best_index = 0usize;
@@ -409,9 +413,7 @@ fn analyze_key_and_timbre(
 ) {
     const FRAME_SIZE: usize = 4096;
     let hop_size = (sample_rate * 0.65).max(FRAME_SIZE as f64) as usize;
-    let first_sample = samples
-        .len()
-        .min((start_time * sample_rate) as usize);
+    let first_sample = samples.len().min((start_time * sample_rate) as usize);
     let final_sample = samples.len().min((end_time * sample_rate) as usize);
     let mut chroma = [0.0f64; 12];
     let mut spectrum = vec![Complex { re: 0.0, im: 0.0 }; FRAME_SIZE];
@@ -453,8 +455,8 @@ fn analyze_key_and_timbre(
                 if frequency < 45.0 || frequency > 5000.0f64.min(sample_rate * 0.48) {
                     continue;
                 }
-                let power = spectrum[bin].re * spectrum[bin].re
-                    + spectrum[bin].im * spectrum[bin].im;
+                let power =
+                    spectrum[bin].re * spectrum[bin].re + spectrum[bin].im * spectrum[bin].im;
                 let perceptual_power = power.ln_1p();
                 if frequency < 250.0 {
                     frame_low += perceptual_power;
@@ -510,8 +512,12 @@ fn analyze_key_and_timbre(
         }
     }
 
-    const MAJOR: [f64; 12] = [6.35, 2.23, 3.48, 2.33, 4.38, 4.09, 2.52, 5.19, 2.39, 3.66, 2.29, 2.88];
-    const MINOR: [f64; 12] = [6.33, 2.68, 3.52, 5.38, 2.60, 3.53, 2.54, 4.75, 3.98, 2.69, 3.34, 3.17];
+    const MAJOR: [f64; 12] = [
+        6.35, 2.23, 3.48, 2.33, 4.38, 4.09, 2.52, 5.19, 2.39, 3.66, 2.29, 2.88,
+    ];
+    const MINOR: [f64; 12] = [
+        6.33, 2.68, 3.52, 5.38, 2.60, 3.53, 2.54, 4.75, 3.98, 2.69, 3.34, 3.17,
+    ];
     const NAMES: [&str; 12] = [
         "C", "C♯", "D", "E♭", "E", "F", "F♯", "G", "A♭", "A", "B♭", "B",
     ];
@@ -569,8 +575,8 @@ fn build_structure(envelope: &EnvelopeResult, result: &mut AudioAnalysis) {
             break;
         }
     }
-    let raw_intro = (phrase_start + phrase_seconds)
-        .max(strong_window as f64 * envelope.window_seconds);
+    let raw_intro =
+        (phrase_start + phrase_seconds).max(strong_window as f64 * envelope.window_seconds);
     result.intro_end_time = clamp(
         nearest_downbeat(&result.downbeats, raw_intro, raw_intro),
         envelope.audible_start,
@@ -586,8 +592,7 @@ fn build_structure(envelope: &EnvelopeResult, result: &mut AudioAnalysis) {
         }
         let section_average = average(&envelope.levels, index, index + four_seconds);
         let tail_average = average(&envelope.levels, index, envelope.levels.len());
-        if section_average >= envelope.reference * 0.68
-            || tail_average >= envelope.reference * 0.72
+        if section_average >= envelope.reference * 0.68 || tail_average >= envelope.reference * 0.72
         {
             continue;
         }
@@ -656,11 +661,7 @@ fn build_structure(envelope: &EnvelopeResult, result: &mut AudioAnalysis) {
         latest_cue,
     );
     let cue_window = (result.mix_in_time / envelope.window_seconds) as usize;
-    let cue_energy = average(
-        &envelope.levels,
-        cue_window,
-        cue_window + four_seconds,
-    );
+    let cue_energy = average(&envelope.levels, cue_window, cue_window + four_seconds);
     result.mix_in_confidence = clamp(
         result.beat_confidence * 0.65
             + clamp(cue_energy / envelope.reference.max(1e-6), 0.0, 1.0) * 0.35,
@@ -837,8 +838,12 @@ pub(crate) fn analyze_audio(
         confidence,
         beats,
         downbeats,
-    }) = tempo::analyze_tempo(samples, sample_rate, result.duration, envelope.audible_start)
-    {
+    }) = tempo::analyze_tempo(
+        samples,
+        sample_rate,
+        result.duration,
+        envelope.audible_start,
+    ) {
         result.bpm = bpm;
         result.beat_interval = beat_interval;
         result.first_beat = first_beat;
@@ -860,7 +865,8 @@ pub(crate) fn analyze_audio(
         peak = peak.max((*sample as f64).abs());
     }
     let rms = (square_sum / (content_end - content_start).max(1) as f64).sqrt();
-    result.loudness_lufs = to_db(rms).max(-70.0) - 0.691;
+    // Ungated RMS is an analysis feature, not a BS.1770 loudness measurement.
+    result.rms_level_dbfs = to_db(rms).max(-70.0);
     result.peak_dbfs = to_db(peak);
     result.dynamic_range_db = clamp(
         to_db(percentile(&envelope.levels, 0.95)) - to_db(percentile(&envelope.levels, 0.2)),
@@ -1019,7 +1025,10 @@ mod tests {
             expected_end
         );
         assert!(!result.energy_curve.is_empty());
-        assert!(result.energy_curve.iter().all(|p| p.energy >= 0.0 && p.energy <= 1.5));
+        assert!(result
+            .energy_curve
+            .iter()
+            .all(|p| p.energy >= 0.0 && p.energy <= 1.5));
     }
 
     #[test]
@@ -1074,9 +1083,7 @@ mod tests {
         );
         assert!(
             result.mix_out_candidates.iter().any(|c| {
-                c.kind == "section_boundary"
-                    || c.kind == "energy_cliff"
-                    || c.kind == "outro_start"
+                c.kind == "section_boundary" || c.kind == "energy_cliff" || c.kind == "outro_start"
             }),
             "mix-out candidates should include structure or energy cues"
         );

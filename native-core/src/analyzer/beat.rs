@@ -1,7 +1,9 @@
 //! Port of upstream `BeatTracker.kt` — Beat This! over the Slaney mel spectrogram.
 
 use super::models;
-use super::{compute_beat_spectrogram, resample, BEAT_SPECTROGRAM_MELS, BEAT_SPECTROGRAM_SAMPLE_RATE};
+use super::{
+    compute_beat_spectrogram, resample, BEAT_SPECTROGRAM_MELS, BEAT_SPECTROGRAM_SAMPLE_RATE,
+};
 
 use rten_tensor::NdTensor;
 
@@ -239,7 +241,10 @@ pub fn grid_confidence(beats: &[f64], peak_logits: &[f64]) -> f64 {
     if interval <= 0.0 {
         return 0.0;
     }
-    let regular = gaps.iter().filter(|g| (*g - interval).abs() <= interval * 0.1).count() as f64
+    let regular = gaps
+        .iter()
+        .filter(|g| (*g - interval).abs() <= interval * 0.1)
+        .count() as f64
         / gaps.len() as f64;
     let strength = 1.0 / (1.0 + (-(median(peak_logits) - 0.5)).exp());
     (0.35 + 0.4 * regular + 0.25 * strength).clamp(0.0, 0.95)

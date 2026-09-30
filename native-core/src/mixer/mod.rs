@@ -13,6 +13,7 @@
 //! four `TransitionStyle` filter rides with upstream's verbatim constants,
 //! arm-lead/timeout, and the 120 ms bail ramp.
 
+use crate::sound::{Clarity, ClarityTuning, LoudnessMode, Protector, SoundMode};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -177,7 +178,10 @@ pub struct QueuedTrack {
 
 pub enum Command {
     /// Background preparation only applies to the voice it was prepared for.
-    ForSource { source: String, command: Box<Command> },
+    ForSource {
+        source: String,
+        command: Box<Command>,
+    },
     Load {
         request: TrackSource,
         reply: Sender<Result<TrackInfo, String>>,
@@ -223,7 +227,9 @@ pub enum Command {
     /// is. Both Android's `MediaPlayer.seekTo` and ExoPlayer's `seekTo` return
     /// before the seek lands, and the position reconciles from the playhead
     /// afterwards. A refusal arrives as an error event instead.
-    Seek { seconds: f64 },
+    Seek {
+        seconds: f64,
+    },
     SetVolume(f32),
     /// Enables the unprocessed single-voice path. The output stream is
     /// separately rebuilt to a matching integer format before this is sent.
@@ -255,10 +261,26 @@ pub enum Command {
     /// are; the render multiplies by them only while this is set, so toggling
     /// needs no reload.
     SetLoudnessEnabled(bool),
+    SetSoundMode(SoundMode),
+    ObserveUnderruns(Arc<AtomicU64>),
+    SetDecodeChunk(usize),
+    SetPreferAppleAac(bool),
+    StartDiagnosticCapture {
+        directory: String,
+        seconds: f64,
+    },
+    FinishDiagnosticCapture {
+        reply: Option<Sender<Result<(), String>>>,
+    },
+    SetClarityTuning(ClarityTuning),
+    SetLoudnessMode(LoudnessMode),
+    SetLoudnessMeasurement(crate::LoudnessMeasurement),
     /// AirPods / speaker swap: new ring producer plus the device's native rate.
     SetOutputFormat {
         rate: u32,
         producer: Producer<f32>,
+        generation: u64,
+        acknowledged: Option<Sender<bool>>,
     },
     Shutdown,
 }
@@ -434,7 +456,12 @@ fn blend_exit_low_pass(progress: f64, clash: f64) -> f32 {
     glide(TransitionFilter::open_hz() as f64, floor, amount) as f32
 }
 
-fn ride_filter_sweep(progress: f64, plan: &TransitionPlan, out: &mut TransitionFilter, inc: &mut TransitionFilter) {
+fn ride_filter_sweep(
+    progress: f64,
+    plan: &TransitionPlan,
+    out: &mut TransitionFilter,
+    inc: &mut TransitionFilter,
+) {
     let sweep = plan.filter_sweep.clamp(0.0, 1.0);
     if sweep <= 0.0 {
         out.open();
@@ -452,7 +479,12 @@ fn ride_filter_sweep(progress: f64, plan: &TransitionPlan, out: &mut TransitionF
     );
 }
 
-fn ride_vocal_separation(progress: f64, plan: &TransitionPlan, out: &mut TransitionFilter, inc: &mut TransitionFilter) {
+fn ride_vocal_separation(
+    progress: f64,
+    plan: &TransitionPlan,
+    out: &mut TransitionFilter,
+    inc: &mut TransitionFilter,
+) {
     let amount = plan.vocal_overlap.clamp(0.0, 1.0);
     if amount <= 0.0 {
         out.open();
@@ -467,25 +499,44 @@ fn ride_vocal_separation(progress: f64, plan: &TransitionPlan, out: &mut Transit
     );
     inc.set_cutoffs(
         TransitionFilter::open_hz(),
-        entry_high_pass(progress, amount, VOCAL_SEPARATION_HIGH_PASS_HZ, ENTRY_OPEN_BY),
+        entry_high_pass(
+            progress,
+            amount,
+            VOCAL_SEPARATION_HIGH_PASS_HZ,
+            ENTRY_OPEN_BY,
+        ),
     );
 }
 
-fn ride_bass_swap(progress: f64, plan: &TransitionPlan, out: &mut TransitionFilter, inc: &mut TransitionFilter) {
+fn ride_bass_swap(
+    progress: f64,
+    plan: &TransitionPlan,
+    out: &mut TransitionFilter,
+    inc: &mut TransitionFilter,
+) {
     let swap_at = plan.bass_swap_fraction.clamp(0.05, 0.95);
     let handover = ((progress - swap_at) / BASS_SWAP_WIDTH * 0.5 + 0.5).clamp(0.0, 1.0);
     let clash = plan.vocal_overlap.clamp(0.0, 1.0);
     let entry = bass_cutoff(1.0 - handover).max(entry_high_pass(
         progress,
         1.0,
-        glide(BLEND_ENTRY_HIGH_PASS_HZ, BLEND_ENTRY_CLASH_HIGH_PASS_HZ, clash),
+        glide(
+            BLEND_ENTRY_HIGH_PASS_HZ,
+            BLEND_ENTRY_CLASH_HIGH_PASS_HZ,
+            clash,
+        ),
         BLEND_ENTRY_OPEN_BY + (BLEND_ENTRY_CLASH_OPEN_BY - BLEND_ENTRY_OPEN_BY) * clash,
     ));
     inc.set_cutoffs(TransitionFilter::open_hz(), entry);
     out.set_cutoffs(blend_exit_low_pass(progress, clash), bass_cutoff(handover));
 }
 
-fn ride_filters(progress: f64, plan: &TransitionPlan, out: &mut TransitionFilter, inc: &mut TransitionFilter) {
+fn ride_filters(
+    progress: f64,
+    plan: &TransitionPlan,
+    out: &mut TransitionFilter,
+    inc: &mut TransitionFilter,
+) {
     match plan.style {
         TransitionStyle::DjFilter => ride_filter_sweep(progress, plan, out, inc),
         TransitionStyle::DjBlend => {
@@ -511,10 +562,8 @@ const CHUNK_FRAMES: usize = 512;
 
 struct Voice {
     decoder: SymphoniaDecoder,
-    resample_l: StreamResampler,
-    resample_r: StreamResampler,
-    speed_l: StreamResampler,
-    speed_r: StreamResampler,
+    resampler: StreamResampler,
+    user_stretch: Option<TimeStretch>,
     spatial: SpatialRenderer,
     filter: TransitionFilter,
     gain: f32,
@@ -523,14 +572,12 @@ struct Voice {
     base_position: f64,
     info: TrackInfo,
     finished: bool,
+    decode_error: Option<String>,
     /// Device-domain frames emitted (post-resample).
     emitted_dev_frames: u64,
     /// Rate the post-decode DSP is currently running at; changes on a route
     /// rebuild, so it is a field rather than a constructor argument.
     device_rate: u32,
-    /// Scratch so the two channels resample with shared phase state.
-    channel_l: Vec<f32>,
-    channel_r: Vec<f32>,
     /// Device-domain samples decoded/resampled but not yet served, plus the
     /// read cursor — pull never returns more than the caller asked for.
     pending_dev: Vec<f32>,
@@ -541,8 +588,7 @@ struct Voice {
     /// output — the "make the music sound rushed" failure upstream raised
     /// `MIN_SILENCE_US` to avoid.
     silent_dev_frames: u64,
-    /// The listener's own speed, applied by the speed resampler. Allowed to
-    /// move pitch — that is what a speed control is.
+    /// The listener's speed, applied with pitch-preserving stereo WSOLA.
     ///
     /// Kept strictly separate from `plan_rate`: folding the handoff stretch
     /// into this resampler is exactly what made it a pitch bend, and the two
@@ -575,6 +621,10 @@ struct Voice {
     /// figure, no correction). The master switch lives on the mixer state, so
     /// this is the measurement only.
     loudness_db: Option<f64>,
+    replay_gain: crate::metadata::ReplayGain,
+    normalization_mode: LoudnessMode,
+    measured_loudness: Option<crate::LoudnessMeasurement>,
+    smoothed_normalization: f32,
     /// Bypass all source/device resampling and voice DSP when rates match.
     bit_perfect: bool,
 }
@@ -595,9 +645,10 @@ impl Voice {
         cue: bool,
     ) -> Result<Voice, String> {
         let kind = SourceKind::parse(&request.source);
-        let mut decoder = SymphoniaDecoder::open(&kind, &request.headers)
-            .map_err(|e| e.to_string())?;
+        let mut decoder =
+            SymphoniaDecoder::open(&kind, &request.headers).map_err(|e| e.to_string())?;
         let src_rate = decoder.sample_rate();
+        crate::diagnostics::source(&request.source, src_rate);
         // Spatial + transition filter run in the device domain, after
         // resample — same 15 ms Haas window the DAC hears, and clip
         // harmonics never hit the sinc. Upstream's processor is also at
@@ -651,10 +702,8 @@ impl Voice {
         // glide has a number to walk from.
         let effective = (playback_speed as f64).clamp(0.5, 2.0) as f32;
         Ok(Voice {
-            resample_l: StreamResampler::new(src_rate, device_rate),
-            resample_r: StreamResampler::new(src_rate, device_rate),
-            speed_l: speed_resampler(device_rate, effective),
-            speed_r: speed_resampler(device_rate, effective),
+            resampler: StreamResampler::stereo(src_rate, device_rate),
+            user_stretch: user_stretcher(device_rate, effective),
             spatial,
             filter: TransitionFilter::new(2, device_rate),
             gain: 1.0,
@@ -672,10 +721,9 @@ impl Voice {
             },
             decoder,
             finished: false,
+            decode_error: None,
             emitted_dev_frames: 0,
             device_rate,
-            channel_l: Vec::new(),
-            channel_r: Vec::new(),
             pending_dev: Vec::new(),
             pending_dev_cursor: 0,
             skip_silence,
@@ -690,8 +738,36 @@ impl Voice {
             glide_done_frames: 0,
             known_duration: (duration > 0.0).then_some(duration),
             loudness_db: request.loudness_db,
+            replay_gain: if let SourceKind::Path(path) = &kind {
+                crate::metadata::read_replay_gain(path)
+            } else {
+                crate::metadata::ReplayGain::default()
+            },
+            normalization_mode: LoudnessMode::Off,
+            measured_loudness: None,
+            smoothed_normalization: 1.0,
             bit_perfect: false,
         })
+    }
+
+    fn mix_into(
+        &mut self,
+        samples: &[f32],
+        destination: &mut [f32],
+        fade_gain: f32,
+        normalization: bool,
+    ) {
+        let target = normalization_gain(self, normalization).0;
+        let alpha = 1.0 - (-1.0 / (self.device_rate as f32 * 0.050)).exp();
+        for (source, mix) in samples.chunks_exact(2).zip(destination.chunks_exact_mut(2)) {
+            self.smoothed_normalization += (target - self.smoothed_normalization) * alpha;
+            if (target - self.smoothed_normalization).abs() < 1e-6 {
+                self.smoothed_normalization = target;
+            }
+            let gain = fade_gain * self.smoothed_normalization;
+            mix[0] += source[0] * gain;
+            mix[1] += source[1] * gain;
+        }
     }
 
     fn set_playback_speed(&mut self, speed: f32, device_rate: u32) {
@@ -700,8 +776,11 @@ impl Voice {
             return;
         }
         self.effective_speed = effective;
-        self.speed_l = speed_resampler(device_rate, effective);
-        self.speed_r = speed_resampler(device_rate, effective);
+        if let Some(stretch) = &mut self.user_stretch {
+            stretch.set_rate(effective as f64);
+        } else {
+            self.user_stretch = user_stretcher(device_rate, effective);
+        }
     }
 
     /// Moves the automix handoff stretch to `rate`.
@@ -713,7 +792,11 @@ impl Voice {
     /// lets the glide land on unity at the end of a blend and leave nothing
     /// behind but the audio.
     fn set_plan_rate(&mut self, rate: f64) {
-        let rate = if rate.is_finite() && rate > 0.0 { rate } else { 1.0 };
+        let rate = if rate.is_finite() && rate > 0.0 {
+            rate
+        } else {
+            1.0
+        };
         self.plan_rate = rate;
         if (rate - 1.0).abs() <= 1e-4 {
             // Hold the stage until the next pull drains it.
@@ -811,10 +894,10 @@ impl Voice {
         let src = self.info.sample_rate.max(1);
         self.device_rate = device_rate;
         let enabled = self.spatial.enabled();
-        self.resample_l = StreamResampler::new(src, device_rate);
-        self.resample_r = StreamResampler::new(src, device_rate);
-        self.speed_l = speed_resampler(device_rate, self.effective_speed);
-        self.speed_r = speed_resampler(device_rate, self.effective_speed);
+        self.resampler = StreamResampler::stereo(src, device_rate);
+        self.user_stretch = user_stretcher(device_rate, self.effective_speed);
+        self.stretch = None;
+        self.stretch_draining = false;
         let mut spatial = SpatialRenderer::new(device_rate);
         spatial.set_enabled(enabled && spatial_enabled && self.info.channels >= 2);
         spatial.set_head_yaw(head_yaw);
@@ -824,6 +907,22 @@ impl Voice {
         self.pending_dev_cursor = 0;
     }
 
+    fn reset_processing(&mut self) {
+        self.resampler.reset();
+        self.user_stretch = user_stretcher(self.device_rate, self.effective_speed);
+        self.stretch = None;
+        self.stretch_draining = false;
+        self.plan_rate = 1.0;
+        self.glide_total_frames = 0;
+        self.glide_done_frames = 0;
+        self.spatial.flush();
+        self.filter.flush();
+        self.pending_dev.clear();
+        self.pending_dev_cursor = 0;
+        self.silent_dev_frames = 0;
+        self.finished = false;
+    }
+
     fn position_seconds(&self) -> f64 {
         let decoder = self.base_position + self.decoder.position_seconds();
         // The WSOLA stage holds roughly a frame of input it has not placed yet,
@@ -831,7 +930,15 @@ impl Voice {
         // hearing. Bounded at `FRAME + SEARCH` — about 12 ms — and only while a
         // handoff stretch is running, but a playhead that leads the sound is
         // the same bug as one that trails it.
-        (decoder - self.stretch_latency_seconds()).max(0.0)
+        (decoder
+            - self.stretch_latency_seconds()
+            - self.resampler.delay_frames() / self.device_rate as f64
+            - self
+                .user_stretch
+                .as_ref()
+                .map(|s| s.latency_frames() / self.device_rate as f64)
+                .unwrap_or(0.0))
+        .max(0.0)
     }
 
     /// How far ahead of the output the decoder is running, in source seconds.
@@ -853,10 +960,14 @@ impl Voice {
     /// un-served device tail converts straight back to source seconds; the
     /// playback-speed factor maps it through the speed resampler.
     fn emitted_position_seconds(&self) -> f64 {
-        let pending_frames =
-            (self.pending_dev.len().saturating_sub(self.pending_dev_cursor) / 2) as f64;
-        let pending_seconds =
-            pending_frames / self.device_rate.max(1) as f64 * self.effective_speed as f64;
+        let pending_frames = (self
+            .pending_dev
+            .len()
+            .saturating_sub(self.pending_dev_cursor)
+            / 2) as f64;
+        let pending_seconds = pending_frames / self.device_rate.max(1) as f64
+            * self.effective_speed as f64
+            * self.plan_rate as f64;
         (self.position_seconds() - pending_seconds).max(0.0)
     }
 
@@ -889,7 +1000,9 @@ impl Voice {
                 return;
             }
             let take = (voice.pending_dev.len() - voice.pending_dev_cursor).min(remaining);
-            out.extend_from_slice(&voice.pending_dev[voice.pending_dev_cursor..voice.pending_dev_cursor + take]);
+            out.extend_from_slice(
+                &voice.pending_dev[voice.pending_dev_cursor..voice.pending_dev_cursor + take],
+            );
             voice.pending_dev_cursor += take;
             voice.emitted_dev_frames += (take / 2) as u64;
         };
@@ -917,18 +1030,22 @@ impl Voice {
         }
 
         while out.len() < want && !self.finished {
-            let src = self.decoder.read_stereo(4096).unwrap_or_default();
+            let src = self
+                .decoder
+                .read_stereo(crate::diagnostics::chunk())
+                .unwrap_or_else(|e| {
+                    self.decode_error = Some(format!("decode failed: {e}"));
+                    Vec::new()
+                });
             if src.is_empty() {
                 self.finished = true;
-                // Drain the resampler tails into the pending buffer.
-                let tail_l = self.resample_l.flush();
-                let tail_r = self.resample_r.flush();
-                let n = tail_l.len().min(tail_r.len());
-                self.pending_dev.clear();
+                self.pending_dev = self.resampler.flush();
                 self.pending_dev_cursor = 0;
-                for i in 0..n {
-                    self.pending_dev.push(tail_l[i]);
-                    self.pending_dev.push(tail_r[i]);
+                if let Some(stretch) = &mut self.user_stretch {
+                    let mut tail = stretch.process_and_take(&self.pending_dev);
+                    stretch.flush();
+                    tail.extend(stretch.take());
+                    self.pending_dev = tail;
                 }
                 // A stretch still running at end of stream gets flushed, or the
                 // last few milliseconds of the record are simply gone. The
@@ -946,6 +1063,10 @@ impl Voice {
                     tail.append(&mut rest);
                     self.pending_dev = tail;
                 }
+                if self.spatial.enabled() || self.filter.active() {
+                    self.pending_dev
+                        .extend(vec![0.0; self.device_rate as usize]);
+                }
                 // Device-domain DSP (spatial, then transition filter) — same
                 // order as upstream's sink processors, at the rate the DAC hears.
                 self.spatial.process(&mut self.pending_dev);
@@ -953,33 +1074,14 @@ impl Voice {
                 serve_pending(&mut out, self);
                 break;
             }
-            self.channel_l.clear();
-            self.channel_r.clear();
-            for pair in src.chunks_exact(2) {
-                self.channel_l.push(pair[0]);
-                self.channel_r.push(pair[1]);
-            }
-
-            let out_l = self.resample_l.process(&self.channel_l);
-            let out_r = self.resample_r.process(&self.channel_r);
-            let n = out_l.len().min(out_r.len());
-            let (speed_l, speed_r) = if (self.effective_speed - 1.0).abs() < 0.001 {
-                (out_l, out_r)
-            } else {
-                (
-                    self.speed_l.process(&out_l[..n]),
-                    self.speed_r.process(&out_r[..n]),
-                )
-            };
-            let n = speed_l.len().min(speed_r.len());
-            self.pending_dev.clear();
+            crate::diagnostics::capture_voice(0, &self.info.source, &src);
+            self.pending_dev = self.resampler.process(&src);
             self.pending_dev_cursor = 0;
-            for i in 0..n {
-                self.pending_dev.push(speed_l[i]);
-                self.pending_dev.push(speed_r[i]);
+            if let Some(stretch) = &mut self.user_stretch {
+                self.pending_dev = stretch.process_and_take(&self.pending_dev);
             }
             // The handoff stretch runs here: in the device domain, after the
-            // listener's own speed (which is allowed to move pitch) and before
+            // listener's pitch-preserving speed and before
             // the spatial and transition stages — so the blend's EQ is shaping
             // the stretched signal rather than being stretched itself, and a
             // filter sweep lands on the beat it was aimed at.
@@ -998,6 +1100,7 @@ impl Voice {
             let silent = self.skip_silence && is_silent(&self.pending_dev);
             self.spatial.process(&mut self.pending_dev);
             self.filter.process(&mut self.pending_dev);
+            crate::diagnostics::capture_voice(1, &self.info.source, &self.pending_dev);
             if silent {
                 self.silent_dev_frames += (self.pending_dev.len() / 2) as u64;
                 // Upstream MIN_SILENCE_US = 1 s: keep the first second so a
@@ -1009,8 +1112,7 @@ impl Voice {
                     let silent_s = self.silent_dev_frames as f64 / device_rate as f64;
                     if silent_s <= MIN_SILENCE_SECS + MAX_SILENCE_KEEP_SECS {
                         // Keep every 5th frame (20 % retention) at −20 dB.
-                        let mut kept: Vec<f32> =
-                            Vec::with_capacity(self.pending_dev.len() / 5 + 2);
+                        let mut kept: Vec<f32> = Vec::with_capacity(self.pending_dev.len() / 5 + 2);
                         for frame in self.pending_dev.chunks_exact(2).step_by(5) {
                             kept.push(frame[0] * MIN_VOLUME_TO_KEEP);
                             kept.push(frame[1] * MIN_VOLUME_TO_KEEP);
@@ -1035,7 +1137,9 @@ impl Voice {
     /// lossless PCM with the DAC clock set to the source rate; it deliberately
     /// avoids the resamplers, silence scan, spatial stage, and transition filter.
     fn pull_bitperfect(&mut self, frames: usize) -> Vec<f32> {
-        if self.finished { return Vec::new(); }
+        if self.finished {
+            return Vec::new();
+        }
         match self.decoder.read_stereo(frames) {
             Ok(samples) => {
                 if samples.is_empty() {
@@ -1073,7 +1177,6 @@ pub const MAX_LOUDNESS_GAIN_DB: f64 = 0.0;
 /// Float samples must stay in range before the output callback. The previous
 /// final `clamp` hard-cut any overs above 0 dBFS before they reached either
 /// float or integer output.
-const MIX_PEAK_CEILING: f32 = 1.0;
 
 /// The loudness correction for one voice: linear gain plus the applied dB for
 /// the readout. `(1.0, None)` whenever there is nothing to correct with — the
@@ -1094,19 +1197,6 @@ pub fn loudness_gain(loudness_db: Option<f64>, enabled: bool) -> (f32, Option<f3
 /// one linear gain to the already-rendered chunk, preserving its waveform while
 /// keeping normalization, EQ and overlapping voices from being hard-clipped at
 /// the output boundary. Samples below the ceiling are returned unchanged.
-fn mix_peak_guard_gain(samples: &[f32]) -> f32 {
-    let peak = samples
-        .iter()
-        .copied()
-        .filter(|sample| sample.is_finite())
-        .map(f32::abs)
-        .fold(0.0f32, f32::max);
-    if peak > MIX_PEAK_CEILING {
-        MIX_PEAK_CEILING / peak
-    } else {
-        1.0
-    }
-}
 
 /// The track length the engine will plan a transition against.
 ///
@@ -1132,9 +1222,14 @@ fn source_still_growing(path: &str) -> bool {
     std::path::Path::new(&grow).is_file() && !std::path::Path::new(&complete).exists()
 }
 
-fn speed_resampler(device_rate: u32, speed: f32) -> StreamResampler {
-    let speed = speed.clamp(0.5, 2.0) as f64;
-    StreamResampler::with_rates(device_rate as f64 * speed, device_rate as f64)
+fn user_stretcher(_device_rate: u32, speed: f32) -> Option<TimeStretch> {
+    if (speed - 1.0).abs() < 1e-6 {
+        None
+    } else {
+        let mut stretch = TimeStretch::new(speed as f64);
+        stretch.set_rate(speed as f64);
+        Some(stretch)
+    }
 }
 
 /// The stretch ratio at fade progress `p`: `base` walked to unity, or unity if
@@ -1183,8 +1278,22 @@ fn silence_exceeds_floor(silent_dev_frames: u64, device_rate: u32) -> bool {
 /// Multiplying here rather than in `Voice::pull` keeps the measurement (peak
 /// classification for skip-silence) on the uncorrected signal — a quiet track
 /// turned up is still a quiet track as far as gap detection is concerned.
-fn applied_gain(voice: &Voice, loudness_enabled: bool) -> f32 {
-    voice.gain * loudness_gain(voice.loudness_db, loudness_enabled).0
+fn normalization_gain(voice: &Voice, enabled: bool) -> (f32, Option<f32>) {
+    if !enabled {
+        return (1.0, None);
+    }
+    if let Some(db) = voice.replay_gain.gain_db(voice.normalization_mode) {
+        return (10f32.powf(db as f32 / 20.0), Some(db as f32));
+    }
+    if let Some(db) = voice
+        .measured_loudness
+        .as_ref()
+        .and_then(|m| m.gain_db(voice.normalization_mode))
+    {
+        return (10f32.powf(db as f32 / 20.0), Some(db as f32));
+    }
+    // YouTube relative loudness: attenuation only; no invented LUFS value.
+    loudness_gain(voice.loudness_db, true)
 }
 
 /// A cue in the last few seconds is the outro, not a mix-in. Fall back to
@@ -1296,11 +1405,21 @@ struct MixerState {
     playback_speed: f32,
     skip_silence: bool,
     eq: EqualizerProcessor,
+    sound_mode: SoundMode,
+    clarity_tuning: ClarityTuning,
+    clarity: Clarity,
+    protector: Protector,
+    pipeline_tail_frames: usize,
+    output_generation: u64,
+    queue_target_ms: u64,
+    underrun_counter: Option<Arc<AtomicU64>>,
+    observed_underruns: u64,
     nerd: Arc<Mutex<NerdSnapshot>>,
     /// Loudness-normalization master switch (upstream
     /// `AppSettings.loudnessNormalization`, on by default). Per-voice figures
     /// ride on the voices; this decides whether the render uses them.
     loudness_enabled: bool,
+    loudness_mode: LoudnessMode,
     /// Correlation probe for a source swap, see [`SwapProbe`].
     swap_probe: SwapProbe,
 }
@@ -1390,9 +1509,21 @@ pub struct NerdSnapshot {
     /// master are — and it is the only number that says whether the swap's
     /// linear fade is the flat one.
     pub swap_correlation: Option<f64>,
+    pub active_stages: Vec<String>,
+    pub converter_delay_frames: f64,
+    pub protection_reduction_db: f32,
+    pub protection_interventions: u64,
+    pub build_revision: String,
+    pub decoder_implementation: String,
+    pub decoded_layout: String,
+    pub queued_target_ms: u64,
+    pub loudness_origin: String,
 }
 
 impl MixerState {
+    fn diagnostic_settings(&self) -> serde_json::Value {
+        serde_json::json!({"sound_mode":format!("{:?}",self.sound_mode),"clarity_preset":format!("{:?}",self.clarity_tuning.preset),"clarity_wet":self.clarity_tuning.wet,"clarity_trims_db":self.clarity_tuning.trims_db,"manual_eq":self.eq.diagnostic_settings(),"loudness_mode":format!("{:?}",self.loudness_mode),"playback_speed":self.playback_speed,"application_volume":self.volume,"bit_perfect":self.bit_perfect,"spatial_enabled":self.spatial_enabled,"head_yaw":self.head_yaw,"skip_silence":self.skip_silence,"crossfade_seconds":self.crossfade_window_s,"underruns":self.underrun_counter.as_ref().map(|c|c.load(Ordering::Relaxed))})
+    }
     fn set_state(&mut self, state: crate::PlaybackState) {
         if self.state != state {
             self.state = state;
@@ -1401,7 +1532,10 @@ impl MixerState {
     }
 
     fn publish_nerd(&self, info: &TrackInfo, loudness_db: Option<f64>) {
-        let (_, gain_db) = loudness_gain(loudness_db, self.loudness_enabled);
+        let (_, gain_db) = loudness_gain(
+            loudness_db,
+            self.loudness_enabled && self.sound_mode == SoundMode::Enhanced,
+        );
         if let Ok(mut nerd) = self.nerd.lock() {
             // Preserved: it describes the last swap, not this track.
             let correlation = nerd.swap_correlation;
@@ -1413,6 +1547,7 @@ impl MixerState {
                 kbps: info.kbps,
                 loudness_gain_db: gain_db,
                 swap_correlation: correlation,
+                ..NerdSnapshot::default()
             };
         }
     }
@@ -1425,6 +1560,10 @@ impl MixerState {
     /// smoothly ramps out the next 120 ms of buffered audio and discards the
     /// remaining backlog before the new track starts.
     fn hard_cut(&mut self) {
+        self.eq.flush();
+        self.clarity.reset();
+        self.protector.reset();
+        self.pipeline_tail_frames = 0;
         self.transition = None;
         self.incoming = None;
         self.pending_next = None;
@@ -1444,11 +1583,11 @@ impl MixerState {
         };
         match Voice::open(
             &request,
-            self.spatial_enabled,
+            self.spatial_enabled && self.sound_mode == SoundMode::Enhanced,
             self.head_yaw,
             self.device_rate,
             self.playback_speed,
-            self.skip_silence,
+            self.skip_silence && self.sound_mode == SoundMode::Enhanced,
             true,
         ) {
             Ok(mut voice) => {
@@ -1456,7 +1595,10 @@ impl MixerState {
                 voice.release_plan_stretch(self.playback_speed, self.device_rate);
                 let info = voice.info.clone();
                 let duration = info.duration_seconds;
-                let (_, gain_db) = loudness_gain(voice.loudness_db, self.loudness_enabled);
+                let (_, gain_db) = loudness_gain(
+                    voice.loudness_db,
+                    self.loudness_enabled && self.sound_mode == SoundMode::Enhanced,
+                );
                 if let Ok(mut nerd) = self.nerd.lock() {
                     let correlation = nerd.swap_correlation;
                     *nerd = NerdSnapshot {
@@ -1467,6 +1609,7 @@ impl MixerState {
                         kbps: info.kbps,
                         loudness_gain_db: gain_db,
                         swap_correlation: correlation,
+                        ..NerdSnapshot::default()
                     };
                 }
                 log::info!("promoted pending next: {}", info.title);
@@ -1481,7 +1624,8 @@ impl MixerState {
             }
             Err(e) => {
                 log::warn!("promote pending failed for {}: {e}", request.title);
-                self.events.error(format!("could not prepare next track: {e}"));
+                self.events
+                    .error(format!("could not prepare next track: {e}"));
             }
         }
     }
@@ -1541,10 +1685,8 @@ impl MixerState {
                     .as_ref()
                     .map(|request| request.plan.clone())
                     .unwrap_or_default();
-                let fade_s = self.blend_seconds(
-                    plan.fade_seconds,
-                    current.known_duration.unwrap_or(0.0),
-                );
+                let fade_s =
+                    self.blend_seconds(plan.fade_seconds, current.known_duration.unwrap_or(0.0));
                 let tail = self.audible_tail_s(&plan, current);
                 let horizon = fade_s + ARM_LEAD_MS as f64 / 1000.0;
                 if tail.is_finite() && tail <= horizon {
@@ -1561,11 +1703,11 @@ impl MixerState {
         request.start_seconds = anchor;
         let mut voice = Voice::open(
             &request,
-            self.spatial_enabled,
+            self.spatial_enabled && self.sound_mode == SoundMode::Enhanced,
             self.head_yaw,
             self.device_rate,
             self.playback_speed,
-            self.skip_silence,
+            self.skip_silence && self.sound_mode == SoundMode::Enhanced,
             false,
         )?;
         voice.gain = 0.0; // silent until the fade lifts it
@@ -1692,20 +1834,13 @@ impl MixerState {
             voice.post_glide_seconds = glide;
             if (voice.decoder.position_seconds() - cue).abs() > 0.05 {
                 voice.base_position = 0.0;
-                voice.spatial.flush();
-                voice.filter.flush();
-                voice.pending_dev.clear();
-                voice.pending_dev_cursor = 0;
-                voice.silent_dev_frames = 0;
-                voice.finished = false;
+                voice.reset_processing();
                 if let Err(e) = voice.decoder.seek_seconds(cue) {
                     log::warn!("could not move the armed cue to {cue:.2}s: {e}");
                 }
             }
         }
-        log::info!(
-            "updated armed transition: fade={fade_s:.1}s cue={cue:.2}s rate={rate:.4}"
-        );
+        log::info!("updated armed transition: fade={fade_s:.1}s cue={cue:.2}s rate={rate:.4}");
     }
 
     /// Opens a different file on a transition that has not started sounding.
@@ -1717,11 +1852,11 @@ impl MixerState {
     fn retarget_armed_source(&mut self, request: TrackSource) {
         match Voice::open(
             &request,
-            self.spatial_enabled,
+            self.spatial_enabled && self.sound_mode == SoundMode::Enhanced,
             self.head_yaw,
             self.device_rate,
             self.playback_speed,
-            self.skip_silence,
+            self.skip_silence && self.sound_mode == SoundMode::Enhanced,
             true,
         ) {
             Ok(mut voice) => {
@@ -1771,9 +1906,7 @@ impl MixerState {
         // Unknown or implausibly short duration (muxed MP4 used to report
         // AAC packet counts as PCM frames): wait for real EOS instead of
         // blending immediately. Upstream uses ExoPlayer's container duration.
-        if current.known_duration.unwrap_or(0.0) < 2.0
-            && current.position_seconds() < 2.0
-        {
+        if current.known_duration.unwrap_or(0.0) < 2.0 && current.position_seconds() < 2.0 {
             return;
         }
         // The plan decides both where the blend ends and how long it runs —
@@ -1820,11 +1953,11 @@ impl MixerState {
         let fade_frames = (fade_s * self.device_rate as f64) as u64;
         match Voice::open(
             &request,
-            self.spatial_enabled,
+            self.spatial_enabled && self.sound_mode == SoundMode::Enhanced,
             self.head_yaw,
             self.device_rate,
             self.playback_speed,
-            self.skip_silence,
+            self.skip_silence && self.sound_mode == SoundMode::Enhanced,
             true,
         ) {
             Ok(mut voice) => {
@@ -1844,7 +1977,8 @@ impl MixerState {
                 // Upstream gives up and lets the queue move on plainly: a
                 // missed crossfade rather than a broken one.
                 log::warn!("arm failed for {}: {e}", request.title);
-                self.events.error(format!("could not prepare next track: {e}"));
+                self.events
+                    .error(format!("could not prepare next track: {e}"));
                 self.transition = None;
             }
         }
@@ -1999,10 +2133,12 @@ impl MixerState {
         let plan = self.transition.as_ref().map(|t| (t.plan.clone(), t.swap));
         let swap = plan.as_ref().is_some_and(|(_, swap)| *swap);
         let dj = plan.as_ref().is_some_and(|(plan, _)| {
-            !swap && plan.bed_fraction > 0.0 && matches!(
-                plan.style,
-                TransitionStyle::DjBlend | TransitionStyle::DjFilter
-            )
+            !swap
+                && plan.bed_fraction > 0.0
+                && matches!(
+                    plan.style,
+                    TransitionStyle::DjBlend | TransitionStyle::DjFilter
+                )
         });
         // A swap needs the linear pair. A plain crossfade needs equal-power.
         // A DJ blend holds the outgoing record up and brings the next one in
@@ -2171,8 +2307,8 @@ impl MixerState {
         }) else {
             return;
         };
-        let buffered_s = self.buffered_frames.load(Ordering::Relaxed) as f64
-            / self.device_rate.max(1) as f64;
+        let buffered_s =
+            self.buffered_frames.load(Ordering::Relaxed) as f64 / self.device_rate.max(1) as f64;
         // Incoming has not filled the ring yet; subtracting the outgoing
         // backlog would clamp a just-cued track to 0 every time. Only the
         // current (session) voice's own backlog counts.
@@ -2183,12 +2319,24 @@ impl MixerState {
         // decoder head instead would throw the playhead forward by the whole
         // ring depth.
         let audible = if handed_off && !swap {
-            voice.position_seconds().max(0.0)
+            voice.emitted_position_seconds().max(0.0)
         } else {
-            (voice.position_seconds() - buffered_s).max(0.0)
+            (voice.emitted_position_seconds()
+                - buffered_s * voice.effective_speed as f64 * voice.plan_rate as f64)
+                .max(0.0)
         };
-        self.position_ms
-            .store((audible * 1000.0) as u64, Ordering::Relaxed);
+        let processing_delay = if self.sound_mode == SoundMode::Enhanced && !self.bit_perfect {
+            (self.clarity.delay_frames() as usize + self.protector.delay_frames()) as f64
+                / self.device_rate.max(1) as f64
+                * voice.effective_speed as f64
+                * voice.plan_rate as f64
+        } else {
+            0.0
+        };
+        self.position_ms.store(
+            ((audible - processing_delay).max(0.0) * 1000.0) as u64,
+            Ordering::Relaxed,
+        );
     }
 }
 
@@ -2233,11 +2381,19 @@ pub fn run_mixer(
         // The mixer blends to interleaved stereo, so the equaliser is a single
         // stereo instance on the mixed stream.
         eq: EqualizerProcessor::new(device_rate, 2),
+        sound_mode: SoundMode::Transparent,
+        clarity_tuning: ClarityTuning::default(),
+        clarity: Clarity::new(device_rate),
+        protector: Protector::new(device_rate),
+        pipeline_tail_frames: 0,
+        output_generation: 0,
+        queue_target_ms: 250,
+        underrun_counter: None,
+        observed_underruns: 0,
         nerd,
-        // Upstream's default: normalization on unless the listener says off.
-        // The engine owner's first `set_loudness_enabled` reconciles this with
-        // the stored setting either way.
-        loudness_enabled: true,
+        // New profiles default to Off; the owner restores any legacy setting.
+        loudness_enabled: false,
+        loudness_mode: LoudnessMode::Off,
         swap_probe: SwapProbe::default(),
     };
 
@@ -2251,9 +2407,22 @@ pub fn run_mixer(
             handle_command(&mut state, cmd, &mut ring);
         }
 
+        if let Some(counter) = &state.underrun_counter {
+            let count = counter.load(Ordering::Relaxed);
+            if count > state.observed_underruns {
+                state.queue_target_ms = (state.queue_target_ms + 60).min(1000);
+                state.observed_underruns = count;
+            }
+        }
         if state.playing {
             render_available(&mut state, &mut ring);
-            std::thread::sleep(Duration::from_millis(4));
+            if state.flush_ring.load(Ordering::Acquire)
+                || state.bail_flush.load(Ordering::Acquire)
+                || state.buffered_frames.load(Ordering::Relaxed)
+                    >= state.device_rate as u64 * state.queue_target_ms / 1000
+            {
+                std::thread::sleep(Duration::from_millis(4));
+            }
         } else {
             // Idle: still service commands promptly, low CPU.
             std::thread::sleep(Duration::from_millis(20));
@@ -2284,11 +2453,11 @@ fn handle_command(state: &mut MixerState, cmd: Command, ring: &mut Producer<f32>
             state.hard_cut();
             match Voice::open(
                 &request,
-                state.spatial_enabled,
+                state.spatial_enabled && state.sound_mode == SoundMode::Enhanced,
                 state.head_yaw,
                 state.device_rate,
                 state.playback_speed,
-                state.skip_silence,
+                state.skip_silence && state.sound_mode == SoundMode::Enhanced,
                 true,
             ) {
                 Ok(mut voice) => {
@@ -2299,7 +2468,10 @@ fn handle_command(state: &mut MixerState, cmd: Command, ring: &mut Producer<f32>
                         && voice.info.channels == 2;
                     let info = voice.info.clone();
                     let duration = voice.info.duration_seconds;
-                    let (_, gain_db) = loudness_gain(voice.loudness_db, state.loudness_enabled);
+                    let (_, gain_db) = loudness_gain(
+                        voice.loudness_db,
+                        state.loudness_enabled && state.sound_mode == SoundMode::Enhanced,
+                    );
                     if let Ok(mut nerd) = state.nerd.lock() {
                         *nerd = NerdSnapshot {
                             codec: info.codec.clone(),
@@ -2310,6 +2482,7 @@ fn handle_command(state: &mut MixerState, cmd: Command, ring: &mut Producer<f32>
                             loudness_gain_db: gain_db,
                             // A new track clears the previous swap's figure.
                             swap_correlation: None,
+                            ..NerdSnapshot::default()
                         };
                     }
                     state.current = Some(voice);
@@ -2334,25 +2507,33 @@ fn handle_command(state: &mut MixerState, cmd: Command, ring: &mut Producer<f32>
             request,
             crossfade_seconds,
             reply,
-        } => {
-            match state.swap_source(request, crossfade_seconds) {
-                Ok(info) => {
-                    let _ = reply.send(Ok(info));
-                }
-                Err(e) => {
-                    let _ = reply.send(Err(e));
-                }
+        } => match state.swap_source(request, crossfade_seconds) {
+            Ok(info) => {
+                let _ = reply.send(Ok(info));
             }
-        }
+            Err(e) => {
+                let _ = reply.send(Err(e));
+            }
+        },
         Command::QueueNext { request } => {
-            if state.bit_perfect { return; }
+            if state.bit_perfect {
+                return;
+            }
             if request.source.is_empty() {
                 state.pending_next = None;
-                if state.transition.as_ref().is_some_and(|t| t.phase == Phase::Arming && !t.swap) {
+                if state
+                    .transition
+                    .as_ref()
+                    .is_some_and(|t| t.phase == Phase::Arming && !t.swap)
+                {
                     state.transition = None;
                     state.incoming = None;
                 }
-            } else if state.current.as_ref().is_some_and(|c| c.info.source == request.source) {
+            } else if state
+                .current
+                .as_ref()
+                .is_some_and(|c| c.info.source == request.source)
+            {
                 // Same path as the playing voice is normally a duplicate and is
                 // dropped. A planned fade is the repeat-one / single-item
                 // repeat-all self-mix: open a second reader on the same file and
@@ -2367,7 +2548,11 @@ fn handle_command(state: &mut MixerState, cmd: Command, ring: &mut Producer<f32>
                 } else {
                     log::debug!("queueNext ignored; already current");
                 }
-            } else if state.incoming.as_ref().is_some_and(|c| c.info.source == request.source) {
+            } else if state
+                .incoming
+                .as_ref()
+                .is_some_and(|c| c.info.source == request.source)
+            {
                 // The early overlap can arm before analysis finishes. Replacing
                 // it once the fade has started would replay this song after the
                 // handoff; replacing the plan while it is still waiting moves
@@ -2432,11 +2617,11 @@ fn handle_command(state: &mut MixerState, cmd: Command, ring: &mut Producer<f32>
                 let title = request.title.clone();
                 match Voice::open(
                     &request,
-                    state.spatial_enabled,
+                    state.spatial_enabled && state.sound_mode == SoundMode::Enhanced,
                     state.head_yaw,
                     state.device_rate,
                     state.playback_speed,
-                    state.skip_silence,
+                    state.skip_silence && state.sound_mode == SoundMode::Enhanced,
                     true,
                 ) {
                     Ok(mut voice) => {
@@ -2447,8 +2632,10 @@ fn handle_command(state: &mut MixerState, cmd: Command, ring: &mut Producer<f32>
                         voice.release_plan_stretch(state.playback_speed, state.device_rate);
                         let info = voice.info.clone();
                         let duration = info.duration_seconds;
-                        let (_, gain_db) =
-                            loudness_gain(voice.loudness_db, state.loudness_enabled);
+                        let (_, gain_db) = loudness_gain(
+                            voice.loudness_db,
+                            state.loudness_enabled && state.sound_mode == SoundMode::Enhanced,
+                        );
                         if let Ok(mut nerd) = state.nerd.lock() {
                             *nerd = NerdSnapshot {
                                 codec: info.codec.clone(),
@@ -2458,6 +2645,7 @@ fn handle_command(state: &mut MixerState, cmd: Command, ring: &mut Producer<f32>
                                 kbps: info.kbps,
                                 loudness_gain_db: gain_db,
                                 swap_correlation: None,
+                                ..NerdSnapshot::default()
                             };
                         }
                         state.current = Some(voice);
@@ -2514,15 +2702,16 @@ fn handle_command(state: &mut MixerState, cmd: Command, ring: &mut Producer<f32>
                     match r {
                         Ok(()) => {
                             voice.base_position = 0.0;
-                            voice.spatial.flush();
-                            voice.filter.flush();
-                            voice.pending_dev.clear();
-                            voice.pending_dev_cursor = 0;
-                            voice.silent_dev_frames = 0;
-                            voice.finished = false;
+                            voice.reset_processing();
+                            state.eq.flush();
+                            state.clarity.reset();
+                            state.protector.reset();
+                            state.pipeline_tail_frames = 0;
                             state.flush_ring.store(true, Ordering::Release);
                             state.buffered_frames.store(0, Ordering::Relaxed);
-                            state.position_ms.store((seconds * 1000.0) as u64, Ordering::Relaxed);
+                            state
+                                .position_ms
+                                .store((seconds * 1000.0) as u64, Ordering::Relaxed);
                         }
                         Err(e) => {
                             state.events.error(format!("seek failed: {e}"));
@@ -2553,10 +2742,14 @@ fn handle_command(state: &mut MixerState, cmd: Command, ring: &mut Producer<f32>
         Command::SetSpatial(enabled) => {
             state.spatial_enabled = enabled;
             if let Some(current) = &mut state.current {
-                current.spatial.set_enabled(enabled);
+                current
+                    .spatial
+                    .set_enabled(enabled && state.sound_mode == SoundMode::Enhanced);
             }
             if let Some(incoming) = &mut state.incoming {
-                incoming.spatial.set_enabled(enabled);
+                incoming
+                    .spatial
+                    .set_enabled(enabled && state.sound_mode == SoundMode::Enhanced);
             }
         }
         Command::SetHeadYaw(yaw) => {
@@ -2568,7 +2761,11 @@ fn handle_command(state: &mut MixerState, cmd: Command, ring: &mut Producer<f32>
                 incoming.spatial.set_head_yaw(yaw);
             }
         }
-        Command::SetVoiceFilter { incoming, low_hz, high_hz } => {
+        Command::SetVoiceFilter {
+            incoming,
+            low_hz,
+            high_hz,
+        } => {
             let target = if incoming {
                 state.incoming.as_mut()
             } else {
@@ -2598,14 +2795,84 @@ fn handle_command(state: &mut MixerState, cmd: Command, ring: &mut Producer<f32>
         Command::SetSkipSilence(enabled) => {
             state.skip_silence = enabled;
             if let Some(v) = &mut state.current {
-                v.skip_silence = enabled;
+                v.skip_silence = enabled && state.sound_mode == SoundMode::Enhanced;
             }
             if let Some(v) = &mut state.incoming {
-                v.skip_silence = enabled;
+                v.skip_silence = enabled && state.sound_mode == SoundMode::Enhanced;
             }
+        }
+        Command::ObserveUnderruns(counter) => {
+            state.observed_underruns = counter.load(Ordering::Relaxed);
+            state.underrun_counter = Some(counter);
+        }
+        Command::SetDecodeChunk(frames) => crate::diagnostics::set_chunk(frames),
+        Command::SetPreferAppleAac(value) => crate::diagnostics::set_prefer_apple_aac(value),
+        Command::StartDiagnosticCapture { directory, seconds } => {
+            if let Err(e) = crate::diagnostics::start(directory, seconds, state.device_rate) {
+                state.events.error(e);
+            } else if let Some(v) = state.current.as_ref() {
+                crate::diagnostics::source(&v.info.source, v.info.sample_rate);
+            }
+        }
+        Command::FinishDiagnosticCapture { reply } => {
+            let settings = state.diagnostic_settings();
+            let snapshot = state.nerd.lock().unwrap().clone();
+            let events = state.events.clone();
+            crate::diagnostics::finish(snapshot, settings, move |result| {
+                if let Err(e) = &result {
+                    events.error(e.clone());
+                }
+                if let Some(reply) = reply {
+                    let _ = reply.send(result);
+                }
+            });
+        }
+        Command::SetSoundMode(mode) => {
+            state.sound_mode = mode;
+            state.clarity.set(mode, state.clarity_tuning.clone());
+            state.protector.reset();
+            state.eq.flush();
+            state.pipeline_tail_frames = 0;
+            if let Some(v) = state.current.as_mut() {
+                let position = state.position_ms.load(Ordering::Relaxed) as f64 / 1000.0;
+                if let Err(e) = v.decoder.seek_seconds(position) {
+                    state.events.error(format!("sound mode seek: {e}"));
+                }
+                v.reset_processing();
+                state.bail_flush.store(true, Ordering::Release);
+            }
+            for voice in state.current.iter_mut().chain(state.incoming.iter_mut()) {
+                if mode == SoundMode::Transparent {
+                    voice.smoothed_normalization = 1.0;
+                }
+                voice.spatial.set_enabled(
+                    mode == SoundMode::Enhanced
+                        && state.spatial_enabled
+                        && voice.info.channels >= 2,
+                );
+                voice.skip_silence = mode == SoundMode::Enhanced && state.skip_silence;
+            }
+        }
+        Command::SetClarityTuning(tuning) => {
+            state.clarity_tuning = tuning.clone();
+            state.clarity.set(state.sound_mode, tuning);
+        }
+        Command::SetLoudnessMeasurement(m) => {
+            if let Some(v) = state.current.as_mut() {
+                v.measured_loudness = Some(m);
+            }
+        }
+        Command::SetLoudnessMode(mode) => {
+            state.loudness_mode = mode;
+            state.loudness_enabled = mode != LoudnessMode::Off;
         }
         Command::SetLoudnessEnabled(enabled) => {
             state.loudness_enabled = enabled;
+            state.loudness_mode = if enabled {
+                LoudnessMode::Track
+            } else {
+                LoudnessMode::Off
+            };
             // The readout follows the switch without a reload: the gain each
             // voice *would* apply is recomputed for the one that is audible.
             if let Some(current) = &state.current {
@@ -2614,20 +2881,45 @@ fn handle_command(state: &mut MixerState, cmd: Command, ring: &mut Producer<f32>
                 state.publish_nerd(&info, db);
             }
         }
-        Command::SetEqTuning { enabled, gains_db, qs, preamp_db, balance } => {
+        Command::SetEqTuning {
+            enabled,
+            gains_db,
+            qs,
+            preamp_db,
+            balance,
+        } => {
             state.eq.set_tuning(
                 enabled,
-                &EqCurve { gains_db, qs, preamp_db },
+                &EqCurve {
+                    gains_db,
+                    qs,
+                    preamp_db,
+                },
                 balance,
             );
         }
-        Command::SetOutputFormat { rate, producer } => {
+        Command::SetOutputFormat {
+            rate,
+            producer,
+            generation,
+            acknowledged,
+        } => {
+            if generation < state.output_generation {
+                if let Some(reply) = acknowledged {
+                    let _ = reply.send(false);
+                }
+                return;
+            }
+            state.output_generation = generation;
+
             *ring = producer;
             let rate = rate.max(1);
             if rate != state.device_rate {
                 log::info!("output format {} Hz -> {rate} Hz", state.device_rate);
                 state.device_rate = rate;
                 state.eq.retarget(rate, 2);
+                state.clarity.retarget(rate);
+                state.protector = Protector::new(rate);
                 let spatial = state.spatial_enabled;
                 let yaw = state.head_yaw;
                 if let Some(v) = &mut state.current {
@@ -2653,12 +2945,11 @@ fn handle_command(state: &mut MixerState, cmd: Command, ring: &mut Producer<f32>
                 match voice.decoder.seek_seconds(resume_s) {
                     Ok(()) => {
                         voice.base_position = 0.0;
-                        voice.spatial.flush();
-                        voice.filter.flush();
-                        voice.pending_dev.clear();
-                        voice.pending_dev_cursor = 0;
-                        voice.silent_dev_frames = 0;
-                        voice.finished = false;
+                        voice.reset_processing();
+                        state.eq.flush();
+                        state.clarity.reset();
+                        state.protector.reset();
+                        state.pipeline_tail_frames = 0;
                         log::info!("output changed; resuming at {resume_s:.3}s");
                     }
                     Err(e) => log::warn!("re-seek after output change failed: {e}"),
@@ -2666,18 +2957,32 @@ fn handle_command(state: &mut MixerState, cmd: Command, ring: &mut Producer<f32>
             }
             state.flush_ring.store(true, Ordering::Release);
             state.buffered_frames.store(0, Ordering::Relaxed);
+            if let Some(reply) = acknowledged {
+                let _ = reply.send(true);
+            }
         }
         Command::Shutdown => {
             state.stop_all();
         }
     }
+    if crate::diagnostics::enabled() {
+        crate::diagnostics::record_settings(state.diagnostic_settings());
+    }
 }
 
 /// Renders while the ring has room for a chunk.
 fn render_available(state: &mut MixerState, ring: &mut Producer<f32>) {
+    if state.underrun_counter.is_some()
+        && (state.flush_ring.load(Ordering::Acquire) || state.bail_flush.load(Ordering::Acquire))
+    {
+        return;
+    }
     if state.bit_perfect {
         render_bitperfect_available(state, ring);
         return;
+    }
+    for voice in state.current.iter_mut().chain(state.incoming.iter_mut()) {
+        voice.normalization_mode = state.loudness_mode;
     }
     let chunk_samples = CHUNK_FRAMES * 2;
     loop {
@@ -2698,6 +3003,11 @@ fn render_available(state: &mut MixerState, ring: &mut Producer<f32>) {
         // to buffer occupancy.
         state.consider_arm();
         state.consider_start_fade();
+        if state.buffered_frames.load(Ordering::Relaxed)
+            >= state.device_rate as u64 * state.queue_target_ms / 1000
+        {
+            break;
+        }
         let free = ring.slots();
         if free < chunk_samples {
             break;
@@ -2717,7 +3027,10 @@ fn render_available(state: &mut MixerState, ring: &mut Producer<f32>) {
 
         // Gapless fallback: current ended with an incoming already armed, or
         // a pending next that never got a fade window (unknown duration).
-        let current_finished = state.current.as_ref().is_some_and(|c| c.finished);
+        let current_finished = state
+            .current
+            .as_ref()
+            .is_some_and(|c| c.finished && c.pending_dev_cursor >= c.pending_dev.len());
         if current_finished && state.transition.is_none() {
             if state.incoming.is_some() {
                 state.promote_incoming();
@@ -2735,14 +3048,12 @@ fn render_available(state: &mut MixerState, ring: &mut Producer<f32>) {
                 if !frames.is_empty() {
                     audible = true;
                     produced = produced.max(frames.len());
-                    let gain = ret.from_gain
-                        * fall_gain(elapsed)
-                        * loudness_gain(ret.voice.loudness_db, state.loudness_enabled).0;
-                    for (i, s) in frames.iter().enumerate() {
-                        if i < scratch.len() {
-                            scratch[i] += s * gain;
-                        }
-                    }
+                    ret.voice.mix_into(
+                        &frames,
+                        &mut scratch,
+                        ret.from_gain * fall_gain(elapsed),
+                        state.loudness_enabled && state.sound_mode == SoundMode::Enhanced,
+                    );
                 }
                 keep_retiring.push(ret);
             }
@@ -2767,13 +3078,18 @@ fn render_available(state: &mut MixerState, ring: &mut Producer<f32>) {
                     if swap_fade {
                         state.swap_probe.observe_current(&frames);
                     }
-                    let gain = applied_gain(voice, state.loudness_enabled);
-                    for (i, s) in frames.iter().enumerate() {
-                        if i < scratch.len() {
-                            scratch[i] += s * gain;
-                        }
-                    }
+                    voice.mix_into(
+                        &frames,
+                        &mut scratch,
+                        voice.gain,
+                        state.loudness_enabled && state.sound_mode == SoundMode::Enhanced,
+                    );
                 }
+            }
+        }
+        for voice in state.current.iter_mut().chain(state.incoming.iter_mut()) {
+            if let Some(error) = voice.decode_error.take() {
+                state.events.error(error);
             }
         }
         if state.playing {
@@ -2793,16 +3109,27 @@ fn render_available(state: &mut MixerState, ring: &mut Producer<f32>) {
                     if swap_fade {
                         state.swap_probe.observe_incoming(&frames);
                     }
-                    let gain = applied_gain(voice, state.loudness_enabled);
-                    for (i, s) in frames.iter().enumerate() {
-                        if i < scratch.len() {
-                            scratch[i] += s * gain;
-                        }
-                    }
+                    voice.mix_into(
+                        &frames,
+                        &mut scratch,
+                        voice.gain,
+                        state.loudness_enabled && state.sound_mode == SoundMode::Enhanced,
+                    );
                 }
             }
         }
 
+        let draining_pipeline = produced == 0 && state.pipeline_tail_frames > 0;
+        if produced > 0 && state.sound_mode == SoundMode::Enhanced {
+            state.pipeline_tail_frames = state.protector.delay_frames()
+                + state.clarity.delay_frames() as usize
+                + state.device_rate as usize * 3;
+        } else if produced == 0 && state.pipeline_tail_frames > 0 {
+            let frames = state.pipeline_tail_frames.min(CHUNK_FRAMES);
+            produced = frames * 2;
+            state.pipeline_tail_frames -= frames;
+            audible = true;
+        }
         if !audible {
             // No voice produced audio this chunk. The queue is truly spent
             // only when nothing is loaded, mid-transition, or winding down —
@@ -2818,35 +3145,153 @@ fn render_available(state: &mut MixerState, ring: &mut Producer<f32>) {
                     log::info!("queue drained; natural end");
                     state.playing = false;
                     state.set_state(crate::PlaybackState::Stopped);
-                    state.events.track_ended(crate::TrackEndReason::Natural,
-                    state.current.as_ref().map(|v| v.info.source.clone()).unwrap_or_default());
+                    state.events.track_ended(
+                        crate::TrackEndReason::Natural,
+                        state
+                            .current
+                            .as_ref()
+                            .map(|v| v.info.source.clone())
+                            .unwrap_or_default(),
+                    );
                 }
                 break;
             }
         }
 
-        // Push only rendered audio. Guard the post-EQ mix with one linear
-        // chunk gain before the final safety clamp, so an overlap cannot turn
-        // over-range peaks into flat-topped distortion.
+        // Push only rendered audio. Protection carries detector and gain state
+        // across render blocks, after the float-headroom processing stages.
         let mut pushed = 0;
         if produced > 0 {
-            state.eq.process(&mut scratch[..produced]);
-            let safety_gain = mix_peak_guard_gain(&scratch[..produced]);
-            for s in scratch.into_iter().take(produced) {
-                let guarded = if s.is_finite() { s * safety_gain } else { 0.0 };
-                if ring.push(guarded.clamp(-MIX_PEAK_CEILING, MIX_PEAK_CEILING)).is_ok() {
+            if state.sound_mode == SoundMode::Enhanced {
+                state.eq.process(&mut scratch[..produced]);
+            }
+            state.clarity.process(&mut scratch[..produced]);
+            state.protector.process(
+                &mut scratch[..produced],
+                state.sound_mode == SoundMode::Enhanced,
+            );
+            if let Ok(mut nerd) = state.nerd.lock() {
+                let mut stages = Vec::new();
+                let primary = if state.transition.as_ref().is_some_and(|t| t.handed_off) {
+                    state.incoming.as_ref().or(state.current.as_ref())
+                } else {
+                    state.current.as_ref()
+                };
+                if let Some(v) = primary {
+                    if !v.resampler.passthrough() {
+                        stages.push("Rate conversion (libsoxr HQ)".into());
+                    }
+                    nerd.converter_delay_frames = v.resampler.delay_frames();
+                    nerd.decoder_implementation = v.decoder.implementation().into();
+                    nerd.decoded_layout = v.decoder.layout();
+                    nerd.loudness_origin = if v.replay_gain.gain_db(v.normalization_mode).is_some()
+                    {
+                        "ReplayGain metadata"
+                    } else if v.measured_loudness.is_some() {
+                        "EBU R128 / BS.1770 LUFS"
+                    } else if v.loudness_db.is_some() {
+                        "YouTube relative loudness (not LUFS)"
+                    } else {
+                        "No measurement"
+                    }
+                    .into();
+                    if v.info.channels != 2 {
+                        stages.push("Channel mapping".into());
+                    }
+                    if v.user_stretch.is_some() {
+                        stages.push("Pitch-preserving speed".into());
+                    }
+                    if v.stretch.is_some() {
+                        stages.push("Automix tempo matching".into());
+                    }
+                    if v.spatial.enabled() {
+                        stages.push("Spatial / head tracking".into());
+                    }
+                    if v.skip_silence {
+                        stages.push("Silence trimming".into());
+                    }
+                }
+                if state.transition.is_some() {
+                    stages.push("Transition".into());
+                }
+                if state.volume != 1.0 {
+                    stages.push("Application volume".into());
+                }
+                if state.clarity.active() {
+                    stages.push("Enhanced clarity (4× exciter)".into());
+                    if state.eq.active() {
+                        stages.push("Manual EQ / tone".into());
+                    }
+                    stages.push("True-peak protection".into());
+                }
+                for v in state.current.iter().chain(state.incoming.iter()) {
+                    for (active, name) in [
+                        (v.spatial.enabled(), "Spatial / head tracking"),
+                        (v.stretch.is_some(), "Automix tempo matching"),
+                        (v.user_stretch.is_some(), "Pitch-preserving speed"),
+                        (v.filter.active(), "Transition filters"),
+                    ] {
+                        if active && !stages.iter().any(|s| s == name) {
+                            stages.push(name.into());
+                        }
+                    }
+                }
+                if let Some(v) = primary {
+                    nerd.loudness_gain_db = normalization_gain(
+                        v,
+                        state.loudness_enabled && state.sound_mode == SoundMode::Enhanced,
+                    )
+                    .1;
+                }
+                if nerd.loudness_gain_db.is_some() && state.sound_mode == SoundMode::Enhanced {
+                    stages.push("Normalization".into());
+                } else if state
+                    .current
+                    .as_ref()
+                    .is_some_and(|v| v.smoothed_normalization != 1.0)
+                {
+                    stages.push("Normalization settling".into());
+                }
+                nerd.active_stages = stages;
+                nerd.protection_reduction_db = state.protector.reduction_db;
+                nerd.protection_interventions = state.protector.interventions
+                    + state
+                        .current
+                        .as_ref()
+                        .map(|v| v.decoder.sanitized_samples())
+                        .unwrap_or(0);
+                nerd.queued_target_ms = state.queue_target_ms;
+                nerd.build_revision = env!("BITCHORD_CORE_REVISION").into();
+            }
+
+            if draining_pipeline
+                && state.pipeline_tail_frames < state.device_rate as usize * 3
+                && scratch[..produced].iter().all(|s| s.abs() < 1e-7)
+            {
+                state.pipeline_tail_frames = 0;
+            }
+            crate::diagnostics::capture(2, &scratch[..produced]);
+            state
+                .buffered_frames
+                .fetch_add(produced as u64 / 2, Ordering::Release);
+            for sample in scratch.into_iter().take(produced) {
+                if ring.push(sample).is_ok() {
                     pushed += 1;
                 } else {
                     break;
                 }
             }
         }
-        state
-            .buffered_frames
-            .fetch_add(pushed as u64 / 2, Ordering::Relaxed);
-        if pushed < chunk_samples {
-            break;
+        if pushed < produced {
+            let missing = ((produced - pushed) / 2) as u64;
+            let _ = state
+                .buffered_frames
+                .fetch_update(Ordering::AcqRel, Ordering::Relaxed, |v| {
+                    Some(v.saturating_sub(missing))
+                });
         }
+
+        break;
     }
 }
 
@@ -2854,9 +3299,21 @@ fn render_available(state: &mut MixerState, ring: &mut Producer<f32>) {
 /// gain multiplication, EQ, fades, clamping, and crossfade scheduling so the
 /// decoded PCM reaches the integer output packer unchanged.
 fn render_bitperfect_available(state: &mut MixerState, ring: &mut Producer<f32>) {
+    if state.underrun_counter.is_some()
+        && (state.flush_ring.load(Ordering::Acquire) || state.bail_flush.load(Ordering::Acquire))
+    {
+        return;
+    }
     let chunk_samples = CHUNK_FRAMES * 2;
     while ring.slots() >= chunk_samples {
-        if !state.playing { break; }
+        if state.buffered_frames.load(Ordering::Relaxed)
+            >= state.device_rate as u64 * state.queue_target_ms / 1000
+        {
+            break;
+        }
+        if !state.playing {
+            break;
+        }
         let frames = match &mut state.current {
             Some(voice) if voice.bit_perfect && voice.info.sample_rate == state.device_rate => {
                 voice.pull(CHUNK_FRAMES, state.device_rate)
@@ -2874,12 +3331,36 @@ fn render_bitperfect_available(state: &mut MixerState, ring: &mut Producer<f32>)
             if exhausted && state.buffered_frames.load(Ordering::Relaxed) == 0 {
                 state.playing = false;
                 state.set_state(crate::PlaybackState::Stopped);
-                state.events.track_ended(crate::TrackEndReason::Natural,
-                    state.current.as_ref().map(|v| v.info.source.clone()).unwrap_or_default());
+                state.events.track_ended(
+                    crate::TrackEndReason::Natural,
+                    state
+                        .current
+                        .as_ref()
+                        .map(|v| v.info.source.clone())
+                        .unwrap_or_default(),
+                );
             }
             break;
         }
         state.publish_audible_position();
+        if let Ok(mut nerd) = state.nerd.lock() {
+            nerd.active_stages.clear();
+            nerd.converter_delay_frames = 0.0;
+            nerd.protection_reduction_db = 0.0;
+            nerd.protection_interventions = 0;
+            nerd.loudness_gain_db = None;
+            nerd.loudness_origin = "Bypassed for qualified integer output".into();
+            nerd.queued_target_ms = state.queue_target_ms;
+            nerd.build_revision = env!("BITCHORD_CORE_REVISION").into();
+            if let Some(v) = state.current.as_ref() {
+                nerd.decoder_implementation = v.decoder.implementation().into();
+                nerd.decoded_layout = v.decoder.layout();
+            }
+        }
+        let frames_len = frames.len() as u64;
+        state
+            .buffered_frames
+            .fetch_add(frames_len / 2, Ordering::Release);
         let mut pushed = 0u64;
         for sample in frames {
             if ring.push(sample).is_ok() {
@@ -2888,8 +3369,14 @@ fn render_bitperfect_available(state: &mut MixerState, ring: &mut Producer<f32>)
                 break;
             }
         }
-        state.buffered_frames.fetch_add(pushed / 2, Ordering::Relaxed);
-        if pushed < chunk_samples as u64 { break; }
+        if pushed < frames_len {
+            let _ = state
+                .buffered_frames
+                .fetch_update(Ordering::AcqRel, Ordering::Relaxed, |v| {
+                    Some(v.saturating_sub((frames_len - pushed) / 2))
+                });
+        }
+        break;
     }
 }
 
@@ -2898,24 +3385,6 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicBool, AtomicU64};
     use std::sync::{Arc, Mutex};
-
-    #[test]
-    fn mix_peak_guard_scales_only_overrange_chunks() {
-        let clean = [0.7, -0.5, 0.1];
-        assert_eq!(mix_peak_guard_gain(&clean), 1.0);
-
-        let over = [1.2, -1.1, 0.4];
-        let gain = mix_peak_guard_gain(&over);
-        assert!(gain < 1.0);
-        assert!((over[0] * gain - MIX_PEAK_CEILING).abs() < 1e-6);
-        assert!(over.iter().all(|sample| (*sample * gain).abs() <= MIX_PEAK_CEILING));
-    }
-
-    #[test]
-    fn mix_peak_guard_ignores_non_finite_values_when_finding_peak() {
-        let gain = mix_peak_guard_gain(&[0.2, f32::INFINITY, f32::NAN]);
-        assert_eq!(gain, 1.0);
-    }
 
     #[derive(Default)]
     struct RecordedEvents {
@@ -3048,7 +3517,19 @@ mod tests {
             let duration = duration.clone();
             let shutdown = shutdown.clone();
             move || {
-                run_mixer(rx, consumer_side, buffered, position, duration, 44_100, events, shutdown, std::sync::Arc::new(AtomicBool::new(false)), std::sync::Arc::new(AtomicBool::new(false)), std::sync::Arc::new(Mutex::new(NerdSnapshot::default())))
+                run_mixer(
+                    rx,
+                    consumer_side,
+                    buffered,
+                    position,
+                    duration,
+                    44_100,
+                    events,
+                    shutdown,
+                    std::sync::Arc::new(AtomicBool::new(false)),
+                    std::sync::Arc::new(AtomicBool::new(false)),
+                    std::sync::Arc::new(Mutex::new(NerdSnapshot::default())),
+                )
             }
         });
 
@@ -3061,8 +3542,8 @@ mod tests {
                 plan: TransitionPlan::default(),
                 headers: std::collections::HashMap::new(),
                 claimed_kbps: 0,
-            loudness_db: None,
-            duration_seconds: 0.0,
+                loudness_db: None,
+                duration_seconds: 0.0,
             },
             reply: crossbeam_channel::bounded(1).0,
         })
@@ -3076,8 +3557,8 @@ mod tests {
                 plan: TransitionPlan::default(),
                 headers: std::collections::HashMap::new(),
                 claimed_kbps: 0,
-            loudness_db: None,
-            duration_seconds: 0.0,
+                loudness_db: None,
+                duration_seconds: 0.0,
             },
         })
         .unwrap();
@@ -3274,8 +3755,8 @@ mod tests {
                 plan: TransitionPlan::default(),
                 headers: std::collections::HashMap::new(),
                 claimed_kbps: 0,
-            loudness_db: None,
-            duration_seconds: 0.0,
+                loudness_db: None,
+                duration_seconds: 0.0,
             },
             reply: crossbeam_channel::bounded(1).0,
         })
@@ -3289,7 +3770,10 @@ mod tests {
             }
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
-        assert!(samples > 0, "current voice must reach the ring (got {samples})");
+        assert!(
+            samples > 0,
+            "current voice must reach the ring (got {samples})"
+        );
 
         shutdown.store(true, Ordering::Relaxed);
         let _ = handle.join();
@@ -3300,10 +3784,8 @@ mod tests {
         // A seekable source must start directly at the requested timestamp:
         // restoring a saved playhead must not decode 180 seconds of audio, and
         // the first ring samples must contain the signal at that position.
-        let a = std::env::temp_dir().join(format!(
-            "bitchord-mixer-resume-{}.wav",
-            std::process::id()
-        ));
+        let a =
+            std::env::temp_dir().join(format!("bitchord-mixer-resume-{}.wav", std::process::id()));
         test_wav(&a, 190.0, 997.0);
 
         let events = Arc::new(RecordedEvents::default());
@@ -3349,12 +3831,15 @@ mod tests {
                 headers: std::collections::HashMap::new(),
                 claimed_kbps: 0,
                 loudness_db: None,
-            duration_seconds: 0.0,
+                duration_seconds: 0.0,
             },
             reply,
         })
         .unwrap();
-        result.recv_timeout(std::time::Duration::from_secs(3)).unwrap().unwrap();
+        result
+            .recv_timeout(std::time::Duration::from_secs(3))
+            .unwrap()
+            .unwrap();
 
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
         let mut first_samples = Vec::new();
@@ -3369,8 +3854,15 @@ mod tests {
                 std::thread::sleep(std::time::Duration::from_millis(2));
             }
         }
-        assert_eq!(first_samples.len(), 256, "mixer did not fill the output ring");
-        let peak = first_samples.iter().map(|sample| sample.abs()).fold(0.0, f32::max);
+        assert_eq!(
+            first_samples.len(),
+            256,
+            "mixer did not fill the output ring"
+        );
+        let peak = first_samples
+            .iter()
+            .map(|sample| sample.abs())
+            .fold(0.0, f32::max);
         assert!(peak > 0.1, "first ring PCM is silent (peak {peak})");
         let started_at = position.load(Ordering::Relaxed) as f64 / 1000.0;
         assert!(
@@ -3464,7 +3956,10 @@ mod tests {
         assert_eq!(super::bound_mix_in_depth(45.0, &no_plan, 210.0), 45.0);
         // And an unknown duration cannot be bounded, so it is passed through for
         // the outro rule to deal with.
-        assert_eq!(super::bound_mix_in_depth(45.0, &planned_at(45.0), 0.0), 45.0);
+        assert_eq!(
+            super::bound_mix_in_depth(45.0, &planned_at(45.0), 0.0),
+            45.0
+        );
     }
 
     fn planned_at(cue: f64) -> TransitionPlan {
@@ -3563,14 +4058,8 @@ mod tests {
         })
         .unwrap();
 
-        let at = drain_until_handoff(
-            &mut consumer,
-            &buffered,
-            &position,
-            &events,
-            20,
-        )
-        .expect("no handoff fired");
+        let at = drain_until_handoff(&mut consumer, &buffered, &position, &events, 20)
+            .expect("no handoff fired");
         assert!(
             at <= 6.0 + 0.6,
             "the handoff fired at {at:.2}s, past the 6 s blend anchor"
@@ -3734,8 +4223,16 @@ mod tests {
         // still the bed — both records full-band, the incoming underneath.
         let left = onsets(0, 1.4, 5.4);
         let right = onsets(1, 1.4, 5.4);
-        assert!(left.len() >= 4, "outgoing clicks in the overlap: {}", left.len());
-        assert!(right.len() >= 4, "incoming clicks in the overlap: {}", right.len());
+        assert!(
+            left.len() >= 4,
+            "outgoing clicks in the overlap: {}",
+            left.len()
+        );
+        assert!(
+            right.len() >= 4,
+            "incoming clicks in the overlap: {}",
+            right.len()
+        );
         let mut worst = 0.0f64;
         for beat in &left {
             let nearest = right
@@ -3754,7 +4251,11 @@ mod tests {
         // The glide is 16 s from the end of the blend (t = 9), so past t = 25
         // the incoming record is back at its own 116 BPM.
         let home = onsets(1, 25.4, 27.6);
-        assert!(home.len() >= 3, "not enough clicks after the glide: {}", home.len());
+        assert!(
+            home.len() >= 3,
+            "not enough clicks after the glide: {}",
+            home.len()
+        );
         let expected = rate as f64 * 60.0 / 116.0;
         for pair in home.windows(2) {
             let gap = (pair[1] - pair[0]) as f64;
@@ -3774,14 +4275,29 @@ mod tests {
     /// scheduled at all.
     #[test]
     fn a_container_without_a_duration_falls_back_to_the_callers_figure() {
-        assert_eq!(super::known_duration(Some(210.0), 209.0), 210.0, "the container wins");
-        assert_eq!(super::known_duration(Some(0.0), 210.0), 210.0, "a zero is not a duration");
-        assert_eq!(super::known_duration(None, 210.0), 210.0, "the caller fills the gap");
-        assert_eq!(super::known_duration(None, 0.0), 0.0, "and unknown stays unknown");
+        assert_eq!(
+            super::known_duration(Some(210.0), 209.0),
+            210.0,
+            "the container wins"
+        );
+        assert_eq!(
+            super::known_duration(Some(0.0), 210.0),
+            210.0,
+            "a zero is not a duration"
+        );
+        assert_eq!(
+            super::known_duration(None, 210.0),
+            210.0,
+            "the caller fills the gap"
+        );
+        assert_eq!(
+            super::known_duration(None, 0.0),
+            0.0,
+            "and unknown stays unknown"
+        );
         assert_eq!(super::known_duration(None, f64::NAN), 0.0);
         assert_eq!(super::known_duration(Some(f64::NAN), 210.0), 210.0);
     }
-
 
     /// The mix-out anchor is a preferred musical point near the end, distinct
     /// from the recording's duration. That anchor schedules the fade; this
@@ -3833,8 +4349,18 @@ mod tests {
             playback_speed: 1.0,
             skip_silence: false,
             eq: EqualizerProcessor::new(44_100, 2),
+            sound_mode: SoundMode::Transparent,
+            clarity_tuning: ClarityTuning::default(),
+            clarity: Clarity::new(44_100),
+            protector: Protector::new(44_100),
+            pipeline_tail_frames: 0,
+            output_generation: 0,
+            queue_target_ms: 250,
+            underrun_counter: None,
+            observed_underruns: 0,
             nerd: Arc::new(Mutex::new(NerdSnapshot::default())),
             loudness_enabled: false,
+            loudness_mode: LoudnessMode::Off,
             swap_probe: SwapProbe::default(),
         };
         let current = state.current.as_ref().unwrap();
@@ -3844,7 +4370,10 @@ mod tests {
             ..request.plan.clone()
         };
         assert_eq!(state.outgoing_end_s(&late_anchor, current), 10.0);
-        assert_eq!(state.effective_fade_seconds(current.known_duration.unwrap()), 10.0 / 3.0);
+        assert_eq!(
+            state.effective_fade_seconds(current.known_duration.unwrap()),
+            10.0 / 3.0
+        );
     }
 
     #[test]
@@ -3867,11 +4396,11 @@ mod tests {
             loudness_db: None,
             duration_seconds: 8.0,
         };
-        let mut current = Voice::open(&request(&a, "A"), false, 0.0, 44_100, 1.0, false, false)
-            .unwrap();
+        let mut current =
+            Voice::open(&request(&a, "A"), false, 0.0, 44_100, 1.0, false, false).unwrap();
         current.finished = true;
-        let mut incoming = Voice::open(&request(&b, "B"), false, 0.0, 44_100, 1.0, false, false)
-            .unwrap();
+        let mut incoming =
+            Voice::open(&request(&b, "B"), false, 0.0, 44_100, 1.0, false, false).unwrap();
         incoming.emitted_dev_frames = 2 * 44_100;
 
         let mut state = MixerState {
@@ -3905,8 +4434,18 @@ mod tests {
             playback_speed: 1.0,
             skip_silence: false,
             eq: EqualizerProcessor::new(44_100, 2),
+            sound_mode: SoundMode::Transparent,
+            clarity_tuning: ClarityTuning::default(),
+            clarity: Clarity::new(44_100),
+            protector: Protector::new(44_100),
+            pipeline_tail_frames: 0,
+            output_generation: 0,
+            queue_target_ms: 250,
+            underrun_counter: None,
+            observed_underruns: 0,
             nerd: Arc::new(Mutex::new(NerdSnapshot::default())),
             loudness_enabled: false,
+            loudness_mode: LoudnessMode::Off,
             swap_probe: SwapProbe::default(),
         };
 
@@ -3918,7 +4457,10 @@ mod tests {
         assert!(incoming_gain > 0.0 && incoming_gain < 1.0);
 
         state.incoming.as_mut().unwrap().emitted_dev_frames = 4 * 44_100;
-        assert!(state.drive_fade(), "the fade completes at its planned duration");
+        assert!(
+            state.drive_fade(),
+            "the fade completes at its planned duration"
+        );
     }
 
     /// Drain the ring the way the device callback would (decrementing the
@@ -4050,8 +4592,8 @@ mod tests {
                 plan: TransitionPlan::default(),
                 headers: std::collections::HashMap::new(),
                 claimed_kbps: 0,
-            loudness_db: None,
-            duration_seconds: 0.0,
+                loudness_db: None,
+                duration_seconds: 0.0,
             },
             reply: crossbeam_channel::bounded(1).0,
         })
@@ -4065,8 +4607,8 @@ mod tests {
                 plan: TransitionPlan::default(),
                 headers: std::collections::HashMap::new(),
                 claimed_kbps: 0,
-            loudness_db: None,
-            duration_seconds: 0.0,
+                loudness_db: None,
+                duration_seconds: 0.0,
             },
         })
         .unwrap();
@@ -4237,8 +4779,14 @@ mod tests {
             let power = (rise as f64).powi(2) + (fall as f64).powi(2);
             worst_track_db = worst_track_db.max(10.0 * power.log10().abs());
         }
-        assert!(worst_swap_db < 1e-4, "swap fade swells by {worst_swap_db} dB");
-        assert!(worst_track_db < 1e-4, "track fade dips by {worst_track_db} dB");
+        assert!(
+            worst_swap_db < 1e-4,
+            "swap fade swells by {worst_swap_db} dB"
+        );
+        assert!(
+            worst_track_db < 1e-4,
+            "track fade dips by {worst_track_db} dB"
+        );
 
         // What a plain equal-power pair costs when both sides are the same
         // signal — recorded so the branch above cannot quietly be undone, and
@@ -4258,7 +4806,10 @@ mod tests {
     fn a_plain_crossfade_is_equal_power_and_starts_from_silence() {
         let (first_rise, first_fall) = fade_gains(0.0, false);
         let (last_rise, last_fall) = fade_gains(1.0, false);
-        assert!(first_rise.abs() < 1e-6, "a crossfade opens on silence, got {first_rise}");
+        assert!(
+            first_rise.abs() < 1e-6,
+            "a crossfade opens on silence, got {first_rise}"
+        );
         assert!((first_fall - 1.0).abs() < 1e-6);
         assert!((last_rise - 1.0).abs() < 1e-6);
         assert!(last_fall.abs() < 1e-6);
@@ -4268,7 +4819,10 @@ mod tests {
             let power = (rise as f64).powi(2) + (fall as f64).powi(2);
             worst_db = worst_db.max(10.0 * power.log10().abs());
         }
-        assert!(worst_db < 1e-4, "equal-power moved the level by {worst_db} dB");
+        assert!(
+            worst_db < 1e-4,
+            "equal-power moved the level by {worst_db} dB"
+        );
     }
 
     /// Bed, then a rise, then the outgoing lets go. The incoming is already
@@ -4289,19 +4843,34 @@ mod tests {
         };
         let bed = 10.0_f64.powf(-14.0 / 20.0) as f32;
         let (open_rise, open_fall) = automix_gains(0.0, &plan);
-        assert!(open_rise.abs() < 1e-4, "the bed eases in from silence, got {open_rise}");
-        assert!((open_fall - 1.0).abs() < 1e-4, "the outgoing stays up, got {open_fall}");
+        assert!(
+            open_rise.abs() < 1e-4,
+            "the bed eases in from silence, got {open_rise}"
+        );
+        assert!(
+            (open_fall - 1.0).abs() < 1e-4,
+            "the outgoing stays up, got {open_fall}"
+        );
 
         let (bed_rise, bed_fall) = automix_gains(0.2, &plan);
         assert!(
             bed_rise > bed * 0.5 && bed_rise < 0.45,
             "early in the blend the incoming is underneath, got {bed_rise}"
         );
-        assert!((bed_fall - 1.0).abs() < 1e-4, "the outgoing is still the record");
+        assert!(
+            (bed_fall - 1.0).abs() < 1e-4,
+            "the outgoing is still the record"
+        );
 
         let (late_rise, late_fall) = automix_gains(0.95, &plan);
-        assert!(late_rise > 0.95, "after the swap the incoming is the record, got {late_rise}");
-        assert!(late_fall < 0.35, "after the swap the outgoing is leaving, got {late_fall}");
+        assert!(
+            late_rise > 0.95,
+            "after the swap the incoming is the record, got {late_rise}"
+        );
+        assert!(
+            late_fall < 0.35,
+            "after the swap the outgoing is leaving, got {late_fall}"
+        );
 
         // The dip is on the incoming, just before the swap, and the outgoing
         // gain at that moment is still full. Sample a half-width either side
@@ -4404,7 +4973,10 @@ mod tests {
             voice.stretch.is_none(),
             "a fresh open must not engage the handoff stretch"
         );
-        assert_eq!(voice.base_plan_rate, 1.03, "but the plan's ratio is remembered");
+        assert_eq!(
+            voice.base_plan_rate, 1.03,
+            "but the plan's ratio is remembered"
+        );
 
         // The blend engages it...
         voice.set_plan_rate(voice.base_plan_rate);
@@ -4490,7 +5062,10 @@ mod tests {
             voice.emitted_dev_frames > before,
             "the drained samples were never emitted"
         );
-        assert!(voice.stretch.is_none(), "the stage should be gone after the drain");
+        assert!(
+            voice.stretch.is_none(),
+            "the stage should be gone after the drain"
+        );
     }
 
     /// Drain `frames` and return the RMS of what came out.
@@ -4691,7 +5266,7 @@ mod tests {
                 headers: std::collections::HashMap::new(),
                 claimed_kbps: kbps,
                 loudness_db: None,
-            duration_seconds: 0.0,
+                duration_seconds: 0.0,
             }
         }
 
@@ -4707,28 +5282,47 @@ mod tests {
     fn stale_preparation_cannot_modify_a_new_selection() {
         let (mut harness, low, high) = SwapHarness::new("stale-preparation");
         let (reply, loaded) = crossbeam_channel::bounded(1);
-        harness.tx.send(Command::Load {
-            request: SwapHarness::source(&high, "Selected", 320), reply,
-        }).unwrap();
-        loaded.recv_timeout(Duration::from_secs(5)).unwrap().unwrap();
+        harness
+            .tx
+            .send(Command::Load {
+                request: SwapHarness::source(&high, "Selected", 320),
+                reply,
+            })
+            .unwrap();
+        loaded
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+            .unwrap();
         let (reply, swapped) = crossbeam_channel::bounded(1);
-        harness.tx.send(Command::ForSource {
-            source: low.display().to_string(),
-            command: Box::new(Command::SwapSource {
-                request: SwapHarness::source(&low, "Obsolete", 96),
-                crossfade_seconds: 0.1, reply,
-            }),
-        }).unwrap();
-        assert!(swapped.recv_timeout(Duration::from_secs(5)).unwrap().is_err());
-        harness.tx.send(Command::ForSource {
-            source: low.display().to_string(),
-            command: Box::new(Command::QueueNext {
-                request: SwapHarness::source(&low, "Obsolete", 96),
-            }),
-        }).unwrap();
+        harness
+            .tx
+            .send(Command::ForSource {
+                source: low.display().to_string(),
+                command: Box::new(Command::SwapSource {
+                    request: SwapHarness::source(&low, "Obsolete", 96),
+                    crossfade_seconds: 0.1,
+                    reply,
+                }),
+            })
+            .unwrap();
+        assert!(swapped
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+            .is_err());
+        harness
+            .tx
+            .send(Command::ForSource {
+                source: low.display().to_string(),
+                command: Box::new(Command::QueueNext {
+                    request: SwapHarness::source(&low, "Obsolete", 96),
+                }),
+            })
+            .unwrap();
         drain_frames(&mut harness.consumer, &harness.buffered, 44_100 * 10);
-        assert!(harness.events.handoffs.lock().unwrap().is_empty(),
-                "stale queued audio must never become audible");
+        assert!(
+            harness.events.handoffs.lock().unwrap().is_empty(),
+            "stale queued audio must never become audible"
+        );
         harness.finish();
     }
 
@@ -4739,27 +5333,48 @@ mod tests {
     fn skip_promotes_queued_track_immediately() {
         let (harness, low, high) = SwapHarness::new("skip-queued");
         let (reply, loaded) = crossbeam_channel::bounded(1);
-        harness.tx.send(Command::Load {
-            request: SwapHarness::source(&low, "First", 96), reply,
-        }).unwrap();
-        loaded.recv_timeout(Duration::from_secs(5)).unwrap().unwrap();
-        harness.tx.send(Command::QueueNext {
-            request: SwapHarness::source(&high, "Second", 320),
-        }).unwrap();
+        harness
+            .tx
+            .send(Command::Load {
+                request: SwapHarness::source(&low, "First", 96),
+                reply,
+            })
+            .unwrap();
+        loaded
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+            .unwrap();
+        harness
+            .tx
+            .send(Command::QueueNext {
+                request: SwapHarness::source(&high, "Second", 320),
+            })
+            .unwrap();
         // The peek names the armed successor without touching it.
         let (reply, peeked) = crossbeam_channel::bounded(1);
         harness.tx.send(Command::PendingTrack { reply }).unwrap();
-        let queued = peeked.recv_timeout(Duration::from_secs(5)).unwrap()
+        let queued = peeked
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
             .expect("a queued track must be visible to the skip peek");
         assert_eq!(queued.title, "Second");
         // The skip opens it now and reports the handoff, like a load would.
         let (reply, skipped) = crossbeam_channel::bounded(1);
         harness.tx.send(Command::SkipToPending { reply }).unwrap();
-        let info = skipped.recv_timeout(Duration::from_secs(10)).unwrap()
+        let info = skipped
+            .recv_timeout(Duration::from_secs(10))
+            .unwrap()
             .expect("an armed track must be skippable");
         assert_eq!(info.title, "Second");
-        assert!(harness.events.handoffs.lock().unwrap().contains(&"Second".to_string()),
-                "the skip must report the handoff the app flips its queue on");
+        assert!(
+            harness
+                .events
+                .handoffs
+                .lock()
+                .unwrap()
+                .contains(&"Second".to_string()),
+            "the skip must report the handoff the app flips its queue on"
+        );
         // Nothing left armed: a second skip is refused, not invented.
         let (reply, again) = crossbeam_channel::bounded(1);
         harness.tx.send(Command::SkipToPending { reply }).unwrap();
@@ -4772,11 +5387,19 @@ mod tests {
         let (harness, _, _) = SwapHarness::new("skip-empty");
         let (reply, peeked) = crossbeam_channel::bounded(1);
         harness.tx.send(Command::PendingTrack { reply }).unwrap();
-        assert!(peeked.recv_timeout(Duration::from_secs(5)).unwrap().is_none());
+        assert!(peeked
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+            .is_none());
         let (reply, skipped) = crossbeam_channel::bounded(1);
         harness.tx.send(Command::SkipToPending { reply }).unwrap();
-        assert!(skipped.recv_timeout(Duration::from_secs(5)).unwrap().is_err(),
-                "with no armed successor the caller must fall back to a full load");
+        assert!(
+            skipped
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap()
+                .is_err(),
+            "with no armed successor the caller must fall back to a full load"
+        );
         harness.finish();
     }
 
@@ -4795,7 +5418,10 @@ mod tests {
         let reply = reply_rx
             .recv_timeout(std::time::Duration::from_secs(10))
             .expect("the mixer must answer a swap");
-        assert!(reply.is_err(), "nothing is playing, so there is nothing to swap");
+        assert!(
+            reply.is_err(),
+            "nothing is playing, so there is nothing to swap"
+        );
         harness.finish();
     }
 
@@ -4845,8 +5471,7 @@ mod tests {
 
         let kbps = harness.nerd.lock().unwrap().kbps;
         assert_eq!(
-            kbps,
-            320,
+            kbps, 320,
             "the promoted source must be the one the readout names"
         );
         assert!(
@@ -4906,7 +5531,11 @@ mod tests {
 
         let (rho, kbps) = {
             let nerd = harness.nerd.lock().unwrap();
-            (nerd.swap_correlation.expect("swap correlation must be measured"), nerd.kbps)
+            (
+                nerd.swap_correlation
+                    .expect("swap correlation must be measured"),
+                nerd.kbps,
+            )
         };
         assert!(
             rho < 0.85,
@@ -4948,6 +5577,8 @@ mod tests {
             .send(Command::SetOutputFormat {
                 rate: 48_000,
                 producer,
+                generation: 1,
+                acknowledged: None,
             })
             .unwrap();
 

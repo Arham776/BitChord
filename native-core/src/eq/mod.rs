@@ -80,16 +80,46 @@ impl EqLayout {
 
     pub fn slots() -> [FilterSlot; Self::SLOTS] {
         [
-            FilterSlot { kind: FilterKind::LowShelf, frequency_hz: 60.0 },
-            FilterSlot { kind: FilterKind::Bell, frequency_hz: 150.0 },
-            FilterSlot { kind: FilterKind::Bell, frequency_hz: 400.0 },
-            FilterSlot { kind: FilterKind::Bell, frequency_hz: 1_000.0 },
-            FilterSlot { kind: FilterKind::Bell, frequency_hz: 2_500.0 },
-            FilterSlot { kind: FilterKind::Bell, frequency_hz: 6_000.0 },
-            FilterSlot { kind: FilterKind::HighShelf, frequency_hz: 14_000.0 },
-            FilterSlot { kind: FilterKind::LowShelf, frequency_hz: 250.0 },
-            FilterSlot { kind: FilterKind::Bell, frequency_hz: 1_000.0 },
-            FilterSlot { kind: FilterKind::HighShelf, frequency_hz: 4_000.0 },
+            FilterSlot {
+                kind: FilterKind::LowShelf,
+                frequency_hz: 60.0,
+            },
+            FilterSlot {
+                kind: FilterKind::Bell,
+                frequency_hz: 150.0,
+            },
+            FilterSlot {
+                kind: FilterKind::Bell,
+                frequency_hz: 400.0,
+            },
+            FilterSlot {
+                kind: FilterKind::Bell,
+                frequency_hz: 1_000.0,
+            },
+            FilterSlot {
+                kind: FilterKind::Bell,
+                frequency_hz: 2_500.0,
+            },
+            FilterSlot {
+                kind: FilterKind::Bell,
+                frequency_hz: 6_000.0,
+            },
+            FilterSlot {
+                kind: FilterKind::HighShelf,
+                frequency_hz: 14_000.0,
+            },
+            FilterSlot {
+                kind: FilterKind::LowShelf,
+                frequency_hz: 250.0,
+            },
+            FilterSlot {
+                kind: FilterKind::Bell,
+                frequency_hz: 1_000.0,
+            },
+            FilterSlot {
+                kind: FilterKind::HighShelf,
+                frequency_hz: 4_000.0,
+            },
         ]
     }
 }
@@ -113,11 +143,25 @@ impl EqCurve {
         let mut gains = [0.0f32; EqLayout::SLOTS];
         let mut q = [0.707f32; EqLayout::SLOTS];
         for i in 0..EqLayout::SLOTS {
-            gains[i] = gains_db.get(i).copied().unwrap_or(0.0);
-            q[i] = qs.get(i).copied().unwrap_or(0.707).max(MIN_Q);
+            gains[i] = gains_db
+                .get(i)
+                .copied()
+                .filter(|v| v.is_finite())
+                .unwrap_or(0.0)
+                .clamp(-24.0, 24.0);
+            q[i] = qs
+                .get(i)
+                .copied()
+                .filter(|v| v.is_finite())
+                .unwrap_or(0.707)
+                .clamp(MIN_Q, 12.0);
         }
         let preamp_db = preamp_for(&gains, &q);
-        Self { gains_db: gains, qs: q, preamp_db }
+        Self {
+            gains_db: gains,
+            qs: q,
+            preamp_db,
+        }
     }
 }
 
@@ -289,6 +333,19 @@ impl EqualizerProcessor {
         processor
     }
 
+    pub fn diagnostic_settings(&self) -> serde_json::Value {
+        serde_json::json!({"enabled":self.target_enabled,"gains_db":self.target_gains,"qs":self.target_qs,"preamp_db":self.target_preamp_db,"balance":self.target_balance})
+    }
+
+    pub fn active(&self) -> bool {
+        !is_flat(
+            self.target_enabled,
+            &self.target_gains,
+            self.target_preamp_db,
+            self.target_balance,
+        )
+    }
+
     pub fn channels(&self) -> usize {
         self.channels
     }
@@ -302,7 +359,11 @@ impl EqualizerProcessor {
             self.target_gains = curve.gains_db;
             self.target_qs = curve.qs;
             self.target_preamp_db = curve.preamp_db;
-            self.target_balance = balance.clamp(-1.0, 1.0);
+            self.target_balance = if balance.is_finite() {
+                balance.clamp(-1.0, 1.0)
+            } else {
+                0.0
+            };
         } else {
             self.target_gains = [0.0; EqLayout::SLOTS];
             self.target_qs = [0.707; EqLayout::SLOTS];
@@ -347,8 +408,12 @@ impl EqualizerProcessor {
         }
         let frame_count = samples.len() / ch;
 
-        if is_flat(self.target_enabled, &self.target_gains, self.target_preamp_db, self.target_balance)
-            && self.is_settled()
+        if is_flat(
+            self.target_enabled,
+            &self.target_gains,
+            self.target_preamp_db,
+            self.target_balance,
+        ) && self.is_settled()
         {
             return;
         }
@@ -378,7 +443,8 @@ impl EqualizerProcessor {
 
     fn glide_towards(&mut self) {
         for slot in 0..EqLayout::SLOTS {
-            self.current_gains[slot] = linear_glide(self.current_gains[slot], self.target_gains[slot]);
+            self.current_gains[slot] =
+                linear_glide(self.current_gains[slot], self.target_gains[slot]);
             self.current_qs[slot] = geometric_glide(self.current_qs[slot], self.target_qs[slot]);
         }
         self.current_preamp_db = linear_glide(self.current_preamp_db, self.target_preamp_db);
@@ -518,12 +584,7 @@ fn usable_frequency(hz: f32, sample_rate: f32) -> f32 {
     hz.clamp(MIN_HZ, sample_rate * MAX_FREQUENCY_FRACTION)
 }
 
-fn is_flat(
-    enabled: bool,
-    gains: &[f32; EqLayout::SLOTS],
-    preamp_db: f32,
-    balance: f32,
-) -> bool {
+fn is_flat(enabled: bool, gains: &[f32; EqLayout::SLOTS], preamp_db: f32, balance: f32) -> bool {
     if !enabled {
         return true;
     }
@@ -539,16 +600,18 @@ mod tests {
     #[test]
     fn flat_curve_has_zero_preamp() {
         let curve = EqCurve::flat();
-        assert!(curve.preamp_db.abs() < 1e-3, "flat preamp {}", curve.preamp_db);
+        assert!(
+            curve.preamp_db.abs() < 1e-3,
+            "flat preamp {}",
+            curve.preamp_db
+        );
     }
 
     #[test]
     fn flat_curve_is_sample_identical_passthrough() {
         let mut eq = EqualizerProcessor::new(48_000, 2);
         eq.set_tuning(false, &EqCurve::flat(), 0.0);
-        let input: Vec<f32> = (0..1024)
-            .map(|i| ((i as f32) * 0.01).sin() * 0.5)
-            .collect();
+        let input: Vec<f32> = (0..1024).map(|i| ((i as f32) * 0.01).sin() * 0.5).collect();
         let mut buf = input.clone();
         eq.process(&mut buf);
         assert_eq!(buf, input);
@@ -594,9 +657,7 @@ mod tests {
         let curve = manual_curve(&[12.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]);
         eq.set_tuning(true, &curve, 0.0);
 
-        let input: Vec<f32> = (0..4096)
-            .map(|i| ((i as f32) * 0.02).sin() * 0.5)
-            .collect();
+        let input: Vec<f32> = (0..4096).map(|i| ((i as f32) * 0.02).sin() * 0.5).collect();
         let mut buf = input.clone();
         eq.process(&mut buf);
         assert_ne!(buf, input);
@@ -638,14 +699,14 @@ mod tests {
         let r_b = rms_channel(&b, 1);
         // balance -1 = fully left: right channel muted (upstream channelGain).
         assert!(l_a > r_a, "balance -1 should favour left (L {l_a} R {r_a})");
-        assert!(r_b > l_b, "balance +1 should favour right (L {l_b} R {r_b})");
+        assert!(
+            r_b > l_b,
+            "balance +1 should favour right (L {l_b} R {r_b})"
+        );
     }
 
     fn rms_channel(buf: &[f32], ch: usize) -> f32 {
-        let sum: f32 = buf
-            .chunks_exact(2)
-            .map(|p| p[ch] * p[ch])
-            .sum();
+        let sum: f32 = buf.chunks_exact(2).map(|p| p[ch] * p[ch]).sum();
         (sum / (buf.len() / 2) as f32).sqrt()
     }
 }

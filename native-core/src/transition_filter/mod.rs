@@ -67,6 +67,13 @@ impl TransitionFilter {
         filter
     }
 
+    pub fn active(&self) -> bool {
+        self.target_low_pass_hz < OPEN_HZ
+            || self.target_high_pass_hz > OFF_HZ
+            || self.current_low_pass_hz < OPEN_HZ - 1.0
+            || self.current_high_pass_hz > OFF_HZ + 0.01
+    }
+
     pub fn sample_rate(&self) -> u32 {
         self.sample_rate
     }

@@ -313,10 +313,12 @@ impl TimeStretch {
         if reference + CORRELATE > limit {
             return self.anchor;
         }
-        let reference_mono: Vec<f32> =
-            (0..CORRELATE).map(|i| self.mid_at(reference + i)).collect();
-        let reference_energy: f32 =
-            reference_mono.iter().map(|s| s * s).sum::<f32>().max(1.0e-9);
+        let reference_mono: Vec<f32> = (0..CORRELATE).map(|i| self.mid_at(reference + i)).collect();
+        let reference_energy: f32 = reference_mono
+            .iter()
+            .map(|s| s * s)
+            .sum::<f32>()
+            .max(1.0e-9);
 
         let earliest = self.anchor.saturating_sub(SEARCH as usize);
         let mut best = self.anchor;
@@ -697,5 +699,3 @@ mod tests {
         );
     }
 }
-
-

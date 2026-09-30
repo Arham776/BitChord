@@ -169,7 +169,9 @@ fn mel_filterbank(sample_rate: f64) -> Vec<MelFilter> {
 
     let mut edges = vec![0.0; BEAT_SPECTROGRAM_MELS + 2];
     for (index, edge) in edges.iter_mut().enumerate() {
-        *edge = mel_to_hz(mel_min + (mel_max - mel_min) * index as f64 / (BEAT_SPECTROGRAM_MELS + 1) as f64);
+        *edge = mel_to_hz(
+            mel_min + (mel_max - mel_min) * index as f64 / (BEAT_SPECTROGRAM_MELS + 1) as f64,
+        );
     }
 
     let mut filters = vec![
@@ -193,8 +195,16 @@ fn mel_filterbank(sample_rate: f64) -> Vec<MelFilter> {
         filter.weights.reserve(last - first + 1);
         for bin in first..=last {
             let hz = bin as f64 * sample_rate / BEAT_SPECTROGRAM_FFT as f64;
-            let rising = if centre > left { (hz - left) / (centre - left) } else { 0.0 };
-            let falling = if right > centre { (right - hz) / (right - centre) } else { 0.0 };
+            let rising = if centre > left {
+                (hz - left) / (centre - left)
+            } else {
+                0.0
+            };
+            let falling = if right > centre {
+                (right - hz) / (right - centre)
+            } else {
+                0.0
+            };
             filter.weights.push(rising.min(falling).max(0.0));
         }
     }
@@ -247,10 +257,16 @@ impl Complex {
         }
     }
     fn add(self, o: Self) -> Self {
-        Self { re: self.re + o.re, im: self.im + o.im }
+        Self {
+            re: self.re + o.re,
+            im: self.im + o.im,
+        }
     }
     fn sub(self, o: Self) -> Self {
-        Self { re: self.re - o.re, im: self.im - o.im }
+        Self {
+            re: self.re - o.re,
+            im: self.im - o.im,
+        }
     }
     fn mul(self, o: Self) -> Self {
         Self {
@@ -310,10 +326,7 @@ pub fn compute_beat_spectrogram(samples: &[f32], sample_rate: f64) -> BeatSpectr
     result.frames = frames;
     result.values = vec![0.0f32; frames * BEAT_SPECTROGRAM_MELS];
 
-    let mut spectrum = vec![
-        Complex { re: 0.0, im: 0.0 };
-        BEAT_SPECTROGRAM_FFT
-    ];
+    let mut spectrum = vec![Complex { re: 0.0, im: 0.0 }; BEAT_SPECTROGRAM_FFT];
     let mut magnitude = vec![0.0f64; bins];
 
     for frame in 0..frames {
@@ -328,7 +341,8 @@ pub fn compute_beat_spectrogram(samples: &[f32], sample_rate: f64) -> BeatSpectr
         for (bin, mag) in magnitude.iter_mut().take(bins).enumerate() {
             *mag = spectrum[bin].abs() / normalization;
         }
-        let row = &mut result.values[frame * BEAT_SPECTROGRAM_MELS..(frame + 1) * BEAT_SPECTROGRAM_MELS];
+        let row =
+            &mut result.values[frame * BEAT_SPECTROGRAM_MELS..(frame + 1) * BEAT_SPECTROGRAM_MELS];
         for (mel, cell) in row.iter_mut().enumerate() {
             let filter = &filters[mel];
             let mut energy = 0.0;
@@ -372,7 +386,10 @@ mod tests {
         let out = resample(&input, rate, 24_000.0);
         // Count zero crossings of the tail: 2 per cycle → freq ≈ crossings/2 per second.
         let tail = &out[out.len() - 12_000..];
-        let crossings = tail.windows(2).filter(|w| w[0].signum() != w[1].signum()).count();
+        let crossings = tail
+            .windows(2)
+            .filter(|w| w[0].signum() != w[1].signum())
+            .count();
         let freq = crossings as f64 / 2.0 * (24_000.0 / 12_000.0);
         assert!((freq - 1000.0).abs() < 25.0, "freq {freq}");
     }
@@ -380,7 +397,9 @@ mod tests {
     #[test]
     fn mel_spectrogram_shape_and_rate_gate() {
         // Wrong rate → empty.
-        let noise: Vec<f32> = (0..44_100).map(|i| (((i as u32).wrapping_mul(2654435761) % 97) as i32) as f32 / 97.0 - 0.5).collect();
+        let noise: Vec<f32> = (0..44_100)
+            .map(|i| (((i as u32).wrapping_mul(2654435761) % 97) as i32) as f32 / 97.0 - 0.5)
+            .collect();
         assert_eq!(compute_beat_spectrogram(&noise, 44_100.0).frames, 0);
 
         // Right rate → frames = (padded - fft)/hop + 1.

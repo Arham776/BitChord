@@ -22,6 +22,8 @@ required-features = ["uniffi/cli"]
 uniffi = "0.32"
 log = "0.4"
 env_logger = "0.11"
+# Gated BS.1770/R128 measurement; separate from the MIR RMS feature.
+ebur128 = "=0.1.10"
 
 # §3.1 Decoder — Symphonia handles AAC/M4A, FLAC, MP3, ALAC, Vorbis,
 # PCM/WAV and AIFF; the libopus adapter below extends it to Opus streams.
@@ -55,9 +57,15 @@ rtrb = "0.3"
 # onnxruntime xcframework. Same graphs upstream ships; rten is the engine.
 rten = "0.26"
 rten-tensor = "0.26"
+sha2 = "0.10"
+serde_json = "1"
 
-# No build.rs needed: the proc-macro route (#[uniffi::export] + setup_scaffolding!)
-# replaces the UDL/uniffi-build setup.
+[build-dependencies]
+cmake = "0.1"
+cc = "1"
+sha2 = "0.10"
+
+# build.rs builds pinned libsoxr and the Apple AAC bridge. UniFFI uses proc macros.
 
 # Apple only: the render thread's QoS class. The mixer answers a real-time
 # deadline — the device callback drains its ring on a schedule the hardware sets

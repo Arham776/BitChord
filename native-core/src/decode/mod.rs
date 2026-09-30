@@ -14,6 +14,9 @@
 //! supplied by the libopus adapter. This lets configured sources serve WebM and
 //! Ogg Opus directly instead of forcing an AAC fallback.
 
+#[cfg(target_vendor = "apple")]
+mod apple_aac;
+mod opus;
 pub mod resampler;
 
 use std::collections::HashMap;
@@ -26,9 +29,8 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use symphonia::core::audio::{Audio, Channels, GenericAudioBufferRef, Position};
-use symphonia::core::codecs::audio::well_known::CODEC_ID_OPUS;
+use symphonia::core::codecs::audio::well_known::{CODEC_ID_AAC, CODEC_ID_MP3, CODEC_ID_OPUS};
 use symphonia::core::codecs::audio::{AudioDecoder, AudioDecoderOptions};
-use symphonia::core::codecs::registry::RegisterableAudioDecoder;
 use symphonia::core::codecs::CodecParameters;
 use symphonia::core::errors::Error as SymphoniaError;
 use symphonia::core::formats::probe::Hint;
@@ -62,8 +64,15 @@ pub struct SymphoniaDecoder {
     track_id: u32,
     sample_rate: u32,
     channels: usize,
+    expected_layout: Channels,
     duration_secs: Option<f64>,
     decoded_frames: u64,
+    seek_skip_frames: usize,
+    decoder_eof_drained: bool,
+    sanitized_samples: u64,
+    priming_total_frames: usize,
+    priming_remaining: usize,
+    valid_frames: Option<u64>,
     /// Interleaved stereo f32 left over from the last decoded packet.
     pending: Vec<f32>,
     pending_cursor: usize,
@@ -87,9 +96,9 @@ fn open_audio_decoder(
 ) -> Result<Box<dyn AudioDecoder>, DecodeError> {
     let opts = AudioDecoderOptions::default();
     if audio.codec == CODEC_ID_OPUS {
-        return symphonia_adapter_libopus::OpusDecoder::try_registry_new(audio, &opts)
-            .map_err(|e| DecodeError(format!("Opus decoder: {e}")));
+        return opus::OpusDecoder::open(audio, true);
     }
+
     let codecs = symphonia::default::get_codecs();
     // Per decode, and a decode is now a routine event, so this is `debug`.
     // The one-line summary (`opened …: codec=… rate=… duration=…`) stays at
@@ -101,27 +110,24 @@ fn open_audio_decoder(
         audio.sample_rate,
         audio.profile,
     );
+    // HE-AAC needs SBR/PS synthesis even when a decoder accepts its LC core.
+    #[cfg(target_vendor = "apple")]
+    if is_he_aac(audio)
+        || (crate::diagnostics::prefer_apple_aac()
+            && audio.codec == symphonia::core::codecs::audio::well_known::CODEC_ID_AAC)
+    {
+        return apple_aac::AppleAacDecoder::open(audio);
+    }
     match codecs.make_audio_decoder(audio, &opts) {
-        Ok(d) => return Ok(d),
-        Err(e) => log::warn!("AAC decoder rejected container config: {e}"),
+        Ok(decoder) => Ok(decoder),
+        Err(error) => {
+            #[cfg(target_vendor = "apple")]
+            if audio.codec == symphonia::core::codecs::audio::well_known::CODEC_ID_AAC {
+                return apple_aac::AppleAacDecoder::open(audio);
+            }
+            Err(DecodeError(format!("decoder: {error}")))
+        }
     }
-
-    // itag 18 / HE-AAC: Symphonia has no SBR. Strip to the LC core so the
-    // track still plays (half-rate, no air band) when the resolver could not
-    // land itag 140. Silence is worse; the resolver still prefers AAC-LC.
-    let rate = audio.sample_rate.unwrap_or(44_100);
-    if is_he_aac(audio) {
-        log::warn!("HE-AAC/SBR at {rate} Hz — decoding LC core only (no reconstructed highs)");
-    }
-    let mut stripped = audio.clone();
-    stripped.extra_data = Some(lc_stereo_asc(rate).into());
-    stripped.profile = None;
-    stripped.channels = Some(Channels::from(Position::FRONT_LEFT | Position::FRONT_RIGHT));
-    stripped.sample_rate = Some(rate);
-    log::warn!("retrying as AAC-LC stereo {rate} Hz");
-    codecs
-        .make_audio_decoder(&stripped, &opts)
-        .map_err(|e| DecodeError(format!("decoder: {e}")))
 }
 
 /// MPEG-4 AudioSpecificConfig: AOT 5 = SBR, 29 = HE-AACv2/PS. LC+SBR
@@ -139,7 +145,7 @@ fn is_he_aac_config(extra: &[u8]) -> bool {
     }
     match aac_audio_object_type(extra) {
         Some(5 | 29) => true,
-        Some(2) => extra.len() > 4 || has_sbr_sync(extra),
+        Some(2) => has_sbr_sync(extra),
         _ => has_sbr_sync(extra),
     }
 }
@@ -179,6 +185,7 @@ fn aac_audio_object_type(extra: &[u8]) -> Option<u8> {
 }
 
 /// Two-byte AudioSpecificConfig: AAC-LC, stereo, 1024-sample frames.
+#[cfg(test)]
 fn lc_stereo_asc(sample_rate: u32) -> [u8; 2] {
     let freq_idx: u16 = match sample_rate {
         96_000 => 0,
@@ -209,6 +216,9 @@ fn codec_label(
     // in an .m4a container, so extension-first detection mislabeled lossless
     // Apple Lossless files as AAC and prevented the exact-PCM route from ever
     // qualifying them.
+    if audio.codec == CODEC_ID_OPUS {
+        return "Opus".into();
+    }
     if audio.codec == CODEC_ID_FLAC {
         return "FLAC".into();
     }
@@ -414,7 +424,33 @@ impl SymphoniaDecoder {
         };
 
         let decoder = open_audio_decoder(&audio)?;
+        let sample_rate = decoder.codec_params().sample_rate.unwrap_or(sample_rate);
+        let channels = decoder
+            .codec_params()
+            .channels
+            .as_ref()
+            .map(|c| c.count())
+            .unwrap_or(channels);
+        let expected_layout = decoder
+            .codec_params()
+            .channels
+            .clone()
+            .ok_or_else(|| DecodeError("missing decoded layout".into()))?;
         let codec = codec_label(source, &audio);
+        let mut timing: Option<(u64, usize)> = None;
+        #[cfg(target_vendor = "apple")]
+        if audio.codec == symphonia::core::codecs::audio::well_known::CODEC_ID_AAC
+            && track.delay.is_none()
+            && track.padding.is_none()
+        {
+            if let SourceKind::Path(path) = source {
+                timing = apple_aac::file_timing(path, sample_rate);
+            }
+        }
+        let duration_secs = timing
+            .map(|(frames, _)| frames as f64 / sample_rate as f64)
+            .or(duration_secs);
+
         // Only report source bit depth for codecs with a meaningful integer PCM
         // precision. Lossy codecs decode to float, which is not their encoded
         // source depth and must not be presented as one.
@@ -439,8 +475,15 @@ impl SymphoniaDecoder {
             track_id,
             sample_rate,
             channels,
+            expected_layout,
             duration_secs,
             decoded_frames: 0,
+            seek_skip_frames: 0,
+            decoder_eof_drained: false,
+            sanitized_samples: 0,
+            priming_total_frames: timing.map(|t| t.1).unwrap_or(0),
+            priming_remaining: timing.map(|t| t.1).unwrap_or(0),
+            valid_frames: timing.map(|t| t.0),
             pending: Vec::new(),
             pending_cursor: 0,
             codec,
@@ -476,13 +519,40 @@ impl SymphoniaDecoder {
 
     /// Source-domain position in seconds.
     pub fn position_seconds(&self) -> f64 {
-        self.decoded_frames as f64 / self.sample_rate as f64
+        let pending = (self.pending.len().saturating_sub(self.pending_cursor) / 2) as u64;
+        self.decoded_frames.saturating_sub(pending) as f64 / self.sample_rate as f64
+    }
+    pub fn sanitized_samples(&self) -> u64 {
+        self.sanitized_samples
+    }
+    pub fn implementation(&self) -> &str {
+        self.decoder.codec_info().long_name
+    }
+    pub fn layout(&self) -> String {
+        format!("{:?}", self.decoder.codec_params().channels)
     }
 
     /// Seeks to `seconds` in source time. Symphonia reports the actual
     /// timestamp landed on; decoded-frame counting restarts from there.
     pub fn seek_seconds(&mut self, seconds: f64) -> Result<(), DecodeError> {
-        let time = Time::try_from_secs_f64(seconds.max(0.0))
+        // Compressed codecs need preceding packets to restore overlap,
+        // prediction and SBR state. Decode the preroll, then discard exactly
+        // to the requested source frame; never expose the cold decoder tail.
+        let codec = self.decoder.codec_params().codec;
+        let preroll = if codec == CODEC_ID_OPUS {
+            // RFC 7845 requires at least 80 ms. A longer bounded history also
+            // converges SILK prediction on quiet Matroska/WebM material.
+            1.0
+        } else if codec == CODEC_ID_AAC || codec == CODEC_ID_MP3 {
+            0.120
+        } else {
+            0.0
+        };
+        let encoded_seconds = (seconds.max(0.0)
+            + self.priming_total_frames as f64 / self.sample_rate as f64
+            - preroll)
+            .max(0.0);
+        let time = Time::try_from_secs_f64(encoded_seconds)
             .ok_or_else(|| DecodeError("bad seek time".into()))?;
         let to = SeekTo::Time {
             time,
@@ -491,6 +561,7 @@ impl SymphoniaDecoder {
         match self.format.seek(SeekMode::Accurate, to) {
             Ok(seeked_to) => {
                 self.decoder.reset();
+                self.decoder_eof_drained = false;
                 self.pending.clear();
                 self.pending_cursor = 0;
                 // Frame counting restarts from where the seek landed. The
@@ -503,9 +574,28 @@ impl SymphoniaDecoder {
                 let landed = self
                     .time_base()
                     .map(|tb| tb.calc_time_saturating(seeked_to.actual_ts).as_secs_f64())
-                    .filter(|t| t.is_finite() && *t > 0.0)
+                    .filter(|t| t.is_finite() && *t >= 0.0)
                     .unwrap_or(requested);
-                self.decoded_frames = (landed * self.sample_rate as f64).round() as u64;
+                let encoded_frames = (landed * self.sample_rate as f64).round() as u64;
+                if self.decoder.codec_params().codec == CODEC_ID_OPUS {
+                    let params = self
+                        .format
+                        .tracks()
+                        .iter()
+                        .find(|t| t.id == self.track_id)
+                        .and_then(|t| t.codec_params.as_ref())
+                        .and_then(|p| p.audio())
+                        .ok_or_else(|| DecodeError("Opus seek lost codec metadata".into()))?;
+                    self.decoder = opus::OpusDecoder::open(params, landed == 0.0)?;
+                }
+                self.priming_remaining = self
+                    .priming_total_frames
+                    .saturating_sub(encoded_frames as usize);
+                self.decoded_frames =
+                    encoded_frames.saturating_sub(self.priming_total_frames as u64);
+                self.seek_skip_frames = ((requested * self.sample_rate as f64).round() as u64)
+                    .saturating_sub(self.decoded_frames)
+                    as usize;
                 Ok(())
             }
             Err(e) => Err(DecodeError(format!("seek: {e}"))),
@@ -533,24 +623,62 @@ impl SymphoniaDecoder {
         let mut interleaved: Vec<f32> = Vec::new();
         let mut skipped = 0u32;
         while out.len() < max_frames * 2 {
+            if self.valid_frames.is_some_and(|f| self.decoded_frames >= f) {
+                break;
+            }
             let packet = match self.format.next_packet() {
-                Ok(Some(p)) => p,
-                Ok(None) => break,
+                Ok(p) => p,
                 Err(SymphoniaError::IoError(ref e))
                     if e.kind() == std::io::ErrorKind::UnexpectedEof =>
                 {
-                    break
+                    None
                 }
                 Err(e) => {
-                    // Muxed MP4 interleaves video samples; a single bad packet
-                    // must not kill the audio track.
                     log::debug!("next_packet: {e}");
                     skipped += 1;
                     if skipped > 256 {
-                        break;
+                        return Err(DecodeError(format!("demuxing failed: {e}")));
                     }
                     continue;
                 }
+            };
+            let Some(packet) = packet else {
+                if !self.decoder_eof_drained && self.implementation() == "Apple AudioToolbox AAC" {
+                    self.decoder_eof_drained = true;
+                    self.decoder.finalize();
+                    let decoded = self.decoder.last_decoded();
+                    interleaved.clear();
+                    copy_interleaved_f32(&decoded, &mut interleaved);
+                    if decoded.spec().rate() != self.sample_rate
+                        || decoded.spec().channels() != &self.expected_layout
+                    {
+                        return Err(DecodeError(
+                            "decoded format changed during AAC drain".into(),
+                        ));
+                    }
+                    for s in &mut interleaved {
+                        if !s.is_finite() {
+                            *s = 0.0;
+                            self.sanitized_samples += 1;
+                        }
+                    }
+                    self.pending = downmix_stereo(&interleaved, &self.expected_layout)?;
+                    let priming = self.priming_remaining.min(self.pending.len() / 2);
+                    self.priming_remaining -= priming;
+                    self.pending.drain(..priming * 2);
+                    if let Some(valid) = self.valid_frames {
+                        self.pending
+                            .truncate(valid.saturating_sub(self.decoded_frames) as usize * 2);
+                    }
+                    self.decoded_frames += (self.pending.len() / 2) as u64;
+                    let skip = self.seek_skip_frames.min(self.pending.len() / 2);
+                    self.seek_skip_frames -= skip;
+                    self.pending.drain(..skip * 2);
+                    let take = self.pending.len().min(max_frames * 2 - out.len());
+                    out.extend_from_slice(&self.pending[..take]);
+                    self.pending_cursor = take;
+                }
+                break;
             };
             if packet.track_id != self.track_id {
                 continue;
@@ -562,37 +690,141 @@ impl SymphoniaDecoder {
                     continue;
                 }
                 Err(e) => {
-                    log::debug!("decode: {e}");
-                    break;
+                    return Err(DecodeError(format!("decode: {e}")));
                 }
             };
 
             interleaved.clear();
             copy_interleaved_f32(&decoded, &mut interleaved);
+            for s in &mut interleaved {
+                if !s.is_finite() {
+                    *s = 0.0;
+                    self.sanitized_samples += 1;
+                }
+            }
+            let spec = decoded.spec();
+            if spec.rate() != self.sample_rate || spec.channels() != &self.expected_layout {
+                return Err(DecodeError(format!(
+                    "decoded format changed: {} Hz / {:?}, expected {} Hz / {:?}",
+                    spec.rate(),
+                    spec.channels(),
+                    self.sample_rate,
+                    self.expected_layout
+                )));
+            }
+            let layout = spec.channels().clone();
             let frames = decoded.frames();
-            self.decoded_frames += frames as u64;
 
-            let ch = self.channels.max(1);
-            let mut i = 0;
-            while i < interleaved.len() && out.len() < max_frames * 2 {
-                let l = interleaved[i];
-                let r = if ch >= 2 {
-                    interleaved.get(i + 1).copied().unwrap_or(l)
-                } else {
-                    l
-                };
-                out.push(l);
-                out.push(r);
-                i += ch;
+            // Every pending buffer has the same stereo layout as the caller.
+            // Keeping raw mono/surround leftovers here changes both channel
+            // order and duration on the next read.
+            self.pending = downmix_stereo(&interleaved, &layout)?;
+            let priming = self.priming_remaining.min(frames);
+            self.priming_remaining -= priming;
+            self.pending.drain(..priming * 2);
+            if let Some(valid) = self.valid_frames {
+                self.pending
+                    .truncate(valid.saturating_sub(self.decoded_frames) as usize * 2);
             }
-            if i < interleaved.len() {
-                self.pending.clear();
-                self.pending.extend_from_slice(&interleaved[i..]);
-                self.pending_cursor = 0;
-            }
+            self.decoded_frames += (self.pending.len() / 2) as u64;
+
+            let skip = self.seek_skip_frames.min(self.pending.len() / 2);
+            self.seek_skip_frames -= skip;
+            self.pending.drain(..skip * 2);
+            let take = self.pending.len().min(max_frames * 2 - out.len());
+            out.extend_from_slice(&self.pending[..take]);
+            self.pending_cursor = take;
         }
         Ok(out)
     }
+}
+
+/// Normalized Lo/Ro fold: fronts at unity, centre and surround at -3 dB.
+/// LFE is omitted (it is an effects channel, not a full-range bass channel).
+/// Dividing by each row's absolute coefficient sum prevents correlated
+/// surround channels from overflowing, without clipping the float signal.
+fn downmix_stereo(input: &[f32], layout: &Channels) -> Result<Vec<f32>, DecodeError> {
+    let channels = layout.count();
+    if channels == 0 || input.len() % channels != 0 {
+        return Err(DecodeError("invalid decoded channel layout".into()));
+    }
+    if channels == 2
+        && (matches!(layout, Channels::Discrete(2))
+            || matches!(layout, Channels::Positioned(p) if *p == (Position::FRONT_LEFT | Position::FRONT_RIGHT)))
+    {
+        return Ok(input.to_vec());
+    }
+    if channels == 1 {
+        return Ok(input.iter().flat_map(|s| [*s, *s]).collect());
+    }
+    let Channels::Positioned(positions) = layout else {
+        return Err(DecodeError(
+            "surround downmix requires positioned channels".into(),
+        ));
+    };
+    let q = std::f32::consts::FRAC_1_SQRT_2;
+    let left = Position::REAR_LEFT
+        | Position::SIDE_LEFT
+        | Position::FRONT_LEFT_CENTER
+        | Position::TOP_FRONT_LEFT
+        | Position::TOP_REAR_LEFT
+        | Position::TOP_SIDE_LEFT
+        | Position::BOTTOM_FRONT_LEFT
+        | Position::FRONT_LEFT_WIDE;
+    let right = Position::REAR_RIGHT
+        | Position::SIDE_RIGHT
+        | Position::FRONT_RIGHT_CENTER
+        | Position::TOP_FRONT_RIGHT
+        | Position::TOP_REAR_RIGHT
+        | Position::TOP_SIDE_RIGHT
+        | Position::BOTTOM_FRONT_RIGHT
+        | Position::FRONT_RIGHT_WIDE;
+    let center = Position::FRONT_CENTER
+        | Position::REAR_CENTER
+        | Position::TOP_CENTER
+        | Position::TOP_FRONT_CENTER
+        | Position::TOP_REAR_CENTER
+        | Position::BOTTOM_FRONT_CENTER;
+    let weights: Vec<(f32, f32)> = positions
+        .iter()
+        .map(|p| {
+            Ok(if p == Position::FRONT_LEFT {
+                (1.0, 0.0)
+            } else if p == Position::FRONT_RIGHT {
+                (0.0, 1.0)
+            } else if left.contains(p) {
+                (q, 0.0)
+            } else if right.contains(p) {
+                (0.0, q)
+            } else if p == Position::LFE1 || p == Position::LFE2 {
+                (0.0, 0.0)
+            } else if center.contains(p) {
+                (q, q)
+            } else {
+                return Err(DecodeError(format!("unsupported channel position: {p:?}")));
+            })
+        })
+        .collect::<Result<_, DecodeError>>()?;
+    let norm_l = weights.iter().map(|w| w.0).sum::<f32>().max(1.0);
+    let norm_r = weights.iter().map(|w| w.1).sum::<f32>().max(1.0);
+    Ok(input
+        .chunks_exact(channels)
+        .flat_map(|frame| {
+            let l = frame
+                .iter()
+                .zip(&weights)
+                .map(|(s, w)| s * w.0)
+                .sum::<f32>()
+                / norm_l;
+            let r = frame
+                .iter()
+                .zip(&weights)
+                .map(|(s, w)| s * w.1)
+                .sum::<f32>()
+                / norm_r;
+            [l, r]
+        })
+        .collect())
 }
 
 fn copy_interleaved_f32(buffer: &GenericAudioBufferRef<'_>, dst: &mut Vec<f32>) {
@@ -1103,6 +1335,41 @@ mod tests {
     use super::*;
 
     #[test]
+    fn positioned_wide_and_height_channels_keep_their_side() {
+        let positions = Position::FRONT_LEFT
+            | Position::FRONT_RIGHT
+            | Position::FRONT_CENTER
+            | Position::LFE1
+            | Position::FRONT_LEFT_CENTER
+            | Position::FRONT_RIGHT_CENTER
+            | Position::TOP_REAR_RIGHT;
+        let layout = Channels::from(positions);
+        for (i, p) in positions.iter().enumerate() {
+            let mut frame = vec![0.0; layout.count()];
+            frame[i] = 1.0;
+            let stereo = downmix_stereo(&frame, &layout).unwrap();
+            if p == Position::FRONT_LEFT_CENTER {
+                assert!(stereo[0] > 0.0);
+                assert_eq!(stereo[1], 0.0);
+            }
+            if p == Position::FRONT_RIGHT_CENTER || p == Position::TOP_REAR_RIGHT {
+                assert_eq!(stereo[0], 0.0);
+                assert!(stereo[1] > 0.0);
+            }
+            if p == Position::LFE1 {
+                assert_eq!(stereo, [0.0, 0.0]);
+            }
+        }
+        let center_lfe = Channels::from(Position::FRONT_CENTER | Position::LFE1);
+        assert_eq!(
+            downmix_stereo(&[0.0, 1.0], &center_lfe).unwrap(),
+            [0.0, 0.0]
+        );
+        let unity = downmix_stereo(&vec![1.0; layout.count()], &layout).unwrap();
+        assert!(unity.iter().all(|v| (*v - 1.0).abs() < 1e-7));
+    }
+
+    #[test]
     fn source_kind_parse() {
         assert!(matches!(
             SourceKind::parse("https://example.com/a.webm"),
@@ -1196,11 +1463,11 @@ mod tests {
     }
 
     #[test]
-    fn long_itag18_extra_is_he_aac() {
-        // 25-byte esds: LC core plus SBR extension (the "aac too complex" path).
+    fn long_lc_config_does_not_imply_sbr() {
+        // Extra configuration bytes alone do not establish an SBR profile.
         let mut extra = lc_stereo_asc(22_050).to_vec();
         extra.extend_from_slice(&[0u8; 23]);
-        assert!(is_he_aac_config(&extra));
+        assert!(!is_he_aac_config(&extra));
     }
 
     #[test]
@@ -1237,5 +1504,83 @@ mod tests {
         };
         assert_eq!(buf.cursor(), Some(500));
         assert_eq!(buf.loaded(), 524);
+    }
+    #[test]
+    fn pcm_layout_and_pull_size_are_independent() {
+        use std::io::Write;
+        for channels in [1u16, 2, 6] {
+            let path = std::env::temp_dir().join(format!(
+                "bitchord-layout-{}-{channels}.wav",
+                std::process::id()
+            ));
+            let frames = 4097usize;
+            let bytes = (frames * channels as usize * 2) as u32;
+            let mut wav = Vec::new();
+            wav.extend(b"RIFF");
+            wav.extend((60 + bytes).to_le_bytes());
+            wav.extend(b"WAVEfmt ");
+            wav.extend(40u32.to_le_bytes());
+            wav.extend(0xfffeu16.to_le_bytes());
+            wav.extend(channels.to_le_bytes());
+            wav.extend(48000u32.to_le_bytes());
+            wav.extend((48000 * channels as u32 * 2).to_le_bytes());
+            wav.extend((channels * 2).to_le_bytes());
+            wav.extend(16u16.to_le_bytes());
+            wav.extend(22u16.to_le_bytes());
+            wav.extend(16u16.to_le_bytes());
+            let mask = match channels {
+                1 => 4u32,
+                2 => 3,
+                _ => 0x3f,
+            };
+            wav.extend(mask.to_le_bytes());
+            wav.extend([1, 0, 0, 0, 0, 0, 16, 0, 128, 0, 0, 170, 0, 56, 155, 113]);
+            wav.extend(b"data");
+            wav.extend(bytes.to_le_bytes());
+            for i in 0..frames {
+                for ch in 0..channels {
+                    wav.extend(
+                        (((i * 17 + ch as usize * 301) % 24000) as i16 - 12000).to_le_bytes(),
+                    );
+                }
+            }
+            std::fs::File::create(&path)
+                .unwrap()
+                .write_all(&wav)
+                .unwrap();
+            let render = |chunk| {
+                let mut d = SymphoniaDecoder::open(
+                    &SourceKind::Path(path.to_string_lossy().into()),
+                    &Default::default(),
+                )
+                .unwrap();
+                let mut x = Vec::new();
+                loop {
+                    let b = d.read_stereo(chunk).unwrap();
+                    if b.is_empty() {
+                        break;
+                    }
+                    x.extend(b);
+                }
+                x
+            };
+            let large = render(8192);
+            assert_eq!(large.len(), frames * 2, "{channels} channels");
+            for chunk in [1, 7, 512, 1023, 4096] {
+                assert_eq!(render(chunk), large, "{channels} channels, chunk {chunk}");
+            }
+            if channels == 1 {
+                assert!(large.chunks_exact(2).all(|p| p[0] == p[1]));
+            }
+            let mut seeked = SymphoniaDecoder::open(
+                &SourceKind::Path(path.to_string_lossy().into()),
+                &Default::default(),
+            )
+            .unwrap();
+            seeked.seek_seconds(1237.0 / 48000.0).unwrap();
+            assert_eq!(seeked.read_stereo(100).unwrap(), large[1237 * 2..1337 * 2]);
+
+            std::fs::remove_file(path).unwrap();
+        }
     }
 }
