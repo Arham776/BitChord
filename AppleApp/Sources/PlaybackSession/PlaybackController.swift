@@ -2053,7 +2053,7 @@ final class PlaybackController {
     }
 
     private static func resolveSource(_ entry: QueueEntry, prefs: ResolvePrefs) async throws -> ResolveOutcome {
-        if let asset = await DownloadStore.shared.asset(for: entry) {
+        if let asset = DownloadStore.shared.asset(for: entry) {
             return ResolveOutcome(source: ResolvedSource(source: asset.path, headers: [:], kbps: asset.kbps,
                 lossless: asset.lossless, origin: .local, youtubeVideoId: asset.youtubeVideoId), leftover: nil)
         }

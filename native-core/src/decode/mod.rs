@@ -517,10 +517,15 @@ impl SymphoniaDecoder {
         self.decoded_frames
     }
 
-    /// Source-domain position in seconds.
+    /// Source-domain position of the next frame returned to the caller.
+    /// A compressed seek keeps decoder preroll pending until the first read,
+    /// but those discarded frames must not move the playback position back.
     pub fn position_seconds(&self) -> f64 {
         let pending = (self.pending.len().saturating_sub(self.pending_cursor) / 2) as u64;
-        self.decoded_frames.saturating_sub(pending) as f64 / self.sample_rate as f64
+        self.decoded_frames
+            .saturating_sub(pending)
+            .saturating_add(self.seek_skip_frames as u64) as f64
+            / self.sample_rate as f64
     }
     pub fn sanitized_samples(&self) -> u64 {
         self.sanitized_samples
@@ -1333,6 +1338,40 @@ impl Drop for HttpMediaSource {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn compressed_seek_reports_the_next_audible_frame_before_preroll_is_read() {
+        let source = SourceKind::parse(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/seek-tone.m4a"
+        ));
+        let mut decoder = SymphoniaDecoder::open(&source, &Default::default()).unwrap();
+        let mut reference = SymphoniaDecoder::open(&source, &Default::default()).unwrap();
+        let baseline = reference.read_stereo(44100 * 3).unwrap();
+        for target in [0.19, 0.190001, 1.337] {
+            decoder.seek_seconds(target).unwrap();
+            let rounded =
+                (target * decoder.sample_rate() as f64).round() / decoder.sample_rate() as f64;
+            assert!(
+                (decoder.position_seconds() - rounded).abs() < 1e-9,
+                "pending preroll must not expose an earlier playback position"
+            );
+            let samples = decoder.read_stereo(17).unwrap();
+            assert_eq!(samples.len(), 34);
+            let start = (target * decoder.sample_rate() as f64).round() as usize * 2;
+            assert!(
+                samples
+                    .iter()
+                    .zip(&baseline[start..start + 34])
+                    .all(|(a, b)| (a - b).abs() < 1e-6),
+                "seek must still decode preroll and return the requested PCM"
+            );
+            assert!(
+                (decoder.position_seconds() - rounded - 17.0 / decoder.sample_rate() as f64).abs()
+                    < 1e-9
+            );
+        }
+    }
 
     #[test]
     fn positioned_wide_and_height_channels_keep_their_side() {

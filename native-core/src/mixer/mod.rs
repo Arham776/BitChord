@@ -1061,6 +1061,10 @@ impl Voice {
         while out.len() < want && !self.finished {
             let at = self.decoder.position_seconds();
             if self.head_trim_allowed && at < self.regions.audible_start_seconds {
+                // Seek once, then let read_stereo consume compressed preroll.
+                // Repeating a seek before reading can never advance the codec
+                // and can also loop on a boundary between source samples.
+                self.head_trim_allowed = false;
                 if self
                     .decoder
                     .seek_seconds(self.regions.next_allowed(at))
@@ -1069,7 +1073,6 @@ impl Voice {
                     self.reset_processing();
                     continue;
                 }
-                self.head_trim_allowed = false;
             }
             let end = self
                 .regions
@@ -5928,6 +5931,73 @@ mod tests {
             source
         ));
         std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn aac_region_cuts_advance_without_reseeking_preroll() {
+        let (done, result) = crossbeam_channel::bounded(1);
+        std::thread::spawn(move || {
+            let fixture = include_bytes!("../../tests/fixtures/seek-tone.m4a");
+            for late in [false, true] {
+                let path = std::env::temp_dir().join(format!(
+                    "bitchord-aac-regions-{}-{late}.m4a",
+                    std::process::id()
+                ));
+                std::fs::write(&path, fixture).unwrap();
+                let source = path.to_string_lossy().to_string();
+                let regions = crate::PlaybackRegions {
+                    // Deliberately between source samples.
+                    audible_start_seconds: 0.190001,
+                    excluded: vec![crate::PlaybackInterval {
+                        start_seconds: 1.0,
+                        end_seconds: 1.5,
+                    }],
+                    ..Default::default()
+                };
+                if !late {
+                    crate::playback_regions::put(source.clone(), regions.clone());
+                }
+                let request = TrackSource {
+                    source: source.clone(),
+                    title: "AAC fixture".into(),
+                    artist: "".into(),
+                    start_seconds: 0.0,
+                    plan: TransitionPlan::default(),
+                    headers: Default::default(),
+                    claimed_kbps: 0,
+                    loudness_db: None,
+                    duration_seconds: 3.0,
+                };
+                let mut voice = Voice::open(&request, false, 0.0, 48000, 1.0, false, true).unwrap();
+                if late {
+                    voice.regions = regions;
+                    voice.skipped_regions = vec![false];
+                }
+                let mut frames = 0;
+                let mut peak = 0.0_f32;
+                for _ in 0..200 {
+                    let pcm = voice.pull(1024, 48000);
+                    frames += pcm.len() / 2;
+                    peak = pcm.iter().fold(peak, |a, b| a.max(b.abs()));
+                    if voice.finished && voice.pending_dev_cursor == voice.pending_dev.len() {
+                        break;
+                    }
+                }
+                assert!(voice.finished, "AAC voice must complete");
+                assert!(peak > 0.1, "AAC voice must produce audible PCM");
+                assert!(
+                    (frames as f64 / 48000.0 - 2.309999).abs() < 0.03,
+                    "trim and skip must retain exact source timing: {frames} frames"
+                );
+                assert!(voice.skipped_regions[0]);
+                drop(voice);
+                std::fs::remove_file(path).unwrap();
+            }
+            done.send(()).unwrap();
+        });
+        result
+            .recv_timeout(Duration::from_secs(3))
+            .expect("AAC boundary seek stalled the mixer");
     }
 
     #[test]

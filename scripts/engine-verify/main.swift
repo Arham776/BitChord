@@ -394,5 +394,41 @@ do {
     check("transport regression checks complete", false, "\(error)")
 }
 
+// AAC preroll must not trap the mixer in a repeated edge-trim seek. Exercise
+// cached and late regions through FFI, the render thread and the real callback.
+do {
+    let fixture = URL(fileURLWithPath: #filePath)
+        .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+        .appendingPathComponent("native-core/tests/fixtures/seek-tone.m4a")
+    for late in [false, true] {
+        try engine.pause()
+        let source = tmp + "/aac-regions-\(late).m4a"
+        try Data(contentsOf: fixture).write(to: URL(fileURLWithPath: source))
+        let regions = PlaybackRegions(audibleStartSeconds: 0.190001, audibleEndSeconds: nil,
+            excluded: [PlaybackInterval(startSeconds: 1, endSeconds: 1.5)])
+        if !late { try engine.setPlaybackRegions(source: source, regions: regions) }
+        _ = try engine.loadTrackPaused(request: LoadRequest(
+            source: source, title: "AAC regions", artist: "harness", startSeconds: 0,
+            plan: nil, headers: nil, claimedKbps: 64, loudnessDb: nil, durationSeconds: 3))
+        if late { try engine.setPlaybackRegions(source: source, regions: regions) }
+        try engine.play()
+        let deadline = Date().addingTimeInterval(2)
+        while engine.outputHealth().outputPeak == 0, Date() < deadline {
+            Thread.sleep(forTimeInterval: 0.02)
+        }
+        check("AAC \(late ? "late" : "cached") trim reaches real output",
+              engine.outputHealth().outputPeak > 0)
+        let before = engine.positionSeconds()
+        let after = readPosition(after: engine, 0.3)
+        check("AAC \(late ? "late" : "cached") trim advances the playhead", after > before + 0.15)
+        try engine.prepareTrackOutput(sourceRate: 48_000, sourceChannels: 2, sourceBitDepth: 0,
+            codec: "AAC", losslessPcm: false, matchSourceRate: true,
+            sessionRate: nil, sessionChannels: nil)
+        check("AAC \(late ? "late" : "cached") mixer acknowledges output preparation", true)
+    }
+} catch {
+    check("AAC region output regression checks complete", false, "\(error)")
+}
+
 print(failures == 0 ? "\nall \(checks) checks passed" : "\n\(failures) of \(checks) checks FAILED")
 exit(failures == 0 ? 0 : 1)

@@ -1111,13 +1111,11 @@ struct NowPlayingView: View {
             pillDivider
 
             // AutoMix is the fourth and last slot, at the right end of the pill.
-            // Deliberately a waveform rather than another infinity: AutoPlay and
-            // AutoMix are separate switches and must not read as the same one.
             Button {
                 Haptics.play(controller.automixEnabled ? .toggleOff : .toggleOn)
                 controller.toggleAutomix()
             } label: {
-                Image(systemName: "waveform")
+                Image(.bchVinylRecord)
                     .resizable().scaledToFit()
                     .frame(width: 22, height: 22)
                     .foregroundStyle(.white.opacity(controller.automixEnabled ? 1 : 0.75))
