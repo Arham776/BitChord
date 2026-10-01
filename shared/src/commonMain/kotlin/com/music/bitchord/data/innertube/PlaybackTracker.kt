@@ -28,6 +28,7 @@ object PlaybackTracker {
 
     private class Session(
         val videoId: String,
+        val generation: Long,
         val cpn: String,
         val tracking: Innertube.PlaybackTracking,
     ) {
@@ -45,16 +46,22 @@ object PlaybackTracker {
     @Volatile
     private var opening: String? = null
 
+    fun onSessionChanged() {
+        opening = null
+        session = null // Never flush an old tracking URL under the next account.
+    }
+
     fun onPlaying(videoId: String) {
         if (!VIDEO_ID.matches(videoId)) return
         if (Innertube.cookie == null) return
         if (session?.videoId == videoId || opening == videoId) return
         opening = videoId
+        val generation = Innertube.sessionGeneration
         scope.launch {
             try {
-                openWithRetries(videoId)
+                openWithRetries(videoId, generation)
             } finally {
-                if (opening == videoId) opening = null
+                if (opening == videoId && Innertube.sessionGeneration == generation) opening = null
             }
         }
     }
@@ -69,13 +76,13 @@ object PlaybackTracker {
 
     fun onProgress(videoId: String, positionSeconds: Long) {
         val current = session ?: return
-        if (current.videoId != videoId) return
+        if (current.videoId != videoId || current.generation != Innertube.sessionGeneration) return
         if (!current.atrSent && positionSeconds >= current.tracking.atrAfterSeconds) {
             current.atrSent = true
             val atrUrl = current.tracking.atrUrl
             if (atrUrl != null) {
                 scope.launch {
-                    runCatching { Innertube.pingAtr(atrUrl, current.cpn) }
+                    runCatching { Innertube.pingAtr(atrUrl, current.cpn, current.generation) }
                 }
             }
         }
@@ -97,11 +104,11 @@ object PlaybackTracker {
         }
     }
 
-    private suspend fun openWithRetries(videoId: String) {
+    private suspend fun openWithRetries(videoId: String, generation: Long) {
         repeat(OPEN_ATTEMPTS) { attempt ->
-            if (opening != videoId) return
+            if (opening != videoId || Innertube.sessionGeneration != generation) return
             val settled = try {
-                open(videoId)
+                open(videoId, generation)
             } catch (e: CancellationException) {
                 throw e
             } catch (_: Throwable) {
@@ -112,13 +119,16 @@ object PlaybackTracker {
         }
     }
 
-    private suspend fun open(videoId: String): Boolean = lock.withLock {
+    private suspend fun open(videoId: String, generation: Long): Boolean = lock.withLock {
+        Innertube.checkSession(generation)
         val signatureTimestamp = CipherUnlock.signatureTimestamp()
         if (signatureTimestamp == null) return@withLock false
         val tracking = Innertube.playbackTracking(videoId, signatureTimestamp)
             ?: return@withLock false
-        val fresh = Session(videoId, Innertube.newCpn(), tracking)
-        Innertube.pingPlayback(tracking.playbackUrl, fresh.cpn)
+        Innertube.checkSession(generation)
+        val fresh = Session(videoId, generation, Innertube.newCpn(), tracking)
+        Innertube.pingPlayback(tracking.playbackUrl, fresh.cpn, generation)
+        Innertube.checkSession(generation)
         session = fresh
         true
     }
@@ -128,7 +138,7 @@ object PlaybackTracker {
         if (!final && positionSeconds <= target.reportedSeconds) return
         target.flushingTo = maxOf(target.flushingTo, positionSeconds)
         lock.withLock {
-            Innertube.pingWatchtime(url, target.cpn, positionSeconds, final)
+            Innertube.pingWatchtime(url, target.cpn, positionSeconds, final, target.generation)
             target.reportedSeconds = maxOf(target.reportedSeconds, positionSeconds)
         }
     }

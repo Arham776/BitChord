@@ -67,7 +67,7 @@ if secrets.usingKeychain {
     print("  · credentials in the Keychain, as the app stores them")
 } else {
     print("  · NOTE: this binary is not entitled for the data-protection keychain, so the")
-    print("    store\'s logic is checked against a UserDefaults-backed substitute. That is a")
+    print("    store\'s logic is checked against a isolated in-memory substitute. That is a")
     print("    property of an unentitled harness, not of the app — see HarnessSecretStore.")
     check("a probe value survives the secret store", {
         secrets.put(key: "harness.roundtrip", value: "x")
@@ -219,35 +219,15 @@ exit(failures == 0 ? 0 : 1)
 /// unsupported. `SecItemAdd` returns `errSecParam` there and `put` discards the
 /// status, so every write vanishes and the store looks broken when nothing is.
 ///
-/// So the backing store is probed first and, when the Keychain cannot be used,
-/// substituted — with the substitution said out loud. The alternative is
+/// So the backing store is always isolated and substituted — with the substitution said out loud. The alternative is
 /// reporting a failure that is a property of the harness, or (worse) a pass that
 /// came from not checking. What is under test here is the store\'s logic: the id
 /// chains, the ordering, the selection, and the identity the requests end up
 /// carrying. The Keychain\'s own three lines are the app\'s, exercised by the app.
 final class HarnessSecretStore: SecretStoreBridgeImpl {
-    private let keychainUsable: Bool
-    private let fallbackKey = "harness.account_sessions"
-
-    init() {
-        Keychain.put("harness.probe", "x")
-        keychainUsable = Keychain.get("harness.probe") == "x"
-        Keychain.clear("harness.probe")
-    }
-
-    var usingKeychain: Bool { keychainUsable }
-
-    func get(key: String) -> String? {
-        keychainUsable ? Keychain.get(key) : UserDefaults.standard.string(forKey: fallbackKey)
-    }
-
-    func put(key: String, value: String?) {
-        if keychainUsable {
-            Keychain.put(key, value)
-        } else if let value {
-            UserDefaults.standard.set(value, forKey: fallbackKey)
-        } else {
-            UserDefaults.standard.removeObject(forKey: fallbackKey)
-        }
-    }
+    // Synthetic requests must never read, delete, or replace a real account.
+    private var values: [String: String] = [:]
+    var usingKeychain: Bool { false }
+    func get(key: String) -> String? { values[key] }
+    func put(key: String, value: String?) { values[key] = value }
 }

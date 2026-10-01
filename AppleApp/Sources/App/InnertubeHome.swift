@@ -4,7 +4,7 @@ import BitChordShared
 /// One shelf of the signed-out Home/Explore feeds, decoded from the shared
 /// module's serialized `HomeFeed` (the bridge crosses FFI as JSON, same
 /// contract as search).
-struct FeedShelf: Decodable, Identifiable {
+struct FeedShelf: Codable, Identifiable {
     let title: String
     let items: [ShelfCard]
     let subtitle: String?
@@ -38,7 +38,7 @@ struct YouTubeSong: Codable, Identifiable, Hashable {
 }
 
 /// A shelf card: a track (videoId) or an album/playlist/artist (browseId).
-struct ShelfCard: Decodable, Identifiable, Hashable {
+struct ShelfCard: Codable, Identifiable, Hashable {
     let title: String
     let subtitle: String?
     let thumbnailUrl: String?
@@ -61,7 +61,7 @@ struct ShelfCard: Decodable, Identifiable, Hashable {
     }
 }
 
-private struct FeedPage: Decodable {
+private struct FeedPage: Codable {
     let shelves: [FeedShelf]
     let continuation: String?
 }
@@ -70,7 +70,7 @@ private struct FeedPage: Decodable {
 
 /// Swift bridge over the shared module's Home/Explore/library feeds
 /// (upstream's `YtMusicRepository` browse pairing).
-struct FeedResult {
+struct FeedResult: Codable, Sendable {
     let shelves: [FeedShelf]
     let continuation: String?
 }
@@ -78,7 +78,7 @@ struct FeedResult {
 /// A grid of mood/genre buttons, as YouTube Music groups them. Decoded from the
 /// shared module's serialized `MoodGenreSection` list, same JSON contract as
 /// every other bridge here.
-struct MoodGenreSection: Decodable, Identifiable {
+struct MoodGenreSection: Codable, Identifiable {
     let title: String
     /// Not a `let`, for the same reason [MoodGenre.thumbnailUrl] is not: the
     /// grid is published again as each section's covers arrive.
@@ -91,7 +91,7 @@ struct MoodGenreSection: Decodable, Identifiable {
 /// without its own params answers with a different, generic page rather than an
 /// error, so a lost `params` looks like a working feature returning the wrong
 /// thing.
-struct MoodGenre: Decodable, Identifiable, Hashable {
+struct MoodGenre: Codable, Identifiable, Hashable {
     let title: String
     let browseId: String
     let params: String?
@@ -104,6 +104,23 @@ struct MoodGenre: Decodable, Identifiable, Hashable {
 
 final class InnertubeFeed: Sendable {
     static let shared = InnertubeFeed()
+
+    func progressive(home: Bool) -> AsyncThrowingStream<FeedResult, Error> {
+        AsyncThrowingStream { stream in
+            let callback = ProgressiveFeedAdapter { payload, complete, message in
+                if let payload {
+                    do {
+                        let result = try JSONDecoder().decode(FeedResult.self, from: Data(payload.utf8))
+                        stream.yield(result)
+                        if complete { stream.finish() }
+                    } catch { stream.finish(throwing: error) }
+                } else if complete { stream.finish(throwing: FeedError(message: message ?? "Feed unavailable")) }
+            }
+            let requestId = home ? HomeBridge.shared.homeProgressive(callback: callback)
+                : HomeBridge.shared.exploreProgressive(callback: callback)
+            stream.onTermination = { _ in HomeBridge.shared.cancelFeed(requestId: requestId) }
+        }
+    }
 
     func home() async throws -> FeedResult {
         try await fetch { HomeBridge.shared.home(callback: $0) }
@@ -122,7 +139,12 @@ final class InnertubeFeed: Sendable {
     }
 
     /// The mood and genre categories behind Explore.
-    func moodAndGenres() async throws -> [MoodGenreSection] {
+    @MainActor
+    func moodAndGenres(force: Bool = false) async throws -> [MoodGenreSection] {
+        try await CachedPages.load("moodAndGenres", force: force) { try await self.raw_moodAndGenres() }
+    }
+
+    private func raw_moodAndGenres() async throws -> [MoodGenreSection] {
         try await withCheckedThrowingContinuation { continuation in
             HomeBridge.shared.moodAndGenres(callback: MoodCallbackAdapter { json, message in
                 guard let json else {
@@ -143,26 +165,29 @@ final class InnertubeFeed: Sendable {
     }
 
     /// One category's playlist shelves.
-    func moodGenreShelves(browseId: String, params: String?) async throws -> [FeedShelf] {
-        try await fetch {
-            HomeBridge.shared.moodGenreShelves(browseId: browseId, params: params, callback: $0)
-        }.shelves
+    @MainActor
+    func moodGenreShelves(browseId: String, params: String?, force: Bool = false) async throws -> [FeedShelf] {
+        try await CachedPages.load("mood:\(browseId):\(params ?? "")", force: force) {
+            try await self.fetch {
+                HomeBridge.shared.moodGenreShelves(browseId: browseId, params: params, callback: $0)
+            }.shelves
+        }
     }
 
     /// A category's tile artwork — the first real cover from the playlists it
     /// opens, fetched after the grid has painted.
+    @MainActor
     func moodGenreArtwork(browseId: String, params: String?) async -> String? {
-        await withCheckedContinuation { continuation in
-            HomeBridge.shared.moodGenreArtwork(
-                browseId: browseId, params: params,
-                callback: ArtworkCallbackAdapter { url, _ in
-                    continuation.resume(returning: url)
-                }
-            )
-        }
+        guard let shelves = try? await moodGenreShelves(browseId: browseId, params: params) else { return nil }
+        return shelves.lazy.flatMap(\.items).compactMap(\.thumbnailUrl).first
     }
 
-    func history() async throws -> [YouTubeSong] {
+    @MainActor
+    func history(force: Bool = false) async throws -> [YouTubeSong] {
+        try await CachedPages.load("history", force: force) { try await self.raw_history() }
+    }
+
+    private func raw_history() async throws -> [YouTubeSong] {
         try await withCheckedThrowingContinuation { continuation in
             HomeBridge.shared.history(callback: FeedCallbackAdapter { json, message in
                 if let json {
@@ -179,7 +204,12 @@ final class InnertubeFeed: Sendable {
         }
     }
 
-    func library() async throws -> [FeedShelf] {
+    @MainActor
+    func library(force: Bool = false) async throws -> [FeedShelf] {
+        try await CachedPages.load("library", force: force) { try await self.raw_library() }
+    }
+
+    private func raw_library() async throws -> [FeedShelf] {
         try await withCheckedThrowingContinuation { continuation in
             LibraryBridge.shared.library(callback: LibraryFeedAdapter { json, message in
                 if let json {
@@ -199,7 +229,12 @@ final class InnertubeFeed: Sendable {
     /// Songs explicitly added to the library (`FEmusic_liked_videos`) —
     /// distinct from Liked Music, which is a rating. Same `[YouTubeSong]`
     /// contract as `history()`.
-    func librarySongs() async throws -> [YouTubeSong] {
+    @MainActor
+    func librarySongs(force: Bool = false) async throws -> [YouTubeSong] {
+        try await CachedPages.load("librarySongs", force: force) { try await self.raw_librarySongs() }
+    }
+
+    private func raw_librarySongs() async throws -> [YouTubeSong] {
         try await withCheckedThrowingContinuation { continuation in
             LibraryBridge.shared.librarySongs(callback: LibraryFeedAdapter { json, message in
                 if let json {
@@ -264,4 +299,10 @@ private final class LibraryFeedAdapter: LibraryBridgeFeedCallback {
     private let onResult: (String?, String?) -> Void
     init(onResult: @escaping (String?, String?) -> Void) { self.onResult = onResult }
     func onResult(json: String?, message: String?) { onResult(json, message) }
+}
+
+private final class ProgressiveFeedAdapter: HomeBridgeProgressiveCallback {
+    let result: (String?, Bool, String?) -> Void
+    init(_ result: @escaping (String?, Bool, String?) -> Void) { self.result = result }
+    func onResult(json: String?, complete: Bool, message: String?) { result(json, complete, message) }
 }

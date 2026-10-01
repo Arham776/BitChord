@@ -1,257 +1,88 @@
 import Foundation
-import JavaScriptCore
 import BitChordShared
 
-/// YouTube player-JS: signatureTimestamp, signatureCipher unlock, and `n`-param
-/// transform. Mirrors NewPipe YoutubeSignatureUtils via JSContext.
+/// Player timestamp and both media-URL transforms, using one deployment of the
+/// player script and a pinned, bundled solver. Work stays off the main actor.
 actor YouTubePlayerJs {
     static let shared = YouTubePlayerJs()
-
+    private let solverDirectory: URL?
+    private var solver: YouTubeChallengeSolver?
     private var baseJsUrl: String?
     private var baseJsText: String?
+    private var baseJsTask: Task<String, Error>?
     private var cachedSts: Int?
-    private var deobfuscationScript: String?
+
+    init(solverDirectory: URL? = Bundle.main.resourceURL?.appendingPathComponent("YouTubeSolver"), playerText: String? = nil) {
+        self.solverDirectory = solverDirectory
+        self.baseJsText = playerText
+    }
 
     func signatureTimestamp() async throws -> Int {
         if let cachedSts { return cachedSts }
         let js = try await baseJs()
-        guard let match = js.range(of: #"signatureTimestamp[=:](\d+)"#, options: .regularExpression) else {
+        let regex = try NSRegularExpression(pattern: #"(?:signatureTimestamp|sts)\s*[:=]\s*(\d{5})"#)
+        guard let match = regex.firstMatch(in: js, range: NSRange(js.startIndex..., in: js)),
+              let range = Range(match.range(at: 1), in: js), let sts = Int(js[range]) else {
             throw PlayerJsError("signatureTimestamp not found in base.js")
         }
-        let digits = String(js[match]).filter(\.isNumber)
-        guard let sts = Int(digits) else { throw PlayerJsError("bad sts") }
         cachedSts = sts
-        print("[PlayerJs] signatureTimestamp=\(sts)")
         return sts
     }
 
-    /// Unlock `signatureCipher` → playable URL, then transform `n` if present.
     func unlockCipher(_ cipher: String, videoId: String) async throws -> String {
         let params = Self.parseQuery(cipher)
-        guard let base = params["url"], let signature = params["s"] else {
+        guard let base = params["url"], let signature = params["s"],
+              var components = URLComponents(string: base) else {
             throw PlayerJsError("signatureCipher missing url/s")
         }
-        let into = params["sp"] ?? "signature"
-        let solved = try await deobfuscateSignature(signature)
-        let sep = base.contains("?") ? "&" : "?"
-        let withSig = "\(base)\(sep)\(into)=\(Self.percentEncode(solved))"
-        return await deobfuscateN(url: withSig, videoId: videoId)
+        let solved = try await solve("sig", challenge: signature)
+        let key = params["sp"] ?? "signature"
+        Self.setQueryValue(solved, for: key, in: &components)
+        guard let url = components.url?.absoluteString else { throw PlayerJsError("Invalid media URL") }
+        return try await transformUrl(url)
     }
 
-    func deobfuscateN(url: String, videoId: String) async -> String {
-        guard var comps = URLComponents(string: url),
-              let items = comps.queryItems,
-              let nItem = items.first(where: { $0.name == "n" }),
-              let nValue = nItem.value, !nValue.isEmpty
-        else { return url }
-
-        do {
-            let js = try await baseJs()
-            let funcName = try extractNFunctionName(js: js)
-            let transformed = try runNamedFunction(js: js, funcName: funcName, arg: nValue)
-            comps.queryItems = items.map {
-                $0.name == "n" ? URLQueryItem(name: "n", value: transformed) : $0
-            }
-            let out = comps.url?.absoluteString ?? url
-            if out != url {
-                print("[PlayerJs] n \(nValue.prefix(8))… -> \(transformed.prefix(8))… for \(videoId)")
-            }
-            return out
-        } catch {
-            print("[PlayerJs] n-param failed for \(videoId): \(error)")
-            return url
-        }
-    }
-
-    // MARK: - Signature
-
-    private func deobfuscateSignature(_ signature: String) async throws -> String {
-        let script = try await deobfuscationCode()
-        let ctx = JSContext()!
-        ctx.exceptionHandler = { _, exc in
-            print("[PlayerJs] JS exception: \(exc?.toString() ?? "?")")
-        }
-        ctx.evaluateScript(script)
-        guard let fn = ctx.objectForKeyedSubscript("deobfuscate") else {
-            throw PlayerJsError("deobfuscate() missing after eval")
-        }
-        guard let result = fn.call(withArguments: [signature])?.toString(), !result.isEmpty else {
-            throw PlayerJsError("deobfuscate returned empty")
-        }
+    /// Direct URLs can carry the throttling challenge too; being unciphered
+    /// does not make them ready for a CDN range request.
+    func transformUrl(_ url: String) async throws -> String {
+        guard var components = URLComponents(string: url), let items = components.queryItems,
+              let challenge = items.first(where: { $0.name == "n" })?.value, !challenge.isEmpty else { return url }
+        let solved = try await solve("n", challenge: challenge)
+        Self.setQueryValue(solved, for: "n", in: &components)
+        guard let result = components.url?.absoluteString else { throw PlayerJsError("Invalid transformed URL") }
         return result
     }
 
-    private func deobfuscationCode() async throws -> String {
-        if let deobfuscationScript { return deobfuscationScript }
-        let js = try await baseJs()
-        let (funcName, extraArgs) = try findSigFunction(js: js)
-        let funcBody = try extractFunction(js: js, name: funcName)
-        let helperName = try findHelperObjectName(in: funcBody)
-        let helper = try extractHelperObject(js: js, name: helperName)
-        let globalArr = extractGlobalArray(js: js)
-        let caller = "function deobfuscate(a){return \(funcName)(\(extraArgs)a);}"
-        let script = [globalArr, helper, funcBody, caller]
-            .compactMap { $0 }
-            .filter { !$0.isEmpty }
-            .joined(separator: ";\n")
-        deobfuscationScript = script
-        print("[PlayerJs] built sig deobfuscator (\(funcName))")
-        return script
+    private func solve(_ type: String, challenge: String) async throws -> String {
+        let player = try await baseJs()
+        if solver == nil {
+            guard let solverDirectory else { throw PlayerJsError("Bundled player solver unavailable") }
+            solver = try YouTubeChallengeSolver(directory: solverDirectory)
+        }
+        return try solver!.solve(type, challenge: challenge, player: player)
     }
 
-    private func findSigFunction(js: String) throws -> (String, String) {
-        let patterns = [
-            #"\b(?:[a-zA-Z0-9_$]+)&&\((?:[a-zA-Z0-9_$]+)=([a-zA-Z0-9_$]{2,})\((\d+,)decodeURIComponent\((?:[a-zA-Z0-9_$]+)\)\)"#,
-            #"\b(?:[a-zA-Z0-9_$]+)&&\((?:[a-zA-Z0-9_$]+)=([a-zA-Z0-9_$]{2,})\(decodeURIComponent\((?:[a-zA-Z0-9_$]+)\)\)"#,
-            #"\bm=([a-zA-Z0-9$]{2,})\(decodeURIComponent\(h\.s\)\)"#,
-            #"\bc&&\(c=([a-zA-Z0-9$]{2,})\(decodeURIComponent\(c\)\)"#,
-            #"(?:\b|[^a-zA-Z0-9$])([a-zA-Z0-9$]{2,})\s*=\s*function\(\s*a\s*\)\s*\{\s*a\s*=\s*a\.split\(\s*\"\"\s*\)"#,
-            #"([\w$]+)\s*=\s*function\((\w+)\)\{\s*\2=\s*\2\.split\(\"\"\)\s*;"#,
-        ]
-        for pat in patterns {
-            if let regex = try? NSRegularExpression(pattern: pat),
-               let m = regex.firstMatch(in: js, range: NSRange(js.startIndex..., in: js)),
-               m.numberOfRanges > 1,
-               let r = Range(m.range(at: 1), in: js) {
-                let name = String(js[r])
-                var extra = ""
-                if m.numberOfRanges > 2, let r2 = Range(m.range(at: 2), in: js) {
-                    extra = String(js[r2])
-                }
-                return (name, extra)
-            }
-        }
-        throw PlayerJsError("sig function not found")
-    }
-
-    private func extractFunction(js: String, name: String) throws -> String {
-        let marker = "\(name)=function"
-        guard let start = js.range(of: marker)?.lowerBound else {
-            throw PlayerJsError("function \(name) not found")
-        }
-        guard let open = js[start...].firstIndex(of: "{") else {
-            throw PlayerJsError("function \(name) has no body")
-        }
-        var depth = 0
-        var i = open
-        while i < js.endIndex {
-            let c = js[i]
-            if c == "{" { depth += 1 }
-            if c == "}" {
-                depth -= 1
-                if depth == 0 {
-                    return "var " + String(js[start..<js.index(after: i)])
-                }
-            }
-            i = js.index(after: i)
-        }
-        throw PlayerJsError("unbalanced braces in \(name)")
-    }
-
-    private func findHelperObjectName(in funcBody: String) throws -> String {
-        let pat = #"[;,]([A-Za-z0-9_$]{2,})\.\w+\("#
-        if let regex = try? NSRegularExpression(pattern: pat),
-           let m = regex.firstMatch(in: funcBody, range: NSRange(funcBody.startIndex..., in: funcBody)),
-           m.numberOfRanges > 1,
-           let r = Range(m.range(at: 1), in: funcBody) {
-            return String(funcBody[r])
-        }
-        throw PlayerJsError("helper object name not found")
-    }
-
-    private func extractHelperObject(js: String, name: String) throws -> String {
-        let marker = "var \(name)={"
-        if let start = js.range(of: marker)?.lowerBound {
-            return try braceSlice(js, from: start, prefix: "")
-        }
-        let alt = "\(name)={"
-        guard let s2 = js.range(of: alt)?.lowerBound else {
-            throw PlayerJsError("helper \(name) not found")
-        }
-        return try braceSlice(js, from: s2, prefix: "var ")
-    }
-
-    private func braceSlice(_ js: String, from start: String.Index, prefix: String) throws -> String {
-        guard let open = js[start...].firstIndex(of: "{") else {
-            throw PlayerJsError("helper has no body")
-        }
-        var depth = 0
-        var i = open
-        while i < js.endIndex {
-            let c = js[i]
-            if c == "{" { depth += 1 }
-            if c == "}" {
-                depth -= 1
-                if depth == 0 {
-                    var end = js.index(after: i)
-                    if end < js.endIndex && js[end] == ";" {
-                        end = js.index(after: end)
-                    }
-                    return prefix + String(js[start..<end])
-                }
-            }
-            i = js.index(after: i)
-        }
-        throw PlayerJsError("unbalanced helper braces")
-    }
-
-    private func extractGlobalArray(js: String) -> String? {
-        let pat = #"var [A-z]=['\"].*?['\"]\.split\(\"[;{]\"\)"#
-        guard let regex = try? NSRegularExpression(pattern: pat),
-              let m = regex.firstMatch(in: js, range: NSRange(js.startIndex..., in: js)),
-              let r = Range(m.range, in: js) else { return nil }
-        return String(js[r])
-    }
-
-    // MARK: - n-param
-
-    private func extractNFunctionName(js: String) throws -> String {
-        if let setRange = js.range(of: ".set(\"n\"") ?? js.range(of: ".set('n'") {
-            let before = String(js[js.startIndex..<setRange.lowerBound].suffix(800))
-            let pat = #"([a-zA-Z0-9\$_]+)\s*\(\s*a[^)]*\.get\(\"n\"\)"#
-            if let regex = try? NSRegularExpression(pattern: pat),
-               let m = regex.firstMatch(in: before, range: NSRange(before.startIndex..., in: before)),
-               m.numberOfRanges > 1, let r = Range(m.range(at: 1), in: before) {
-                return String(before[r])
-            }
-        }
-        let fallback = #"([a-zA-Z0-9\$_]+)\s*=\s*function\([^)]*\)\s*\{[^\}]*split\(\"\"\).*join\(\"\"\).*"#
-        if let regex = try? NSRegularExpression(pattern: fallback, options: [.dotMatchesLineSeparators]),
-           let m = regex.firstMatch(in: js, range: NSRange(js.startIndex..., in: js)),
-           m.numberOfRanges > 1, let r = Range(m.range(at: 1), in: js) {
-            return String(js[r])
-        }
-        throw PlayerJsError("n function not found")
-    }
-
-    private func runNamedFunction(js: String, funcName: String, arg: String) throws -> String {
-        let ctx = JSContext()!
-        if let r = js.range(of: funcName) {
-            let start = js.index(r.lowerBound, offsetBy: -5000, limitedBy: js.startIndex) ?? js.startIndex
-            let end = js.index(r.lowerBound, offsetBy: 30000, limitedBy: js.endIndex) ?? js.endIndex
-            ctx.evaluateScript(String(js[start..<end]))
-        }
-        if ctx.objectForKeyedSubscript(funcName) == nil {
-            ctx.evaluateScript(js)
-        }
-        guard let fn = ctx.objectForKeyedSubscript(funcName) else {
-            throw PlayerJsError("function \(funcName) not in context")
-        }
-        guard let result = fn.call(withArguments: [arg])?.toString(), !result.isEmpty else {
-            throw PlayerJsError("\(funcName) returned empty")
-        }
-        return result
+    private static func setQueryValue(_ value: String, for key: String, in components: inout URLComponents) {
+        // Preserve every other signed parameter's exact encoding. queryItems
+        // reconstruction can turn %2B into + and change what the CDN receives.
+        let allowed = CharacterSet(charactersIn: "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-._~")
+        let encodedKey = key.addingPercentEncoding(withAllowedCharacters: allowed) ?? key
+        let encodedValue = value.addingPercentEncoding(withAllowedCharacters: allowed) ?? value
+        var parts = (components.percentEncodedQuery ?? "").split(separator: "&").map(String.init)
+        parts.removeAll { $0.split(separator: "=", maxSplits: 1).first?.removingPercentEncoding == key }
+        parts.append("\(encodedKey)=\(encodedValue)")
+        components.percentEncodedQuery = parts.joined(separator: "&")
     }
 
     // MARK: - base.js
 
     private func baseJs() async throws -> String {
         if let t = baseJsText { return t }
-        let url = try await baseJsUrlString()
-        let (data, _) = try await URLSession.shared.data(from: URL(string: url)!)
-        guard let text = String(data: data, encoding: .utf8), !text.isEmpty else {
-            throw PlayerJsError("empty base.js")
-        }
+        if let baseJsTask { return try await baseJsTask.value }
+        let task = Task { try await self.loadText(url: try await self.baseJsUrlString()) }
+        baseJsTask = task
+        defer { baseJsTask = nil }
+        let text = try await task.value
         baseJsText = text
         return text
     }
@@ -266,8 +97,7 @@ actor YouTubePlayerJs {
         req.setValue(
             "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36",
             forHTTPHeaderField: "User-Agent")
-        let (data, _) = try await URLSession.shared.data(for: req)
-        let html = String(data: data, encoding: .utf8) ?? ""
+        let html = try await loadText(request: req)
         if let range = html.range(of: #""jsUrl":"[^"]*base\.js[^"]*""#, options: .regularExpression) {
             var js = String(html[range])
             js = js.replacingOccurrences(of: "\"jsUrl\":\"", with: "")
@@ -281,9 +111,7 @@ actor YouTubePlayerJs {
     }
 
     private func playerUrlFromIframeApi() async throws -> String {
-        let (data, _) = try await URLSession.shared.data(
-            from: URL(string: "https://www.youtube.com/iframe_api")!)
-        let text = String(data: data, encoding: .utf8) ?? ""
+        let text = try await loadText(url: "https://www.youtube.com/iframe_api")
         let pat = #"player\\?/([a-z0-9]{8})\\?/"#
         guard let regex = try? NSRegularExpression(pattern: pat),
               let m = regex.firstMatch(in: text, range: NSRange(text.startIndex..., in: text)),
@@ -293,6 +121,23 @@ actor YouTubePlayerJs {
         }
         let hash = String(text[r])
         return "https://www.youtube.com/s/player/\(hash)/player_ias.vflset/en_GB/base.js"
+    }
+
+    private func loadText(url: String) async throws -> String {
+        guard let url = URL(string: url) else { throw PlayerJsError("Invalid player URL") }
+        return try await loadText(request: URLRequest(url: url))
+    }
+
+    private func loadText(request: URLRequest) async throws -> String {
+        let (data, response) = try await URLSession.shared.data(for: request)
+        guard let http = response as? HTTPURLResponse, http.statusCode == 200,
+              let url = http.url, url.scheme == "https", url.host == "www.youtube.com",
+              url.port == nil || url.port == 443, url.user == nil, url.password == nil,
+              data.count <= 5 * 1024 * 1024,
+              let text = String(data: data, encoding: .utf8), !text.isEmpty else {
+            throw PlayerJsError("Player script request failed")
+        }
+        return text
     }
 
     private static func parseQuery(_ cipher: String) -> [String: String] {
@@ -306,10 +151,6 @@ actor YouTubePlayerJs {
         return out
     }
 
-    private static func percentEncode(_ s: String) -> String {
-        s.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? s
-    }
-
     struct PlayerJsError: Error, LocalizedError {
         let msg: String
         init(_ m: String) { msg = m }
@@ -320,15 +161,17 @@ actor YouTubePlayerJs {
 // MARK: - CipherUnlockBridge wiring
 
 enum CipherUnlockWiring {
-    static func install() {
-        CipherUnlockBridge.shared.setImpl(value: Impl())
+    static func install(player: YouTubePlayerJs = .shared) {
+        CipherUnlockBridge.shared.setImpl(value: Impl(player: player))
     }
 
     private final class Impl: CipherUnlockBridgeImpl {
+        let player: YouTubePlayerJs
+        init(player: YouTubePlayerJs) { self.player = player }
         func signatureTimestamp(callback: CipherUnlockBridgeResultCallback) {
             Task {
                 do {
-                    let sts = try await YouTubePlayerJs.shared.signatureTimestamp()
+                    let sts = try await player.signatureTimestamp()
                     callback.onResult(value: String(sts), error: nil)
                 } catch {
                     callback.onResult(value: nil, error: error.localizedDescription)
@@ -336,10 +179,17 @@ enum CipherUnlockWiring {
             }
         }
 
+        func transformUrl(url: String, callback: CipherUnlockBridgeResultCallback) {
+            Task {
+                do { callback.onResult(value: try await player.transformUrl(url), error: nil) }
+                catch { callback.onResult(value: nil, error: error.localizedDescription) }
+            }
+        }
+
         func unlockCipher(videoId: String, cipher: String, callback: CipherUnlockBridgeResultCallback) {
             Task {
                 do {
-                    let url = try await YouTubePlayerJs.shared.unlockCipher(cipher, videoId: videoId)
+                    let url = try await player.unlockCipher(cipher, videoId: videoId)
                     callback.onResult(value: url, error: nil)
                 } catch {
                     callback.onResult(value: nil, error: error.localizedDescription)

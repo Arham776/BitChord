@@ -1,7 +1,7 @@
 import Foundation
 import BitChordShared
 
-struct DetailPageModel: Decodable {
+struct DetailPageModel: Codable {
     let browseId: String
     let title: String
     let subtitle: String
@@ -45,7 +45,7 @@ struct DetailPageModel: Decodable {
         url = try c.decodeIfPresent(String.self, forKey: .url)
     }
 
-    struct SongPayload: Decodable {
+    struct SongPayload: Codable {
         let videoId: String
         let title: String
         let artist: String
@@ -85,7 +85,7 @@ struct DetailPageModel: Decodable {
     }
 }
 
-struct ArtistSubscriptionPayload: Decodable {
+struct ArtistSubscriptionPayload: Codable {
     let channelId: String
     let subscribed: Bool
 }
@@ -93,7 +93,12 @@ struct ArtistSubscriptionPayload: Decodable {
 final class InnertubeDetail: Sendable {
     static let shared = InnertubeDetail()
 
-    func browse(browseId: String) async throws -> DetailPageModel {
+    @MainActor
+    func browse(browseId: String, force: Bool = false) async throws -> DetailPageModel {
+        try await CachedPages.load("detail:browse:\(browseId)", force: force) { try await self.raw_browse(browseId: browseId) }
+    }
+
+    private func raw_browse(browseId: String) async throws -> DetailPageModel {
         try await withCheckedThrowingContinuation { cont in
             DetailBridge.shared.browse(browseId: browseId, callback: DetailCallback { json, msg in
                 if let json {
@@ -103,7 +108,7 @@ final class InnertubeDetail: Sendable {
                         let page = try JSONDecoder().decode(DetailPageModel.self, from: Data(json.utf8))
                         cont.resume(returning: page)
                     } catch {
-                        print("[Detail] decode failed: \(error) json: \(json.prefix(1000))")
+                        print("[Detail] response could not be decoded")
                         cont.resume(throwing: error)
                     }
                 } else {
@@ -113,7 +118,12 @@ final class InnertubeDetail: Sendable {
         }
     }
 
-    func browseArtist(browseId: String) async throws -> DetailPageModel {
+    @MainActor
+    func browseArtist(browseId: String, force: Bool = false) async throws -> DetailPageModel {
+        try await CachedPages.load("detail:browseArtist:\(browseId)", force: force) { try await self.raw_browseArtist(browseId: browseId) }
+    }
+
+    private func raw_browseArtist(browseId: String) async throws -> DetailPageModel {
         try await withCheckedThrowingContinuation { cont in
             DetailBridge.shared.browseArtist(browseId: browseId, callback: DetailCallback { json, msg in
                 if let json {

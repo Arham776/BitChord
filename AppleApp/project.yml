@@ -54,6 +54,9 @@ targets:
       - path: Resources/AudioLicenses
         type: folder
         buildPhase: resources
+      - path: Resources/YouTubeSolver
+        type: folder
+        buildPhase: resources
     dependencies:
       - target: BitChordWidget
         embed: true
@@ -92,7 +95,7 @@ targets:
           - UIInterfaceOrientationLandscapeLeft
           - UIInterfaceOrientationLandscapeRight
         UILaunchScreen: {}
-        NSMotionUsageDescription: BitChord uses headphone motion to keep spatial audio anchored when you turn your head.
+        NSMotionUsageDescription: BitChord uses headphone motion to keep its spatial effect anchored when you turn your head.
         NSSpeechRecognitionUsageDescription: BitChord uses on-device speech recognition to align fetched lyrics with the playing audio. Audio is not sent to a server for alignment.
     entitlements:
       path: BitChord.entitlements

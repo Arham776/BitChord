@@ -199,6 +199,7 @@ actor StreamFileCache {
 actor CanvasFileCache {
     static let shared = CanvasFileCache()
     private static let limit: Int64 = 150 * 1024 * 1024
+    private var inFlight: [URL: Task<URL, Never>] = [:]
 
     var folder: URL { DiskCache.cachesSubfolder("canvas") }
 
@@ -217,16 +218,35 @@ actor CanvasFileCache {
             DiskCache.touch(dest)
             return dest
         }
-        guard let (data, response) = try? await URLSession.shared.data(from: remote) else { return remote }
+        if let task = inFlight[remote] { return await task.value }
+        let task = Task { await download(remote, to: dest) }
+        inFlight[remote] = task
+        let result = await task.value
+        inFlight[remote] = nil
+        return result
+    }
+
+    private func download(_ remote: URL, to dest: URL) async -> URL {
+        guard let (data, response) = try? await URLSession.shared.data(for: CanvasMediaRequest.download(remote)),
+              !data.isEmpty else { return remote }
         if let http = response as? HTTPURLResponse, !(200..<300).contains(http.statusCode) {
+            PlaybackDebugLog.shared.record("animated artwork download failed HTTP \(http.statusCode) host=\(remote.host ?? "unknown")")
             return remote
         }
         if let mimeType = response.mimeType?.lowercased(), mimeType.contains("mpegurl") {
             return remote
         }
+        if let mimeType = response.mimeType?.lowercased(),
+           mimeType.contains("text/") || mimeType.contains("json") { return remote }
         try? data.write(to: dest, options: .atomic)
         DiskCache.trimFolder(folder, limitBytes: Self.limit)
         return FileManager.default.fileExists(atPath: dest.path) ? dest : remote
+    }
+
+    func invalidate(_ remote: URL) {
+        let ext = remote.pathExtension.lowercased()
+        let path = folder.appendingPathComponent("\(DiskCache.hashName(remote.absoluteString)).\(ext)")
+        try? FileManager.default.removeItem(at: path)
     }
 
     func clear() { DiskCache.clearFolder(folder) }

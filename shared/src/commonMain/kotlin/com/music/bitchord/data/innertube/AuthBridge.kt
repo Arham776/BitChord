@@ -51,9 +51,14 @@ object AuthBridge {
      * a caller that guessed would be guessing.
      */
     fun currentIdentity(callback: IdentityCallback) {
+        val generation = Innertube.sessionGeneration
         bridgeScope.launch {
-            runCatching { Innertube.ensureSessionScope() }
-            val identity = Innertube.currentIdentity()
+            val identity = runCatching {
+                Innertube.checkSession(generation)
+                Innertube.ensureSessionScope()
+                Innertube.checkSession(generation)
+                Innertube.currentIdentity()
+            }.getOrNull()
             callback.onResult(identity?.pageId, identity?.dataSyncId, identity?.authUser)
         }
     }
@@ -82,6 +87,8 @@ object AuthBridge {
         StreamResolver.onSessionChanged()
         return true
     }
+
+    fun sessionGeneration(): Long = Innertube.sessionGeneration
 
     fun isSignedIn(): Boolean = Innertube.cookie?.let { Innertube.hasApiSid(it) } == true
 
@@ -119,9 +126,12 @@ object AuthBridge {
      * other than a music client.
      */
     fun ensureSession(callback: DoneCallback) {
+        val generation = Innertube.sessionGeneration
         bridgeScope.launch {
             try {
+                Innertube.checkSession(generation)
                 Innertube.ensureSessionScope()
+                Innertube.checkSession(generation)
                 callback.onResult(true, null)
             } catch (e: Throwable) {
                 DebugLog.e("could not read the session scope", e)

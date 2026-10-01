@@ -68,7 +68,8 @@ struct AudioPipelineSheet: View {
                         row("Bit-perfect", bitPerfectStatus)
                         row("Loudness", loudness)
                         row("EQ Preset", eqPreset)
-                        row("Spatial Audio", spatial ? "On" : "Off")
+                        row("BitChord spatial effect", spatial && AudioRouteState.shared.permitsCustomSpatial ? "On" : "Off")
+                        row("Apple spatial playback", AudioRouteState.shared.spatialDescription)
                         row("Output API", "CoreAudio")
                         // Reports engine-side sample changes; a clean engine path
                         // still does not prove CoreAudio's final hardware output.
@@ -430,6 +431,10 @@ struct OutputDeviceSheet: View {
             Form {
                 Section {
                     row("Device", deviceName)
+                    #if os(iOS)
+                    row("System Route", AudioRouteState.shared.name)
+                    row("Apple spatial playback", AudioRouteState.shared.spatialDescription)
+                    #endif
                     row("Sample Rate", deviceRate)
                     row("Channels", deviceChannels)
                     row("Pipeline", pipelineSummary)

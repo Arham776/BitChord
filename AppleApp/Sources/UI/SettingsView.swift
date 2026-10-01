@@ -698,10 +698,12 @@ struct SettingsView: View {
             )
             SettingsToggleLine(
                 glyph: .spatial,
-                title: "Spatial Audio",
-                subtitle: "Widens stereo tracks for a more immersive feel",
+                title: "BitChord spatial effect",
+                subtitle: "Optional stereo widening and head tracking. Suspended when Apple reports Spatial Audio is enabled.",
                 isOn: $spatial
             )
+            Text("Apple’s Headphone Accommodations, Adaptive Audio and Conversation Awareness are managed in system Accessibility, AirPods settings and Control Center. BitChord keeps your manual EQ choices.")
+                .font(.caption).foregroundStyle(.secondary)
 #if os(iOS)
             SettingsToggleLine(
                 glyph: .musicOnly,

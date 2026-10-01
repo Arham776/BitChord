@@ -106,8 +106,9 @@ final class CanvasVideoView: PlatformCanvasView {
 
     fileprivate func configure(_ value: CanvasConfiguration) {
         let wasActive = configuration?.active ?? false
+        let sourceChanged = currentURL != value.url || configuration?.fallback != value.fallback
         configuration = value
-        if currentURL != value.url {
+        if sourceChanged {
             currentURL = value.url
             generation += 1
             let requestGeneration = generation
@@ -165,7 +166,7 @@ final class CanvasVideoView: PlatformCanvasView {
     private func mount(_ url: URL, cachedRemoteRetryURL: URL? = nil) {
         self.cachedRemoteRetryURL = cachedRemoteRetryURL
         clearItem()
-        let item = AVPlayerItem(url: url)
+        let item = AVPlayerItem(asset: CanvasMediaRequest.asset(url))
         let output = AVPlayerItemVideoOutput(pixelBufferAttributes: [
             kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA
         ])
@@ -226,9 +227,19 @@ final class CanvasVideoView: PlatformCanvasView {
         playerLayer.opacity = 0
         if !triedCachedRemoteRetry, let remote = cachedRemoteRetryURL {
             triedCachedRemoteRetry = true
-            NSLog("[BitChord] retrying animated artwork directly from %@ after cached playback failed",
+            NSLog("[BitChord] downloading animated artwork again from %@ after cached playback failed",
                   remote.host ?? "remote host")
-            mount(remote)
+            // Some clip hosts ignore Range requests. AVPlayer cannot stream
+            // their MP4s, but it can decode a complete cached download.
+            generation += 1
+            let requestGeneration = generation
+            clearItem()
+            Task { [weak self] in
+                await CanvasFileCache.shared.invalidate(remote)
+                let local = await CanvasFileCache.shared.cachedFile(for: remote)
+                guard let self, self.generation == requestGeneration else { return }
+                self.mount(local)
+            }
             return
         }
         guard !triedFallback, let fallback = configuration?.fallback else {
@@ -236,7 +247,15 @@ final class CanvasVideoView: PlatformCanvasView {
             return
         }
         triedFallback = true
-        mount(fallback)
+        triedCachedRemoteRetry = false
+        generation += 1
+        let requestGeneration = generation
+        clearItem()
+        Task { [weak self] in
+            let local = fallback.isFileURL ? fallback : await CanvasFileCache.shared.cachedFile(for: fallback)
+            guard let self, self.generation == requestGeneration else { return }
+            self.mount(local, cachedRemoteRetryURL: local == fallback ? nil : fallback)
+        }
     }
 
     private func revealIfReady() {

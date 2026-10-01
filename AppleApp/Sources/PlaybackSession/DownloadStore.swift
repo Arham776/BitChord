@@ -91,6 +91,11 @@ final class DownloadStore {
         var pendingDeletes: Set<String>? = nil
     }
     private var index = Index()
+    private var restoreTask: Task<Void, Never>?
+    private var restoreActions: [@MainActor () -> Void] = []
+    private(set) var restoring = false
+    private var refreshTask: Task<Void, Never>?
+    private var refreshID = UUID()
     private(set) var items: [DownloadedTrack] = []
     var jobs: [Job] = []
     var onChange: (() -> Void)?
@@ -123,6 +128,36 @@ final class DownloadStore {
         self.legacyDirectoryOverride = legacyDirectory
         self.directory = directory ?? FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
             .appendingPathComponent("BitChord/Downloads", isDirectory: true)
+        if startWorker {
+            restoring = true; writable = false
+            let root = self.directory
+            let legacy = self.legacyFolder
+            restoreTask = Task { [weak self] in
+                let restored = await Task.detached(priority: .utility) { Self.readIndex(directory: root, legacyFolder: legacy) }.value
+                guard let self else { return }
+                switch restored {
+                case .success(let restoredIndex):
+                    self.index = restoredIndex
+                    self.jobs = restoredIndex.jobs.map { job in
+                        var job = job
+                        if job.status == .running { job.status = .queued; job.runID = UUID().uuidString }
+                        return job
+                    }
+                    self.writable = true
+                case .failure:
+                    PlaybackDebugLog.shared.record("download index unavailable; downloads kept unchanged")
+                }
+                self.restoring = false
+                let actions = self.restoreActions; self.restoreActions.removeAll()
+                actions.forEach { $0() }
+                self.refresh()
+                self.timer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in
+                    Task { @MainActor in self?.pump(); self?.prune() }
+                }
+                self.pump()
+            }
+            return
+        }
         do {
             try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
             if FileManager.default.fileExists(atPath: indexURL.path) {
@@ -147,6 +182,43 @@ final class DownloadStore {
             }
             pump()
         }
+    }
+
+    func waitUntilReady() async { await restoreTask?.value }
+    private func afterRestore(_ action: @escaping @MainActor () -> Void) -> Bool {
+        guard restoring else { return false }
+        restoreActions.append(action)
+        return true
+    }
+
+    nonisolated private static func readIndex(directory: URL, legacyFolder: URL) -> Result<Index, Error> {
+        do {
+            try FileManager.default.createDirectory(at: directory.appendingPathComponent("audio"), withIntermediateDirectories: true)
+            let url = directory.appendingPathComponent("index.json")
+            var index = FileManager.default.fileExists(atPath: url.path)
+                ? try JSONDecoder().decode(Index.self, from: Data(contentsOf: url)) : Index()
+            guard index.version == 1 else { throw CocoaError(.fileReadCorruptFile) }
+            if !index.migrated {
+                let files = (try? FileManager.default.contentsOfDirectory(at: legacyFolder, includingPropertiesForKeys: nil)) ?? []
+                for file in files where ["m4a", "mp3", "flac", "mp4", "aac", "opus", "ogg", "wav"].contains(file.pathExtension.lowercased()) {
+                    guard let hash = hashFile(file.path) else { continue }
+                    let metadata = readTrackMetadata(path: file.path)
+                    let id = "legacy:" + digest(file.path)
+                    let entry = QueueEntry(id: id, title: metadata?.title.downloadNonEmpty ?? file.deletingPathExtension().lastPathComponent,
+                        artist: metadata?.artist.downloadNonEmpty ?? "Unknown artist", source: file.path,
+                        albumName: metadata?.album, artworkData: nil, isLocal: true)
+                    let bytes = ((try? FileManager.default.attributesOfItem(atPath: file.path)[.size]) as? NSNumber)?.int64Value ?? 0
+                    index.assets[id] = Asset(id: id, path: file.path, provider: "legacy", recordingIdentity: id,
+                        codec: file.pathExtension, kbps: 0, lossless: false, youtubeVideoId: nil, bytes: bytes,
+                        sha256: hash, entry: entry, managed: false)
+                    index.bindings[id] = id
+                    index.owners[id] = Owner(id: id, browseId: nil, accountId: "", title: entry.title, requests: [id])
+                }
+                index.migrated = true
+                try JSONEncoder().encode(index).write(to: url, options: .atomic)
+            }
+            return .success(index)
+        } catch { return .failure(error) }
     }
 
     nonisolated static func digest(_ text: String) -> String { SHA256.hash(data: Data(text.utf8)).map { String(format: "%02x", $0) }.joined() }
@@ -200,13 +272,24 @@ final class DownloadStore {
         index.migrated = true; persist()
     }
     func refresh() {
-        items = index.assets.values.filter { FileManager.default.fileExists(atPath: $0.path) }.map { asset in
-            let metadata = readTrackMetadata(path: asset.path)
-            return DownloadedTrack(path: asset.path, title: asset.entry.title, artist: asset.entry.artist,
-                                   album: asset.entry.albumName ?? "", artwork: metadata?.artwork)
-        }.sorted { $0.title < $1.title }
-        onChange?()
+        guard !restoring else { return }
+        let assets = Array(index.assets.values)
+        let id = UUID(); refreshID = id
+        refreshTask?.cancel()
+        let work = Task.detached(priority: .utility) {
+            assets.filter { FileManager.default.fileExists(atPath: $0.path) }.map { asset in
+                let metadata = readTrackMetadata(path: asset.path)
+                return DownloadedTrack(path: asset.path, title: asset.entry.title, artist: asset.entry.artist,
+                    album: asset.entry.albumName ?? "", artwork: metadata?.artwork)
+            }.sorted { $0.title < $1.title }
+        }
+        refreshTask = Task {
+            let scanned = await work.value
+            guard refreshID == id, !Task.isCancelled else { return }
+            items = scanned; onChange?()
+        }
     }
+    func waitForRefresh() async { await refreshTask?.value }
     func asset(for entry: QueueEntry, quality: String? = nil) -> Asset? {
         let candidates = index.assets.values.filter { asset in
             (asset.entry.source == entry.source && asset.entry.id == entry.id) || canonicalPath(asset.path) == canonicalPath(entry.source) ||
@@ -224,6 +307,8 @@ final class DownloadStore {
         return "\(done) of \(owner.requests.count) saved" + (failed > 0 ? " · \(failed) failed" : "")
     }
     @discardableResult func download(_ entry: QueueEntry) -> RequestResult {
+        if afterRestore({ _ = self.download(entry) }) { return .started }
+        guard writable else { return .ignoredLocalTrack }
         guard !entry.isLocal else { return .ignoredLocalTrack }
         let quality = PlatformSettings.shared.getString(key: "download_quality", default: "LOSSLESS")
         let id = requestId(entry, quality: quality)
@@ -242,21 +327,26 @@ final class DownloadStore {
     func hasCollection(_ browseId: String) -> Bool { index.owners[collectionId(browseId)] != nil }
     private func collectionId(_ browseId: String) -> String { Self.digest(accountId + "|" + browseId) }
     func syncIfOwned(browseId: String) async {
+        await waitUntilReady()
         if hasCollection(browseId) { _ = await downloadCollection(browseId: browseId) }
     }
     @discardableResult func downloadCollection(browseId: String) async -> RequestResult {
+        let generation = PageSession.generation()
+        await waitUntilReady()
+        guard generation == PageSession.generation(), !Task.isCancelled else { return .ignoredLocalTrack }
         let ownerId = collectionId(browseId), scope = accountId
         guard writable, syncs.insert(ownerId).inserted else { return .alreadyExists }
         defer { syncs.remove(ownerId) }
         do {
-            var page = try await InnertubeDetail.shared.browse(browseId: browseId)
+            var page = try await InnertubeDetail.shared.browse(browseId: browseId, force: true)
             var seen: Set<String> = []
             while let token = page.continuation, !token.isEmpty {
+                guard generation == PageSession.generation(), !Task.isCancelled else { return .ignoredLocalTrack }
                 guard seen.insert(token).inserted else { throw CocoaError(.fileReadCorruptFile) }
                 let extra = try await InnertubeDetail.shared.more(token: token)
                 page.songs += extra.songs; page.continuation = extra.continuation
             }
-            guard accountId == scope else { return .ignoredLocalTrack }
+            guard accountId == scope, generation == PageSession.generation() else { return .ignoredLocalTrack }
             let quality = PlatformSettings.shared.getString(key: "download_quality", default: "LOSSLESS")
             var requests: [String] = []
             for song in page.songs {
@@ -268,7 +358,7 @@ final class DownloadStore {
             return .started
         } catch { PlaybackDebugLog.shared.record("collection refresh failed; previous membership retained: \(error)"); return .ignoredLocalTrack }
     }
-    func removeOwner(_ id: String) { index.owners.removeValue(forKey: id); persist(); prune(); refresh() }
+    func removeOwner(_ id: String) { if afterRestore({ self.removeOwner(id) }) { return }; index.owners.removeValue(forKey: id); persist(); prune(); refresh() }
     func retryOwner(_ owner: Owner) { for id in owner.requests { _ = retry(id) } }
     @discardableResult func retry(_ id: String) -> RequestResult {
         guard let i = jobs.firstIndex(where: { $0.id == id && $0.status == .failed }) else { return .alreadyExists }
@@ -282,9 +372,10 @@ final class DownloadStore {
         jobs[i].runID = UUID().uuidString; jobs[i].status = .failed; jobs[i].cancelled = true; jobs[i].message = "Cancelled"
         persist(); if restartWorker { pump() }
     }
-    func cancelAll() { for id in jobs.filter({ $0.status == .queued || $0.status == .running }).map(\.id) { cancel(id) } }
-    func clearFinishedJobs() { jobs.removeAll { $0.status == .done }; persist() }
+    func cancelAll() { if afterRestore({ self.cancelAll() }) { return }; for id in jobs.filter({ $0.status == .queued || $0.status == .running }).map(\.id) { cancel(id) } }
+    func clearFinishedJobs() { if afterRestore({ self.clearFinishedJobs() }) { return }; jobs.removeAll { $0.status == .done }; persist() }
     func delete(_ path: String) {
+        if afterRestore({ self.delete(path) }) { return }
         guard let asset = index.assets.values.first(where: { canonicalPath($0.path) == canonicalPath(path) }) else { return }
         let requests = Set(index.bindings.filter { $0.value == asset.id }.map(\.key))
         for key in Array(index.owners.keys) { index.owners[key]?.requests.removeAll { requests.contains($0) } }
@@ -292,7 +383,7 @@ final class DownloadStore {
         if index.pendingDeletes == nil { index.pendingDeletes = [] }; index.pendingDeletes?.insert(asset.id)
         persist(); prune(); refresh()
     }
-    func clearDownloads() { cancelAll(); index.owners = [:]; persist(); prune(); refresh() }
+    func clearDownloads() { if afterRestore({ self.clearDownloads() }) { return }; cancelAll(); index.owners = [:]; persist(); prune(); refresh() }
     private func prune() {
         guard writable else { return }
         let requests = Set(index.owners.values.flatMap(\.requests))

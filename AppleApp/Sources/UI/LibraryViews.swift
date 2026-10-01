@@ -48,6 +48,7 @@ struct HomeView: View {
         case .loaded(let shelves):
             ScrollView {
                 VStack(alignment: .leading, spacing: 28) {
+                    if feed.usingSavedContent { SavedContentNotice(message: feed.refreshError) }
                     if !auth.signedIn {
                         SignInBanner { auth.loginPresented = true }
                     }
@@ -349,11 +350,13 @@ private extension Array {
 /// Explore tab — upstream shows mood and genre categories here.
 struct ExploreView: View {
     @State private var moods = MoodGenreLoader()
+    @Environment(AuthController.self) private var auth
     @Environment(\.horizontalSizeClass) private var sizeClass
 
     var body: some View {
         NavigationStack {
             content
+                .savedPageNotice("moodAndGenres")
                 .navigationTitle("Explore")
                 .toolbar {
                     #if os(iOS)
@@ -366,8 +369,11 @@ struct ExploreView: View {
                 .refreshable {
                     await moods.load(force: true)
                 }
-                .task {
+                .task(id: auth.sessionEpoch) {
                     await moods.load(force: false)
+                }
+                .onReceive(NotificationCenter.default.publisher(for: .pageCacheUpdated)) { note in
+                    if note.object as? String == "moodAndGenres" { Task { await moods.load(force: false) } }
                 }
         }
     }
@@ -537,8 +543,10 @@ private struct MoodTile: View {
 struct MoodGenrePlaylistsView: View {
     let category: MoodGenre
     @Environment(PlaybackController.self) private var controller
+    @Environment(AuthController.self) private var auth
     @Environment(AppModel.self) private var appModel
     @State private var shelves: [FeedShelf] = []
+    @State private var dataGeneration: Int64?
     @State private var phase: LoadPhase = .loading
 
     enum LoadPhase { case loading, loaded, failed(String) }
@@ -593,9 +601,10 @@ struct MoodGenrePlaylistsView: View {
                     .padding(.horizontal, 24)
                     .padding(.vertical, 20)
                 }
-                .refreshable { await load() }
+                .refreshable { await load(force: true) }
             }
         }
+        .savedPageNotice("mood:\(category.browseId):\(category.params ?? "")")
         .navigationTitle(category.title)
         #if os(iOS)
         .navigationBarTitleDisplayMode(.large)
@@ -605,17 +614,25 @@ struct MoodGenrePlaylistsView: View {
             }
         }
         #endif
-        .task { await load() }
+        .task(id: auth.sessionEpoch) { shelves = []; phase = .loading; await load() }
+        .onReceive(NotificationCenter.default.publisher(for: .pageCacheUpdated)) { note in
+            if note.object as? String == "mood:\(category.browseId):\(category.params ?? "")" { Task { await load() } }
+        }
     }
 
-    private func load() async {
-        phase = .loading
+    private func load(force: Bool = false) async {
+        let generation = PageSession.generation()
+        if shelves.isEmpty { phase = .loading }
         do {
-            shelves = try await InnertubeFeed.shared.moodGenreShelves(
-                browseId: category.browseId, params: category.params
+            let result = try await InnertubeFeed.shared.moodGenreShelves(
+                browseId: category.browseId, params: category.params, force: force
             )
+            guard generation == PageSession.generation(), !Task.isCancelled else { return }
+            shelves = result
             phase = .loaded
         } catch {
+            guard generation == PageSession.generation(), !Task.isCancelled else { return }
+            if !shelves.isEmpty { return }
             phase = .failed(error.localizedDescription)
         }
     }
@@ -633,17 +650,22 @@ final class MoodGenreLoader {
     enum Phase { case loading, loaded([MoodGenreSection]), failed(String) }
 
     private(set) var phase: Phase = .loading
-    private var loaded = false
+    private var loadedGeneration: Int64?
+    private var requestID = UUID()
 
     func load(force: Bool) async {
-        if !force, loaded, case .loaded = phase { return }
-        phase = .loading
+        let generation = PageSession.generation()
+        let id = UUID(); requestID = id
+        if loadedGeneration != generation { phase = .loading }
+        loadedGeneration = generation
         do {
-            var sections = try await InnertubeFeed.shared.moodAndGenres()
+            var sections = try await InnertubeFeed.shared.moodAndGenres(force: force)
+            guard generation == PageSession.generation(), requestID == id, !Task.isCancelled else { return }
             phase = .loaded(sections)
-            loaded = true
-            await fillArtwork(&sections)
+            await fillArtwork(&sections, generation: generation, id: id)
         } catch {
+            guard generation == PageSession.generation(), requestID == id, !Task.isCancelled else { return }
+            if case .loaded = phase { return }
             phase = .failed(error.localizedDescription)
         }
     }
@@ -651,16 +673,31 @@ final class MoodGenreLoader {
     /// Replaces the categories with ones carrying artwork, once each has
     /// answered. Published one section at a time so the first covers to arrive
     /// are on screen while the rest are still being asked for.
-    private func fillArtwork(_ sections: inout [MoodGenreSection]) async {
-        for index in sections.indices {
-            for itemIndex in sections[index].items.indices {
-                let item = sections[index].items[itemIndex]
-                guard item.thumbnailUrl == nil else { continue }
-                if let cover = await InnertubeFeed.shared
-                    .moodGenreArtwork(browseId: item.browseId, params: item.params) {
-                    sections[index].items[itemIndex].thumbnailUrl = cover
-                    publish(sections)
+    private func fillArtwork(_ sections: inout [MoodGenreSection], generation: Int64, id: UUID) async {
+        // Start in display order and cap concurrency: visible tiles go first.
+        let jobs = sections.indices.flatMap { section in
+            sections[section].items.indices.compactMap { item -> (Int, Int, MoodGenre)? in
+                let category = sections[section].items[item]
+                return category.thumbnailUrl == nil ? (section, item, category) : nil
+            }
+        }
+        await withTaskGroup(of: (Int, Int, String?).self) { group in
+            var next = 0
+            func enqueue() {
+                guard next < jobs.count else { return }
+                let job = jobs[next]; next += 1
+                group.addTask {
+                    let cover = await InnertubeFeed.shared.moodGenreArtwork(browseId: job.2.browseId, params: job.2.params)
+                    return (job.0, job.1, cover)
                 }
+            }
+            for _ in 0..<min(4, jobs.count) { enqueue() }
+            while let (section, item, cover) = await group.next() {
+                guard generation == PageSession.generation(), requestID == id, !Task.isCancelled else {
+                    group.cancelAll(); return
+                }
+                if let cover { sections[section].items[item].thumbnailUrl = cover; publish(sections) }
+                enqueue()
             }
         }
     }
@@ -820,6 +857,7 @@ struct LibraryLandingView: View {
     @State private var downloadStore = DownloadStore.shared
     @State private var local = LocalLibrary.shared
     @State private var shelves: [FeedShelf] = []
+    @State private var dataGeneration: Int64?
     @State private var loading = true
     @State private var error: String?
 
@@ -832,12 +870,15 @@ struct LibraryLandingView: View {
                 // 2. On Device Shelf
                 onDeviceShelf
 
+                if !CacheStatus.shared.saved.isDisjoint(with: ["library", "librarySongs", "history"]) {
+                    SavedContentNotice(message: CacheStatus.shared.failures.values.first)
+                }
                 // 3. Signed-out prompt or Signed-in shelves
                 if !auth.signedIn {
                     signedInPrompt
                 } else if loading {
                     FeedSkeleton()
-                } else if let error {
+                } else if let error, shelves.isEmpty {
                     EmptyStateView(
                         icon: Image(.bchLibrary),
                         title: "Library couldn't load",
@@ -853,11 +894,14 @@ struct LibraryLandingView: View {
         }
         .refreshable {
             downloadStore.refresh()
-            await loadShelves()
+            await loadShelves(force: true)
         }
         .task(id: auth.sessionEpoch) {
             downloadStore.refresh()
             await loadShelves()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .pageCacheUpdated)) { note in
+            if note.object as? String == "library" { Task { await loadShelves() } }
         }
     }
 
@@ -1015,17 +1059,22 @@ struct LibraryLandingView: View {
         shelf.title.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == "playlists"
     }
 
-    private func loadShelves() async {
+    private func loadShelves(force: Bool = false) async {
         guard auth.signedIn else {
             loading = false
             shelves = []
             return
         }
-        loading = true
+        let generation = PageSession.generation()
+        if dataGeneration != generation { shelves = []; dataGeneration = generation }
+        loading = shelves.isEmpty
         error = nil
         do {
-            shelves = try await InnertubeFeed.shared.library()
+            let result = try await InnertubeFeed.shared.library(force: force)
+            guard generation == PageSession.generation(), !Task.isCancelled else { return }
+            shelves = result
         } catch {
+            guard generation == PageSession.generation(), !Task.isCancelled else { return }
             self.error = error.localizedDescription
         }
         loading = false
@@ -1738,6 +1787,7 @@ struct SavedShelfView: View {
     var emptySubtitle = "Channels you subscribe to show up here."
     @Environment(AuthController.self) private var auth
     @State private var shelves: [FeedShelf] = []
+    @State private var dataGeneration: Int64?
     @State private var loading = true
     @State private var error: String?
 
@@ -1780,7 +1830,7 @@ struct SavedShelfView: View {
                     .padding(.horizontal, 24)
                     .padding(.vertical, 20)
                 }
-                .refreshable { await load() }
+                .refreshable { await load(force: true) }
             }
         }
         .navigationTitle(title)
@@ -1795,20 +1845,30 @@ struct SavedShelfView: View {
             }
         }
         #endif
+        .savedPageNotice("library")
         .task(id: auth.sessionEpoch) { await load() }
+        .onReceive(NotificationCenter.default.publisher(for: .pageCacheUpdated)) { note in
+            guard let name = note.object as? String, ["library", "librarySongs", "history"].contains(name) else { return }
+            Task { await load() }
+        }
     }
 
-    private func load() async {
+    private func load(force: Bool = false) async {
         guard auth.signedIn else {
             loading = false
             shelves = []
             return
         }
-        loading = true
+        let generation = PageSession.generation()
+        if dataGeneration != generation { shelves = []; dataGeneration = generation }
+        loading = shelves.isEmpty
         error = nil
         do {
-            shelves = try await InnertubeFeed.shared.library()
+            let result = try await InnertubeFeed.shared.library(force: force)
+            guard generation == PageSession.generation(), !Task.isCancelled else { return }
+            shelves = result
         } catch {
+            guard generation == PageSession.generation(), !Task.isCancelled else { return }
             self.error = error.localizedDescription
         }
         loading = false
@@ -1822,6 +1882,7 @@ struct SavedPlaylistsView: View {
     @Environment(AuthController.self) private var auth
     @Environment(AppModel.self) private var appModel
     @State private var shelves: [FeedShelf] = []
+    @State private var dataGeneration: Int64?
     @State private var loading = true
     @State private var error: String?
 
@@ -1860,7 +1921,7 @@ struct SavedPlaylistsView: View {
                     .padding(.horizontal, 24)
                     .padding(.vertical, 20)
                 }
-                .refreshable { await load() }
+                .refreshable { await load(force: true) }
             }
         }
         .navigationTitle(title)
@@ -1875,20 +1936,30 @@ struct SavedPlaylistsView: View {
             }
         }
         #endif
+        .savedPageNotice("library")
         .task(id: auth.sessionEpoch) { await load() }
+        .onReceive(NotificationCenter.default.publisher(for: .pageCacheUpdated)) { note in
+            guard let name = note.object as? String, ["library", "librarySongs", "history"].contains(name) else { return }
+            Task { await load() }
+        }
     }
 
-    private func load() async {
+    private func load(force: Bool = false) async {
         guard auth.signedIn else {
             loading = false
             shelves = []
             return
         }
-        loading = true
+        let generation = PageSession.generation()
+        if dataGeneration != generation { shelves = []; dataGeneration = generation }
+        loading = shelves.isEmpty
         error = nil
         do {
-            shelves = try await InnertubeFeed.shared.library()
+            let result = try await InnertubeFeed.shared.library(force: force)
+            guard generation == PageSession.generation(), !Task.isCancelled else { return }
+            shelves = result
         } catch {
+            guard generation == PageSession.generation(), !Task.isCancelled else { return }
             self.error = error.localizedDescription
         }
         loading = false
@@ -1991,6 +2062,7 @@ struct UnifiedSongsView: View {
     @State private var local = LocalLibrary.shared
     @State private var pickingFolder = false
     @State private var songs: [YouTubeSong] = []
+    @State private var dataGeneration: Int64?
     @State private var songsLoading = true
     @State private var songsError: String?
 
@@ -2135,20 +2207,30 @@ struct UnifiedSongsView: View {
                 local.scanPicked(url)
             }
         }
+        .savedPageNotice("librarySongs")
         .task(id: auth.sessionEpoch) { await loadSongs() }
+        .onReceive(NotificationCenter.default.publisher(for: .pageCacheUpdated)) { note in
+            guard let name = note.object as? String, ["library", "librarySongs", "history"].contains(name) else { return }
+            Task { await loadSongs() }
+        }
     }
 
-    private func loadSongs() async {
+    private func loadSongs(force: Bool = false) async {
         guard auth.signedIn else {
             songsLoading = false
             songs = []
             return
         }
-        songsLoading = true
+        let generation = PageSession.generation()
+        if dataGeneration != generation { songs = []; dataGeneration = generation }
+        songsLoading = songs.isEmpty
         songsError = nil
         do {
-            songs = try await InnertubeFeed.shared.librarySongs()
+            let result = try await InnertubeFeed.shared.librarySongs(force: force)
+            guard generation == PageSession.generation(), !Task.isCancelled else { return }
+            songs = result
         } catch {
+            guard generation == PageSession.generation(), !Task.isCancelled else { return }
             self.songsError = error.localizedDescription
         }
         songsLoading = false
@@ -2176,6 +2258,7 @@ struct UnifiedAlbumsView: View {
     @State private var local = LocalLibrary.shared
     @State private var pickingFolder = false
     @State private var shelves: [FeedShelf] = []
+    @State private var dataGeneration: Int64?
     @State private var loading = true
     @State private var error: String?
 
@@ -2230,7 +2313,7 @@ struct UnifiedAlbumsView: View {
                     }
                     .padding(.vertical, 20)
                 }
-                .refreshable { await load() }
+                .refreshable { await load(force: true) }
             }
         }
         .navigationTitle(title)
@@ -2277,7 +2360,12 @@ struct UnifiedAlbumsView: View {
                 local.scanPicked(url)
             }
         }
+        .savedPageNotice("library")
         .task(id: auth.sessionEpoch) { await load() }
+        .onReceive(NotificationCenter.default.publisher(for: .pageCacheUpdated)) { note in
+            guard let name = note.object as? String, ["library", "librarySongs", "history"].contains(name) else { return }
+            Task { await load() }
+        }
     }
 
     private func collectionSection(title: String, items: [ShelfCard]) -> some View {
@@ -2362,17 +2450,22 @@ struct UnifiedAlbumsView: View {
         }
     }
 
-    private func load() async {
+    private func load(force: Bool = false) async {
         guard auth.signedIn else {
             loading = false
             shelves = []
             return
         }
-        loading = true
+        let generation = PageSession.generation()
+        if dataGeneration != generation { shelves = []; dataGeneration = generation }
+        loading = shelves.isEmpty
         error = nil
         do {
-            shelves = try await InnertubeFeed.shared.library()
+            let result = try await InnertubeFeed.shared.library(force: force)
+            guard generation == PageSession.generation(), !Task.isCancelled else { return }
+            shelves = result
         } catch {
+            guard generation == PageSession.generation(), !Task.isCancelled else { return }
             self.error = error.localizedDescription
         }
         loading = false
@@ -2388,6 +2481,7 @@ struct UnifiedArtistsView: View {
     @State private var local = LocalLibrary.shared
     @State private var pickingFolder = false
     @State private var shelves: [FeedShelf] = []
+    @State private var dataGeneration: Int64?
     @State private var loading = true
     @State private var error: String?
 
@@ -2452,7 +2546,7 @@ struct UnifiedArtistsView: View {
                     }
                     .padding(.vertical, 20)
                 }
-                .refreshable { await load() }
+                .refreshable { await load(force: true) }
             }
         }
         .navigationTitle(title)
@@ -2499,7 +2593,12 @@ struct UnifiedArtistsView: View {
                 local.scanPicked(url)
             }
         }
+        .savedPageNotice("library")
         .task(id: auth.sessionEpoch) { await load() }
+        .onReceive(NotificationCenter.default.publisher(for: .pageCacheUpdated)) { note in
+            guard let name = note.object as? String, ["library", "librarySongs", "history"].contains(name) else { return }
+            Task { await load() }
+        }
     }
 
     private func scanPrompt(kind: String) -> some View {
@@ -2570,17 +2669,22 @@ struct UnifiedArtistsView: View {
         }
     }
 
-    private func load() async {
+    private func load(force: Bool = false) async {
         guard auth.signedIn else {
             loading = false
             shelves = []
             return
         }
-        loading = true
+        let generation = PageSession.generation()
+        if dataGeneration != generation { shelves = []; dataGeneration = generation }
+        loading = shelves.isEmpty
         error = nil
         do {
-            shelves = try await InnertubeFeed.shared.library()
+            let result = try await InnertubeFeed.shared.library(force: force)
+            guard generation == PageSession.generation(), !Task.isCancelled else { return }
+            shelves = result
         } catch {
+            guard generation == PageSession.generation(), !Task.isCancelled else { return }
             self.error = error.localizedDescription
         }
         loading = false
@@ -2628,6 +2732,7 @@ struct HistoryView: View {
     @Environment(PlaybackController.self) private var controller
     @Environment(AuthController.self) private var auth
     @State private var songs: [YouTubeSong] = []
+    @State private var dataGeneration: Int64?
     @State private var loading = true
     @State private var error: String?
 
@@ -2642,7 +2747,7 @@ struct HistoryView: View {
                 ) { auth.loginPresented = true }
             } else if loading {
                 ProgressView().frame(maxWidth: .infinity, maxHeight: .infinity)
-            } else if let error {
+            } else if let error, songs.isEmpty {
                 EmptyStateView(
                     icon: Image(.bchClock),
                     title: "History couldn't load",
@@ -2695,20 +2800,31 @@ struct HistoryView: View {
             }
         }
         #endif
+        .savedPageNotice("history")
+        .savedPageNotice("library")
         .task(id: auth.sessionEpoch) { await load() }
+        .onReceive(NotificationCenter.default.publisher(for: .pageCacheUpdated)) { note in
+            guard let name = note.object as? String, ["library", "librarySongs", "history"].contains(name) else { return }
+            Task { await load() }
+        }
     }
 
-    private func load() async {
+    private func load(force: Bool = false) async {
         guard auth.signedIn else {
             loading = false
             songs = []
             return
         }
-        loading = true
+        let generation = PageSession.generation()
+        if dataGeneration != generation { songs = []; dataGeneration = generation }
+        loading = songs.isEmpty
         error = nil
         do {
-            songs = try await InnertubeFeed.shared.history()
+            let result = try await InnertubeFeed.shared.history(force: force)
+            guard generation == PageSession.generation(), !Task.isCancelled else { return }
+            songs = result
         } catch {
+            guard generation == PageSession.generation(), !Task.isCancelled else { return }
             self.error = error.localizedDescription
         }
         loading = false
@@ -2725,6 +2841,7 @@ private struct YoutubeLibraryView: View {
     @Environment(AuthController.self) private var auth
     @Environment(AppModel.self) private var appModel
     @State private var shelves: [FeedShelf] = []
+    @State private var dataGeneration: Int64?
     @State private var loading = true
     @State private var error: String?
 
@@ -2739,7 +2856,7 @@ private struct YoutubeLibraryView: View {
                 ) { auth.loginPresented = true }
             } else if loading {
                 ScrollView { FeedSkeleton() }
-            } else if let error {
+            } else if let error, shelves.isEmpty {
                 EmptyStateView(
                     icon: Image(.bchLibrary),
                     title: "Library couldn't load",
@@ -2788,7 +2905,7 @@ private struct YoutubeLibraryView: View {
                     .padding(.horizontal, 24)
                     .padding(.vertical, 20)
                 }
-                .refreshable { await load() }
+                .refreshable { await load(force: true) }
             }
         }
         .navigationTitle("Recent")
@@ -2803,7 +2920,12 @@ private struct YoutubeLibraryView: View {
             }
         }
         #endif
+        .savedPageNotice("library")
         .task(id: auth.sessionEpoch) { await load() }
+        .onReceive(NotificationCenter.default.publisher(for: .pageCacheUpdated)) { note in
+            guard let name = note.object as? String, ["library", "librarySongs", "history"].contains(name) else { return }
+            Task { await load() }
+        }
     }
 
     private func pinnedShelves(_ shelves: [FeedShelf]) -> [FeedShelf] {
@@ -2833,17 +2955,22 @@ private struct YoutubeLibraryView: View {
         return t == "playlists"
     }
 
-    private func load() async {
+    private func load(force: Bool = false) async {
         guard auth.signedIn else {
             loading = false
             shelves = []
             return
         }
-        loading = true
+        let generation = PageSession.generation()
+        if dataGeneration != generation { shelves = []; dataGeneration = generation }
+        loading = shelves.isEmpty
         error = nil
         do {
-            shelves = try await InnertubeFeed.shared.library()
+            let result = try await InnertubeFeed.shared.library(force: force)
+            guard generation == PageSession.generation(), !Task.isCancelled else { return }
+            shelves = result
         } catch {
+            guard generation == PageSession.generation(), !Task.isCancelled else { return }
             self.error = error.localizedDescription
         }
         loading = false
@@ -3050,9 +3177,14 @@ private struct LocalPlaylistsView: View {
             }
         }
         #endif
+        .savedPageNotice("library")
         .task(id: auth.sessionEpoch) { await load() }
+        .onReceive(NotificationCenter.default.publisher(for: .pageCacheUpdated)) { note in
+            guard let name = note.object as? String, ["library", "librarySongs", "history"].contains(name) else { return }
+            Task { await load() }
+        }
         .onAppear { local.restoreViewPreferences() }
-        .refreshable { await load() }
+        .refreshable { await load(force: true) }
         .overlay {
             if matchingImport {
                 ZStack {
@@ -3083,7 +3215,7 @@ private struct LocalPlaylistsView: View {
         }
     }
 
-    private func load() async {
+    private func load(force: Bool = false) async {
         loading = true
         files = Self.localM3uPlaylists(tracks: local.tracks)
         if auth.signedIn {

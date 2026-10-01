@@ -45,6 +45,7 @@ enum AudioSessionManager {
         let session = AVAudioSession.sharedInstance()
         let message = "audio session \(event) category=\(session.category.rawValue) "
             + "mode=\(session.mode.rawValue) options=\(session.categoryOptions.rawValue) "
+            + "policy=\(session.routeSharingPolicy.rawValue) "
             + "active=\(isActive) otherAudio=\(session.isOtherAudioPlaying)"
         PlaybackDebugLog.shared.record(message)
         NSLog("[BitChord] %@", message)
@@ -75,7 +76,10 @@ enum AudioSessionManager {
     /// Coexistence is determined only by the user's mixing preference. Native
     /// Now Playing prominence must never silently change the audio policy.
     @discardableResult
-    static func activate(preferredSampleRate: Double? = nil) async throws -> Format? {
+    static func activate(preferredSampleRate: Double? = nil, restartRouting: Bool = false) async throws -> Format? {
+        #if os(macOS)
+        _ = await HeadphoneRouting.shared.acquire(allowSwitching: !PlatformSettings.shared.getBoolean(key: "prefer_usb_dac", default: false), restart: restartRouting)
+        #endif
         return try await withCheckedThrowingContinuation { continuation in
             sessionQueue.async {
                 do {
@@ -99,12 +103,13 @@ enum AudioSessionManager {
                 let mixing = PlatformSettings.shared.getBoolean(
                     key: "mix_with_other_audio", default: true
                 )
-                var options: AVAudioSession.CategoryOptions = []
-                if mixing {
-                    options.insert(.mixWithOthers)
-                }
-                if session.category != .playback || session.mode != .default || session.categoryOptions != options {
-                    try session.setCategory(.playback, mode: .default, options: options)
+                let options: AVAudioSession.CategoryOptions = mixing ? [.mixWithOthers] : []
+                // Long-form routing rejects mixWithOthers with OSStatus -50.
+                // Use the default routing policy when the user wants mixing;
+                // playback still supports AirPlay and Bluetooth with that policy.
+                let policy: AVAudioSession.RouteSharingPolicy = mixing ? .default : .longFormAudio
+                if session.category != .playback || session.mode != .default || session.categoryOptions != options || session.routeSharingPolicy != policy {
+                    try session.setCategory(.playback, mode: .default, policy: policy, options: options)
                 }
                 if PlatformSettings.shared.getBoolean(
                     key: "match_source_sample_rate", default: true
@@ -153,6 +158,7 @@ enum AudioSessionManager {
         NSLog("[BitChord] audio session %@",
               "category=\(session.category.rawValue) mode=\(session.mode.rawValue) "
               + "options=\(session.categoryOptions.rawValue) volume=\(session.outputVolume) "
+              + "policy=\(session.routeSharingPolicy.rawValue) "
               + "route=\(output.map { "\($0.portType.rawValue)/\($0.portName)" } ?? "none") "
               + "rate=\(session.sampleRate) ch=\(channels) "
               + "otherAudio=\(session.isOtherAudioPlaying) "
@@ -168,6 +174,9 @@ enum AudioSessionManager {
     /// Deactivates the playback session and notifies other audio apps that
     /// they may resume or take back exclusive hardware access.
     static func deactivate(notifyOthers: Bool = true) async {
+        #if os(macOS)
+        await HeadphoneRouting.shared.release()
+        #endif
         await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
             sessionQueue.async {
                 deactivateSynchronously(notifyOthers: notifyOthers)
@@ -232,10 +241,19 @@ enum AudioSessionManager {
         }
         return [token]
 #else
-        _ = handler
-        _ = onOldDeviceUnavailable
-        return []
+        return [MacAudioRoutes(changed: handler, disconnected: onOldDeviceUnavailable)]
 #endif
+    }
+
+    static func observeSpatialCapabilities(_ handler: @escaping (Bool?) -> Void) -> [NSObjectProtocol] {
+        #if os(iOS)
+        return [NotificationCenter.default.addObserver(forName: AVAudioSession.spatialPlaybackCapabilitiesChangedNotification,
+            object: nil, queue: .main) { notification in
+                handler((notification.userInfo?[AVAudioSessionSpatialAudioEnabledKey] as? NSNumber)?.boolValue)
+            }]
+        #else
+        return []
+        #endif
     }
 
     /// Observes audio session interruptions (phone calls, Siri, other apps).

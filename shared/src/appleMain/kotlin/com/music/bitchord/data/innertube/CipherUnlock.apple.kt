@@ -15,6 +15,8 @@ actual object CipherUnlock {
 
     actual suspend fun unlockCipher(videoId: String, cipher: String): String? =
         CipherUnlockBridge.unlockCipher(videoId, cipher)
+
+    actual suspend fun transformUrl(url: String): String? = CipherUnlockBridge.transformUrl(url)
 }
 
 /**
@@ -25,6 +27,7 @@ object CipherUnlockBridge {
     interface Impl {
         fun signatureTimestamp(callback: ResultCallback)
         fun unlockCipher(videoId: String, cipher: String, callback: ResultCallback)
+        fun transformUrl(url: String, callback: ResultCallback)
     }
 
     fun interface ResultCallback {
@@ -60,6 +63,16 @@ object CipherUnlockBridge {
                     if (error.isUnparseablePlayer()) SignatureSolver.markBroken(error)
                     DebugLog.d("cipher unlock failed: $error")
                 }
+                if (cont.isActive) cont.resume(value)
+            })
+        }
+    }
+
+    suspend fun transformUrl(url: String): String? {
+        val bridge = impl ?: return url
+        return suspendCancellableCoroutine { cont ->
+            bridge.transformUrl(url, ResultCallback { value, error ->
+                if (error != null) DebugLog.d("media URL transform failed: $error")
                 if (cont.isActive) cont.resume(value)
             })
         }

@@ -24,8 +24,10 @@ object DetailBridge {
     }
 
     fun browse(browseId: String, callback: DetailCallback) {
+        val generation = Innertube.sessionGeneration
         bridgeScope.launch {
             try {
+                Innertube.checkSession(generation)
                 val response = Innertube.browse(browseId)
                 val header = InnertubeParser.parseBrowseHeader(response)
                 val songs = InnertubeParser.collectSongsDeep(response)
@@ -50,6 +52,7 @@ object DetailBridge {
                     librarySaved = library?.saved,
                     playlistOwned = owned,
                 )
+                Innertube.checkSession(generation)
                 callback.onResult(
                     json.encodeToString(DetailPage.serializer(), page),
                     null,
@@ -61,8 +64,10 @@ object DetailBridge {
     }
 
     fun browseArtist(browseId: String, callback: DetailCallback) {
+        val generation = Innertube.sessionGeneration
         bridgeScope.launch {
             try {
+                Innertube.checkSession(generation)
                 val response = Innertube.browse(browseId)
                 val artistPage = InnertubeParser.parseArtistPage(response)
                 val page = DetailPage(
@@ -78,6 +83,7 @@ object DetailBridge {
                     monthlyListenerCount = artistPage.monthlyListenerCount,
                     subscription = artistPage.subscription,
                 )
+                Innertube.checkSession(generation)
                 callback.onResult(
                     json.encodeToString(DetailPage.serializer(), page),
                     null,
@@ -89,8 +95,10 @@ object DetailBridge {
     }
 
     fun more(token: String, callback: DetailCallback) {
+        val generation = Innertube.sessionGeneration
         bridgeScope.launch {
             try {
+                Innertube.checkSession(generation)
                 val response = Innertube.browseContinuation(token)
                 val playlistShelf = InnertubeParser.parsePlaylistShelf(response)
                 val songs = playlistShelf?.songs
@@ -105,6 +113,7 @@ object DetailBridge {
                         ?: InnertubeParser.continuationToken(response),
                     suggestedSongs = playlistShelf?.suggested.orEmpty(),
                 )
+                Innertube.checkSession(generation)
                 callback.onResult(json.encodeToString(DetailPage.serializer(), page), null)
             } catch (e: Throwable) {
                 callback.onResult(null, e.message ?: e.toString())

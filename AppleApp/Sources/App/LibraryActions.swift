@@ -25,10 +25,11 @@ enum LibraryActions {
     ///
     /// - Returns: the failure message, or `nil` on success.
     static func toggleLike(videoId: String) async -> String? {
+        let generation = PageSession.generation()
         let previous = cachedLike(videoId)
         let next = previous == "LIKE" ? "INDIFFERENT" : "LIKE"
         let failure = await rate(videoId: videoId, status: next)
-        if failure != nil {
+        if failure != nil, generation == PageSession.generation() {
             // `rate` already wrote `next` optimistically; put it back.
             LikeStore.shared.set(videoId, previous)
         }
@@ -55,7 +56,7 @@ enum LibraryActions {
 
     static func createPlaylist(title: String, privacy: String, videoId: String?) async -> String? {
         await withCheckedContinuation { cont in
-            LibraryActionsBridge.shared.createPlaylist(title: title, privacy: privacy, videoId: videoId, callback: JsonCB { json, _ in
+            LibraryActionsBridge.shared.createPlaylist(title: title, privacy: privacy, videoId: videoId, callback: JsonCB(invalidateOnSuccess: true) { json, _ in
                 cont.resume(returning: json)
             })
         }
@@ -119,6 +120,7 @@ enum LibraryActions {
         playlistId: String,
         songs: [(setVideoId: String, videoId: String)]
     ) async -> String? {
+        let generation = PageSession.generation()
         var seen = Set<String>()
         var extras: [(String, String)] = []
         for song in songs {
@@ -129,10 +131,12 @@ enum LibraryActions {
             }
         }
         for extra in extras {
+            guard generation == PageSession.generation() else { return "Account changed; reload before trying again" }
             if let err = await removeFromPlaylist(playlistId: playlistId, setVideoId: extra.0, videoId: extra.1) {
                 return err
             }
         }
+        guard generation == PageSession.generation() else { return "Account changed; reload before trying again" }
         return extras.isEmpty ? "No duplicates" : nil
     }
 
@@ -178,6 +182,8 @@ final class LikeStore {
         map[videoId] ?? LibraryActionsBridge.shared.likeStatus(videoId: videoId)
     }
 
+    func clear() { map.removeAll(); epoch += 1 }
+
     func set(_ videoId: String, _ status: String) {
         map[videoId] = status
         epoch += 1
@@ -202,12 +208,48 @@ struct SongMenuDTO: Codable {
 
 private final class DoneCB: LibraryActionsBridgeDoneCallback {
     let handler: (Bool, String?) -> Void
-    init(_ handler: @escaping (Bool, String?) -> Void) { self.handler = handler }
-    func onResult(ok: Bool, message: String?) { handler(ok, message) }
+    let context: PageContext
+    @MainActor init(_ handler: @escaping (Bool, String?) -> Void) {
+        self.handler = handler; context = PageSession.capture()
+    }
+    func onResult(ok: Bool, message: String?) {
+        Task { @MainActor in
+            guard context.generation == PageSession.generation() else {
+                handler(false, "Account changed; reload before trying again"); return
+            }
+            if ok {
+                await PageRepository.shared.invalidate(partition: context.partition)
+                CacheStatus.shared.reset()
+            }
+            guard context.generation == PageSession.generation() else {
+                handler(false, "Account changed; reload before trying again"); return
+            }
+            handler(ok, message)
+        }
+    }
 }
 
 private final class JsonCB: LibraryActionsBridgeJsonCallback {
     let handler: (String?, String?) -> Void
-    init(_ handler: @escaping (String?, String?) -> Void) { self.handler = handler }
-    func onResult(json: String?, message: String?) { handler(json, message) }
+    let context: PageContext
+    let invalidateOnSuccess: Bool
+    @MainActor init(invalidateOnSuccess: Bool = false, _ handler: @escaping (String?, String?) -> Void) {
+        self.handler = handler; self.invalidateOnSuccess = invalidateOnSuccess
+        context = PageSession.capture()
+    }
+    func onResult(json: String?, message: String?) {
+        Task { @MainActor in
+            guard context.generation == PageSession.generation() else {
+                handler(nil, "Account changed; reload before trying again"); return
+            }
+            if invalidateOnSuccess, json != nil {
+                await PageRepository.shared.invalidate(partition: context.partition)
+                CacheStatus.shared.reset()
+            }
+            guard context.generation == PageSession.generation() else {
+                handler(nil, "Account changed; reload before trying again"); return
+            }
+            handler(json, message)
+        }
+    }
 }

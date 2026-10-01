@@ -33,8 +33,10 @@ object PlayerBridge {
     }
 
     fun resolve(videoId: String, maxKbps: Int, callback: ResolveCallback) {
+        val generation = Innertube.sessionGeneration
         bridgeScope.launch {
             try {
+                Innertube.checkSession(generation)
                 val resolved = StreamResolver.resolve(videoId, maxKbps)
                     ?: throw IllegalStateException("No playable stream for $videoId")
                 val payload = StreamPayload(
@@ -44,6 +46,7 @@ object PlayerBridge {
                     headers = resolved.headers,
                     loudnessDb = resolved.loudnessDb,
                 )
+                Innertube.checkSession(generation)
                 callback.onResult(json.encodeToString(StreamPayload.serializer(), payload), null)
             } catch (e: StreamResolver.PermanentlyUnplayableException) {
                 // A verdict, not a failure. Carried in the message so the caller can

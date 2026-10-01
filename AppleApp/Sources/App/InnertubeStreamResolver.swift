@@ -55,21 +55,9 @@ final class InnertubeStreamResolver: Sendable {
             )
         }
 
-        // The `n` parameter is a throttle token googlevideo refuses to serve
-        // un-transformed. Formats that arrived with a plain `url` are transformed
-        // by the shared module as it unlocks them; this is the belt-and-braces pass
-        // for any that still carry one, and it is a no-op when they do not.
-        //
-        // Upstream does the equivalent inside its extractor and does *not* run it a
-        // second time over an already-solved URL — solving costs a trip through the
-        // player JavaScript, and paying it twice is both latency and a second chance
-        // to hit whatever is currently failing it.
-        let deobfuscated = await YouTubePlayerJs.shared.deobfuscateN(url: payload.url, videoId: videoId)
-        guard deobfuscated != payload.url else { return payload }
-        return ResolvedYouTubeStream(
-            url: deobfuscated, kbps: payload.kbps, mimeType: payload.mimeType,
-            headers: payload.headers, loudnessDb: payload.loudnessDb
-        )
+        // The shared resolver transforms both direct and ciphered URLs before
+        // probing. Applying the n transform again corrupts a verified URL.
+        return payload
     }
 
     struct StreamError: Error, LocalizedError {
@@ -103,6 +91,12 @@ final class InnertubeStreamResolver: Sendable {
         /// sent any, otherwise a statement of what failed and never the raw error.
         static func say(_ raw: String) -> String {
             let said = raw.lowercased()
+            if said.contains("signed-in playback:") {
+                return "Your signed-in session could not be restored. Check your connection or sign in again."
+            }
+            if said.contains("temporarily unavailable") {
+                return "Playback is temporarily unavailable. Try again shortly."
+            }
             if said.contains("sign in") || said.contains("not a bot") {
                 return "YouTube is asking this device to sign in before it will serve anything. That is YouTube's gate rather than anything to do with the track."
             }

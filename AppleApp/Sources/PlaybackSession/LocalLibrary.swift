@@ -37,6 +37,8 @@ final class LocalLibrary {
     private(set) var scanned = false
     var onChange: (() -> Void)?
 
+    private var scanTask: Task<Void, Never>?
+    private var scanID = UUID()
     private var securityURL: URL?
 
     /// Restores the persisted bookmark and rescans. BITCHORD_LIBRARY_PATH is
@@ -94,12 +96,23 @@ final class LocalLibrary {
     #endif
 
     private func scan(folder: URL) {
+        scanTask?.cancel()
+        let id = UUID(); scanID = id
+        let work = Task.detached(priority: .utility) { Self.readTracks(folder: folder) }
+        scanTask = Task {
+            let result = await withTaskCancellationHandler { await work.value } onCancel: { work.cancel() }
+            guard scanID == id, !Task.isCancelled else { return }
+            tracks = result; scanned = true; onChange?()
+        }
+    }
+
+    nonisolated private static func readTracks(folder: URL) -> [LocalTrack] {
         let fm = FileManager.default
         let keys: [URLResourceKey] = [.isRegularFileKey]
         guard let enumerator = fm.enumerator(at: folder,
                                              includingPropertiesForKeys: keys,
                                              options: [.skipsHiddenFiles, .skipsPackageDescendants]) else {
-            return
+            return []
         }
         let audioPaths = enumerator
             .compactMap { $0 as? URL }
@@ -112,6 +125,7 @@ final class LocalLibrary {
 
         var found: [LocalTrack] = []
         for path in audioPaths {
+            if Task.isCancelled { return [] }
             let fileName = URL(fileURLWithPath: path).deletingPathExtension().lastPathComponent
             let dates = fileDates(at: path)
             if let meta = readTrackMetadata(path: path) {
@@ -146,9 +160,7 @@ final class LocalLibrary {
         // answers to "what order is this" depending on which one you had looked at.
         // Alphabetical by path keeps the list stable between scans, which is what
         // the ordering's tie-breakers assume.
-        tracks = found.sorted { $0.path.localizedStandardCompare($1.path) == .orderedAscending }
-        scanned = true
-        onChange?()
+        return found.sorted { $0.path.localizedStandardCompare($1.path) == .orderedAscending }
     }
 
     /// The file's own dates, read once per file during the scan.
@@ -156,7 +168,7 @@ final class LocalLibrary {
     /// Not on a background queue of its own: the scan is already off the main
     /// thread's critical path and a stat per file is cheap next to the tag read
     /// that follows it.
-    private func fileDates(at path: String) -> (added: Date?, modified: Date?) {
+    nonisolated private static func fileDates(at path: String) -> (added: Date?, modified: Date?) {
         let url = URL(fileURLWithPath: path)
         let keys: Set<URLResourceKey> = [.creationDateKey, .contentModificationDateKey]
         guard let values = try? url.resourceValues(forKeys: keys) else { return (nil, nil) }

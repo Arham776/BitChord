@@ -13,9 +13,11 @@ repo="$(cd "$here/.." && pwd)"
 
 fw="$repo/AppleApp/Frameworks/BitChordShared.xcframework/macos-arm64"
 bin="$(mktemp -d)/playback-verify"
-xcrun swiftc -O -o "$bin" \
+xcrun swiftc -O -module-cache-path /tmp/bitchord-swift-module-cache -o "$bin" \
   -F "$fw" -framework BitChordShared \
   -Xlinker -rpath -Xlinker "$fw/BitChordShared.framework/Versions/A" \
+  "$repo/AppleApp/Sources/App/YouTubeChallengeSolver.swift" \
+  "$repo/AppleApp/Sources/App/YouTubePlayerJs.swift" \
   "$here/playback-verify/main.swift"
 
-exec "$bin"
+exec "$bin" "$repo/AppleApp/Resources/YouTubeSolver"

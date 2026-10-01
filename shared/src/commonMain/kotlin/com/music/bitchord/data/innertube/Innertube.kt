@@ -28,7 +28,9 @@ import kotlinx.serialization.json.put
 import kotlinx.serialization.json.putJsonArray
 import kotlinx.serialization.json.putJsonObject
 import kotlinx.serialization.json.JsonArrayBuilder
-import kotlin.concurrent.Volatile
+import kotlin.concurrent.atomics.AtomicReference
+import kotlin.concurrent.atomics.ExperimentalAtomicApi
+import com.music.bitchord.data.http.HttpStatusException
 import kotlin.time.Clock
 import kotlinx.io.IOException
 
@@ -52,6 +54,7 @@ import kotlinx.io.IOException
  * Authenticated requests are signed with Google's SAPISIDHASH scheme derived
  * from the stored cookie; no long-lived token is ever minted or stored.
  */
+@OptIn(ExperimentalAtomicApi::class)
 object Innertube {
 
     private const val MUSIC_BASE = "https://music.youtube.com/youtubei/v1"
@@ -70,40 +73,69 @@ object Innertube {
 
     private val json = Json { ignoreUnknownKeys = true }
 
-    /** Session cookie captured by the login WebView; null = browse as guest. */
-    @Volatile
-    var cookie: String? = null
-        set(value) {
-            if (field != value) {
-                // A scope kept across a sign-in would credit the new account's
-                // plays to the old one, and a visitor id minted under the old
-                // session is not bound to the new one.
-                scope = null
-                visitorData = null
-                visitorDataIsSessionBound = false
-            }
-            field = value
+    // One immutable state: request identity must never mix two account selections.
+    private data class SessionState(
+        val generation: Long = 0,
+        val cookie: String? = null,
+        val scope: SessionScope? = null,
+        val channel: ChannelSelection? = null,
+        val visitor: String? = null,
+        val visitorBound: Boolean = false,
+    )
+    private val sessionState = AtomicReference(SessionState())
+    private fun updateSession(change: (SessionState) -> SessionState) {
+        while (true) {
+            val before = sessionState.load()
+            if (sessionState.compareAndSet(before, change(before))) return
         }
+    }
+    val sessionGeneration: Long get() = sessionState.load().generation
+    var cookie: String?
+        get() = sessionState.load().cookie
+        set(value) {
+            if (value == cookie) return
+            updateSession { SessionState(generation = it.generation + 1, cookie = value) }
+            sessionChanged()
+        }
+    private var visitorData: String?
+        get() = sessionState.load().visitor
+        set(value) { updateSession { it.copy(visitor = value) } }
+    private val visitorDataIsSessionBound: Boolean get() = sessionState.load().visitorBound
+    private val scope: SessionScope? get() = sessionState.load().scope
+    private val channelOverride: ChannelSelection? get() = sessionState.load().channel
 
-    /**
-     * Google's per-session visitor id. Far more load-bearing than "an id for
-     * stats": a `player` request that carries no visitor id is treated as a
-     * client with no session at all, and Google answers it with
-     * `LOGIN_REQUIRED` / "Sign in to confirm you're not a bot", or with
-     * stream URLs that serve a byte to anything and then refuse every real
-     * read with 403. Fetched deliberately by [ensureVisitorData] rather than
-     * hoped for.
-     */
-    @Volatile
-    private var visitorData: String? = null
+    private fun sessionChanged() {
+        com.music.bitchord.data.LikeState.clear()
+        StreamResolver.onSessionChanged()
+        PlaybackTracker.onSessionChanged()
+    }
+    class SessionUnavailableException : IllegalStateException("Your saved session could not be verified. Try again when connected.")
+    class AuthenticationException : IllegalStateException("Your YouTube Music session has expired. Sign in again.")
+    class PlayerAuthenticationException : IllegalStateException("This playback client rejected authentication")
+    class SessionChangedException : CancellationException("Account changed during request")
 
-    /**
-     * Whether [visitorData] came from the signed-in shell rather than being
-     * minted anonymously. A session-bound id must not be replaced by a later
-     * anonymous mint.
-     */
-    @Volatile
-    private var visitorDataIsSessionBound = false
+    internal class RequestSession(
+        val generation: Long,
+        val cookie: String?,
+        val authUser: String?,
+        val pageId: String?,
+        val dataSyncId: String?,
+        val visitor: String?,
+        val clientVersion: String,
+    )
+    internal fun requestSession(): RequestSession {
+        val state = sessionState.load()
+        if (state.cookie != null && state.scope == null) throw SessionUnavailableException()
+        val chosen = state.channel
+        return RequestSession(state.generation, state.cookie,
+            chosen?.authUser ?: state.scope?.authUser,
+            if (chosen != null) chosen.pageId else state.scope?.pageId,
+            if (chosen != null) chosen.dataSyncId else state.scope?.dataSyncId,
+            state.visitor, state.scope?.clientVersion ?: WEB_REMIX_VERSION)
+    }
+    internal fun checkSession(generation: Long) {
+        if (sessionGeneration != generation) throw SessionChangedException()
+    }
 
     /**
      * A visitor id for this session, minting one if there isn't one yet.
@@ -112,12 +144,13 @@ object Innertube {
      */
     suspend fun ensureVisitorData(refresh: Boolean = false): String? {
         if (!refresh && visitorData != null) return visitorData
+        val generation = sessionGeneration
         runCatching { fetchVisitorData() }
             .getOrNull()
             ?.let {
-                if (refresh || !visitorDataIsSessionBound) {
-                    visitorData = it
-                    visitorDataIsSessionBound = false
+                updateSession { state ->
+                    if (state.generation == generation && !state.visitorBound) state.copy(visitor = it)
+                    else state
                 }
             }
         return visitorData
@@ -166,9 +199,6 @@ object Innertube {
         val clientVersion: String?,
     )
 
-    @Volatile
-    private var scope: SessionScope? = null
-
     private val scopeLock = Mutex()
 
     /**
@@ -193,16 +223,14 @@ object Innertube {
         val authUser: String? = null,
     )
 
-    @Volatile
-    private var channelOverride: ChannelSelection? = null
-
     /** Adopts a page scope read out of a page the listener was actually looking at. */
     fun adoptPageScope(pageId: String?, dataSyncId: String?, authUser: String?) {
-        channelOverride = if (pageId == null && dataSyncId == null) {
-            null
-        } else {
-            ChannelSelection(pageId, dataSyncId, authUser)
-        }
+        val chosen = if (pageId == null && dataSyncId == null && authUser == null) null
+            else ChannelSelection(pageId, dataSyncId, authUser)
+        val before = channelOverride
+        if (before?.pageId == chosen?.pageId && before?.dataSyncId == chosen?.dataSyncId && before?.authUser == chosen?.authUser) return
+        updateSession { it.copy(generation = it.generation + 1, channel = chosen) }
+        sessionChanged()
     }
 
     /**
@@ -230,25 +258,15 @@ object Innertube {
         clientVersion: String?,
         loggedIn: Boolean,
     ) {
-        val version = clientVersion?.takeIf { it.isNotBlank() } ?: scope?.clientVersion
-        if (!loggedIn) {
-            DebugLog.w("captured page was signed out; not scoping requests to it")
-            scope = version?.let { SessionScope(null, null, "0", it) }
-            return
+        updateSession { state ->
+            val version = clientVersion?.takeIf { it.isNotBlank() } ?: state.scope?.clientVersion
+            state.copy(generation = state.generation + 1,
+                scope = if (loggedIn && !authUser.isNullOrBlank()) SessionScope(dataSyncId?.takeIf { it.isNotBlank() },
+                    pageId?.takeIf { it.isNotBlank() }, authUser, version) else null,
+                visitor = visitorData?.takeIf { it.isNotBlank() } ?: state.visitor,
+                visitorBound = loggedIn && !visitorData.isNullOrBlank())
         }
-        scope = SessionScope(
-            dataSyncId = dataSyncId?.takeIf { it.isNotBlank() },
-            pageId = pageId?.takeIf { it.isNotBlank() },
-            authUser = authUser?.takeIf { it.isNotBlank() } ?: "0",
-            clientVersion = version,
-        )
-        // The page's own visitor id, bound to this session — strictly better than
-        // the anonymous one [fetchVisitorData] mints.
-        visitorData?.takeIf { it.isNotBlank() }?.let {
-            this.visitorData = it
-            visitorDataIsSessionBound = true
-        }
-        DebugLog.d("adopted page scope: pageId=${pageId ?: "none"} authUser=${authUser ?: "0"}")
+        sessionChanged()
     }
 
     /**
@@ -298,11 +316,11 @@ object Innertube {
      * not exist. A half-overridden identity is worse than an unsigned request.
      */
     private fun pageIdFor(session: SessionScope?): String? =
-        channelOverride?.pageId ?: session?.pageId
+        channelOverride.let { if (it != null) it.pageId else session?.pageId }
 
     /** The account to send as `onBehalfOfUser`. No fallback, for the reason above. */
     private fun dataSyncIdFor(session: SessionScope?): String? =
-        channelOverride?.dataSyncId ?: session?.dataSyncId
+        channelOverride.let { if (it != null) it.dataSyncId else session?.dataSyncId }
 
     /**
      * Which account in the cookie jar, chosen channel's first.
@@ -317,43 +335,27 @@ object Innertube {
     private val webRemixVersion: String
         get() = scope?.clientVersion ?: WEB_REMIX_VERSION
 
-    /**
-     * Reads the session scope, once per cookie, before anything that depends
-     * on being the right account. Fails open: a shell that cannot be fetched
-     * leaves [scope] null and every request behaves as it did unsigned.
-     */
+    /** Resolve signed-in identity before issuing any account-bound request. */
     suspend fun ensureSessionScope() {
-        val session = cookie ?: return
-        if (scope != null) return
+        val expected = sessionState.load()
+        val session = expected.cookie ?: return
+        if (expected.scope != null) return
         scopeLock.withLock {
-            if (scope != null || cookie != session) return
-            runCatching { fetchSessionScope(session) }
-                .getOrNull()
-                ?.let { fresh ->
-                    // A login or profile switch can happen while the shell is in
-                    // flight. Never install the old cookie's answer under the
-                    // new one: that is a guaranteed 401, and worse, it can
-                    // credit a play to the profile that just left.
-                    if (cookie != session) {
-                        DebugLog.d("discarding a session scope from an account that is no longer active")
-                        return@let
-                    }
-                    scope = fresh
-                    // The shell can only ever report the identity
-                    // music.youtube.com serves by default, so it is kept and the
-                    // override outranks it — a disagreement here is expected
-                    // whenever the listener chose a different channel, and the
-                    // choice is theirs.
-                    val chosen = channelOverride
-                    if (chosen != null &&
-                        (chosen.pageId != fresh.pageId || chosen.dataSyncId != fresh.dataSyncId)
-                    ) {
-                        DebugLog.w(
-                            "server shell identity differs from the selected channel; " +
-                                "keeping the override (pageId=${chosen.pageId ?: "none"})",
-                        )
-                    }
-                }
+            checkSession(expected.generation)
+            if (scope != null) return
+            val fresh = try { fetchSessionScope(session, expected.generation) }
+            catch (error: CancellationException) { throw error }
+            catch (error: AuthenticationException) { throw error }
+            catch (error: HttpStatusException) {
+                if (error.status == 401) throw AuthenticationException()
+                throw SessionUnavailableException()
+            }
+            catch (error: Throwable) { throw SessionUnavailableException() }
+            checkSession(expected.generation)
+            updateSession { state ->
+                if (state.generation == expected.generation) state.copy(scope = fresh) else state
+            }
+            checkSession(expected.generation)
         }
     }
 
@@ -361,8 +363,8 @@ object Innertube {
      * The music.youtube.com shell, for its `ytcfg`. Read by regex rather than
      * evaluating the config blob. A key that moves reads as absent.
      */
-    private suspend fun fetchSessionScope(session: String): SessionScope? {
-        val html = Http.getText(
+    internal var scopeTransport: suspend (String) -> String = { session ->
+        Http.getText(
             "$MUSIC_ORIGIN/",
             headers = buildMap {
                 put("User-Agent", WEB_USER_AGENT)
@@ -371,24 +373,27 @@ object Innertube {
                 sapisidFrom(session)?.let { put("Authorization", sapisidHash(it)) }
             },
         )
+    }
+
+    private suspend fun fetchSessionScope(session: String, generation: Long): SessionScope {
+        val html = scopeTransport(session)
         val signedIn = CONFIG_LOGGED_IN.find(html)?.groupValues?.get(1) == "true"
         val clientVersion = CONFIG_CLIENT_VERSION.find(html)?.groupValues?.get(1)
         if (!signedIn) {
-            DebugLog.w("music.youtube.com served a signed-out shell; not scoping requests")
-            return clientVersion?.let { SessionScope(null, null, "0", it) }
+            throw AuthenticationException()
         }
         val dataSyncId = CONFIG_DATASYNC_ID.find(html)?.groupValues?.get(1)
-            ?.substringBefore("||")
-            ?.takeIf { it.isNotBlank() }
+            ?.let { normalizeDataSyncId(it) }
         val pageId = CONFIG_PAGE_ID.find(html)?.groupValues?.get(1)?.takeIf { it.isNotBlank() }
         val authUser = CONFIG_SESSION_INDEX.find(html)?.groupValues?.get(1)?.takeIf { it.isNotBlank() }
         CONFIG_VISITOR_DATA.find(html)?.groupValues?.get(1)
             ?.takeIf { it.isNotBlank() }
             ?.let {
-                visitorData = it
-                visitorDataIsSessionBound = true
+                updateSession { state ->
+                    if (state.generation == generation) state.copy(visitor = it, visitorBound = true) else state
+                }
             }
-        return SessionScope(dataSyncId, pageId, authUser ?: "0", clientVersion)
+        return SessionScope(dataSyncId, pageId, authUser ?: channelOverride?.authUser ?: throw SessionUnavailableException(), clientVersion)
     }
 
     private val CONFIG_LOGGED_IN = Regex(""""LOGGED_IN"\s*:\s*(true|false)""")
@@ -441,7 +446,7 @@ object Innertube {
      * `browse` verbatim. Works as a guest.
      */
     suspend fun browse(browseId: String, params: String? = null): JsonObject =
-        postMusic("browse") {
+        postMusic("browse", requireIdentity = browseId in PERSONAL_BROWSE) {
             put("browseId", browseId)
             params?.let { put("params", it) }
         }
@@ -459,7 +464,7 @@ object Innertube {
     }
 
     /** Signed-in profile: display name, email/handle and avatar. */
-    suspend fun accountMenu(): JsonObject = postMusic("account/account_menu") {}
+    suspend fun accountMenu(): JsonObject = postMusic("account/account_menu", requireIdentity = true) {}
 
     /**
      * The watch queue that YouTube Music would play after [videoId] — the
@@ -637,13 +642,14 @@ object Innertube {
     private fun JsonObject.trackingUrl(key: String): String? =
         ((this[key] as? JsonObject)?.get("baseUrl") as? JsonPrimitive)?.contentOrNull
 
-    suspend fun pingPlayback(baseUrl: String, cpn: String): Int =
-        pingStats(baseUrl, cpn)
+    suspend fun pingPlayback(baseUrl: String, cpn: String, generation: Long = sessionGeneration): Int =
+        pingStats(baseUrl, cpn, generation = generation)
 
-    suspend fun pingWatchtime(baseUrl: String, cpn: String, seconds: Long, final: Boolean = false): Int =
+    suspend fun pingWatchtime(baseUrl: String, cpn: String, seconds: Long, final: Boolean = false, generation: Long = sessionGeneration): Int =
         pingStats(
             baseUrl,
             cpn,
+            generation = generation,
             extra = buildMap {
                 put("st", "0")
                 put("et", seconds.toString())
@@ -653,10 +659,10 @@ object Innertube {
             },
         )
 
-    suspend fun pingAtr(baseUrl: String, cpn: String): Int =
+    suspend fun pingAtr(baseUrl: String, cpn: String, generation: Long = sessionGeneration): Int =
         Http.getStatus(
             url = baseUrl,
-            headers = statsHeaders(),
+            headers = statsHeaders(baseUrl, generation),
             query = mapOf("cpn" to cpn),
         )
 
@@ -664,13 +670,17 @@ object Innertube {
         baseUrl: String,
         cpn: String,
         extra: Map<String, String> = emptyMap(),
-    ): Int = Http.getStatus(
+        generation: Long = sessionGeneration,
+    ): Int {
+        checkSession(generation)
+        val session = requestSession()
+        return Http.getStatus(
         url = baseUrl,
-        headers = statsHeaders(),
+        headers = statsHeaders(baseUrl, generation, session),
         query = mapOf(
             "ver" to "2",
             "c" to "WEB_REMIX",
-            "cver" to webRemixVersion,
+            "cver" to session.clientVersion,
             "cpn" to cpn,
             "cplayer" to "UNIPLAYER",
             "cbr" to "Chrome",
@@ -680,15 +690,20 @@ object Innertube {
             "hl" to "en_US",
             "cr" to "US",
         ) + extra,
-    )
+    ).also { checkSession(generation) }
+    }
 
-    private fun statsHeaders(): Map<String, String> = buildMap {
+    private fun statsHeaders(url: String, generation: Long, session: RequestSession = requestSession()): Map<String, String> = buildMap {
+        checkSession(generation)
+        val target = io.ktor.http.Url(url)
+        require(target.protocol.name == "https" && target.port == 443 && target.user.isNullOrEmpty() && target.password.isNullOrEmpty() && target.host in setOf("music.youtube.com", "www.youtube.com", "s.youtube.com")) { "Untrusted playback tracking destination" }
+        checkSession(session.generation)
         put("X-Origin", MUSIC_ORIGIN)
         put("Origin", MUSIC_ORIGIN)
         put("Referer", "$MUSIC_ORIGIN/")
         put("User-Agent", WEB_USER_AGENT)
-        visitorData?.let { put("X-Goog-Visitor-Id", it) }
-        putAll(authHeaders(MUSIC_ORIGIN))
+        session.visitor?.let { put("X-Goog-Visitor-Id", it) }
+        putAll(authHeaders(session, MUSIC_ORIGIN))
     }
 
     fun newCpn(): String {
@@ -907,7 +922,7 @@ object Innertube {
                 throw e
             } catch (e: Exception) {
                 if (!e.isTransport()) throw e
-                DebugLog.d("retrying $what: ${e.message}")
+                DebugLog.d("retrying $what after transport failure")
             }
             delay(backoff)
             backoff *= 2
@@ -952,14 +967,34 @@ object Innertube {
         "unsatisfiable constraints", "could not connect",
     )
 
+    internal class MusicRequest(val url: String, val body: String, val headers: Map<String, String>, val query: Map<String, String>)
+    internal var musicTransport: suspend (MusicRequest) -> String = { request ->
+        Http.postJson(request.url, request.body, request.headers, request.query)
+    }
+
+    internal var playerTransport: suspend (MusicRequest) -> String = { request ->
+        Http.postJson(request.url, request.body, request.headers, request.query, timeoutMillis = PLAYER_TIMEOUT_MS)
+    }
+
+    private val PERSONAL_BROWSE = setOf("FEmusic_history", "FEmusic_liked_videos", "FEmusic_liked_playlists",
+        "FEmusic_liked_albums", "FEmusic_library_corpus_track_artists", "FEmusic_library_corpus_artists", "FEmusic_library_non_music_audio_list")
+
+    private val SAFE_MUSIC_READS = setOf("browse", "search", "music/get_search_suggestions", "account/account_menu", "next", "player", "get_transcript")
+
     private suspend fun postMusic(
         endpoint: String,
         query: Map<String, String> = emptyMap(),
+        refreshAllowed: Boolean = true,
+        requireIdentity: Boolean = false,
         bodyExtras: JsonObjectBuilder.() -> Unit,
     ): JsonObject {
+        val generation = sessionGeneration
         ensureSessionScope()
-        val session = scope
-        val clientVersion = webRemixVersion
+        checkSession(generation)
+        val session = requestSession()
+        val clientVersion = session.clientVersion
+        val safeRead = endpoint in SAFE_MUSIC_READS
+        if ((!safeRead || requireIdentity) && session.cookie == null) throw NotSignedInException()
         val body = buildJsonObject {
             putJsonObject("context") {
                 putJsonObject("client") {
@@ -967,11 +1002,11 @@ object Innertube {
                     put("clientVersion", clientVersion)
                     put("hl", "en")
                     put("gl", "US")
-                    visitorData?.let { put("visitorData", it) }
+                    session.visitor?.let { put("visitorData", it) }
                 }
                 putJsonObject("user") {
                     put("lockedSafetyMode", false)
-                    dataSyncIdFor(session)?.let { put("onBehalfOfUser", it) }
+                    session.dataSyncId?.let { put("onBehalfOfUser", it) }
                 }
                 putJsonObject("request") { put("useSsl", true) }
             }
@@ -984,17 +1019,27 @@ object Innertube {
             put("Referer", "$MUSIC_ORIGIN/")
             put("X-YouTube-Client-Name", WEB_REMIX_CLIENT_ID)
             put("X-YouTube-Client-Version", clientVersion)
-            visitorData?.let { put("X-Goog-Visitor-Id", it) }
-            putAll(authHeaders(MUSIC_ORIGIN))
+            session.visitor?.let { put("X-Goog-Visitor-Id", it) }
+            putAll(authHeaders(session, MUSIC_ORIGIN))
         }
-        val text = withRetry("postMusic/$endpoint") {
-            Http.postJson(
-                url = "$MUSIC_BASE/$endpoint",
-                body = json.encodeToString(JsonObject.serializer(), body),
-                headers = headers,
-                query = query + ("prettyPrint" to "false"),
-            )
+        val text = try { withRetry("postMusic/$endpoint", attempts = if (safeRead) 3 else 1) {
+            checkSession(generation)
+            musicTransport(MusicRequest("$MUSIC_BASE/$endpoint",
+                json.encodeToString(JsonObject.serializer(), body), headers,
+                query + ("prettyPrint" to "false")))
         }
+        } catch (error: HttpStatusException) {
+            if (error.status == 401 && session.cookie != null) {
+                if (safeRead && refreshAllowed) {
+                    checkSession(generation)
+                    updateSession { if (it.generation == generation) it.copy(scope = null) else it }
+                    return postMusic(endpoint, query, refreshAllowed = false, requireIdentity = requireIdentity, bodyExtras = bodyExtras)
+                }
+                throw AuthenticationException()
+            }
+            throw error
+        }
+        checkSession(generation)
         val response = json.parseToJsonElement(text) as? JsonObject
             ?: error("innertube $endpoint: unexpected response shape")
         // Browse responses carry one; a session that never happened to see
@@ -1023,7 +1068,16 @@ object Innertube {
         playerClient: PlayerClient,
         signatureTimestamp: Int? = null,
         authenticated: Boolean = false,
+        refreshAllowed: Boolean = true,
     ): JsonObject {
+        val generation = sessionGeneration
+        if (authenticated) ensureSessionScope()
+        checkSession(generation)
+        val session = if (authenticated) requestSession() else {
+            val state = sessionState.load()
+            RequestSession(state.generation, null, null, null, null, state.visitor, WEB_REMIX_VERSION)
+        }
+        if (authenticated && session.cookie == null) throw NotSignedInException()
         val body = buildJsonObject {
             putJsonObject("context") {
                 putJsonObject("client") {
@@ -1036,7 +1090,11 @@ object Innertube {
                     playerClient.androidSdkVersion?.let { put("androidSdkVersion", it.toInt()) }
                     put("hl", "en")
                     put("gl", "US")
-                    visitorData?.let { put("visitorData", it) }
+                    session.visitor?.let { put("visitorData", it) }
+                }
+                if (authenticated) putJsonObject("user") {
+                    session.dataSyncId?.let { put("onBehalfOfUser", it) }
+                    put("lockedSafetyMode", false)
                 }
             }
             put("videoId", videoId)
@@ -1056,21 +1114,29 @@ object Innertube {
             put("X-YouTube-Client-Version", playerClient.clientVersion)
             playerClient.origin?.let { put("Origin", it) }
             playerClient.referer?.let { put("Referer", it) }
-            visitorData?.let { put("X-Goog-Visitor-Id", it) }
-            if (authenticated) putAll(authHeaders(playerClient.apiOrigin))
+            session.visitor?.let { put("X-Goog-Visitor-Id", it) }
+            if (authenticated) {
+                put("Origin", playerClient.apiOrigin)
+                put("X-Origin", playerClient.apiOrigin)
+                putAll(authHeaders(session, playerClient.apiOrigin))
+            }
         }
-        val text = withRetry("player/${playerClient.clientName}") {
-            Http.postJson(
-                // Browser-shaped clients are served from the Music host, app
-                // clients from YouTube proper. Posting WEB_REMIX at the wrong one
-                // is a refused request, not a weaker one.
-                url = "${playerClient.apiBase}/player",
-                body = json.encodeToString(JsonObject.serializer(), body),
-                headers = headers,
-                query = mapOf("prettyPrint" to "false"),
-                timeoutMillis = PLAYER_TIMEOUT_MS,
-            )
+        val text = try { withRetry("player/${playerClient.clientName}") {
+            checkSession(generation)
+            playerTransport(MusicRequest("${playerClient.apiBase}/player",
+                json.encodeToString(JsonObject.serializer(), body), headers, mapOf("prettyPrint" to "false")))
+        } } catch (error: HttpStatusException) {
+            if (authenticated && error.status == 401) {
+                checkSession(generation)
+                if (refreshAllowed) {
+                    updateSession { if (it.generation == generation) it.copy(scope = null) else it }
+                    return postPlayer(videoId, playerClient, signatureTimestamp, authenticated, refreshAllowed = false)
+                }
+                throw PlayerAuthenticationException()
+            }
+            throw error
         }
+        checkSession(generation)
         return json.parseToJsonElement(text) as? JsonObject
             ?: error("innertube player: unexpected response shape")
     }
@@ -1097,12 +1163,16 @@ object Innertube {
      * signature over the origin this request is going to. Google recomputes
      * the digest over the origin it sees and rejects a mismatch with 401.
      */
-    internal fun authHeaders(origin: String = MUSIC_ORIGIN): Map<String, String> = buildMap {
-        val session = cookie ?: return@buildMap
-        put("Cookie", session)
-        put("X-Goog-AuthUser", authUserFor(scope))
-        pageIdFor(scope)?.let { put("X-Goog-PageId", it) }
-        sapisidFrom(session)?.let { put("Authorization", sapisidHash(it, origin)) }
+    internal fun authHeaders(origin: String = MUSIC_ORIGIN): Map<String, String> =
+        authHeaders(requestSession(), origin)
+
+    internal fun authHeaders(session: RequestSession, origin: String): Map<String, String> = buildMap {
+        require(origin == MUSIC_ORIGIN || origin == YOUTUBE_ORIGIN) { "Untrusted authentication origin" }
+        val cookie = session.cookie ?: return@buildMap
+        put("Cookie", cookie)
+        session.authUser?.let { put("X-Goog-AuthUser", it) }
+        session.pageId?.let { put("X-Goog-PageId", it) }
+        sapisidFrom(cookie)?.let { put("Authorization", sapisidHash(it, origin)) }
     }
 
     /**

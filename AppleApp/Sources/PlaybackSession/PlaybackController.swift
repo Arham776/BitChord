@@ -489,6 +489,8 @@ final class PlaybackController {
     private var wasInterrupted = false
 
     init() {
+        _ = LoadingMonitor.shared
+        _ = LaunchReadiness.shared
         let configuredSpeed = Double(PlatformSettings.shared.getFloat(key: "playback_speed", default: 1))
         playbackRate = configuredSpeed.isFinite ? min(max(configuredSpeed, 0.5), 2.0) : 1.0
         engine.registerCallback(callback: EngineCallbacks(controller: self))
@@ -497,15 +499,31 @@ final class PlaybackController {
         // Also pause if the old device became unavailable (e.g. headphones unplugged).
         routeObservers = AudioSessionManager.observeRouteChanges(
             { [weak self] in
-                Task { @MainActor in self?.outputRouteChanged() }
+                Task { @MainActor in
+                    AudioRouteState.shared.refresh()
+                    self?.applySpatialPreference()
+                    self?.outputRouteChanged()
+                }
             },
             onOldDeviceUnavailable: { [weak self] in
                 Task { @MainActor in
-                    guard let self, self.isPlaying else { return }
-                    self.togglePlayPause()
+                    guard let self, self.isPlaying || self.isBuffering || self.wasInterrupted else { return }
+                    self.pausePlayback()
                 }
             }
         )
+        #if os(iOS)
+        routeObservers.append(NotificationCenter.default.addObserver(forName: UIAccessibility.monoAudioStatusDidChangeNotification, object: nil, queue: .main) { [weak self] _ in
+            Task { @MainActor in AudioRouteState.shared.refresh(); self?.applySpatialPreference() }
+        })
+        #endif
+        AudioRouteState.shared.refresh()
+        routeObservers += AudioSessionManager.observeSpatialCapabilities { [weak self] enabled in
+            Task { @MainActor in
+                AudioRouteState.shared.refresh(systemSpatialEnabled: enabled)
+                self?.applySpatialPreference()
+            }
+        }
         // Handle interruptions cleanly: when an incoming call, Siri, navigation,
         // or another app begins, pause engine, notify nowPlaying, and deactivate
         // session so the other app has exclusive audio access. When interruption
@@ -541,6 +559,8 @@ final class PlaybackController {
             if event == "audio media services were reset" {
                 Task { @MainActor in
                     self?.nowPlaying.audioSessionUnavailable()
+                    AudioRouteState.shared.refresh()
+                    self?.applySpatialPreference()
                     self?.outputRouteChanged()
                 }
             }
@@ -582,7 +602,12 @@ final class PlaybackController {
         }
 #endif
         nowPlaying.onPause = { [weak self] in
-            guard let self, self.isPlaying || self.isBuffering else { return }
+            guard let self else { return }
+            // A physical/remote Pause during a Siri interruption still cancels
+            // the pending resume, even though the engine is already paused.
+            self.wasInterrupted = false
+            self.resumeGeneration &+= 1
+            guard self.isPlaying || self.isBuffering else { return }
             self.pausePlayback()
         }
         nowPlaying.onNext = { [weak self] in self?.next() }
@@ -607,7 +632,7 @@ final class PlaybackController {
         // (upstream runs PlaybackService on its own thread).
         let eng = engine
         let crossfade = Double(PlatformSettings.shared.getInt(key: "crossfade_seconds", default: 0))
-        let spatial = PlatformSettings.shared.getBoolean(key: "spatial_audio", default: false)
+        let spatial = PlatformSettings.shared.getBoolean(key: "spatial_audio", default: false) && AudioRouteState.shared.permitsCustomSpatial
         let skip = PlatformSettings.shared.getBoolean(key: "skip_silence", default: false)
         let speed = PlatformSettings.shared.getFloat(key: "playback_speed", default: 1)
         playbackRate = Double(speed).isFinite ? min(max(Double(speed), 0.5), 2.0) : 1.0
@@ -735,7 +760,10 @@ final class PlaybackController {
     ///    milliseconds and `requestOutputRebuild` is not dropped when a rebuild
     ///    is already running, so this second pass runs after the session is up
     ///    even if CoreAudio's own rebuild beat us to it.
+    private var routeRecoveryGeneration: UInt64 = 0
     private func outputRouteChanged() {
+        routeRecoveryGeneration &+= 1
+        let recovery = routeRecoveryGeneration
         guard started, state == .playing else { return }
         let selection = playGeneration
         let intent = resumeGeneration
@@ -746,14 +774,14 @@ final class PlaybackController {
             } catch {
                 await MainActor.run { [weak self] in
                     guard let self, self.playGeneration == selection,
-                          self.resumeGeneration == intent else { return }
+                          self.resumeGeneration == intent, self.routeRecoveryGeneration == recovery else { return }
                     self.audioActivationFailed(error)
                 }
                 return
             }
             await MainActor.run { [weak self] in
                 guard let self, self.isPlaying, self.playGeneration == selection,
-                      self.resumeGeneration == intent else { return }
+                      self.resumeGeneration == intent, self.routeRecoveryGeneration == recovery else { return }
                 do {
                     try engine.requestOutputRebuild(force: true)
                     self.nowPlaying.requestPrimaryIfPossible(reason: "route activation")
@@ -1168,7 +1196,8 @@ final class PlaybackController {
                     sessionFormat = try await AudioSessionManager.activate(
                         preferredSampleRate: matchRate
                             ? (sourceFormat.sampleRate > 0 ? Double(sourceFormat.sampleRate) : nil)
-                            : nil
+                            : nil,
+                        restartRouting: true
                     )
                 } catch {
                     await MainActor.run { [weak self] in
@@ -1247,6 +1276,9 @@ final class PlaybackController {
         if !loading { position = engine.positionSeconds() }
         positionSampledAt = Date()
         state = .paused
+        #if os(macOS)
+        Task { await HeadphoneRouting.shared.releaseWhenIdle() }
+        #endif
         try? engine.pause()
         if loading {
             playGeneration &+= 1
@@ -1327,8 +1359,9 @@ final class PlaybackController {
         // A paused/inactive output must take the load path, which awaits
         // activation. Instant promotion is reserved for an audible session.
         guard queue.indices.contains(target) else { return false }
+        guard isPlaying else { return false }
         #if os(iOS)
-        guard isPlaying, AudioSessionManager.isActive else { return false }
+        guard AudioSessionManager.isActive else { return false }
         #endif
         let entry = queue[target]
         guard let queued = engine.pendingTrack(),
@@ -1346,6 +1379,11 @@ final class PlaybackController {
             loadCurrent(target)
             return true
         }
+        // Promoting an armed successor is a new selection too. Invalidate
+        // outgoing loads/upgrades just as the full load path does.
+        playGeneration &+= 1
+        resumeGeneration &+= 1
+        loadSubmissionGate.invalidate(to: playGeneration)
         // Ensure the promoted output is unmuted; this is idempotent for an
         // already playing session.
         do { try engine.play() } catch {
@@ -1454,12 +1492,15 @@ final class PlaybackController {
     }
 
     func updateSpatial(enabled: Bool) {
-        try? engine.setSpatialEnabled(enabled: enabled)
-        if enabled && soundMode == "ENHANCED" {
-            headTracker.start(engine: engine)
-        } else {
-            headTracker.stop()
-        }
+        applySpatialPreference(enabled: enabled)
+    }
+
+    private func applySpatialPreference(enabled: Bool? = nil) {
+        let requested = enabled ?? PlatformSettings.shared.getBoolean(key: "spatial_audio", default: false)
+        let effective = requested && AudioRouteState.shared.permitsCustomSpatial
+        try? engine.setSpatialEnabled(enabled: effective)
+        if effective && soundMode == "ENHANCED" { headTracker.start(engine: engine) }
+        else { headTracker.stop() }
     }
 
     func updateSpeed(_ speed: Float) {
@@ -1561,7 +1602,7 @@ final class PlaybackController {
         soundMode = value == "ENHANCED" ? "ENHANCED" : "TRANSPARENT"
         PlatformSettings.shared.putString(key: "sound_mode", value: soundMode)
         try? engine.setSoundMode(mode: soundMode == "ENHANCED" ? .enhanced : .transparent)
-        if soundMode == "ENHANCED", PlatformSettings.shared.getBoolean(key: "spatial_audio", default: false) { headTracker.start(engine: engine) } else { headTracker.stop() }
+        applySpatialPreference()
         scheduleLoudnessMeasurement()
     }
     func updateClarity(preset: String? = nil, wet: Double? = nil) {
@@ -1896,11 +1937,9 @@ final class PlaybackController {
         widgetPublisher.publish(entry: entry, isPlaying: false,
                                 canNext: index + 1 < queue.count,
                                 canPrevious: index > 0)
-        // The next songs start fetching now, in parallel with this one, including
-        // when this load is a cold resume of the track that was playing last
-        // time. Waiting until the handoff is what made their download show up
-        // at the end of the current song.
-        warmUpcoming(around: index, generation: generation)
+        // Start read-ahead after this selection has loaded (syncEngineQueueNext).
+        // Rapid Next taps must not start four speculative resolver walks ahead
+        // of the track the listener is actually waiting for.
         if wasAudible {
             PlaybackTrackerBridge.shared.onTrackChanged(positionSeconds: Int64(outgoingPosition))
         }
@@ -2134,6 +2173,12 @@ final class PlaybackController {
 
         @MainActor
         static func current() -> ResolvePrefs {
+            #if DEBUG
+            if ProcessInfo.processInfo.arguments.contains("--verify-navigation") {
+                return ResolvePrefs(maxKbps: Int.max, wantLossless: false, jiosaavn: false,
+                                    canSubstitute: false, preferMusicOnly: false)
+            }
+            #endif
             let qualityKey = NetworkQuality.shared.metered ? "audio_quality_cellular" : "audio_quality_wifi"
             let streamQuality = PlatformSettings.shared.getString(key: qualityKey, default: "LOSSLESS")
             return ResolvePrefs(
@@ -2147,6 +2192,8 @@ final class PlaybackController {
     }
 
     private static func resolveSource(_ entry: QueueEntry, prefs: ResolvePrefs) async throws -> ResolveOutcome {
+        await DownloadStore.shared.waitUntilReady()
+        try Task.checkCancellation()
         if let asset = DownloadStore.shared.asset(for: entry) {
             return ResolveOutcome(source: ResolvedSource(source: asset.path, headers: [:], kbps: asset.kbps,
                 lossless: asset.lossless, origin: .local, youtubeVideoId: asset.youtubeVideoId), leftover: nil)
@@ -2221,8 +2268,8 @@ final class PlaybackController {
         let lookup = Task<QualityUpgrade.Candidate?, Never> {
             await Self.resolveSubstitute(entry, prefs: prefs)?.asCandidate()
         }
-        let fallback = Task<ResolvedSource?, Never> {
-            try? await Self.resolveYouTube(videoId: videoId, prefs: prefs)
+        let fallback = Task<ResolvedSource, Error> {
+            try await Self.resolveYouTube(videoId: videoId, prefs: prefs)
         }
 
         // Prefer-music-only for a music video: the video's own upload is the
@@ -2245,15 +2292,12 @@ final class PlaybackController {
                     leftover: nil
                 )
             }
-            if let yt = await fallback.value {
-                return ResolveOutcome(source: yt, leftover: nil)
-            }
-            throw InnertubeStreamResolver.StreamError(message: "No stream")
+            return ResolveOutcome(source: try await fallback.value, leftover: nil)
         }
 
         let race = FirstUsableSourceRace()
         _ = Task { await race.finishLookup(await lookup.value) }
-        _ = Task { await race.finishFallback(await fallback.value) }
+        _ = Task { await race.finishFallback(try? await fallback.value) }
 
         switch await race.wait() {
         case .substitute(let stream):
@@ -2271,7 +2315,9 @@ final class PlaybackController {
             // upgrade path instead of making it delay the first audible sample.
             return ResolveOutcome(source: source, leftover: lookup)
         case .none:
-            throw InnertubeStreamResolver.StreamError(message: "No stream")
+            // Preserve the resolver's actual failure instead of replacing
+            // account/CDN errors with an uninformative "No stream".
+            return ResolveOutcome(source: try await fallback.value, leftover: nil)
         }
     }
 
@@ -2425,41 +2471,19 @@ final class PlaybackController {
         let lossless: Bool?
     }
 
-    /// Fetches the tracks around the playing one into the stream cache
-    /// without queueing any. The blend's own `syncEngineQueueNext` then
-    /// finds the file already on disk — and so does a manual Back: the
-    /// previous track's file is what "the kept one" means, and fetching two
-    /// steps behind as well as ahead is what makes back-to-back Back taps
-    /// instant instead of a re-download each.
-    ///
-    /// A cold resume takes this path too. It does not cancel a blend that is
-    /// already running: that only exists once a track is loaded, and a resume
-    /// from a killed process has no engine yet. Unpausing a track the engine
-    /// still holds does not come through here.
+    /// Warm the immediate successor after foreground playback loads. Back
+    /// reuses tracks already fetched into the stream cache. Keeping read-ahead
+    /// bounded avoids a burst of obsolete player walks during rapid Next taps.
     private func warmUpcoming(around index: Int, generation: UInt64) {
         // Repeat-one never arms a different next track into the engine, but the
         // song after the loop still has to be measured while the loop runs —
         // otherwise turning repeat off starts a cold whole-track decode with
         // seconds left (upstream requestAnalysisAround). Automix self-mix only
         // needs the current file, which is already loaded.
-        let ahead: [QueueEntry]
-        let behind: [QueueEntry]
-        if repeatMode == .one {
-            ahead = (index + 1 < queue.count) ? [queue[index + 1]] : []
-            behind = index > 0 ? [queue[index - 1]] : []
-        } else {
-            ahead = (1...2).compactMap { offset -> QueueEntry? in
-                let at = index + offset
-                guard queue.indices.contains(at) else { return nil }
-                return queue[at]
-            }
-            behind = (1...2).compactMap { offset -> QueueEntry? in
-                let at = index - offset
-                guard queue.indices.contains(at) else { return nil }
-                return queue[at]
-            }
-        }
-        let prefetch = ahead + behind
+        // Previously played tracks are already in the stream cache. Resolve
+        // only the immediate successor, keeping rapid navigation from flooding
+        // the provider with obsolete requests two tracks ahead and behind.
+        let prefetch = queue.indices.contains(index + 1) ? [queue[index + 1]] : []
         guard !prefetch.isEmpty else { return }
         let prefs = ResolvePrefs.current()
         for entry in prefetch {
@@ -2613,7 +2637,7 @@ final class PlaybackController {
     }
 
     private func loadDidFail(entry: QueueEntry, error: Error) {
-        lastError = "Couldn't play “\(entry.title)” — \(error)"
+        lastError = "Couldn't play “\(entry.title)” — \(error.localizedDescription)"
         // Somebody (pause, another load, sleep, interruption) owns the
         // transport now; their state stands and only the message is new.
         // Tearing the engine down here would stop whatever they started.
@@ -4203,9 +4227,9 @@ final class PlaybackController {
     private func refreshArtwork(_ entry: QueueEntry) {
         guard let raw = entry.thumbnailUrl, !raw.isEmpty else { return }
         let sized = SharedArtwork.sized(raw, 544) ?? raw
-        guard let url = URL(string: sized) else { return }
+        let headers = WebDavBridge.shared.playbackHeaders(fileUrl: sized)
         Task {
-            guard let (data, _) = try? await URLSession.shared.data(from: url), !data.isEmpty else { return }
+            guard let data = await ArtworkRequests.shared.data(url: sized, headers: headers), !data.isEmpty else { return }
             await MainActor.run { [weak self] in
                 guard let self, self.current?.id == entry.id else { return }
                 self.current?.artworkData = data
@@ -4310,6 +4334,184 @@ private final class AutoPlayAdapter: AutoPlayBridgeAutoPlayCallback {
 #if DEBUG
 extension PlaybackController {
 #if os(iOS)
+    /// Explicit, muted cold-launch diagnostic: exercise the saved queue that
+    /// init restored, rather than loading a replacement fixture in this process.
+    func verifyRestoredResumeBehavior(mixing: Bool) async {
+        let savedQueue = UserDefaults.standard.data(forKey: "bitchord_last_played")
+        let savedContext = PlatformSettings.shared.getString(key: "last_playback_context", default: "")
+        let savedMixing = mixWithOtherAudio
+        let savedAutomix = automixEnabled
+        let savedVolume = volume
+        let saved = LastPlayed.load()
+        let background = UIApplication.shared.beginBackgroundTask(withName: "restored resume verification")
+        defer { UIApplication.shared.endBackgroundTask(background) }
+        var checks: [String: Bool] = [:]
+        var samples: [[String: Any]] = []
+        func sample(_ label: String) {
+            let session = AVAudioSession.sharedInstance()
+            let row: [String: Any] = ["label": label, "id": current?.id ?? "",
+                "position": position, "enginePosition": engine.positionSeconds(),
+                "state": String(describing: state), "audioActive": AudioSessionManager.isActive,
+                "category": session.category.rawValue, "options": session.categoryOptions.rawValue,
+                "policy": session.routeSharingPolicy.rawValue, "error": lastError ?? ""]
+            samples.append(row)
+            debugLog.record("restored resume verification \(row)")
+        }
+        if let saved {
+            let entry = saved.tracks[saved.index]
+            checks["restored_track_and_position"] = current?.id == entry.id
+                && playingIndex == saved.index && abs(position - saved.position) < 0.01
+            checks["cold_output_inactive"] = !started && !AudioSessionManager.isActive && state == .paused
+            sample("cold restore")
+            do {
+                setMixWithOtherAudio(mixing)
+                setAutomixEnabled(false)
+                volume = 0
+                togglePlayPause()
+                await playbackStartTask?.value
+                // Native commands finish submitting before the render thread
+                // publishes its first position snapshot. Observe that snapshot
+                // before checking the restored seek, rather than reading 0.
+                for _ in 0..<40 {
+                    if !isPlaying || engine.positionSeconds() >= max(0, saved.position - 0.1) { break }
+                    try await Task.sleep(for: .milliseconds(50))
+                }
+                checks["loaded_saved_track"] = isPlaying && current?.id == entry.id && lastError == nil
+                let resumedAt = engine.positionSeconds()
+                checks["loaded_saved_position"] = abs(resumedAt - saved.position) < 1
+                sample("first play")
+                try await Task.sleep(for: .seconds(3))
+                checks["playback_progress"] = isPlaying && engine.positionSeconds() > resumedAt + 2
+                let session = AVAudioSession.sharedInstance()
+                checks["mixing_preference_preserved"] = mixWithOtherAudio == mixing
+                    && session.categoryOptions.contains(.mixWithOthers) == mixing
+                checks["compatible_routing_policy"] = session.routeSharingPolicy == (mixing ? .default : .longFormAudio)
+                checks["active_playback_category"] = AudioSessionManager.isActive && session.category == .playback
+                sample("playing")
+                pausePlayback()
+                let pausedAt = engine.positionSeconds()
+                try await Task.sleep(for: .milliseconds(500))
+                checks["stable_pause"] = state == .paused && abs(engine.positionSeconds() - pausedAt) < 0.1
+                try await nowPlaying.onPlayAsync?()
+                try await Task.sleep(for: .seconds(2))
+                checks["resume_progress"] = isPlaying && engine.positionSeconds() > pausedAt + 1
+                sample("resumed")
+            } catch {
+                checks["runtime_error"] = false
+                debugLog.record("restored resume verification error: \(error)")
+            }
+        } else {
+            checks["saved_track_available"] = false
+        }
+        pausePlayback()
+        playGeneration &+= 1
+        resumeGeneration &+= 1
+        loadSubmissionGate.advance(to: playGeneration) { [engine] in try? engine.stop() }
+        nowPlaying.stop()
+        await AudioSessionManager.deactivate()
+        setMixWithOtherAudio(savedMixing)
+        setAutomixEnabled(savedAutomix)
+        volume = savedVolume
+        if let savedQueue { UserDefaults.standard.set(savedQueue, forKey: "bitchord_last_played") }
+        else { UserDefaults.standard.removeObject(forKey: "bitchord_last_played") }
+        PlatformSettings.shared.putString(key: "last_playback_context", value: savedContext)
+        restoreSession()
+        checks["saved_queue_restored"] = UserDefaults.standard.data(forKey: "bitchord_last_played") == savedQueue
+        checks["saved_preferences_restored"] = mixWithOtherAudio == savedMixing && automixEnabled == savedAutomix
+            && volume == savedVolume
+        let result: [String: Any] = ["checks": checks, "samples": samples, "mixing": mixing,
+            "passed": !checks.isEmpty && checks.values.allSatisfy { $0 }]
+        let report = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("restored-resume-\(mixing ? "mixing" : "exclusive")-verification.json")
+        if let data = try? JSONSerialization.data(withJSONObject: result, options: [.prettyPrinted, .sortedKeys]) {
+            try? data.write(to: report, options: .atomic)
+        }
+        debugLog.record("restored resume verification complete: \(checks)")
+    }
+
+    /// Explicit, muted device diagnostic. Uses the signed-in account already
+    /// restored by AuthController and restores the user's saved queue afterward.
+    func verifyRapidNavigation() async {
+        let savedQueue = UserDefaults.standard.data(forKey: "bitchord_last_played")
+        let savedContext = PlatformSettings.shared.getString(key: "last_playback_context", default: "")
+        let savedAutomix = automixEnabled
+        let savedVolume = volume
+        let background = UIApplication.shared.beginBackgroundTask(withName: "navigation verification")
+        defer {
+            UIApplication.shared.endBackgroundTask(background)
+            setAutomixEnabled(savedAutomix)
+            volume = savedVolume
+            if let savedQueue { UserDefaults.standard.set(savedQueue, forKey: "bitchord_last_played") }
+            else { UserDefaults.standard.removeObject(forKey: "bitchord_last_played") }
+            PlatformSettings.shared.putString(key: "last_playback_context", value: savedContext)
+            restoreSession()
+        }
+        let ids = ["3qKFa86UuxY", "N4HWTqcvMMY", "MnaA85nYEeE", "L9M8HGw71NU",
+                   "pNxTO1czMkc", "QX1KRphxnQc", "Xxq1XfsQOIE", "35tNuvmBVMc",
+                   "N7IxlspnaQw", "9NM0hPDWIyg"]
+        let entries = ids.enumerated().map { index, id in
+            QueueEntry(id: id, title: "Navigation fixture \(index + 1)", artist: "BitChord",
+                       source: "yt:" + id, durationText: "3:00", isLocal: false)
+        }
+        var checks: [String: Bool] = [:]
+        var samples: [[String: Any]] = []
+        func sample(_ label: String) {
+            let row: [String: Any] = ["label": label, "id": current?.id ?? "", "index": playingIndex,
+                "state": String(describing: state), "position": position, "error": lastError ?? ""]
+            samples.append(row)
+            debugLog.record("navigation verification \(row)")
+        }
+        do {
+            setAutomixEnabled(false)
+            volume = 0
+            play(entries)
+            for _ in 0..<50 {
+                if state != .buffering { break }
+                try await Task.sleep(for: .milliseconds(400))
+            }
+            sample("initial")
+            var played = isPlaying
+            for step in 1..<entries.count {
+                next()
+                try await Task.sleep(for: .seconds(4))
+                checks["next_\(step)_selected"] = current?.id == ids[step]
+                played = played || isPlaying
+                sample("next \(step)")
+            }
+            // Force the usual restart threshold out of the way so these taps
+            // exercise actual Back selection, including after failed loads.
+            for step in 1...3 {
+                seek(to: 0)
+                previous()
+                try await Task.sleep(for: .seconds(4))
+                checks["back_\(step)_selected"] = current?.id == ids[ids.count - 1 - step]
+                played = played || isPlaying
+                sample("back \(step)")
+            }
+            checks["at_least_one_live_track_played"] = played
+            // Return to the first track after all failures and rapid selections.
+            play([entries[0]])
+            for _ in 0..<50 {
+                if state != .buffering { break }
+                try await Task.sleep(for: .milliseconds(400))
+            }
+            checks["first_track_still_playable"] = isPlaying
+            sample("return to first")
+        } catch { checks["runtime_error"] = false }
+        pausePlayback()
+        playGeneration &+= 1
+        resumeGeneration &+= 1
+        loadSubmissionGate.advance(to: playGeneration) { [engine] in try? engine.stop() }
+        nowPlaying.stop()
+        await AudioSessionManager.deactivate()
+        let result: [String: Any] = ["checks": checks, "samples": samples,
+            "passed": !checks.isEmpty && checks.values.allSatisfy { $0 }]
+        let report = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("navigation-verification.json")
+        try? JSONSerialization.data(withJSONObject: result, options: [.prettyPrinted, .sortedKeys]).write(to: report)
+        debugLog.record("navigation verification complete: \(checks)")
+    }
+
     /// An explicit diagnostic launch exercises the real controller, RemoteIO,
     /// decoder and published MediaSession. User queue/preferences are restored.
     func verifyNativeResumeBehavior() async {
@@ -4433,9 +4635,11 @@ extension PlaybackController {
                 setMixWithOtherAudio(true)
                 _ = try await AudioSessionManager.activate()
                 checks["\(name)_paused_mixing_on"] = !isPlaying && AVAudioSession.sharedInstance().categoryOptions.contains(.mixWithOthers)
+                    && AVAudioSession.sharedInstance().routeSharingPolicy == .default
                 setMixWithOtherAudio(false)
                 _ = try await AudioSessionManager.activate()
                 checks["\(name)_paused_mixing_off"] = !isPlaying && !AVAudioSession.sharedInstance().categoryOptions.contains(.mixWithOthers)
+                    && AVAudioSession.sharedInstance().routeSharingPolicy == .longFormAudio
                 checks["\(name)_paused_mixing_keeps_position"] = abs(engine.positionSeconds() - mixingPosition) < 0.15
             }
         } catch {

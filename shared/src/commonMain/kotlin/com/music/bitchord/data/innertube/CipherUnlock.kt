@@ -11,6 +11,7 @@ import kotlin.concurrent.Volatile
 expect object CipherUnlock {
     suspend fun signatureTimestamp(): Int?
     suspend fun unlockCipher(videoId: String, cipher: String): String?
+    suspend fun transformUrl(url: String): String?
 }
 
 /**

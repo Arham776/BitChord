@@ -1,8 +1,8 @@
 package com.music.bitchord.data.canvas
 
 import com.music.bitchord.data.http.Http
-import io.ktor.client.plugins.ClientRequestException
-import io.ktor.http.HttpStatusCode
+import com.music.bitchord.data.http.HttpStatusException
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.serialization.json.Json
@@ -27,7 +27,7 @@ object AppleMusicCanvas {
     private const val AMP = "https://amp-api.music.apple.com/v1/catalog"
     private const val WEB = "https://music.apple.com/us/browse"
     private const val MIN_SCORE = 12
-    private const val TOKEN_RETRY_MS = 30L * 60 * 1000
+    private const val TOKEN_RETRY_MS = 30_000L
     private val json = Json { ignoreUnknownKeys = true; isLenient = true }
     private val lock = Mutex()
 
@@ -37,7 +37,6 @@ object AppleMusicCanvas {
     private val rejected = mutableSetOf<String>()
 
     suspend fun search(title: String, artist: String, album: String?): CanvasArtworkDto? {
-        val bearer = token() ?: return null
         val term = buildString {
             if (!title.contains(artist, ignoreCase = true)) append(artist).append(' ')
             append(title)
@@ -47,7 +46,6 @@ object AppleMusicCanvas {
         }
         val body = catalogGet(
             "$AMP/us/search",
-            bearer,
             mapOf(
                 "term" to term,
                 "types" to "songs",
@@ -86,7 +84,7 @@ object AppleMusicCanvas {
                 }
             }
             val albumId = albumId(song) ?: continue
-            fetchAlbum(albumId, bearer, songName, songArtist)?.let { return it }
+            fetchAlbum(albumId, songName, songArtist)?.let { return it }
         }
         return null
     }
@@ -96,11 +94,9 @@ object AppleMusicCanvas {
      * Albums carry `editorialVideo` inline on the search result.
      */
     suspend fun searchAlbum(album: String, artist: String): CanvasArtworkDto? {
-        val bearer = token() ?: return null
         val term = if (album.contains(artist, ignoreCase = true)) album else "$artist $album"
         val body = catalogGet(
             "$AMP/us/search",
-            bearer,
             mapOf(
                 "term" to term,
                 "types" to "albums",
@@ -141,13 +137,11 @@ object AppleMusicCanvas {
 
     private suspend fun fetchAlbum(
         albumId: String,
-        bearer: String,
         songTitle: String?,
         songArtist: String?,
     ): CanvasArtworkDto? {
         val body = catalogGet(
             "$AMP/us/albums/$albumId",
-            bearer,
             mapOf("extend" to "editorialVideo"),
         ) ?: return null
         val album = runCatching {
@@ -256,14 +250,9 @@ object AppleMusicCanvas {
         "apple music", "today's hits", "session",
     )
 
-    private suspend fun catalogGet(url: String, bearer: String, query: Map<String, String>): String? =
-        try {
+    private suspend fun catalogGet(url: String, query: Map<String, String>): String? =
+        readCanvasCatalog(token = { token() }, reject = { reject(it) }) { bearer ->
             Http.getText(url, headers = authHeaders(bearer), query = query, timeoutMillis = 8_000)
-        } catch (e: ClientRequestException) {
-            if (e.response.status == HttpStatusCode.Unauthorized) reject(bearer)
-            null
-        } catch (_: Exception) {
-            null
         }
 
     private fun authHeaders(bearer: String) = mapOf(
@@ -335,6 +324,28 @@ object AppleMusicCanvas {
     }
 
     private fun currentTimeMs(): Long = canvasNowMs()
+}
+
+/** A rejected provider token gets one fresh read; network errors keep it intact. */
+internal suspend fun readCanvasCatalog(
+    token: suspend () -> String?,
+    reject: suspend (String) -> Unit,
+    request: suspend (String) -> String,
+): String? {
+    repeat(2) {
+        val bearer = token() ?: return null
+        try {
+            return request(bearer)
+        } catch (error: HttpStatusException) {
+            if (error.status != 401) return null
+            reject(bearer)
+        } catch (error: CancellationException) {
+            throw error
+        } catch (_: Exception) {
+            return null
+        }
+    }
+    return null
 }
 
 internal suspend fun canvasGet(url: String, extraHeaders: Map<String, String> = emptyMap()): String? {

@@ -14,6 +14,15 @@ import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Deferred
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.CoroutineStart
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
+import kotlin.concurrent.atomics.AtomicLong
+import kotlin.concurrent.atomics.AtomicReference
+import kotlin.concurrent.atomics.ExperimentalAtomicApi
 import kotlinx.serialization.builtins.ListSerializer
 import kotlinx.serialization.json.Json
 
@@ -23,6 +32,7 @@ import kotlinx.serialization.json.Json
  * FEmusic_new_releases and FEmusic_explore supplements, plus FEmusic_home's
  * continuation for signed-in paging.
  */
+@OptIn(ExperimentalAtomicApi::class)
 object HomeBridge {
 
     private val bridgeScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
@@ -46,47 +56,95 @@ object HomeBridge {
 
     /**
      * Category shelves, kept so a category's cover and its contents are one
-     * request rather than two. A plain map rather than a flow because the
-     * [MoodCallback] answer is already the UI's to publish.
+     * request rather than two. Only identical active requests share a flight;
+     * the app-owned page repository controls freshness and disk persistence.
      */
-    private val moodGenreShelfCache = mutableMapOf<String, List<HomeShelf>>()
+    private val moodLock = Mutex()
+    private val moodGenreFlights = mutableMapOf<String, Deferred<List<HomeShelf>>>()
+    private val requestIds = AtomicLong(0)
+    private val requests = AtomicReference<Map<Long, Job>>(emptyMap())
+    private fun updateRequests(change: (Map<Long, Job>) -> Map<Long, Job>) {
+        while (true) {
+            val old = requests.load()
+            if (requests.compareAndSet(old, change(old))) return
+        }
+    }
+    fun interface ProgressiveCallback {
+        fun onResult(json: String?, complete: Boolean, message: String?)
+    }
+    fun cancelFeed(requestId: Long) { requests.load()[requestId]?.cancel() }
+    fun homeProgressive(callback: ProgressiveCallback): Long = startFeed(true, callback)
+    fun exploreProgressive(callback: ProgressiveCallback): Long = startFeed(false, callback)
 
-    fun home(callback: FeedCallback) {
-        bridgeScope.launch {
+    private fun startFeed(home: Boolean, callback: ProgressiveCallback): Long {
+        val id = requestIds.fetchAndAdd(1) + 1
+        val generation = Innertube.sessionGeneration
+        val job = bridgeScope.launch(start = CoroutineStart.LAZY) {
             try {
                 Innertube.ensureSessionScope()
                 if (Innertube.cookie == null) Innertube.ensureVisitorData()
-                val feed = coroutineScope {
-                    val recent = async { runCatching { recentlyPlayed() }.getOrNull() }
-                    val homeRaw = async { Innertube.browse("FEmusic_home") }
-                    val newReleases = async {
-                        runCatching { InnertubeParser.parseHome(Innertube.browse("FEmusic_new_releases")) }
-                            .getOrDefault(emptyList())
-                    }
-                    val explore = async {
-                        runCatching { InnertubeParser.parseHome(Innertube.browse("FEmusic_explore")) }
-                            .getOrDefault(emptyList())
-                    }
-                    val home = homeRaw.await()
-                    val shelves = listOfNotNull(recent.await()) +
-                        InnertubeParser.parseHome(home) +
-                        newReleases.await() +
-                        explore.await()
-                    HomeFeed(
-                        shelves = shelves.distinctBy { it.title.lowercase() },
-                        continuation = InnertubeParser.continuationToken(home),
-                    )
-                }
-                check(feed.shelves.isNotEmpty()) { "No results from YouTube Music" }
-                DebugLog.d(
-                    "home: signedIn=${Innertube.cookie != null} " +
-                        "shelves=${feed.shelves.size} " +
-                        "titles=${feed.shelves.joinToString { it.title }}",
-                )
-                callback.onResult(json.encodeToString(HomeFeed.serializer(), feed), null)
+                Innertube.checkSession(generation)
+                progressiveFeed(home, generation, publish = { feed, complete ->
+                    callback.onResult(json.encodeToString(HomeFeed.serializer(), feed), complete, null)
+                })
             } catch (e: Throwable) {
-                callback.onResult(null, e.message ?: e.toString())
+                callback.onResult(null, true, e.message ?: "Feed unavailable")
+            } finally { updateRequests { it - id } }
+        }
+        updateRequests { it + (id to job) }
+        job.start()
+        return id
+    }
+
+    internal suspend fun progressiveFeed(
+        home: Boolean, generation: Long,
+        publish: (HomeFeed, Boolean) -> Unit,
+        browse: suspend (String) -> kotlinx.serialization.json.JsonObject = { Innertube.browse(it) },
+    ) = coroutineScope {
+        // Supplements are independent and never hold the primary feed off screen.
+        val parts = List(if (home) 4 else 2) { emptyList<HomeShelf>() }.toMutableList()
+        val extras = if (home) listOf("FEmusic_history", "FEmusic_new_releases", "FEmusic_explore")
+            else listOf("FEmusic_charts")
+        val completed = kotlinx.coroutines.channels.Channel<Pair<Int, List<HomeShelf>>>(extras.size)
+        val extraJobs = extras.mapIndexed { index, name ->
+            launch {
+                val shelves = try {
+                    if (name == HISTORY) {
+                        if (Innertube.cookie == null) emptyList() else {
+                            val songs = InnertubeParser.collectSongsDeep(browse(name)).distinctBy { it.videoId }.take(RECENT_LIMIT)
+                            if (songs.isEmpty()) emptyList() else listOf(HomeShelf(RECENT_TITLE, songs.map {
+                                ShelfItem(it.title, it.artist, it.thumbnailUrl, it.videoId, null)
+                            }))
+                        }
+                    } else InnertubeParser.parseHome(browse(name))
+                } catch (e: CancellationException) { throw e }
+                  catch (_: Exception) { emptyList() }
+                completed.send(index to shelves)
             }
+        }
+        try {
+            val primary = browse(if (home) "FEmusic_home" else "FEmusic_explore")
+            parts[if (home) 1 else 0] = InnertubeParser.parseHome(primary)
+            val token = InnertubeParser.continuationToken(primary)
+            fun emit(complete: Boolean) {
+                Innertube.checkSession(generation)
+                val shelves = parts.flatten().distinctBy { it.title.lowercase() }
+                if (complete) check(shelves.isNotEmpty()) { "No results from YouTube Music" }
+                publish(HomeFeed(shelves, token), complete)
+            }
+            emit(false)
+            repeat(extras.size) { count ->
+                val (index, shelves) = completed.receive()
+                parts[if (home && index == 0) 0 else index + (if (home) 1 else 1)] = shelves
+                // Home parts: history=0, primary=1, releases=2, explore=3.
+                emit(count == extras.lastIndex)
+            }
+        } finally { extraJobs.forEach { it.cancel() }; completed.close() }
+    }
+
+    fun home(callback: FeedCallback) {
+        homeProgressive { payload, complete, message ->
+            if (complete) callback.onResult(payload, message)
         }
     }
 
@@ -99,8 +157,10 @@ object HomeBridge {
      * needed, and neither can be derived from the other.
      */
     fun moodAndGenres(callback: MoodCallback) {
+        val generation = Innertube.sessionGeneration
         bridgeScope.launch {
             try {
+                Innertube.checkSession(generation)
                 Innertube.ensureSessionScope()
                 if (Innertube.cookie == null) Innertube.ensureVisitorData()
                 val sections = InnertubeParser.parseMoodAndGenres(
@@ -128,59 +188,52 @@ object HomeBridge {
      * two categories can share an id and differ only by params, and collapsing
      * them would show one category's playlists under another's name.
      */
-    fun moodGenreShelves(browseId: String, params: String?, callback: FeedCallback) {
-        val key = "$browseId:${params.orEmpty()}"
-        moodGenreShelfCache[key]?.let { cached ->
-            callback.onResult(
-                json.encodeToString(HomeFeed.serializer(), HomeFeed(cached)),
-                null,
-            )
-            return
-        }
-        bridgeScope.launch {
-            try {
-                Innertube.ensureSessionScope()
+    private suspend fun categoryShelves(browseId: String, params: String?): List<HomeShelf> {
+        val generation = Innertube.sessionGeneration
+        val key = "$generation:$browseId:${params.orEmpty()}"
+        val flight = moodLock.withLock {
+            Innertube.checkSession(generation)
+            moodGenreFlights[key] ?: bridgeScope.async(start = CoroutineStart.LAZY) {
                 val shelves = InnertubeParser.parseHome(Innertube.browse(browseId, params))
-                moodGenreShelfCache[key] = shelves
-                callback.onResult(
-                    json.encodeToString(HomeFeed.serializer(), HomeFeed(shelves)),
-                    null,
-                )
-            } catch (e: Throwable) {
-                callback.onResult(null, e.message ?: e.toString())
+                Innertube.checkSession(generation)
+                shelves
+            }.also { moodGenreFlights[key] = it; it.start() }
+        }
+        try { return flight.await().also { Innertube.checkSession(generation) } }
+        finally {
+            moodLock.withLock {
+                if (moodGenreFlights[key] === flight && flight.isCompleted) moodGenreFlights.remove(key)
             }
         }
     }
 
-    /**
-     * A category's tile artwork: the first real cover from the playlists it
-     * opens.
-     *
-     * "Real" is doing work here — a category with no cover of its own borrows
-     * one from its contents rather than shipping an empty tile, which is why
-     * this reuses the shelf cache instead of asking for the covers separately.
-     */
-    fun moodGenreArtwork(browseId: String, params: String?, callback: ArtworkCallback) {
+    fun moodGenreShelves(browseId: String, params: String?, callback: FeedCallback) {
+        val generation = Innertube.sessionGeneration
         bridgeScope.launch {
             try {
-                Innertube.ensureSessionScope()
-                val shelves = moodGenreShelfCache["$browseId:${params.orEmpty()}"]
-                    ?: InnertubeParser.parseHome(Innertube.browse(browseId, params))
-                        .also { moodGenreShelfCache["$browseId:${params.orEmpty()}"] = it }
-                val cover = shelves.asSequence()
-                    .flatMap { it.items.asSequence() }
-                    .mapNotNull { it.thumbnailUrl }
-                    .firstOrNull { it.isNotBlank() }
+                Innertube.checkSession(generation)
+                val shelves = categoryShelves(browseId, params)
+                callback.onResult(json.encodeToString(HomeFeed.serializer(), HomeFeed(shelves)), null)
+            } catch (e: Throwable) { callback.onResult(null, e.message ?: "Category unavailable") }
+        }
+    }
+    fun moodGenreArtwork(browseId: String, params: String?, callback: ArtworkCallback) {
+        val generation = Innertube.sessionGeneration
+        bridgeScope.launch {
+            try {
+                Innertube.checkSession(generation)
+                val cover = categoryShelves(browseId, params).asSequence().flatMap { it.items.asSequence() }
+                    .mapNotNull { it.thumbnailUrl }.firstOrNull { it.isNotBlank() }
                 callback.onResult(cover, null)
-            } catch (e: Throwable) {
-                callback.onResult(null, e.message ?: e.toString())
-            }
+            } catch (e: Throwable) { callback.onResult(null, e.message ?: "Artwork unavailable") }
         }
     }
 
     fun moreHome(token: String, callback: FeedCallback) {
+        val generation = Innertube.sessionGeneration
         bridgeScope.launch {
             try {
+                Innertube.checkSession(generation)
                 Innertube.ensureSessionScope()
                 val response = Innertube.browseContinuation(token)
                 val feed = HomeFeed(
@@ -195,26 +248,8 @@ object HomeBridge {
     }
 
     fun explore(callback: FeedCallback) {
-        bridgeScope.launch {
-            try {
-                Innertube.ensureSessionScope()
-                if (Innertube.cookie == null) Innertube.ensureVisitorData()
-                val explore = Innertube.browse("FEmusic_explore")
-                val charts = runCatching { InnertubeParser.parseHome(Innertube.browse("FEmusic_charts")) }
-                    .getOrDefault(emptyList())
-                val shelves = (InnertubeParser.parseHome(explore) + charts)
-                    .distinctBy { it.title.lowercase() }
-                check(shelves.isNotEmpty()) { "No results from YouTube Music" }
-                callback.onResult(
-                    json.encodeToString(
-                        HomeFeed.serializer(),
-                        HomeFeed(shelves, InnertubeParser.continuationToken(explore)),
-                    ),
-                    null,
-                )
-            } catch (e: Throwable) {
-                callback.onResult(null, e.message ?: e.toString())
-            }
+        exploreProgressive { payload, complete, message ->
+            if (complete) callback.onResult(payload, message)
         }
     }
 
@@ -223,8 +258,10 @@ object HomeBridge {
     }
 
     fun history(callback: FeedCallback) {
+        val generation = Innertube.sessionGeneration
         bridgeScope.launch {
             try {
+                Innertube.checkSession(generation)
                 Innertube.ensureSessionScope()
                 if (Innertube.cookie == null) {
                     callback.onResult(
@@ -242,8 +279,10 @@ object HomeBridge {
     }
 
     private fun feed(browseIds: List<String>, callback: FeedCallback) {
+        val generation = Innertube.sessionGeneration
         bridgeScope.launch {
             try {
+                Innertube.checkSession(generation)
                 Innertube.ensureSessionScope()
                 if (Innertube.cookie == null) Innertube.ensureVisitorData()
                 val shelves = browseIds

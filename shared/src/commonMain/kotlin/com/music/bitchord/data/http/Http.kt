@@ -37,6 +37,7 @@ package com.music.bitchord.data.http
  */
 expect object Http {
     /** POST JSON, return the response body as text. */
+    @Throws(Exception::class)
     suspend fun postJson(
         url: String,
         body: String,
@@ -46,6 +47,7 @@ expect object Http {
     ): String
 
     /** GET, return the response body as text. */
+    @Throws(Exception::class)
     suspend fun getText(
         url: String,
         headers: Map<String, String> = emptyMap(),
@@ -58,6 +60,7 @@ expect object Http {
      * engine as [probe], so it has the same TLS fingerprint that googlevideo
      * accepts. Range requests are supported via [headers].
      */
+    @Throws(Exception::class)
     suspend fun getBytes(
         url: String,
         headers: Map<String, String> = emptyMap(),
@@ -70,12 +73,14 @@ expect object Http {
      * that tells a URL that serves audio from one that 403s on the first real
      * read, before it is handed to the engine.
      */
+    @Throws(Exception::class)
     suspend fun probe(url: String, headers: Map<String, String> = emptyMap()): ProbeResult
 
     /**
      * GET that returns the status code and ignores the body. Stats pings
      * (`s.youtube.com`) answer 204; treating that as an error would drop plays.
      */
+    @Throws(Exception::class)
     suspend fun getStatus(
         url: String,
         headers: Map<String, String> = emptyMap(),
@@ -86,6 +91,7 @@ expect object Http {
     /**
      * POST application/x-www-form-urlencoded. Non-2xx still returns the body.
      */
+    @Throws(Exception::class)
     suspend fun postForm(
         url: String,
         fields: Map<String, String>,
@@ -97,6 +103,7 @@ expect object Http {
      * GET that does not throw on non-2xx. Used by lyrics/canvas providers that
      * need the status code.
      */
+    @Throws(Exception::class)
     suspend fun getRaw(
         url: String,
         headers: Map<String, String> = emptyMap(),
@@ -105,6 +112,7 @@ expect object Http {
     ): RawHttpText
 
     /** POST raw bytes (protobuf / JSON without a forced charset). */
+    @Throws(Exception::class)
     suspend fun postBytes(
         url: String,
         body: ByteArray,
@@ -125,6 +133,7 @@ expect object Http {
      * Non-2xx returns rather than throws, for the same reason as [getRaw]: a WebDAV
      * `412` and a `405` are *answers*, and reading them is the whole point.
      */
+    @Throws(Exception::class)
     suspend fun requestRaw(
         url: String,
         method: String,
@@ -141,6 +150,7 @@ expect object Http {
      * caller's decision about how to stream it is not something this seam should
      * hide behind a `String`.
      */
+    @Throws(Exception::class)
     suspend fun requestBytes(
         url: String,
         method: String,
@@ -165,6 +175,7 @@ expect object Http {
      * Non-2xx returns rather than throws, for the same reason as [getRaw]: a `404` on
      * a cover is an answer.
      */
+    @Throws(Exception::class)
     suspend fun getBytesRaw(
         url: String,
         headers: Map<String, String> = emptyMap(),
@@ -195,3 +206,5 @@ data class ProbeResult(
     /** Whether any body bytes arrived at all. */
     val bodyArrived: Boolean,
 )
+
+class HttpStatusException(val status: Int) : IllegalStateException("Request failed (HTTP $status)")

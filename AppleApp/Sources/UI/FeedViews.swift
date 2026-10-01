@@ -11,54 +11,106 @@ import AppKit
 final class FeedLoader {
     enum Source { case home, explore }
     enum Phase { case loading, loaded([FeedShelf]), failed(String) }
-
+    static let home = FeedLoader(.home)
+    static let explore = FeedLoader(.explore)
     private(set) var phase: Phase = .loading
     private(set) var loadingMore = false
+    private(set) var usingSavedContent = false
+    private(set) var refreshError: String?
     private var continuation: String?
     private var loadedEpoch: Int?
+    private var context: PageContext?
+    private var loadTask: Task<Void, Never>?
+    private var requestID = UUID()
     private let source: Source
+    private var cacheName: String { source == .home ? "home" : "explore" }
 
-    init(_ source: Source) {
-        self.source = source
-    }
+    init(_ source: Source) { self.source = source }
+    func load() async { await load(force: true, epoch: loadedEpoch) }
 
-    func load() async {
-        await load(force: true, epoch: nil)
-    }
-
-    /// Skip the network trip when this loader already has shelves for `epoch`.
-    /// Used so a remounted Home tab does not flash a skeleton after Now Playing.
     func load(force: Bool, epoch: Int?) async {
-        if !force, let epoch, loadedEpoch == epoch, case .loaded = phase { return }
-        phase = .loading
+        let current = PageSession.capture()
+        if let loadTask, context == current { await loadTask.value; return }
+        if context != current {
+            loadTask?.cancel(); loadTask = nil
+            phase = .loading; continuation = nil; usingSavedContent = false
+        }
+        context = current
+        let id = UUID(); requestID = id
+        let task = Task { await self.fetch(force: force, epoch: epoch, context: current, id: id) }
+        loadTask = task
+        await task.value
+        if requestID == id { loadTask = nil }
+    }
+
+    private func fetch(force: Bool, epoch: Int?, context: PageContext, id: UUID) async {
+        refreshError = nil
+        let cacheRevision = await PageRepository.shared.cacheRevision()
+        let saved = await PageRepository.shared.saved(cacheName, context: context)
+        guard requestID == id, PageSession.generation() == context.generation, !Task.isCancelled else { return }
+        if !force, loadedEpoch == epoch, let saved, saved.fresh, case .loaded = phase { return }
+        if let saved, let result = try? JSONDecoder().decode(FeedResult.self, from: saved.data) {
+            phase = .loaded(result.shelves); usingSavedContent = true
+            Task { await LaunchReadiness.shared.contentAppeared() }
+        }
         continuation = nil
         do {
-            let result = source == .home
-                ? try await InnertubeFeed.shared.home()
-                : try await InnertubeFeed.shared.explore()
-            continuation = result.continuation
-            loadedEpoch = epoch
-            phase = .loaded(result.shelves)
+            let started = ContinuousClock.now
+            var first = true
+            for try await result in InnertubeFeed.shared.progressive(home: source == .home) {
+                guard requestID == id, PageSession.generation() == context.generation, !Task.isCancelled else { return }
+                if !result.shelves.isEmpty {
+                    phase = .loaded(result.shelves)
+                    Task { await LaunchReadiness.shared.contentAppeared() }
+                    usingSavedContent = false
+                    if first {
+                        PlaybackDebugLog.shared.record("\(cacheName) first content: \(started.duration(to: .now))")
+                        first = false
+                    }
+                }
+                continuation = result.continuation
+                loadedEpoch = epoch
+                if let data = try? JSONEncoder().encode(result) {
+                    await PageRepository.shared.store(data, name: cacheName, context: context, expectedRevision: cacheRevision, currentGeneration: { PageSession.generation() })
+                }
+            }
         } catch {
-            phase = .failed(error.localizedDescription)
+            guard requestID == id, PageSession.generation() == context.generation, !Task.isCancelled else { return }
+            continuation = nil
+            if case .loaded = phase { refreshError = error.localizedDescription; usingSavedContent = true }
+            else { phase = .failed(error.localizedDescription) }
         }
     }
 
     func loadMore() async {
-        guard source == .home || source == .explore, let token = continuation, !token.isEmpty, !loadingMore else { return }
+        guard let context, PageSession.generation() == context.generation,
+              let token = continuation, !token.isEmpty, !loadingMore else { return }
+        let id = requestID
         loadingMore = true
         defer { loadingMore = false }
         do {
-            let result = source == .home
-                ? try await InnertubeFeed.shared.moreHome(token: token)
+            let result = source == .home ? try await InnertubeFeed.shared.moreHome(token: token)
                 : try await InnertubeFeed.shared.moreExplore(token: token)
+            guard requestID == id, PageSession.generation() == context.generation, !Task.isCancelled else { return }
             continuation = result.continuation
             if case .loaded(let existing) = phase {
                 let seen = Set(existing.map(\.title))
                 phase = .loaded(existing + result.shelves.filter { !seen.contains($0.title) })
             }
         } catch {
+            guard requestID == id, PageSession.generation() == context.generation, !Task.isCancelled else { return }
+            refreshError = error.localizedDescription
         }
+    }
+}
+
+struct SavedContentNotice: View {
+    var message: String? = nil
+    var body: some View {
+        Label(message == nil ? "Showing saved content · Refreshing" : "Showing saved content · Couldn't refresh",
+              systemImage: "clock.arrow.circlepath")
+            .font(.caption).foregroundStyle(.secondary)
+            .accessibilityHint(message ?? "Content will update when the refresh finishes")
     }
 }
 
@@ -311,4 +363,19 @@ struct HeroShelf: View {
             }
         }
     }
+}
+
+private struct SavedPageNoticeModifier: ViewModifier {
+    let name: String
+    func body(content: Content) -> some View {
+        content.overlay(alignment: .bottom) {
+            if CacheStatus.shared.saved.contains(name) {
+                SavedContentNotice(message: CacheStatus.shared.failures[name])
+                    .padding(10).background(.regularMaterial, in: Capsule()).padding(12)
+            }
+        }
+    }
+}
+extension View {
+    func savedPageNotice(_ name: String) -> some View { modifier(SavedPageNoticeModifier(name: name)) }
 }

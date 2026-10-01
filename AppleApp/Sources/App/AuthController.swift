@@ -5,7 +5,7 @@ import BitChordShared
 /// In-memory sign-in state. The cookie lives in [AuthStore] (Keychain) and
 /// is copied into Innertube only through [AuthBridge.applyCookie], which
 /// refuses a jar with no SAPISID.
-@Observable
+@MainActor @Observable
 final class AuthController {
     var signedIn = false
     var accountName: String?
@@ -13,7 +13,9 @@ final class AuthController {
     var accountPhotoUrl: String?
     var loginPresented = false
     /// Home/Explore observe this and reload after sign-in / sign-out.
-    var sessionEpoch = 0
+    var sessionEpoch = 0 {
+        didSet { PageSession.reset(); CacheStatus.shared.reset(); LikeStore.shared.clear() }
+    }
 
     init() {
         // AccountStore reads its encrypted blob during restore. Install the
@@ -121,9 +123,11 @@ final class AuthController {
             clientVersion: session.clientVersion,
             loggedIn: true
         )
+        let generation = PageSession.generation()
         AuthBridge.shared.ensureSession(callback: SessionDoneAdapter { ok, _ in
             guard ok else {
                 Task { @MainActor in
+                    guard PageSession.generation() == generation else { onComplete?(false); return }
                     self.restorePreviousSession(cookie: previousCookie)
                     self.sessionUnavailableReason =
                         "Google gave a session this app could not use. Try signing in again."
@@ -133,6 +137,7 @@ final class AuthController {
             }
             AccountBridge.shared.account(callback: AccountCallbackAdapter { json, _ in
                 Task { @MainActor in
+                    guard PageSession.generation() == generation else { onComplete?(false); return }
                     guard let json,
                           let info = try? JSONDecoder().decode(AccountInfo.self, from: Data(json.utf8))
                     else {
@@ -211,6 +216,7 @@ final class AuthController {
             sessionUnavailableReason = "The account could not be removed from Keychain. Try again after unlocking this device."
             return
         }
+        Task { await PageRepository.shared.invalidate() }
         if let remaining = AccountStore.shared.activeAccount() {
             AccountStore.shared.restore()
             _ = AuthStore.save(remaining.cookie)
@@ -328,15 +334,25 @@ final class AuthController {
     private func refreshAccount() async {
         let epoch = sessionEpoch
         await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
-            AuthBridge.shared.ensureSession(callback: SessionDoneAdapter { _, _ in
-                AccountBridge.shared.account(callback: AccountCallbackAdapter { json, _ in
+            AuthBridge.shared.ensureSession(callback: SessionDoneAdapter { ok, message in
+                guard ok else {
+                    Task { @MainActor in
+                        if self.sessionEpoch == epoch { self.sessionUnavailableReason = message ?? "Your saved session could not be verified." }
+                        cont.resume()
+                    }
+                    return
+                }
+                AccountBridge.shared.account(callback: AccountCallbackAdapter { json, message in
                     Task { @MainActor in
                         if self.signedIn, self.sessionEpoch == epoch,
                            let json, let info = try? JSONDecoder().decode(AccountInfo.self, from: Data(json.utf8)) {
                             self.accountName = info.name
                             self.accountEmail = info.email
                             self.accountPhotoUrl = info.photoUrl
+                            self.sessionUnavailableReason = nil
                             self.publishAccount()
+                        } else if self.signedIn, self.sessionEpoch == epoch {
+                            self.sessionUnavailableReason = message ?? "Your saved session could not be verified."
                         }
                         cont.resume()
                     }

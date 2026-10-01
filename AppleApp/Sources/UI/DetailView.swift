@@ -34,6 +34,7 @@ struct DetailView: View {
     @State private var saved = false
     @State private var saving = false
     @State private var continuation: String?
+    @State private var pageRequestID = UUID()
     @State private var suggested: [DetailPageModel.SongPayload] = []
     @Environment(AuthController.self) private var auth
     @Environment(AppModel.self) private var appModel
@@ -72,7 +73,7 @@ struct DetailView: View {
                 loadedPage(page)
             }
         }
-        .refreshable { await load() }
+        .refreshable { await load(force: true) }
         .navigationTitle(scrolledPastHeader ? (page?.title.isEmpty == false ? page!.title : initialTitle) : "")
         #if os(iOS)
         .navigationBarTitleDisplayMode(.inline)
@@ -98,9 +99,15 @@ struct DetailView: View {
             Button("Public") { Task { await setPrivacy("PUBLIC") } }
             Button("Cancel", role: .cancel) {}
         }
-        .task {
+        .task(id: auth.sessionEpoch) {
+            page = nil; continuation = nil; headerArt = nil
+            saving = false; subscribing = false; subscriptionOverride = nil
             pinned = PlaylistPinning.pinnedIds().contains(browseId)
             await load()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .pageCacheUpdated)) { note in
+            guard let name = note.object as? String, name == "detail:browse:\(browseId)" || name == "detail:browseArtist:\(browseId)" else { return }
+            Task { await load() }
         }
     }
 
@@ -125,6 +132,10 @@ struct DetailView: View {
                     }
 
                     VStack(alignment: .leading, spacing: 0) {
+                        if CacheStatus.shared.saved.contains("detail:browse:\(browseId)") || CacheStatus.shared.saved.contains("detail:browseArtist:\(browseId)") {
+                            SavedContentNotice(message: CacheStatus.shared.failures["detail:browse:\(browseId)"])
+                                .padding(.vertical, 8)
+                        }
                         if !page.songs.isEmpty {
                             if searching {
                                 searchField(tint: tint)
@@ -844,37 +855,53 @@ struct DetailView: View {
     }
 
     private func loadHeaderArt(_ url: String?) async -> Data? {
-        guard let url, let endpoint = URL(string: SharedArtwork.sized(url, 720) ?? url) else { return nil }
-        return (try? await URLSession.shared.data(from: endpoint))?.0
+        guard let url else { return nil }
+        let sized = SharedArtwork.sized(url, 720) ?? url
+        let headers = WebDavBridge.shared.playbackHeaders(fileUrl: sized)
+        return await ArtworkRequests.shared.data(url: sized, headers: headers)
     }
 
-    private func load() async {
-        loading = true
+    private func load(force: Bool = false) async {
+        let request = UUID(); pageRequestID = request
+        let generation = PageSession.generation()
+        loading = page == nil
         error = nil
         subscriptionOverride = nil
         do {
             if browseId.hasPrefix("UC") {
-                page = try await InnertubeDetail.shared.browseArtist(browseId: browseId)
+                let result = try await InnertubeDetail.shared.browseArtist(browseId: browseId, force: force)
+                guard generation == PageSession.generation(), pageRequestID == request, !Task.isCancelled else { return }
+                page = result
                 if page?.songs.isEmpty == true {
-                    page = try await InnertubeDetail.shared.browse(browseId: browseId)
+                    let result = try await InnertubeDetail.shared.browse(browseId: browseId, force: force)
+                guard generation == PageSession.generation(), pageRequestID == request, !Task.isCancelled else { return }
+                page = result
                 }
             } else {
-                page = try await InnertubeDetail.shared.browse(browseId: browseId)
+                let result = try await InnertubeDetail.shared.browse(browseId: browseId, force: force)
+                guard generation == PageSession.generation(), pageRequestID == request, !Task.isCancelled else { return }
+                page = result
             }
             saved = page?.librarySaved ?? false
             continuation = page?.continuation
             suggested = page?.suggestedSongs ?? []
         } catch {
-            self.error = error.localizedDescription
+            guard generation == PageSession.generation(), pageRequestID == request, !Task.isCancelled else { return }
+            if page == nil { self.error = error.localizedDescription }
         }
+        guard generation == PageSession.generation(), pageRequestID == request, !Task.isCancelled else { return }
         loading = false
         if error == nil { await DownloadStore.shared.syncIfOwned(browseId: browseId) }
     }
 
     private func loadMore() async {
         guard let token = continuation, !token.isEmpty else { return }
+        let generation = PageSession.generation()
+        let request = pageRequestID
         continuation = nil
-        guard let extra = try? await InnertubeDetail.shared.more(token: token), var page else { return }
+        guard let extra = try? await InnertubeDetail.shared.more(token: token),
+              generation == PageSession.generation(), !Task.isCancelled,
+              pageRequestID == request, var page else { return }
         let known = Set(page.songs.map(\.videoId))
         page.songs.append(contentsOf: extra.songs.filter { !known.contains($0.videoId) })
         suggested.append(contentsOf: extra.suggestedSongs)
@@ -884,21 +911,25 @@ struct DetailView: View {
 
     private func toggleSave(_ page: DetailPageModel) async {
         guard let pid = page.libraryPlaylistId else { return }
+        let generation = PageSession.generation()
         saving = true
         let next = !saved
-        if await LibraryActions.ratePlaylist(playlistId: pid, saved: next) == nil {
-            saved = next
-        }
+        let failure = await LibraryActions.ratePlaylist(playlistId: pid, saved: next)
+        guard generation == PageSession.generation(), !Task.isCancelled else { return }
+        if failure == nil { saved = next }
         saving = false
     }
 
     private func toggleSubscription(_ subscription: ArtistSubscriptionPayload, artistName: String) async {
         guard !subscribing else { return }
+        let generation = PageSession.generation()
         subscribing = true
         let wasSubscribed = subscriptionOverride ?? subscription.subscribed
         let next = !wasSubscribed
         subscriptionOverride = next
-        if let failure = await LibraryActions.setSubscribed(channelId: subscription.channelId, subscribed: next) {
+        let failure = await LibraryActions.setSubscribed(channelId: subscription.channelId, subscribed: next)
+        guard generation == PageSession.generation(), !Task.isCancelled else { return }
+        if let failure {
             subscriptionOverride = wasSubscribed
             toast.show("Couldn’t update subscription: \(failure)", kind: .failure)
         } else {
@@ -913,11 +944,13 @@ struct DetailView: View {
     }
 
     private func removeDuplicates(_ page: DetailPageModel) async {
+        let generation = PageSession.generation()
         let pairs = page.songs.compactMap { song -> (setVideoId: String, videoId: String)? in
             guard let setVideoId = song.setVideoId else { return nil }
             return (setVideoId, song.videoId)
         }
-        _ = await LibraryActions.removeDuplicates(playlistId: browseId, songs: pairs)
+        let failure = await LibraryActions.removeDuplicates(playlistId: browseId, songs: pairs)
+        guard generation == PageSession.generation(), !Task.isCancelled, failure == nil else { return }
         var seen = Set<String>()
         var kept: [DetailPageModel.SongPayload] = []
         for song in page.songs {

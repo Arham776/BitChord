@@ -1,5 +1,6 @@
 import SwiftUI
 import BitChordShared
+import ImageIO
 #if os(iOS)
 import UIKit
 #else
@@ -204,8 +205,7 @@ final class ArtworkCache: @unchecked Sendable {
     /// concurrent file reads for images that have already scrolled away.
     private let readQueue = DispatchQueue(
         label: "com.example.bitchord.artwork-disk",
-        qos: .userInitiated,
-        attributes: .concurrent
+        qos: .userInitiated
     )
 
     init() {
@@ -215,8 +215,12 @@ final class ArtworkCache: @unchecked Sendable {
 
     /// The warm path. A memory hit returns immediately; a miss returns nil and
     /// the caller falls back to its async load, which populates both tiers.
+    private func cacheKey(_ url: String) -> String {
+        let headers = WebDavBridge.shared.playbackHeaders(fileUrl: url)
+        return PageRepository.digest(url + headers.sorted { $0.key < $1.key }.map { "\($0.key):\($0.value)" }.joined(separator: "\u{0}"))
+    }
     func get(_ url: String) -> PlatformImage? {
-        memory.object(forKey: url as NSString)
+        memory.object(forKey: cacheKey(url) as NSString)
     }
 
     /// Synchronous disk read, for the rare caller that genuinely needs the bytes
@@ -230,45 +234,64 @@ final class ArtworkCache: @unchecked Sendable {
         return resolved
     }
 
+    private static func decode(_ data: Data, url: String) -> PlatformImage? {
+        guard let source = CGImageSourceCreateWithData(data as CFData, nil) else { return nil }
+        let requested: Int
+        if let range = url.range(of: #"w\d+-h\d+"#, options: .regularExpression) {
+            requested = min(2048, max(64, Int(url[range].dropFirst().split(separator: "-").first ?? "1200") ?? 1200))
+        } else { requested = 1200 }
+        let options: [CFString: Any] = [kCGImageSourceCreateThumbnailFromImageAlways: true,
+            kCGImageSourceCreateThumbnailWithTransform: true, kCGImageSourceThumbnailMaxPixelSize: requested,
+            kCGImageSourceShouldCacheImmediately: true]
+        guard let cg = CGImageSourceCreateThumbnailAtIndex(source, 0, options as CFDictionary) else { return nil }
+        #if os(iOS)
+        return UIImage(cgImage: cg)
+        #else
+        return NSImage(cgImage: cg, size: NSSize(width: cg.width, height: cg.height))
+        #endif
+    }
+
+    private func imageCost(_ image: PlatformImage) -> Int {
+        #if os(iOS)
+        return (image.cgImage?.bytesPerRow ?? 0) * (image.cgImage?.height ?? 0)
+        #else
+        return Int(image.size.width * image.size.height * 4)
+        #endif
+    }
+
     private func readFromDisk(_ url: String) -> PlatformImage? {
         let file = diskURL(url)
-        guard let data = try? Data(contentsOf: file),
-              let image = PlatformImage(data: data) else { return nil }
-        memory.setObject(image, forKey: url as NSString, cost: data.count)
-        DiskCache.touch(file)
+        guard let data = try? Data(contentsOf: file), let image = Self.decode(data, url: url) else { return nil }
+        memory.setObject(image, forKey: cacheKey(url) as NSString, cost: imageCost(image))
         return image
     }
 
     func load(_ url: String) async -> PlatformImage? {
         if let hit = get(url) { return hit }
-        // The disk is checked off the main actor: a warm disk cache should be
-        // nearly as fast as memory, and should not cost a frame of scroll.
         let onDisk = await withCheckedContinuation { (cont: CheckedContinuation<PlatformImage?, Never>) in
-            readQueue.async { [weak self] in
-                cont.resume(returning: self?.readFromDisk(url))
-            }
+            readQueue.async { [weak self] in cont.resume(returning: self?.readFromDisk(url)) }
         }
         if let onDisk { return onDisk }
-
-        guard let endpoint = URL(string: url) else { return nil }
-        // A remote library's covers are behind the share's credential, and
-        // `AsyncImage`/`URLSession` have nowhere to put one — so the header is asked
-        // of the shared rule, which answers with an empty dictionary for anything that
-        // is not on the configured share. Every YouTube and local URL goes through
-        // this unchanged, and the rule itself (host, not port) lives in Kotlin
-        // because it is the same rule the cover fetch and the stream fetch obey.
-        var request = URLRequest(url: endpoint)
-        for (field, value) in WebDavBridge.shared.playbackHeaders(fileUrl: url) {
-            request.setValue(value, forHTTPHeaderField: field)
+        let headers = WebDavBridge.shared.playbackHeaders(fileUrl: url)
+        let key = cacheKey(url)
+        guard let data = await ArtworkRequests.shared.data(url: url, headers: headers), !Task.isCancelled else { return nil }
+        return await withCheckedContinuation { continuation in
+            readQueue.async { [weak self] in
+                guard let self, key == self.cacheKey(url), let image = Self.decode(data, url: url) else {
+                    continuation.resume(returning: nil); return
+                }
+                self.memory.setObject(image, forKey: key as NSString, cost: self.imageCost(image))
+                try? data.write(to: self.diskURL(url), options: .atomic)
+                // Trim per batch, rather than walking the folder after every tile.
+                if Date().timeIntervalSince(self.lastTrim) > 60 {
+                    self.lastTrim = Date()
+                    DiskCache.trimFolder(self.folder, limitBytes: Self.diskLimit)
+                }
+                continuation.resume(returning: image)
+            }
         }
-        guard let (data, _) = try? await URLSession.shared.data(for: request),
-              let image = PlatformImage(data: data) else { return nil }
-        memory.setObject(image, forKey: url as NSString, cost: data.count)
-        let file = diskURL(url)
-        try? data.write(to: file, options: .atomic)
-        DiskCache.trimFolder(folder, limitBytes: Self.diskLimit)
-        return image
     }
+    private var lastTrim = Date.distantPast
 
     func clear() {
         memory.removeAllObjects()
@@ -276,7 +299,7 @@ final class ArtworkCache: @unchecked Sendable {
     }
 
     private func diskURL(_ url: String) -> URL {
-        folder.appendingPathComponent(DiskCache.hashName(url))
+        folder.appendingPathComponent(cacheKey(url))
     }
 }
 
@@ -749,5 +772,24 @@ enum LyricsSourceCatalog {
 
     static func label(for name: String) -> String? {
         entries.first { $0.name == name }?.label
+    }
+}
+
+actor ArtworkRequests {
+    static let shared = ArtworkRequests()
+    private var flights: [String: Task<Data?, Never>] = [:]
+    func data(url: String, headers: [String: String]) async -> Data? {
+        let key = PageRepository.digest(url + headers.sorted { $0.key < $1.key }.map { "\($0.key):\($0.value)" }.joined())
+        if let task = flights[key] { return await task.value }
+        let task = Task<Data?, Never> {
+            guard let endpoint = URL(string: url) else { return nil }
+            var request = URLRequest(url: endpoint)
+            headers.forEach { request.setValue($0.value, forHTTPHeaderField: $0.key) }
+            return try? await GuardedHTTP.shared.data(for: request)
+        }
+        flights[key] = task
+        let data = await task.value
+        flights.removeValue(forKey: key)
+        return data
     }
 }

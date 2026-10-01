@@ -8,9 +8,12 @@ import CoreMotion
 /// denied motion permission, disconnected AirPods, and **macOS** (no
 /// `CMHeadphoneMotionManager`) all fall back to yaw 0 — upstream's fixed
 /// widening. Does not opt the session into platform Spatial Audio.
+@MainActor
 final class HeadTracker: NSObject {
     private var engine: PlayerEngine?
     private var running = false
+    private var motionGeneration: UInt64 = 0
+    private var referenceYaw: Double?
 
 #if os(iOS)
     private let manager = CMHeadphoneMotionManager()
@@ -27,8 +30,10 @@ final class HeadTracker: NSObject {
         self.engine = engine
 #if os(iOS)
         guard !running else { return }
-        guard manager.isDeviceMotionAvailable else { return }
-        if CMHeadphoneMotionManager.authorizationStatus() == .denied { return }
+        let permission = CMHeadphoneMotionManager.authorizationStatus()
+        guard permission != .denied && permission != .restricted else { resetYaw(); return }
+        // Register before checking availability so disconnected headphones can
+        // connect later without the user toggling the effect off and on.
         running = true
         manager.delegate = self
         startUpdatesIfConnected()
@@ -42,6 +47,7 @@ final class HeadTracker: NSObject {
             return
         }
         running = false
+        motionGeneration &+= 1
         manager.delegate = nil
         manager.stopDeviceMotionUpdates()
 #endif
@@ -49,19 +55,26 @@ final class HeadTracker: NSObject {
     }
 
     private func resetYaw() {
+        referenceYaw = nil
         try? engine?.setHeadRotation(yaw: 0)
     }
 
 #if os(iOS)
     private func startUpdatesIfConnected() {
         guard running, manager.isDeviceMotionAvailable else { return }
+        motionGeneration &+= 1
+        let generation = motionGeneration
         manager.startDeviceMotionUpdates(to: queue) { [weak self] motion, error in
-            guard let self, error == nil, let motion else { return }
-            // ±π/2 rad (±90°) maps onto the DSP's −1..1 range; beyond that
-            // saturates — turning past profile shouldn't swap the image.
-            let halfPi = Float.pi / 2
-            let yaw = min(max(Float(motion.attitude.yaw) / halfPi, -1), 1)
-            try? self.engine?.setHeadRotation(yaw: yaw)
+            let rawYaw = motion?.attitude.yaw
+            let failed = error != nil
+            Task { @MainActor in
+                guard let self, self.running, self.motionGeneration == generation else { return }
+                guard !failed, let rawYaw else { self.resetYaw(); return }
+                if self.referenceYaw == nil { self.referenceYaw = rawYaw }
+                let relative = atan2(sin(rawYaw - (self.referenceYaw ?? rawYaw)), cos(rawYaw - (self.referenceYaw ?? rawYaw)))
+                let yaw = min(max(Float(relative) / (Float.pi / 2), -1), 1)
+                try? self.engine?.setHeadRotation(yaw: yaw)
+            }
         }
     }
 #endif
@@ -69,13 +82,12 @@ final class HeadTracker: NSObject {
 
 #if os(iOS)
 extension HeadTracker: CMHeadphoneMotionManagerDelegate {
-    func headphoneMotionManagerDidConnect(_ manager: CMHeadphoneMotionManager) {
-        startUpdatesIfConnected()
+    nonisolated func headphoneMotionManagerDidConnect(_ manager: CMHeadphoneMotionManager) {
+        Task { @MainActor in self.resetYaw(); self.startUpdatesIfConnected() }
     }
 
-    func headphoneMotionManagerDidDisconnect(_ manager: CMHeadphoneMotionManager) {
-        manager.stopDeviceMotionUpdates()
-        resetYaw()
+    nonisolated func headphoneMotionManagerDidDisconnect(_ manager: CMHeadphoneMotionManager) {
+        Task { @MainActor in self.motionGeneration &+= 1; self.manager.stopDeviceMotionUpdates(); self.resetYaw() }
     }
 }
 #endif

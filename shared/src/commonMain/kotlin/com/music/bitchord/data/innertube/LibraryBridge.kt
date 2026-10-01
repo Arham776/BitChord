@@ -44,10 +44,13 @@ object LibraryBridge {
      * `[YouTubeSong]`.
      */
     fun librarySongs(callback: FeedCallback) {
+        val generation = Innertube.sessionGeneration
         bridgeScope.launch {
             try {
+                Innertube.checkSession(generation)
                 Innertube.ensureSessionScope()
                 if (Innertube.cookie == null) {
+                    Innertube.checkSession(generation)
                     callback.onResult(
                         json.encodeToString(ListSerializer(Song.serializer()), emptyList()),
                         null,
@@ -56,6 +59,7 @@ object LibraryBridge {
                 }
                 val songs = InnertubeParser.collectSongsDeep(Innertube.browse(LIBRARY_SONGS))
                     .distinctBy { it.videoId }
+                Innertube.checkSession(generation)
                 callback.onResult(json.encodeToString(ListSerializer(Song.serializer()), songs), null)
             } catch (e: Throwable) {
                 callback.onResult(null, e.message ?: e.toString())
@@ -64,10 +68,13 @@ object LibraryBridge {
     }
 
     fun library(callback: FeedCallback) {
+        val generation = Innertube.sessionGeneration
         bridgeScope.launch {
             try {
+                Innertube.checkSession(generation)
                 Innertube.ensureSessionScope()
                 if (Innertube.cookie == null) {
+                    Innertube.checkSession(generation)
                     callback.onResult(
                         json.encodeToString(HomeFeed.serializer(), HomeFeed(emptyList())),
                         null,
@@ -77,13 +84,12 @@ object LibraryBridge {
                 val shelves = coroutineScope {
                     FEEDS.map { (title, browseId) ->
                         async {
-                            val items = runCatching {
-                                InnertubeParser.parseLibraryItems(Innertube.browse(browseId))
-                            }.getOrDefault(emptyList())
+                            val items = InnertubeParser.parseLibraryItems(Innertube.browse(browseId))
                             HomeShelf(title, items)
                         }
                     }.awaitAll().filter { it.items.isNotEmpty() }
                 }
+                Innertube.checkSession(generation)
                 callback.onResult(
                     json.encodeToString(HomeFeed.serializer(), HomeFeed(shelves)),
                     null,

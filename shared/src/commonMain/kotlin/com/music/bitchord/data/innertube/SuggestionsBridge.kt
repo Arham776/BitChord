@@ -21,10 +21,13 @@ object SuggestionsBridge {
     }
 
     fun suggest(input: String, callback: SuggestionsCallback) {
+        val generation = Innertube.sessionGeneration
         bridgeScope.launch {
             try {
+                Innertube.checkSession(generation)
                 val response = Innertube.searchSuggestions(input)
                 val suggestions = InnertubeParser.parseSearchSuggestions(response)
+                Innertube.checkSession(generation)
                 callback.onResult(
                     json.encodeToString(ListSerializer(String.serializer()), suggestions),
                     null,

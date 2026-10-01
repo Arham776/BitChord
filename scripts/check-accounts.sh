@@ -8,11 +8,11 @@
 # the wrong channel, and nothing on screen would say so — so these checks read
 # Innertube's own answers back rather than the store's.
 #
-# Writes to the same credential store the app reads, and restores what it found.
+# Uses an isolated synthetic secret store; never touches real account credentials.
 #
 # One environment note the harness reports out loud rather than hiding: an
 # unentitled command-line binary cannot use macOS's data-protection keychain, so
-# it checks the store's logic against a `UserDefaults`-backed substitute and says
+# it checks the store's logic against a `memory-backed substitute and says
 # so in its output. That is a property of the harness binary, not of the app —
 # the app is signed with a `keychain-access-groups` entitlement and uses the real
 # thing.

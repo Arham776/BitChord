@@ -20,10 +20,14 @@ object AccountBridge {
     }
 
     fun account(callback: AccountCallback) {
+        val generation = Innertube.sessionGeneration
         bridgeScope.launch {
             try {
+                Innertube.checkSession(generation)
+                check(Innertube.cookie != null) { "Sign in to view your account" }
                 Innertube.ensureSessionScope()
                 val response = Innertube.accountMenu()
+                Innertube.checkSession(generation)
                 val account = InnertubeParser.parseAccount(response)
                 if (account != null) {
                     callback.onResult(

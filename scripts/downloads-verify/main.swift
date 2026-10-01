@@ -4,6 +4,7 @@ import BitChordShared
 // UI-independent collaborators. DownloadStore itself and QueueEntry are the app sources.
 struct LocalTrack { var path = ""; var title = ""; var artist = ""; var durationSeconds = 0.0; var album = ""; var artwork: Data? }
 @MainActor final class NetworkQuality { static let shared = NetworkQuality(); var connected = true; var metered = false }
+@MainActor enum PageSession { static func generation() -> Int64 { AuthBridge.shared.sessionGeneration() } }
 struct TestCacheMetadata { var codec: String; var kbps: Int }
 actor StreamFileCache {
     static let shared = StreamFileCache()
@@ -18,7 +19,7 @@ struct TestPage { var songs: [TestSong]; var continuation: String?; var thumbnai
 @MainActor final class InnertubeDetail {
     static let shared = InnertubeDetail()
     var pages: [TestPage] = []; var fails = false
-    func browse(browseId: String) async throws -> TestPage { try take() }
+    func browse(browseId: String, force: Bool = false) async throws -> TestPage { try take() }
     func more(token: String) async throws -> TestPage { try take() }
     private func take() throws -> TestPage {
         if fails || pages.isEmpty { throw CocoaError(.fileReadUnknown) }
@@ -98,6 +99,7 @@ final class FixtureBackend: DownloadBackend, @unchecked Sendable {
         let migrationRoot = root.appendingPathComponent("migration")
         let migrated = DownloadStore(directory: migrationRoot, startWorker: false, legacyDirectory: legacyRoot)
         migrated.refresh()
+        await migrated.waitForRefresh()
         assert(migrated.items.count == 1 && FileManager.default.fileExists(atPath: oldFile.path), "legacy migration preserves the original file")
         assert(migrated.provenance(for: oldFile.path) == nil, "legacy names do not establish YouTube provenance")
         migrated.retainPlayback(paths: [oldFile.path]); migrated.delete(oldFile.path)
@@ -143,13 +145,13 @@ final class FixtureBackend: DownloadBackend, @unchecked Sendable {
         let worker = DownloadStore(directory: root.appendingPathComponent("worker"), legacyDirectory: legacyRoot, backend: backend)
         let entries = (0..<3).map { QueueEntry.youtube(videoId: "worker-\($0)", title: "Worker fixture", artist: "Validation") }
         entries.forEach { _ = worker.download($0) }
-        for _ in 0..<100 { if worker.jobs.allSatisfy({ $0.status == .done }) { break }; try await Task.sleep(for: .milliseconds(50)) }
+        for _ in 0..<100 { if !worker.restoring && worker.jobs.count == 3 && worker.jobs.allSatisfy({ $0.status == .done }) { break }; try await Task.sleep(for: .milliseconds(50)) }
         assert(worker.jobs.count == 3 && worker.jobs.allSatisfy { $0.status == .done }, "pending worker completes independent jobs")
         assert(backend.counts().0 == 2 && backend.counts().1 == 3, "worker permits exactly two concurrent transfers")
         let joiningBackend = FixtureBackend(); joiningBackend.sharedRecording = true
         let joining = DownloadStore(directory: root.appendingPathComponent("joining"), legacyDirectory: legacyRoot, backend: joiningBackend)
         _ = joining.download(entries[0]); _ = joining.download(entries[1])
-        for _ in 0..<100 { if joining.jobs.allSatisfy({ $0.status == .done }) { break }; try await Task.sleep(for: .milliseconds(50)) }
+        for _ in 0..<100 { if !joining.restoring && joining.jobs.count == 2 && joining.jobs.allSatisfy({ $0.status == .done }) { break }; try await Task.sleep(for: .milliseconds(50)) }
         assert(joiningBackend.counts().1 == 1, "matching resolved renditions join one transfer")
         assert(joining.asset(for: entries[0])?.path == joining.asset(for: entries[1])?.path, "shared recording is used during playback for each request")
         let previousWifi = PlatformSettings.shared.getBoolean(key: "wifi_only_downloads", default: true)
@@ -174,6 +176,7 @@ final class FixtureBackend: DownloadBackend, @unchecked Sendable {
         let failedBackend = FixtureBackend(); failedBackend.resolutionFails = true
         let failing = DownloadStore(directory: root.appendingPathComponent("retries"), legacyDirectory: legacyRoot, backend: failedBackend)
         _ = failing.download(entries[0])
+        await failing.waitUntilReady()
         for attempt in 1...3 {
             for _ in 0..<100 { if failing.jobs[0].attempts >= attempt && failing.jobs[0].status != .running { break }; try await Task.sleep(for: .milliseconds(10)) }
             if attempt < 3 { failing.jobs[0].retryAt = .distantPast; failing.networkPolicyChanged() }

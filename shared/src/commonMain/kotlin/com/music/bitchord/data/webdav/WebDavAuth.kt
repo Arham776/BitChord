@@ -1,6 +1,7 @@
 package com.music.bitchord.data.webdav
 
 import com.music.bitchord.data.remote.WebDavConfig
+import com.music.bitchord.data.http.CredentialPolicy
 import com.music.bitchord.data.settings.AppSettings
 
 /**
@@ -23,7 +24,7 @@ import com.music.bitchord.data.settings.AppSettings
  * appear in the `href`s it hands back, and one absolute `href` on another host is
  * enough to make a client send `Authorization: Basic` — a base64 string, i.e. the
  * password in the clear — to a host the listener has never heard of. Upstream is right
- * about this and gets it right by the host, not by the port; see [headerFor].
+ * to withhold credentials across hosts. This port also checks scheme and port; see [headerFor].
  *
  * Reading the settings rather than being handed them means the answer cannot go stale:
  * there is no sequence of calls that leaves the published header disagreeing with what
@@ -35,12 +36,7 @@ object WebDavAuth {
     fun headerFor(requestUrl: String): String? {
         val configured = AppSettings.webDavUrl.value
         if (!WebDavConfig.isConfigured(configured)) return null
-        val host = WebDavConfig.hostOf(requestUrl) ?: return null
-        // Host-only comparison, and that is [WebDavConfig.hostOf]'s own rule rather than
-        // an accident: a share on `example.com:8443` has to get the credential that
-        // belongs to `example.com`, and matching on the port as well would both send a
-        // secret to a host it does not belong to and withhold it from the one it does.
-        if (host != WebDavConfig.hostOf(configured)) return null
+        if (!CredentialPolicy.sameOrigin(requestUrl, configured)) return null
         return WebDavConfig.basicAuthHeader(
             AppSettings.webDavUsername.value,
             AppSettings.webDavPassword.value,

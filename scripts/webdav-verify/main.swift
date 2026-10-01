@@ -293,8 +293,8 @@ check(
         && !WebDavAuth.shared.authorizes(requestUrl: foreignTrack)
 )
 check(
-    "a port does not make a different host",
-    WebDavAuth.shared.headerFor(requestUrl: base.replacingOccurrences(of: ":8081", with: ":8082")) != nil
+    "a credential does not cross port boundaries",
+    WebDavAuth.shared.headerFor(requestUrl: base.replacingOccurrences(of: ":8081", with: ":8082")) == nil
 )
 
 do {

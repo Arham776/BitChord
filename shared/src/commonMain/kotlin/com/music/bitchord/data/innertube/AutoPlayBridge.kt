@@ -23,11 +23,14 @@ object AutoPlayBridge {
     }
 
     fun related(videoId: String, callback: AutoPlayCallback) {
+        val generation = Innertube.sessionGeneration
         bridgeScope.launch {
             try {
+                Innertube.checkSession(generation)
                 val response = Innertube.next(videoId)
                 val songs = InnertubeParser.parseWatchQueue(response)
                     .filterNot { it.isVideo }
+                Innertube.checkSession(generation)
                 callback.onResult(
                     json.encodeToString(songListSerializer, songs),
                     null,

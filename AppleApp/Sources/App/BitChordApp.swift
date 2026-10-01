@@ -34,6 +34,17 @@ struct BitChordApp: App {
                 .task {
                     #if DEBUG
                     #if os(iOS)
+                    if ProcessInfo.processInfo.arguments.contains("--verify-restored-resume") {
+                        CipherUnlockWiring.install()
+                        let mixing = ProcessInfo.processInfo.arguments.contains("--mixing-on")
+                        await controller.verifyRestoredResumeBehavior(mixing: mixing)
+                        return
+                    }
+                    if ProcessInfo.processInfo.arguments.contains("--verify-navigation") {
+                        CipherUnlockWiring.install()
+                        await controller.verifyRapidNavigation()
+                        return
+                    }
                     if ProcessInfo.processInfo.arguments.contains("--verify-native-resume") {
                         await controller.verifyNativeResumeBehavior()
                         return
@@ -68,29 +79,33 @@ struct BitChordApp: App {
                     // engine should not wait behind it. Whatever is missing stays
                     // missing, and Automix keeps its tempo fallback — the whole reason
                     // the models are optional.
-                    AutomixModelStore.shared.refresh()
-                    AutomixModelStore.shared.onChanged = {
-                        Task { await reloadAutomixModels() }
-                    }
-                    Task { await reloadAutomixModels() }
-                    // Engine is started on-demand when the user actually begins
-                    // playback (via playQueue, togglePlayPause, or remote commands)
-                    // so opening the app never interrupts other audio playing on the device.
-                    // After the shell is up and the first frame has been drawn: an
-                    // offer as the window appears reads as chrome, and one that
-                    // arrives a moment later reads as a question.
                     Task {
-                        try? await Task.sleep(for: .seconds(1))
-                        appModel.offerAutomixModelsIfNeeded()
+                        await LaunchReadiness.shared.waitForContent()
+                        AutomixModelStore.shared.refresh()
+                        AutomixModelStore.shared.onChanged = {
+                            Task { await reloadAutomixModels() }
+                        }
+                        Task { await reloadAutomixModels() }
+                        // Engine is started on-demand when the user actually begins
+                        // playback (via playQueue, togglePlayPause, or remote commands)
+                        // so opening the app never interrupts other audio playing on the device.
+                        // After the shell is up and the first frame has been drawn: an
+                        // offer as the window appears reads as chrome, and one that
+                        // arrives a moment later reads as a question.
+                        Task {
+                            try? await Task.sleep(for: .seconds(1))
+                            appModel.offerAutomixModelsIfNeeded()
+                        }
+                        LocalLibrary.shared.restore()
+                        DownloadStore.shared.refresh()
+                        Task { await StreamFileCache.shared.trim() }
+                        let token = PlatformSettings.shared.getSecret(key: "discord_token") ?? ""
+                        if !token.isEmpty { DiscordGateway.shared.connect(token: token) }
                     }
-                    LocalLibrary.shared.restore()
-                    DownloadStore.shared.refresh()
-                    Task { await StreamFileCache.shared.trim() }
-                    let token = PlatformSettings.shared.getSecret(key: "discord_token") ?? ""
-                    if !token.isEmpty { DiscordGateway.shared.connect(token: token) }
                 }
                 .onChange(of: scenePhase) { _, phase in
                     appModel.scenePhase = phase
+                    LoadingMonitor.shared.setActive(phase == .active)
                     if phase == .background {
                         // No GPU work back here: a Music Understanding inference
                         // caught mid-flight aborts with

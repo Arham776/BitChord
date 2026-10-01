@@ -2,6 +2,7 @@ package com.music.bitchord.data.innertube
 
 import com.music.bitchord.data.DebugLog
 import com.music.bitchord.data.http.Http
+import com.music.bitchord.data.http.ProbeResult
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.CoroutineStart
@@ -49,7 +50,7 @@ import kotlin.time.TimeSource
  * ## And the signed-in retries
  *
  * The part the port was missing altogether, and the direct answer to "why is
- * this treated as a bot when upstream is not": [authenticatedWebRemixStream]
+ * this treated as a bot when upstream is not": [authenticatedStream]
  * asks [PlayerClient.WEB_REMIX] carrying the listener's real cookie once the
  * anonymous walk has been refused, and an age gate re-asks the client that
  * reported it *with* the session. Previously a bot check had nowhere to go, and
@@ -81,15 +82,11 @@ object StreamResolver {
      * No browser client appears here, for upstream's reason: sent bare they are
      * ciphered without exception and usually refused, so they would be a slow way
      * to reach nothing. They are the *signed-in* fallback instead — see
-     * [authenticatedWebRemixStream] — which is the one case a cookie belongs on
+     * [authenticatedStream] — which is the one case a cookie belongs on
      * one.
      *
-     * This list used to be reordered locally, with [PlayerClient.ANDROID_VR]
-     * deleted outright because it "mints honeypot URLs on this network". A
-     * per-network observation does not belong in the client list: it is
-     * [standDown]'s job, and now it is one. A client that answers with a URL which
-     * fails a 2 MiB [Http.probe] is stood down on the spot, so a network that
-     * dislikes ANDROID_VR no longer pays for it on every single track.
+     * CDN refusals stay local to the media URL. Session-wide stand-down is
+     * reserved for player-client refusals, separately for guest and signed-in.
      */
     private val CLIENTS = listOf(
         PlayerClient.ANDROID_MUSIC,
@@ -132,9 +129,12 @@ object StreamResolver {
     suspend fun resolve(videoId: String, maxKbps: Int = Int.MAX_VALUE): ResolvedStream? {
         // Before anything asks. Without a visitor id the good clients refuse
         // outright and the rest hand back URLs that only *look* like they work.
+        val generation = Innertube.sessionGeneration
         runCatching { Innertube.ensureVisitorData() }
+        Innertube.checkSession(generation)
 
         recent.snapshot()[videoId]
+            ?.takeIf { it.generation == Innertube.sessionGeneration }
             ?.takeIf { it.at.elapsedNow() < URL_TTL }
             ?.takeIf { maxKbps == Int.MAX_VALUE || it.stream.kbps <= maxKbps }
             ?.let { return it.stream }
@@ -142,10 +142,11 @@ object StreamResolver {
         unplayableReason(videoId)?.let { throw PermanentlyUnplayableException(it) }
 
         val stream = coalescedResolve(videoId, maxKbps)
+        Innertube.checkSession(generation)
         // Only ever stored once it has served bytes, so this is a cache of
         // known-good answers rather than of recent attempts. A capped caller gets
         // no entry, because a download must not inherit playback's bitrate.
-        if (maxKbps == Int.MAX_VALUE) remember(videoId, stream)
+        if (maxKbps == Int.MAX_VALUE) remember(videoId, stream, generation)
         return stream
     }
 
@@ -162,8 +163,10 @@ object StreamResolver {
      * than coalescing only the duplicates.
      */
     private suspend fun coalescedResolve(videoId: String, maxKbps: Int): ResolvedStream {
-        val key = "$videoId|$maxKbps"
+        val key = "${Innertube.sessionGeneration}|$videoId|$maxKbps"
         recent.snapshot()[videoId]
+            ?.takeIf { it.generation == Innertube.sessionGeneration }
+            ?.takeIf { it.at.elapsedNow() < URL_TTL }
             ?.takeIf { maxKbps == Int.MAX_VALUE || it.stream.kbps <= maxKbps }
             ?.let { return it.stream }
 
@@ -196,13 +199,23 @@ object StreamResolver {
     private val resolverScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
 
     private suspend fun resolveUncached(videoId: String, maxKbps: Int): ResolvedStream {
-        runCatching { Innertube.ensureSessionScope() }
         val errors = mutableListOf<String>()
-
-        val stream = playerStream(videoId, maxKbps, errors)
-            ?: authenticatedWebRemixStream(videoId, maxKbps)
+        val generation = Innertube.sessionGeneration
+        val canAuthenticate = if (Innertube.cookie == null) false else try {
+            Innertube.ensureSessionScope()
+            Innertube.checkSession(generation)
+            Innertube.requestSession().cookie != null
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            errors += "Signed-in playback: ${e.message}"
+            false
+        }
+        val stream = playerStream(videoId, maxKbps, errors, canAuthenticate)
+            ?: if (canAuthenticate) authenticatedStream(videoId, maxKbps, errors) else null
         if (stream != null) return stream
 
+        if (errors.isEmpty()) errors += "Playback clients are temporarily unavailable; try again shortly"
         DebugLog.w("$videoId: every player client refused. ${errors.joinToString("; ")}")
         permanentReason(errors)?.let { reason ->
             rememberUnplayable(videoId, reason)
@@ -257,21 +270,20 @@ object StreamResolver {
         videoId: String,
         maxKbps: Int,
         errors: MutableList<String>,
+        canAuthenticate: Boolean,
     ): ResolvedStream? {
+        val generation = Innertube.sessionGeneration
         var timestamp: Int? = null
         var mintedFreshVisitor = false
-        // One signed-in retry per client per walk. Without the bound, a client
-        // answering the age gate with the age gate signed in would be asked twice
-        // for every walk, and there are seven of them.
-        val triedSignedIn = mutableSetOf<PlayerClient>()
-
         for (client in clientOrder()) {
+            Innertube.checkSession(generation)
             if (isStoodDown(videoId, client)) continue
 
             // Only fetched when a client that needs it is reached — it costs a
             // download of YouTube's player JavaScript.
             if (client.needsSignatureTimestamp && timestamp == null) {
-                timestamp = CipherUnlock.signatureTimestamp()
+                timestamp = timestampProvider()
+                Innertube.checkSession(generation)
                 if (timestamp == null) {
                     DebugLog.d("$videoId: no signatureTimestamp; skipping ${client.clientName}")
                     errors += "${client.clientName}: no signature timestamp"
@@ -284,26 +296,6 @@ object StreamResolver {
             } catch (e: Innertube.UnplayableException) {
                 when {
                     e.isPermanent -> throw e
-
-                    // A device client refused with "Sign in to confirm your age"
-                    // is making a statement about the *request*, not the track: the
-                    // same client asked again carrying the session is answered OK.
-                    // Worth doing on these clients in particular because they
-                    // return plain `url` fields, so this never touches the
-                    // signature solver — which is what makes it the route that
-                    // still works when the solver is broken.
-                    e.isAgeGate && Innertube.cookie != null && !triedSignedIn.contains(client) -> {
-                        triedSignedIn += client
-                        DebugLog.d(
-                            "$videoId: ${client.clientName} wants an age check; asking again signed in",
-                        )
-                        try {
-                            Innertube.player(videoId, client, timestamp, authenticated = true)
-                        } catch (retry: Innertube.UnplayableException) {
-                            noteRefusal(client, videoId, retry, errors)
-                            continue
-                        }
-                    }
 
                     // A visitor id can be burned while the session around it is
                     // fine, and the only symptom is being called a bot. Worth one
@@ -361,36 +353,33 @@ object StreamResolver {
                 continue
             }
 
-            val picked = firstPlayable(videoId, client, formats, errors, loudnessDbOf(response))
-            if (picked == null) {
-                standDown(videoId, client)
-                refused(videoId, client)
-                continue
-            }
-
-            // The format the URL was minted for is what the answer is judged against,
-            // so a muxed `video/mp4` is accepted for the `video/mp4` it was minted
-            // for and an error page is refused for both of them.
-            when (probe(picked.url, client.mediaHeaders(), picked.mimeType)) {
-                ProbeVerdict.OK -> {
-                    DebugLog.d(
-                        "resolved $videoId via ${client.clientName}@${client.clientVersion} " +
-                            "@ ${picked.kbps}kbps",
-                    )
-                    served(client)
-                    preferred = client
-                    return picked
+            val errorsBeforeProbe = errors.size
+            var picked = firstPlayable(videoId, client, formats, errors, loudnessDbOf(response))
+            // A CDN can refuse a freshly issued URL while a new player read
+            // issues a usable one. For guests, permit one fresh read of the
+            // Android client; never replay the refused media URL. Signed-in
+            // listeners take the authenticated fallback instead.
+            if (picked == null && !canAuthenticate && client == PlayerClient.ANDROID &&
+                errors.drop(errorsBeforeProbe).any { "media HTTP 403" in it }) {
+                try {
+                    val fresh = Innertube.player(videoId, client, timestamp)
+                    picked = firstPlayable(videoId, client, rankForPlayback(fresh, maxKbps), errors, loudnessDbOf(fresh))
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (e: Exception) {
+                    errors += "${client.clientName}: fresh player read failed (${e.message})"
                 }
-                // The client itself is being refused this track; don't spend another
-                // round trip on it for a while.
-                ProbeVerdict.REFUSED -> {
-                    standDown(videoId, client)
-                    refused(videoId, client)
-                }
-                // Nobody answered, so this says nothing about the client.
-                ProbeVerdict.UNREACHABLE -> Unit
             }
-            errors += "${client.clientName}: minted an unusable URL (${picked.mimeType})"
+            if (picked != null) {
+                served(client)
+                preferred = client
+                DebugLog.d("resolved $videoId via ${client.clientName}@${client.clientVersion} @ ${picked.kbps}kbps")
+                return picked
+            }
+            // A track's CDN URLs are not a verdict about every other track.
+            // In particular, speculative prefetch must not disable the last
+            // working client after three songs happened to return dead URLs.
+            // Do not cache this transient failure: Back/Next can ask for a fresh URL.
         }
         return null
     }
@@ -413,23 +402,35 @@ object StreamResolver {
         errors: MutableList<String>,
         loudnessDb: Double? = null,
     ): ResolvedStream? {
+        val generation = Innertube.sessionGeneration
         for (format in formats) {
-            val url = format.url ?: format.signatureCipher?.let { cipher ->
-                if (SignatureSolver.isBroken) {
-                    null
-                } else {
-                    CipherUnlock.unlockCipher(videoId, cipher)
-                }
-            } ?: continue
-            return ResolvedStream(
-                url = patchClientVersion(url, client.clientVersion),
+            val url = if (format.url != null) {
+                urlTransform(format.url)
+            } else if (!SignatureSolver.isBroken && format.signatureCipher != null) {
+                CipherUnlock.unlockCipher(videoId, format.signatureCipher)
+            } else null
+            Innertube.checkSession(generation)
+            if (url == null) continue
+            val mediaClient = PlayerClient.forStreamUrl(url)
+            val mintedName = Regex("[?&]c=([^&]+)").find(url)?.groupValues?.get(1)
+            val picked = ResolvedStream(
+                // A signed URL belongs to the identity named by the URL, which
+                // may differ from the player client (guest muxed renditions).
+                // Rewriting cver changes the signed URL and can make it 403.
+                url = url,
                 kbps = format.kbps,
                 mimeType = format.mimeType,
-                headers = client.mediaHeaders(),
+                headers = if (mintedName != null) mediaClient.mediaHeaders() else client.mediaHeaders(),
                 loudnessDb = loudnessDb,
             )
+            val result = streamProbe(picked.url, picked.headers)
+            Innertube.checkSession(generation)
+            if (result.classify(picked.mimeType) == ProbeVerdict.OK) return picked
+            errors += "${client.clientName}@${client.clientVersion}: media HTTP ${result.status} (${picked.mimeType})"
         }
-        errors += "${client.clientName}: ${formats.size} format(s), none unlocked"
+        if (errors.none { it.startsWith("${client.clientName}@${client.clientVersion}: media") }) {
+            errors += "${client.clientName}@${client.clientVersion}: ${formats.size} format(s), none unlocked"
+        }
         return null
     }
 
@@ -471,74 +472,51 @@ object StreamResolver {
 
     // ---- The signed-in fallback --------------------------------------------
 
-    /**
-     * Tried after the anonymous walk and before giving up, and only when there is
-     * a session to send: [PlayerClient.WEB_REMIX] carrying the signed-in listener's
-     * own cookie.
-     *
-     * Upstream's reasoning, which the port had no code for at all:
-     *
-     *  > The anonymous walk in playerStream is refused on sight far more often than
-     *  > not right now — every device client answering "sign in to confirm you're
-     *  > not a bot" to a request that, honestly, isn't signed in. A real session
-     *  > cookie on a browser-shaped client is the one case that isn't an anonymous
-     *  > device pretending otherwise, which is why it is asked at all.
-     *
-     * Asked *after* the walk rather than ahead of it because of what it costs when
-     * it does not work: WEB_REMIX is a web client, so every format it returns is
-     * ciphered, so this is the one path that has to solve a signature on every
-     * track — and a signature that cannot be solved is not a cheap no. Ahead of the
-     * walk, every track would pay for the most expensive failure available before
-     * anything cheaper was tried.
-     *
-     * Gated on [SignatureSolver] for the same reason: with the solver known broken,
-     * the unciphered signed-in route inside [playerStream] is the only one that can
-     * work, and this would be a round trip and a log line.
-     *
-     * Anything short of a working URL — no cookie, a refusal, a format that will not
-     * unlock, a probe that fails — returns null rather than throwing, so a bad guess
-     * here never costs more than the one round trip.
+    /** Signed-in device clients first, then the browser client. Verdicts are
+     * scoped independently from anonymous attempts. Every request uses the
+     * resolved account snapshot; unavailable credentials never become account 0.
      */
-    private suspend fun authenticatedWebRemixStream(
+    private suspend fun authenticatedStream(
         videoId: String,
         maxKbps: Int,
+        errors: MutableList<String>,
     ): ResolvedStream? {
-        if (Innertube.cookie == null) return null
-        if (SignatureSolver.isBroken) return null
-        return try {
-            val timestamp = CipherUnlock.signatureTimestamp() ?: return null
-            val response = Innertube.player(
-                videoId = videoId,
-                client = PlayerClient.WEB_REMIX,
-                signatureTimestamp = timestamp,
-                authenticated = true,
-            )
-            val formats = rankForPlayback(response, maxKbps)
-            if (formats.isEmpty()) {
-                DebugLog.d("$videoId: signed-in WEB_REMIX offered no usable format")
+        // Anonymous bot checks must not suppress the same client with a valid
+        // resolved account. Device clients may return direct URLs even when
+        // the web signature solver is unavailable.
+        for (client in listOf(PlayerClient.ANDROID_MUSIC, PlayerClient.ANDROID, PlayerClient.TVHTML5, PlayerClient.WEB_REMIX)) {
+            if (isStoodDown(videoId, client, authenticated = true)) continue
+            try {
+                val timestamp = if (client.needsSignatureTimestamp) timestampProvider() ?: continue else null
+                val response = Innertube.player(videoId, client, timestamp, authenticated = true)
+                val formats = rankForPlayback(response, maxKbps)
+                if (formats.isEmpty()) {
+                    errors += "Signed-in ${client.clientName}: no addressed audio formats"
+                    standDown(videoId, client, authenticated = true)
+                    refused(videoId, client, authenticated = true)
+                    continue
+                }
+                val picked = firstPlayable(videoId, client, formats, errors, loudnessDbOf(response)) ?: continue
+                served(client, authenticated = true)
+                DebugLog.d("resolved $videoId via signed-in ${client.clientName} @ ${picked.kbps}kbps")
+                return picked
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Innertube.UnplayableException) {
+                errors += "Signed-in ${client.clientName}: ${e.displayReason}"
+                if (e.looksLikeBotCheck) standDownEverywhere(client, authenticated = true)
+                else standDown(videoId, client, authenticated = true)
+            } catch (e: Innertube.AuthenticationException) {
+                errors += "Signed-in playback: ${e.message}"
                 return null
+            } catch (e: Innertube.PlayerAuthenticationException) {
+                errors += "Signed-in ${client.clientName}: ${e.message}"
+                standDownEverywhere(client, authenticated = true)
+            } catch (e: Exception) {
+                errors += "Signed-in ${client.clientName}: ${e.message}"
             }
-            val picked = firstPlayable(
-                videoId,
-                PlayerClient.WEB_REMIX,
-                formats,
-                mutableListOf(),
-                loudnessDbOf(response),
-            ) ?: return null
-            if (probe(picked.url, PlayerClient.WEB_REMIX.mediaHeaders(), picked.mimeType) != ProbeVerdict.OK) {
-                DebugLog.d("$videoId: signed-in WEB_REMIX URL did not probe clean")
-                standDown(videoId, PlayerClient.WEB_REMIX)
-                return null
-            }
-            DebugLog.d("resolved $videoId via signed-in WEB_REMIX @ ${picked.kbps}kbps")
-            preferred = PlayerClient.WEB_REMIX
-            picked
-        } catch (e: CancellationException) {
-            throw e
-        } catch (e: Exception) {
-            DebugLog.d("signed-in WEB_REMIX failed for $videoId: ${e.message}")
-            null
         }
+        return null
     }
 
     // ---- Session lifecycle --------------------------------------------------
@@ -555,6 +533,8 @@ object StreamResolver {
      * without it.
      */
     fun onSessionChanged() {
+        inFlight.snapshot().values.forEach { it.cancel() }
+        inFlight.clear()
         unplayable.clear()
         standDownUntil.clear()
         refusalsByClient.clear()
@@ -587,12 +567,9 @@ object StreamResolver {
         recent.update { m ->
             m.entries.firstOrNull { it.value.stream.url == url }?.let { m.remove(it.key) }
         }
-        // Independent of that lookup on purpose: dropping the preference is what
-        // breaks the loop, and it must happen even if the URL already aged out.
-        if (preferred == client) {
-            DebugLog.w("${client.clientName} refused a URL it had already served; standing it down")
-            standDownEverywhere(client)
-        }
+        // A tail-range refusal invalidates this URL, not every track minted by
+        // this client. A background download must not disable foreground Next.
+        DebugLog.w("${client.clientName} refused a served media URL; requesting a fresh URL")
     }
 
     // ---- Verdicts and stand-downs ------------------------------------------
@@ -624,23 +601,22 @@ object StreamResolver {
     /** Clients refused a given track, and until when. */
     private val standDownUntil = CowMap<String, TimeMark>()
 
-    private fun trackKey(videoId: String, client: PlayerClient) =
-        "$videoId|${client.clientName}@${client.clientVersion}"
+    private fun trackKey(videoId: String, client: PlayerClient, authenticated: Boolean = false) =
+        "$authenticated|$videoId|${client.clientName}@${client.clientVersion}"
 
-    private fun clientKey(client: PlayerClient) = "*|${client.clientName}@${client.clientVersion}"
+    private fun clientKey(client: PlayerClient, authenticated: Boolean = false) = "$authenticated|*|${client.clientName}@${client.clientVersion}"
 
-    private fun standDown(videoId: String, client: PlayerClient) {
-        standDownUntil.update { it[trackKey(videoId, client)] = TimeSource.Monotonic.markNow() + STAND_DOWN }
+    private fun standDown(videoId: String, client: PlayerClient, authenticated: Boolean = false) {
+        standDownUntil.update { it[trackKey(videoId, client, authenticated)] = TimeSource.Monotonic.markNow() + STAND_DOWN }
     }
 
-    private fun isStoodDown(videoId: String, client: PlayerClient): Boolean =
-        isStoodDown(trackKey(videoId, client)) || isStoodDown(clientKey(client))
+    private fun isStoodDown(videoId: String, client: PlayerClient, authenticated: Boolean = false): Boolean =
+        isStoodDown(trackKey(videoId, client, authenticated)) || isStoodDown(clientKey(client, authenticated))
 
     private fun isStoodDown(key: String): Boolean {
         val until = standDownUntil.snapshot()[key] ?: return false
-        // A stand-down is always recorded as `now + STAND_DOWN`, so the deadline
-        // has not passed while less than STAND_DOWN has elapsed since it was set.
-        if (until.elapsedNow() < STAND_DOWN) return true
+        // The stored mark is a deadline, not the moment the failure occurred.
+        if (!until.hasPassedNow()) return true
         standDownUntil.update { it.remove(key) }
         return false
     }
@@ -654,8 +630,8 @@ object StreamResolver {
      * walk and finds out whether the client is being served again, while every
      * track in between goes straight to what works.
      */
-    private fun standDownEverywhere(client: PlayerClient) {
-        val key = clientKey(client)
+    private fun standDownEverywhere(client: PlayerClient, authenticated: Boolean = false) {
+        val key = clientKey(client, authenticated)
         if (!isStoodDown(key)) {
             DebugLog.d("${client.clientName} is refusing this session; standing it down app-wide")
         }
@@ -680,8 +656,8 @@ object StreamResolver {
     /** Low, because the cost of being wrong is bounded by [STAND_DOWN]. */
     private const val REFUSALS_BEFORE_STANDING_DOWN = 3
 
-    private fun refused(videoId: String, client: PlayerClient) {
-        val key = clientKey(client)
+    private fun refused(videoId: String, client: PlayerClient, authenticated: Boolean = false) {
+        val key = clientKey(client, authenticated)
         var escalate = false
         refusalsByClient.update { m ->
             val tracks = (m[key] ?: emptySet()) + videoId
@@ -694,11 +670,11 @@ object StreamResolver {
                 escalate = true
             }
         }
-        if (escalate) standDownEverywhere(client)
+        if (escalate) standDownEverywhere(client, authenticated)
     }
 
-    private fun served(client: PlayerClient) {
-        refusalsByClient.update { it.remove(clientKey(client)) }
+    private fun served(client: PlayerClient, authenticated: Boolean = false) {
+        refusalsByClient.update { it.remove(clientKey(client, authenticated)) }
     }
 
     // ---- Cache --------------------------------------------------------------
@@ -718,7 +694,7 @@ object StreamResolver {
         val loudnessDb: Double? = null,
     )
 
-    private class Resolved(val stream: ResolvedStream, val at: TimeMark)
+    private class Resolved(val stream: ResolvedStream, val at: TimeMark, val generation: Long)
 
     /**
      * Stream URLs already resolved, by videoId — and, since only a probed one is
@@ -732,13 +708,13 @@ object StreamResolver {
      */
     private val recent = CowMap<String, Resolved>()
 
-    private fun remember(videoId: String, stream: ResolvedStream) {
+    private fun remember(videoId: String, stream: ResolvedStream, generation: Long) {
         recent.update { m ->
             if (m.size >= MAX_REMEMBERED) {
                 m.entries.removeAll { it.value.at.elapsedNow() >= URL_TTL }
                 if (m.size >= MAX_REMEMBERED) m.clear()
             }
-            m[videoId] = Resolved(stream, TimeSource.Monotonic.markNow())
+            m[videoId] = Resolved(stream, TimeSource.Monotonic.markNow(), generation)
         }
     }
 
@@ -811,18 +787,11 @@ object StreamResolver {
 
     private val REFUSAL_CODES = setOf(403, 404, 410)
 
-    private suspend fun probe(url: String, headers: Map<String, String>, expected: String): ProbeVerdict =
-        Http.probe(url, headers).classify(expected)
-
-    /**
-     * Align the URL's `cver` with the client that actually asked.
-     *
-     * The player response fills it in from the request, but a signature or `n`
-     * transform can be solved against player JavaScript of a different vintage, and
-     * googlevideo answers a version it does not expect with a 403.
-     */
-    private fun patchClientVersion(url: String, clientVersion: String): String =
-        if ("cver=" in url) url.replace(Regex("cver=[^&]+"), "cver=$clientVersion") else url
+    // Synthetic transport seams exercise the real resolver, including verdict
+    // memory and coalescing, without depending on live provider responses.
+    internal var streamProbe: suspend (String, Map<String, String>) -> ProbeResult = { url, headers -> Http.probe(url, headers) }
+    internal var timestampProvider: suspend () -> Int? = { CipherUnlock.signatureTimestamp() }
+    internal var urlTransform: suspend (String) -> String? = { CipherUnlock.transformUrl(it) }
 
     /**
      * Google's verdicts here last hours rather than a session, and so does the

@@ -2,6 +2,11 @@ package com.music.bitchord.data.http
 
 import io.ktor.client.HttpClient
 import io.ktor.client.engine.darwin.Darwin
+import io.ktor.client.plugins.HttpSend
+import io.ktor.client.plugins.plugin
+import io.ktor.client.request.HttpRequestBuilder
+import io.ktor.http.URLBuilder
+import io.ktor.http.takeFrom
 import io.ktor.client.plugins.HttpTimeout
 import io.ktor.client.plugins.timeout
 import io.ktor.client.request.forms.FormDataContent
@@ -31,6 +36,8 @@ import platform.Foundation.NSHTTPCookieSecure
 import platform.Foundation.NSHTTPCookieStorage
 import platform.Foundation.NSHTTPCookieValue
 import platform.Foundation.NSURL
+import platform.Foundation.HTTPShouldHandleCookies
+import platform.Foundation.valueForHTTPHeaderField
 
 /**
  * Apple actual of [Http] — Ktor's Darwin engine, **one** client.
@@ -81,6 +88,12 @@ actual object Http {
      */
     private val client: HttpClient = HttpClient(Darwin) {
         engine {
+            configureRequest {
+                // An explicit account snapshot owns this request's Cookie
+                // header. Do not let anonymous/provider jar cookies compete
+                // with it when Foundation builds the actual request.
+                if (valueForHTTPHeaderField("Cookie") != null) HTTPShouldHandleCookies = false
+            }
             configureSession {
                 HTTPShouldSetCookies = true
                 HTTPCookieStorage = cookieJar
@@ -88,16 +101,51 @@ actual object Http {
         }
         install(HttpTimeout)
         expectSuccess = false
+        followRedirects = false
+    }.apply {
+        plugin(HttpSend).intercept { initial ->
+            var request = initial
+            var call = execute(request)
+            repeat(5) {
+                if (call.response.status.value !in setOf(301, 302, 303, 307, 308) ||
+                    request.method !in setOf(HttpMethod.Get, HttpMethod.Head)) return@intercept call
+                val location = call.response.headers["Location"] ?: return@intercept call
+                val from = request.url.build().toString()
+                val destination = URLBuilder(request.url).apply { takeFrom(location) }.build().toString()
+                val hasProviderCookie = cookieJar.cookies?.filterIsInstance<NSHTTPCookie>()?.any { cookie ->
+                    val host = request.url.host.lowercase()
+                    val domain = cookie.domain.removePrefix(".").lowercase()
+                    host == domain || host.endsWith(".$domain")
+                } == true
+                val credentials = hasProviderCookie || request.headers.names().any {
+                    it.equals("Authorization", true) || it.equals("Cookie", true) || it.startsWith("X-Goog-", true)
+                }
+                if (!CredentialPolicy.mayRedirect(from, destination, credentials)) return@intercept call
+                val next = HttpRequestBuilder().apply {
+                    takeFrom(request)
+                    url.takeFrom(destination)
+                    if (!CredentialPolicy.sameOrigin(from, destination)) {
+                        listOf("Authorization", "Cookie", "Origin", "X-Origin", "Referer", "X-Goog-Visitor-Id", "X-Goog-PageId", "X-Goog-AuthUser")
+                            .forEach { headers.remove(it) }
+                    }
+                }
+                call.response.bodyAsChannel().cancel(null)
+                request = next
+                call = execute(request)
+            }
+            call
+        }
     }
 
     /** Throws for a non-2xx, standing in for what `expectSuccess = true` would. */
     private fun HttpResponse.requireSuccess(what: String) {
         val code = status.value
         if (code !in 200..299) {
-            error("$what: HTTP $code ${status.description}")
+            throw HttpStatusException(code)
         }
     }
 
+    @Throws(Exception::class)
     actual suspend fun postJson(
         url: String,
         body: String,
@@ -115,6 +163,7 @@ actual object Http {
         query.forEach { (key, value) -> parameter(key, value) }
     }.also { it.requireSuccess("POST $url") }.bodyAsText()
 
+    @Throws(Exception::class)
     actual suspend fun getText(
         url: String,
         headers: Map<String, String>,
@@ -129,6 +178,7 @@ actual object Http {
         query.forEach { (key, value) -> parameter(key, value) }
     }.also { it.requireSuccess("GET $url") }.bodyAsText()
 
+    @Throws(Exception::class)
     actual suspend fun getStatus(
         url: String,
         headers: Map<String, String>,
@@ -143,6 +193,7 @@ actual object Http {
         query.forEach { (key, value) -> parameter(key, value) }
     }.status.value
 
+    @Throws(Exception::class)
     actual suspend fun getBytes(
         url: String,
         headers: Map<String, String>,
@@ -155,6 +206,7 @@ actual object Http {
         headers.forEach { (key, value) -> header(key, value) }
     }.also { it.requireSuccess("GET $url") }.bodyAsBytes()
 
+    @Throws(Exception::class)
     actual suspend fun postForm(
         url: String,
         fields: Map<String, String>,
@@ -171,6 +223,7 @@ actual object Http {
         }))
     }.bodyAsText()
 
+    @Throws(Exception::class)
     actual suspend fun getRaw(
         url: String,
         headers: Map<String, String>,
@@ -189,6 +242,7 @@ actual object Http {
         return RawHttpText(status = response.status.value, body = body)
     }
 
+    @Throws(Exception::class)
     actual suspend fun postBytes(
         url: String,
         body: ByteArray,
@@ -211,6 +265,7 @@ actual object Http {
         return RawHttpBytes(status = response.status.value, body = bytes)
     }
 
+    @Throws(Exception::class)
     actual suspend fun requestRaw(
         url: String,
         method: String,
@@ -240,6 +295,7 @@ actual object Http {
         return RawHttpText(status = response.status.value, body = text)
     }
 
+    @Throws(Exception::class)
     actual suspend fun requestBytes(
         url: String,
         method: String,
@@ -267,6 +323,7 @@ actual object Http {
         return RawHttpBytes(status = response.status.value, body = bytes)
     }
 
+    @Throws(Exception::class)
     actual suspend fun getBytesRaw(
         url: String,
         headers: Map<String, String>,
@@ -357,6 +414,7 @@ actual object Http {
      * boundary asks the question that actually decides whether the track will
      * finish.
      */
+    @Throws(Exception::class)
     actual suspend fun probe(
         url: String,
         headers: Map<String, String>,

@@ -33,6 +33,8 @@ let ids = ProcessInfo.processInfo.environment["VIDEO_IDS"]?
         "kJQP7kiw5Fk",
     ]
 
+CipherUnlockWiring.install(player: YouTubePlayerJs(solverDirectory: URL(fileURLWithPath: CommandLine.arguments[1])))
+
 var failures: [String] = []
 var served: [(String, String, Int, String)] = []
 var unavailable: [String] = []
