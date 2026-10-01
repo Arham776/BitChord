@@ -78,9 +78,15 @@ The app does not ship with a hosted Listen Together service. Enter a compatible 
 
 Automix works without downloaded models, using its built-in analysis fallback. The app can offer the beat-analysis model and the larger vocal-analysis model separately. The developer helper `scripts/fetch-automix-models.sh` downloads and verifies both models into `AppleApp/Resources/Models/` for local builds.
 
-## External services
+## Disclaimer & Legal Notice
 
-BitChord is client software; it does not host or license the music catalogues it can access. It connects to third-party music, lyrics, and account services, whose availability and behavior are outside this project's control. You are responsible for following the terms of services you use and the laws that apply to you.
+BitChord is an independent, unofficial third-party music player and client. It is not affiliated with or endorsed by Google LLC, YouTube Music, or the providers of any configured sources.
+
+- **No media hosting:** BitChord is a client, not a music-hosting service. It accesses external sources and local libraries; downloaded tracks are stored on the listener's device.
+- **Copyright and service terms:** Access through BitChord does not grant rights to any music or other content. You are responsible for ensuring your use complies with applicable law and the terms of any provider or API you access.
+- **No ad or availability guarantee:** Third-party services can change their catalogs, access rules, availability, and ad behavior. This project makes no guarantee that a source will remain available or behave in a particular way.
+- **No warranty and limitation of liability:** For GPLv3-covered portions, the software is provided without warranty and liability is limited as set out in Sections 15 and 16 of [`LICENSE`](LICENSE), except where applicable law requires otherwise or the parties agree in writing. This summary does not replace the license; separately licensed components remain subject to their own terms.
+- **Copyleft:** GPLv3 permits redistribution, including for a fee, under its terms. Distributors of GPL-covered binaries must meet the corresponding-source and notice requirements. Other components have their own terms; see [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md).
 
 ## Credits and licenses
 
