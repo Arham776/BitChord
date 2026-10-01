@@ -1,5 +1,7 @@
 # BitChord for Apple Platforms
 
+![BitChord for Apple platforms on Mac, iPad, and iPhone](artwork/cover-exports/BitChord-Cover-4K-3840x2160.png)
+
 An unofficial Apple-platform port of [BitChord](https://github.com/kushagrasinghx/BitChord), the music client originally created by [Kushagra Singh](https://github.com/kushagrasinghx).
 
 This project brings BitChord to macOS, iPhone, and iPad with a SwiftUI interface, shared Kotlin Multiplatform logic, and a Rust audio engine. It is an independent port; it is not affiliated with Google or YouTube.
