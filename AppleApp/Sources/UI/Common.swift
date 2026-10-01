@@ -204,7 +204,7 @@ final class ArtworkCache: @unchecked Sendable {
     /// Serialises cold disk reads so a fast scroll does not queue hundreds of
     /// concurrent file reads for images that have already scrolled away.
     private let readQueue = DispatchQueue(
-        label: "com.example.bitchord.artwork-disk",
+        label: "BitChord.artwork-disk",
         qos: .userInitiated
     )
 

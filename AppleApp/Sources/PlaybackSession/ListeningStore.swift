@@ -75,7 +75,7 @@ final class ListeningStore {
     /// that lands while another is queued replaces it rather than joining a
     /// queue. State below is main-thread only; the writer hops back to clear it.
     private let persistQueue = DispatchQueue(
-        label: "com.example.bitchord.listening-persist",
+        label: "BitChord.listening-persist",
         qos: .utility
     )
     /// Fastest the store will rewrite the disk while a track is playing. The

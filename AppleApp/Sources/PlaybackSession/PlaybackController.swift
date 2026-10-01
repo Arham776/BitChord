@@ -3346,7 +3346,7 @@ final class PlaybackController {
     }
 
     private func pollWidgetCommands() {
-        guard let defaults = UserDefaults(suiteName: "group.com.example.bitchord"),
+        guard let defaults = UserDefaults(suiteName: AppIdentity.appGroupIdentifier),
               let cmd = defaults.string(forKey: "widget.command") else { return }
         defaults.removeObject(forKey: "widget.command")
         switch cmd {

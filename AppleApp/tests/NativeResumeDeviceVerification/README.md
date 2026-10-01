@@ -42,11 +42,11 @@ To repeat after building/installing a Debug app:
 
 ```sh
 xcrun devicectl device process launch --device DEVICE_UDID --console \
-  --terminate-existing com.example.bitchord -- --verify-native-resume
+  --terminate-existing YOUR_BUNDLE_ID -- --verify-native-resume
 
 xcrun devicectl device copy from --device DEVICE_UDID \
   --domain-type appDataContainer \
-  --domain-identifier com.example.bitchord \
+  --domain-identifier YOUR_BUNDLE_ID \
   --source Documents/native-resume-verification.json \
   --destination /tmp/native-resume-verification.json
 ```

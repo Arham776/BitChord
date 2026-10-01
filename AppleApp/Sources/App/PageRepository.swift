@@ -48,7 +48,7 @@ actor PageRepository {
     func statistics() -> Statistics {
         Statistics(cacheHits: cacheHits, networkRequests: networkRequests, coalescedRequests: coalescedRequests)
     }
-    private static let log = Logger(subsystem: "com.example.bitchord", category: "loading")
+    private static let log = Logger(subsystem: AppIdentity.bundleIdentifier, category: "loading")
 
     init(folder: URL? = nil, byteLimit: Int = 20 * 1024 * 1024, freshness: TimeInterval = 300) {
         self.folder = folder ?? FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]

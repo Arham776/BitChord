@@ -8,7 +8,6 @@ name: BitChord
 attributes:
   LastUpgradeCheck: "1520"
 options:
-  bundleIdPrefix: com.example
   createIntermediateGroups: true
   xcodeVersion: "15.0"
   deploymentTarget:
@@ -16,13 +15,16 @@ options:
     macOS: "15.0"
 settings:
   base:
+    # Change this to a reverse-DNS identifier you control before signing.
+    # The shared App Group is derived from this value below.
+    BITCHORD_BUNDLE_ID: com.example.bitchord
+    BITCHORD_APP_GROUP_ID: "group.$(BITCHORD_BUNDLE_ID)"
     SWIFT_VERSION: "5"
     MARKETING_VERSION: "0.1.0"
     CURRENT_PROJECT_VERSION: "1"
     # Typed asset symbols (Image(.bchHome)) — Xcode 15+ asset codegen.
     ASSETCATALOG_COMPILER_GENERATE_SWIFT_ASSET_SYMBOL_EXTENSIONS: "YES"
-    # Local signing: personal development team, automatic profiles.
-    DEVELOPMENT_TEAM: YOUR_TEAM_ID
+    # Each developer selects their own Team in Xcode's Signing & Capabilities.
     CODE_SIGN_STYLE: Automatic
     # The spec (§0) ports arm64 targets only: iosArm64, iosSimulatorArm64,
     # macosArm64. Generic iOS Simulator destinations otherwise attempt a
@@ -36,7 +38,7 @@ targets:
     supportedDestinations: [iOS, macOS]
     settings:
       base:
-        PRODUCT_BUNDLE_IDENTIFIER: com.example.bitchord
+        PRODUCT_BUNDLE_IDENTIFIER: "$(BITCHORD_BUNDLE_ID)"
         # Resolve Music Understanding on OS 27+; leave Automix on Rust MIR below that.
         OTHER_LDFLAGS: "$(inherited) -weak_framework MusicUnderstanding"
     sources:
@@ -78,9 +80,10 @@ targets:
         CFBundleDisplayName: BitChord
         CFBundleShortVersionString: "$(MARKETING_VERSION)"
         CFBundleVersion: "$(CURRENT_PROJECT_VERSION)"
+        BitChordAppGroupIdentifier: "$(BITCHORD_APP_GROUP_ID)"
         LSApplicationCategoryType: public.app-category.music
         CFBundleURLTypes:
-          - CFBundleURLName: com.example.bitchord
+          - CFBundleURLName: "$(BITCHORD_BUNDLE_ID)"
             CFBundleURLSchemes: [bitchord]
         UIBackgroundModes:
           - audio
@@ -109,13 +112,13 @@ targets:
         com.apple.security.network.client: true
         com.apple.security.files.user-selected.read-write: true
         com.apple.security.application-groups:
-          - group.com.example.bitchord
+          - "$(BITCHORD_APP_GROUP_ID)"
   BitChordWidget:
     type: app-extension
     supportedDestinations: [iOS, macOS]
     settings:
       base:
-        PRODUCT_BUNDLE_IDENTIFIER: com.example.bitchord.widget
+        PRODUCT_BUNDLE_IDENTIFIER: "$(BITCHORD_BUNDLE_ID).widget"
     sources:
       - Sources/Widget
     info:
@@ -124,6 +127,7 @@ targets:
         CFBundleDisplayName: BitChord Widget
         CFBundleShortVersionString: "$(MARKETING_VERSION)"
         CFBundleVersion: "$(CURRENT_PROJECT_VERSION)"
+        BitChordAppGroupIdentifier: "$(BITCHORD_APP_GROUP_ID)"
         NSExtension:
           NSExtensionPointIdentifier: com.apple.widgetkit-extension
     entitlements:
@@ -131,4 +135,4 @@ targets:
       properties:
         com.apple.security.app-sandbox: true
         com.apple.security.application-groups:
-          - group.com.example.bitchord
+          - "$(BITCHORD_APP_GROUP_ID)"

@@ -28,6 +28,7 @@ import io.ktor.http.contentType
 import io.ktor.utils.io.cancel
 import io.ktor.utils.io.readRemaining
 import kotlinx.io.readByteArray
+import platform.Foundation.NSBundle
 import platform.Foundation.NSHTTPCookie
 import platform.Foundation.NSHTTPCookieDomain
 import platform.Foundation.NSHTTPCookieName
@@ -74,10 +75,12 @@ import platform.Foundation.valueForHTTPHeaderField
  */
 actual object Http {
 
-    private const val COOKIE_GROUP = "group.com.example.bitchord"
+    private val cookieGroup = NSBundle.mainBundle.objectForInfoDictionaryKey(
+        "BitChordAppGroupIdentifier"
+    ) as? String ?: error("BitChordAppGroupIdentifier is missing from the app Info.plist")
 
     private val cookieJar: NSHTTPCookieStorage =
-        NSHTTPCookieStorage.sharedCookieStorageForGroupContainerIdentifier(COOKIE_GROUP)
+        NSHTTPCookieStorage.sharedCookieStorageForGroupContainerIdentifier(cookieGroup)
 
     /**
      * The one client. `httpShouldSetCookies` stays on so provider cookies

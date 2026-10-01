@@ -17,7 +17,7 @@ import Security
 /// The `ThisDeviceOnly` half keeps it out of iCloud Keychain and out of any
 /// backup that would restore it to a different device.
 enum Keychain {
-    private static let service = "com.example.bitchord.credentials"
+    private static let service = "\(AppIdentity.bundleIdentifier).credentials"
 
     /// Read a value, or nil when there is none.
     ///

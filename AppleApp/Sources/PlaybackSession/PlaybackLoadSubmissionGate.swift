@@ -4,7 +4,7 @@ import Foundation
 /// Advancing enqueues the stop behind any already-running load and before the
 /// next load. The main thread never waits for a decoder or output rebuild.
 final class PlaybackLoadSubmissionGate: @unchecked Sendable {
-    private let queue = DispatchQueue(label: "com.example.bitchord.playback-submission")
+    private let queue = DispatchQueue(label: "BitChord.playback-submission")
     private let lock = NSLock()
     private var generation: UInt64 = 0
     private var revision: UInt64 = 0
