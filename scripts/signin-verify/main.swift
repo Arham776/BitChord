@@ -157,6 +157,82 @@ check("the advice names the host", advice.contains("blog.youtube"), advice)
 check("the advice is not empty for no host", !SignInNavigation.offSignInHostAdvice(host: nil).isEmpty)
 check("the advice is not empty for an empty host", !SignInNavigation.offSignInHostAdvice(host: "").isEmpty)
 
+// ---- completion is presentation, never automatic capture -----------------
+
+let musicURL = URL(string: "https://music.youtube.com/")!
+check("only the HTTPS Music origin can supply a profile", SignInNavigation.isMusicOrigin(musicURL))
+for invalid in [
+    "https://music.youtube.com.evil.test/", "https://music.youtube.com@evil.test/",
+    "http://music.youtube.com/", "https://music.youtube.com:444/", "https://youtube.com/",
+    "https://user:pass@music.youtube.com/"
+] {
+    check("a different origin cannot supply a profile: \(invalid)", !SignInNavigation.isMusicOrigin(URL(string: invalid)))
+}
+check("the explicit default port is the Music origin", SignInNavigation.isMusicOrigin(URL(string: "https://music.youtube.com:443/")))
+
+let flow = LoginFlow()
+var captureRequests = 0
+flow.session.take = { captureRequests += 1 }
+flow.navigating(to: URL(string: "https://accounts.google.com/ServiceLogin"))
+check("Google login stays in the browser", !flow.showsCompletion && !flow.pageReady)
+flow.navigating(to: musicURL)
+check("Music's arrival presents preparation, not success", flow.showsCompletion && flow.checkingPage && !flow.pageReady)
+flow.inspectedPage(loggedIn: false)
+check("an unfinished login or channel chooser remains usable", !flow.showsCompletion && flow.pageReady)
+flow.navigating(to: musicURL)
+flow.inspectedPage(loggedIn: true)
+check("a signed-in page presents the explicit completion step", flow.showsCompletion && flow.pageReady)
+check("inspecting a signed-in page never requests capture", captureRequests == 0)
+flow.chooseProfile()
+check("choosing a channel reveals the existing page", !flow.showsCompletion && flow.pageReady)
+flow.navigating(to: URL(string: "https://accounts.google.com/AccountChooser"))
+check("leaving Music removes confirmation immediately", !flow.pageReady && !flow.showsCompletion)
+flow.navigating(to: URL(string: "https://music.youtube.com/?authuser=1"))
+flow.inspectedPage(loggedIn: true)
+check("a channel switch stays in the browser for review", !flow.showsCompletion && flow.pageReady)
+check("switching profiles never requests capture", captureRequests == 0)
+flow.taking = true
+check("verification hides the page and disables another capture", flow.showsCompletion && !flow.pageReady)
+flow.captureFailed("Verification refused")
+check("a rejection keeps the selected page available to retry", flow.pageReady && flow.captureFailedMessage == "Verification refused")
+flow.taking = true
+flow.captureSucceeded()
+check("only completed validation clears Checking", !flow.taking && flow.captureFailedMessage == nil)
+
+let retryFlow = LoginFlow()
+retryFlow.navigating(to: musicURL)
+retryFlow.inspectedPage(loggedIn: true)
+retryFlow.taking = true
+retryFlow.captureFailed("Save failed")
+check("a failed save stays on completion with a retry", retryFlow.showsCompletion && retryFlow.pageReady)
+retryFlow.navigating(to: URL(string: "https://music.youtube.com.evil.test/"))
+retryFlow.inspectedPage(loggedIn: true)
+check("a lookalike cannot show a successful profile", !retryFlow.pageReady && !retryFlow.showsCompletion)
+
+// ---- the profile shown before confirmation -------------------------------
+
+let menu = """
+{"actions":[{"openPopupAction":{"popup":{"multiPageMenuRenderer":{"header":{"activeAccountHeaderRenderer":{"accountName":{"runs":[{"text":"Fixture "},{"text":"Channel"}]},"email":{"simpleText":"fixture@example.test"},"accountPhoto":{"thumbnails":[{"url":"https://yt3.googleusercontent.com/small","width":32},{"url":"https://yt3.googleusercontent.com/large","width":128}]}}}}}}}]}
+"""
+let preview = SignInProfilePreview.parse(Data(menu.utf8))
+check("the preview reads the current account-menu name", preview?.name == "Fixture Channel")
+check("the preview reads the account subtitle", preview?.subtitle == "fixture@example.test")
+check("the preview uses the larger avatar", preview?.avatarURL?.path == "/large")
+check("missing photos have a useful initial fallback", preview?.initials == "FC")
+check("a missing account header cannot invent a profile", SignInProfilePreview.parse(Data("{}".utf8)) == nil)
+check("invalid JSON cannot invent a profile", SignInProfilePreview.parse(Data("invalid".utf8)) == nil)
+check("a channel handle is a valid secondary line", SignInProfilePreview.parse(Data(menu.replacingOccurrences(of: "\"email\"", with: "\"channelHandle\"").utf8))?.subtitle == "fixture@example.test")
+check("relative Google photo URLs become HTTPS", SignInProfilePreview.safeAvatarURL("//lh3.googleusercontent.com/avatar")?.scheme == "https")
+for url in ["http://yt3.googleusercontent.com/x", "file:///tmp/avatar", "https://googleusercontent.com.evil.test/x", "https://user:password@yt3.googleusercontent.com/x"] {
+    check("an unsafe avatar is refused: \(url)", SignInProfilePreview.safeAvatarURL(url) == nil)
+}
+let originalScope = SignInProfileScope(SignInCaptureFields(loggedIn: true, pageId: "brand", dataSyncId: "account||brand", authUser: "1", visitorData: nil, clientVersion: nil))
+let changedScope = SignInProfileScope(SignInCaptureFields(loggedIn: true, pageId: "other-brand", dataSyncId: "account||other-brand", authUser: "1", visitorData: nil, clientVersion: nil))
+check("two channels under one account are different review identities", originalScope != changedScope)
+check("passkey help only appears on Google's real challenge", SignInNavigation.isGooglePasskeyPage(URL(string: "https://accounts.google.com/v3/signin/challenge/pk")))
+check("a lookalike cannot request password navigation", !SignInNavigation.isGooglePasskeyPage(URL(string: "https://accounts.google.com.evil.test/v3/signin/challenge/pk")))
+check("the identifier screen is not a passkey challenge", !SignInNavigation.isGooglePasskeyPage(URL(string: "https://accounts.google.com/v3/signin/identifier")))
+
 // ---- the user agent -------------------------------------------------------
 
 // A second harness, `check-signin-live.sh`, asks Google. These are the parts
@@ -306,6 +382,8 @@ if let root = CommandLine.arguments.dropFirst().first {
     ] {
         check("the sign-in screen never calls \(what)", !text.contains(call))
     }
+    check("no Safari session import remains", !text.contains("SessionImportView") && !text.contains("importPresented"))
+    check("no Safari handoff link remains", !text.contains("Link("))
     // And the other half of the same bug: the old `.openOutside` decision itself.
     check("the old open-outside decision is gone", !text.contains("openOutside"))
     check("the policy has no open-outside decision either",

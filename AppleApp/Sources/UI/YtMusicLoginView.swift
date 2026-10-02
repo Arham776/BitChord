@@ -2,260 +2,314 @@ import SwiftUI
 import WebKit
 import BitChordShared
 
-/// In-app Google sign-in for YouTube Music — port of upstream
-/// `auth/YtMusicLoginScreen.kt` plus the confirmation header in `MainActivity.kt`.
-///
-/// ## Flow
-///
-/// Load Google's real login with `continue=music.youtube.com`. When Google
-/// redirects to music.youtube.com the session cookies land in an isolated
-/// `WKWebsiteDataStore` (not Safari, not `URLSession.shared`), and the listener
-/// confirms the profile shown by the live page. The password never passes through
-/// app code. Google may refuse embedded sign-in and third-party passkeys are
-/// unavailable here; the explicit Safari/import route below covers that case.
-///
-/// Do not replace this with `ASWebAuthenticationSession`: that uses Safari and
-/// never returns a music.youtube.com cookie jar to the app.
-///
-/// ## Why the listener confirms rather than the page capturing
-///
-/// Upstream does not capture on reaching the Music origin either, and the reason
-/// is the whole design of this screen: a multi-account login can still be waiting
-/// for the listener to choose an identity *on that very page*, and capturing the
-/// moment it loads is the race that used to create a fake profile and close too
-/// soon. So arriving only *enables* confirmation, and a refused capture leaves the
-/// screen open rather than closing on a session that is not a session yet.
-///
-/// ## Why the navigation is policed
-///
-/// A music.youtube.com page carries links out to the YouTube Music app and to the
-/// App Store, and WebKit hands a `youtube://` or `itms-apps://` navigation to the
-/// system by itself — which takes the listener out of the sign-in into another app
-/// mid-flow, and the session never comes back. So those are refused here, and
-/// *nothing* on this screen is ever opened anywhere else: see [SignInNavigation]
-/// for why the rest of the web loads in place instead.
-///
-/// ## The header is upstream's
-///
-/// Title, hint and confirmation mirror what upstream's `MainActivity` shows —
-/// Close, the "switch using the avatar" hint once the Music page is up, and Use
-/// This Profile — mapped onto the navigation bar, which is where a sheet keeps
-/// such things on this platform. The hint reads as a banner that pushes the page
-/// down, exactly as upstream's `Column` lays its header above the web view.
-/// There is deliberately nothing below the page: a confirmation in the bar cannot
-/// be missed below content that scrolls, and it is where Close already lives.
+/// Google's login stays in an isolated WebKit cookie store. Reaching Music
+/// presents a native completion step; the listener still explicitly confirms
+/// the live page's profile, as upstream does. Account/channel selection can
+/// reopen the same page without replacing its web view or losing its cookies.
 struct YtMusicLoginView: View {
-    /// The confirmed session, with a completion the owner calls once validation
-    /// finishes. Staying open until then is the point: closing on capture and
-    /// validating afterwards is how a half-finished channel chooser used to
-    /// become a durable broken account.
     var onCaptured: (SignInCapture, @escaping (Bool) -> Void) -> Void
     var onDismiss: () -> Void
 
     @State private var flow = LoginFlow()
-    @State private var importPresented = false
 
     var body: some View {
-        // Upstream's `MainActivity` structure, in Apple form: a header (here the
-        // navigation bar: Close, title, Use This Profile) with its subtitle as a
-        // banner, and the web page filling the rest. A `VStack` rather than an
-        // overlay on purpose — upstream's `Column` pushes the page down instead
-        // of floating over it, so the banner never covers the profile it talks
-        // about. And nothing below the page: the confirmation lives in the bar,
-        // where Cancel already lives, not in a footer under content that scrolls.
         VStack(spacing: 0) {
-            if let prompt = flow.prompt {
-                Text(prompt)
-                    .font(.footnote)
-                    .foregroundStyle(flow.captureFailedMessage == nil ? Color.secondary : Color.orange)
-                    .multilineTextAlignment(.center)
-                    .frame(maxWidth: .infinity)
-                    .padding(.horizontal, 20)
-                    .padding(.vertical, 8)
-                    .background(.bar)
-                    .transition(.opacity)
-            }
-            LoginWebView(
-                flow: flow,
-                onCaptured: onCaptured,
-                onUnavailable: { reason in flow.captureFailed(reason) }
-            )
-            Button("Use a Safari session instead") { importPresented = true }
-                .buttonStyle(.plain)
-                .foregroundStyle(.tint)
-                .font(.footnote.weight(.semibold))
-                .frame(maxWidth: .infinity)
+            if !flow.showsCompletion, let prompt = flow.prompt {
+                VStack(spacing: 10) {
+                    Text(prompt)
+                        .font(.footnote)
+                        .foregroundStyle(flow.captureFailedMessage == nil ? Color.secondary : Color.orange)
+                        .multilineTextAlignment(.center)
+                        .frame(maxWidth: .infinity)
+                    if flow.passkeyHelp {
+                        Button {
+                            flow.session.usePassword?()
+                        } label: {
+                            if flow.selectingPassword { ProgressView().controlSize(.small) }
+                            else { Text("Use Password") }
+                        }
+                        .buttonStyle(.bordered)
+                        .disabled(flow.selectingPassword)
+                    }
+                }
+                .padding(.horizontal, 20)
                 .padding(.vertical, 12)
                 .background(.bar)
+            }
+            ZStack {
+                // Keep the browser alive under the completion screen. Returning
+                // to Google's avatar menu must use this exact session.
+                LoginWebView(
+                    flow: flow,
+                    onCaptured: onCaptured,
+                    onUnavailable: { reason in flow.captureFailed(reason) }
+                )
+                .opacity(flow.showsCompletion ? 0 : 1)
+                .allowsHitTesting(!flow.showsCompletion)
+                .accessibilityHidden(flow.showsCompletion)
+
+                if flow.showsCompletion {
+                    SignInCompletionStep(
+                        flow: flow,
+                        onConfirm: { flow.session.take?() },
+                        onChoose: { flow.chooseProfile() }
+                    )
+                }
+            }
         }
-        .animation(.easeInOut(duration: 0.2), value: flow.prompt)
-        .navigationTitle("Sign in to YouTube Music")
+        .navigationTitle(flow.showsCompletion ? "Finish signing in" : "Sign in to YouTube Music")
         #if os(iOS)
         .navigationBarTitleDisplayMode(.inline)
         #endif
+        .interactiveDismissDisabled(flow.taking)
         .toolbar {
             ToolbarItem(placement: .cancellationAction) {
                 Button("Close", action: onDismiss)
+                    .disabled(flow.taking)
+                    #if os(macOS)
+                    .keyboardShortcut(.cancelAction)
+                    #endif
             }
             ToolbarItem(placement: .confirmationAction) {
-                if flow.taking {
-                    ProgressView().controlSize(.small)
-                        .accessibilityLabel("Checking…")
-                } else if flow.pageReady {
-                    Button("Use This Profile") {
-                        flow.session.take?()
-                    }
-                    .accessibilityHint("Saves the profile shown by the page to this device")
+                if flow.pageReady && !flow.showsCompletion {
+                    Button("Use This Profile") { flow.session.take?() }
                 }
             }
         }
-        .sheet(isPresented: $importPresented) {
-            SessionImportView(onCaptured: onCaptured)
-        }
     }
+
 }
 
-/// Explicit fallback when Google refuses the embedded view. The transfer is
-/// manual until a Safari extension can be verified on a real device; unlike a
-/// fake browser user agent, this path does not claim WebKit passkey support.
-private struct SessionImportView: View {
-    var onCaptured: (SignInCapture, @escaping (Bool) -> Void) -> Void
-    @Environment(\.dismiss) private var dismiss
-    @State private var cookieHeader = ""
-    @State private var checking = false
-    @State private var error: String?
+/// A native review card. Kept separate so loading, unavailable, and verified
+/// profile layouts can be previewed without starting a browser or an account.
+struct SignInCompletionStep: View {
+    let flow: LoginFlow
+    var onConfirm: () -> Void
+    var onChoose: () -> Void
+    @Environment(\.dynamicTypeSize) private var dynamicTypeSize
 
-    private var normalizedHeader: String {
-        let trimmed = cookieHeader.trimmingCharacters(in: .whitespacesAndNewlines)
-        if trimmed.lowercased().hasPrefix("cookie:") {
-            return String(trimmed.dropFirst(7)).trimmingCharacters(in: .whitespacesAndNewlines)
-        }
-        return trimmed
+    private var contentWidth: CGFloat {
+        #if os(macOS)
+        400
+        #else
+        440
+        #endif
+    }
+
+    private var avatarSize: CGFloat {
+        #if os(macOS)
+        72
+        #else
+        88
+        #endif
     }
 
     var body: some View {
-        NavigationStack {
-            Form {
-                Section {
-                    Link("Open YouTube Music in Safari", destination: URL(string: "https://music.youtube.com/")!)
-                    Text("Sign in there with your passkey or password. To transfer the session, copy the Cookie request header for music.youtube.com from your browser's developer tools and paste it below.")
-                        .font(.footnote)
-                        .foregroundStyle(.secondary)
-                }
-                Section("Session cookie") {
-                    SecureField("Paste Cookie header", text: $cookieHeader)
-                        .textContentType(.password)
-                    Text("This header grants account access. Keep it private; BitChord stores a verified session in Keychain.")
-                        .font(.footnote)
-                        .foregroundStyle(.secondary)
-                }
-                if let error {
-                    Text(error).foregroundStyle(.red)
-                }
-                Section {
-                    Button {
-                        let header = normalizedHeader
-                        guard !header.contains("\n"), !header.contains("\r"),
-                              AuthBridge.shared.hasApiSid(cookieHeader: header)
-                        else {
-                            error = "Paste the Cookie header from a signed-in YouTube Music request."
-                            return
-                        }
-                        checking = true
-                        error = nil
-                        onCaptured(SignInCapture(
-                            cookie: header,
-                            pageId: nil,
-                            dataSyncId: nil,
-                            authUser: nil,
-                            visitorData: nil,
-                            clientVersion: nil,
-                            loggedIn: true
-                        )) { accepted in
-                            Task { @MainActor in
-                                checking = false
-                                if accepted { dismiss() }
-                                else { error = "The session could not be verified. Keep the browser open and try a fresh header." }
-                            }
-                        }
-                    } label: {
-                        if checking { ProgressView() }
-                        else { Text("Import and Verify") }
+        GeometryReader { geometry in
+            ScrollView {
+                VStack(spacing: 24) {
+                    VStack(spacing: 8) {
+                        Text(flow.taking ? "Signing you in" : "Confirm your profile")
+                            .font(.title2.weight(.semibold))
+                        Text("Connect your YouTube Music profile to BitChord.")
+                            .font(.callout)
+                            .foregroundStyle(.secondary)
                     }
-                    .disabled(checking || normalizedHeader.isEmpty)
+                    if let profile = flow.profile {
+                        profileCard(profile)
+                    } else if flow.taking {
+                        Image(systemName: "person.crop.circle")
+                            .font(.system(size: 64, weight: .light))
+                            .foregroundStyle(.secondary)
+                    } else if flow.checkingPage || flow.loadingProfile {
+                        VStack(spacing: 16) {
+                            ProgressView()
+                            Text("Loading your profile…")
+                                .foregroundStyle(.secondary)
+                        }
+                        .frame(maxWidth: .infinity, minHeight: 180)
+                    } else {
+                        VStack(spacing: 12) {
+                            Image(systemName: "person.crop.circle")
+                                .font(.system(size: 48, weight: .light))
+                                .foregroundStyle(.secondary)
+                            Text("Review your profile on Google")
+                                .font(.headline)
+                            Text("Your profile details couldn’t be loaded. You can still review and confirm them on the Google page.")
+                                .font(.callout)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                    if let error = flow.captureFailedMessage {
+                        Label(error, systemImage: "exclamationmark.circle")
+                            .font(.footnote)
+                            .foregroundStyle(.orange)
+                    }
+                    if flow.taking {
+                        ProgressView("Verifying your profile…")
+                        Text("Finishing sign-in to BitChord.")
+                            .font(.footnote)
+                            .foregroundStyle(.secondary)
+                    } else if flow.profile != nil || flow.checkingPage || flow.loadingProfile {
+                        profileActions(availableWidth: geometry.size.width)
+                        Text("Your library and recommendations will use this profile.")
+                            .font(.footnote)
+                            .foregroundStyle(.secondary)
+                    } else {
+                        Button(action: onChoose) {
+                            Text("Review Profile on Google")
+                        }
+                        .buttonStyle(.borderedProminent)
+                        #if os(macOS)
+                        .controlSize(.regular)
+                        .keyboardShortcut(.defaultAction)
+                        #else
+                        .controlSize(.large)
+                        #endif
+                    }
                 }
-            }
-            .navigationTitle("Import Safari Session")
-            .toolbar {
-                ToolbarItem(placement: .cancellationAction) {
-                    Button("Cancel") { dismiss() }
-                }
+                .multilineTextAlignment(.center)
+                .frame(maxWidth: contentWidth)
+                .padding(.horizontal, 24)
+                .padding(.vertical, 32)
+                .frame(maxWidth: .infinity, minHeight: geometry.size.height)
             }
         }
     }
-}
 
-@Observable
-final class LoginFlow {
-    /// The page has reached the Music origin, so there may be a session to take.
-    var reachedMusicOrigin = false
-    /// A capture is in flight.
-    var taking = false
-    /// The last capture was asked for and there was no session to take.
-    var captureFailedMessage: String?
-    /// The newest refusal, if the last thing that happened was a refused link.
-    var refusal: SignInNavigation.Refusal?
-    /// The host of a page that is not Google's sign-in, or nil while it is.
-    var offOriginHost: String?
-
-    /// Where the confirmation button reaches the web view.
-    ///
-    /// A plain box rather than observable state on purpose. It is written from
-    /// `makeWebView`, which runs *during* the view update, and SwiftUI discards
-    /// observable mutations made there — which is how confirmation ends up wired
-    /// to a web view the button cannot see, and pressing it does nothing at all.
-    /// Held outside observation the write survives, and the button reads it when
-    /// it is tapped rather than trusting a re-render to have happened in between.
-    let session = SignInSession()
-
-    /// Upstream's `onPageReady`: the Music page is up, so the confirmation is
-    /// offered. A button anywhere before that is worse than no button, because it
-    /// looks like the sign-in is broken rather than incomplete.
-    var pageReady: Bool { reachedMusicOrigin && !taking }
-
-    /// A capture was asked for and there was no session to take. Not a failure
-    /// and not a reason to close: the screen stays open and the listener can try
-    /// again once the page has settled.
-    func captureFailed(_ reason: String) {
-        taking = false
-        captureFailedMessage = reason
-    }
-
-    func captureSucceeded() {
-        taking = false
-        captureFailedMessage = nil
-    }
-
-    /// The one line over the page: the newest thing worth saying, or nothing.
-    ///
-    /// Ordered by freshness: a failed capture is what the listener just did, a
-    /// refused link is what they just pressed, and the standing guidance is the
-    /// oldest of the three. The avatar-switch hint only appears once the Music
-    /// page is up — before that there is no profile to switch.
-    var prompt: String? {
-        if let captureFailedMessage { return captureFailedMessage }
-        if let refusal { return refusal.summary }
-        if reachedMusicOrigin {
-            return "Switch using the avatar, then use this profile."
+    @ViewBuilder
+    private func profileActions(availableWidth: CGFloat) -> some View {
+        #if os(macOS)
+        HStack(spacing: 12) {
+            chooseButton(fullWidth: false)
+            confirmButton(fullWidth: false)
         }
-        if let offOriginHost { return SignInNavigation.offSignInHostAdvice(host: offOriginHost) }
-        return nil
+        .frame(maxWidth: .infinity, alignment: .trailing)
+        #else
+        if availableWidth >= 520 && !dynamicTypeSize.isAccessibilitySize {
+            ViewThatFits(in: .horizontal) {
+                HStack(spacing: 12) {
+                    chooseButton(fullWidth: false)
+                    confirmButton(fullWidth: false)
+                }
+                .fixedSize(horizontal: true, vertical: false)
+                stackedActions
+            }
+            .frame(maxWidth: .infinity)
+        } else {
+            stackedActions
+        }
+        #endif
+    }
+
+    private var stackedActions: some View {
+        VStack(spacing: 12) {
+            confirmButton(fullWidth: true)
+            chooseButton(fullWidth: true)
+        }
+    }
+
+    private func confirmButton(fullWidth: Bool) -> some View {
+        Button(action: onConfirm) {
+            Text("Use This Profile")
+                .frame(maxWidth: fullWidth ? .infinity : nil)
+        }
+        .buttonStyle(.borderedProminent)
+        #if os(macOS)
+        .controlSize(.regular)
+        .keyboardShortcut(.defaultAction)
+        #else
+        .controlSize(.large)
+        #endif
+        .disabled(!flow.pageReady || flow.loadingProfile)
+    }
+
+    private func chooseButton(fullWidth: Bool) -> some View {
+        Button(action: onChoose) {
+            Text("Choose another profile")
+                .frame(maxWidth: fullWidth ? .infinity : nil)
+        }
+        .buttonStyle(.bordered)
+        #if os(macOS)
+        .controlSize(.regular)
+        #else
+        .controlSize(.large)
+        #endif
+        .disabled(flow.loadingProfile || flow.checkingPage)
+    }
+
+    private func profileCard(_ profile: SignInProfilePreview) -> some View {
+        VStack(spacing: 16) {
+            AsyncImage(url: profile.avatarURL) { phase in
+                if let image = phase.image {
+                    image.resizable().scaledToFill()
+                } else {
+                    Circle().fill(Color.accentColor.opacity(0.12))
+                        .overlay {
+                            Text(profile.initials)
+                                .font(.title.weight(.medium))
+                                .foregroundStyle(.tint)
+                        }
+                }
+            }
+            .frame(width: avatarSize, height: avatarSize)
+            .clipShape(Circle())
+            .accessibilityHidden(true)
+            VStack(spacing: 5) {
+                Text(profile.name)
+                    .font(.title3.weight(.semibold))
+                    .fixedSize(horizontal: false, vertical: true)
+                if let subtitle = profile.subtitle {
+                    Text(subtitle)
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+        }
+        .padding(28)
+        .frame(maxWidth: .infinity)
+        .background(Color.primary.opacity(0.045), in: .rect(cornerRadius: 24))
+        .overlay { RoundedRectangle(cornerRadius: 24).strokeBorder(Color.primary.opacity(0.06)) }
+        .accessibilityElement(children: .combine)
     }
 }
 
-/// The one thing the confirmation button has to be able to call. See [LoginFlow.session].
-final class SignInSession {
-    var take: (() -> Void)?
+/// Read-only account_menu request for this candidate, without applying its
+/// cookie/scope to Innertube or touching Keychain. Uses the existing shared
+/// signing functions and the same account endpoint/parser shape as upstream.
+@MainActor
+enum SignInProfileLoader {
+    static func request(cookie: String, fields: SignInCaptureFields) -> URLRequest? {
+        guard fields.loggedIn,
+              let secret = Innertube.shared.sapisidFrom(cookieHeader: cookie),
+              let version = fields.clientVersion else { return nil }
+        let origin = "https://music.youtube.com"
+        var request = URLRequest(url: URL(string: origin + "/youtubei/v1/account/account_menu?prettyPrint=false")!)
+        request.httpMethod = "POST"
+        request.timeoutInterval = 5
+        var client: [String: Any] = ["clientName": "WEB_REMIX", "clientVersion": version, "hl": "en", "gl": "US"]
+        if let visitor = fields.visitorData { client["visitorData"] = visitor }
+        var user: [String: Any] = ["lockedSafetyMode": false]
+        if let identity = SignInProfileScope(fields).dataSyncId { user["onBehalfOfUser"] = identity }
+        request.httpBody = try? JSONSerialization.data(withJSONObject: ["context": ["client": client, "user": user, "request": ["useSsl": true]]])
+        for (name, value) in [
+            "Content-Type": "application/json", "Origin": origin, "X-Origin": origin,
+            "Referer": origin + "/", "User-Agent": SignInUserAgent.desktopSafari(),
+            "X-YouTube-Client-Name": "67", "X-YouTube-Client-Version": version,
+            "Cookie": cookie, "Authorization": Innertube.shared.sapisidHash(sapisid: secret, origin: origin)
+        ] { request.setValue(value, forHTTPHeaderField: name) }
+        if let account = fields.authUser { request.setValue(account, forHTTPHeaderField: "X-Goog-AuthUser") }
+        if let page = fields.pageId { request.setValue(page, forHTTPHeaderField: "X-Goog-PageId") }
+        if let visitor = fields.visitorData { request.setValue(visitor, forHTTPHeaderField: "X-Goog-Visitor-Id") }
+        return request
+    }
+
+    static func load(cookie: String, fields: SignInCaptureFields) async -> SignInProfilePreview? {
+        guard let request = request(cookie: cookie, fields: fields),
+              let data = try? await GuardedHTTP.shared.data(for: request) else { return nil }
+        return SignInProfilePreview.parse(data)
+    }
 }
 
 #if os(macOS)
@@ -318,12 +372,20 @@ private struct LoginWebView: UIViewRepresentable {
 /// completion handlers are the only thing here that is not, and those hop to the
 /// main actor themselves rather than mutating observed state off it.
 @MainActor
-final class LoginWebCoordinator: NSObject, WKNavigationDelegate, WKUIDelegate, WKHTTPCookieStoreObserver {
+final class LoginWebCoordinator: NSObject, WKNavigationDelegate, WKUIDelegate, WKHTTPCookieStoreObserver, WKScriptMessageHandler {
     private let flow: LoginFlow
     private let onCaptured: (SignInCapture, @escaping (Bool) -> Void) -> Void
     private let onUnavailable: (String) -> Void
+    private let profileLoader: (String, SignInCaptureFields) async -> SignInProfilePreview?
     private let store: WKWebsiteDataStore
     private var captured = false
+    private var active = true
+    private var navigationRevision = 0
+    private var pageProbeTask: Task<Void, Never>?
+    private var passwordTask: Task<Void, Never>?
+    private var attemptedPasswordPreference = false
+    private var pendingPasswordChoice = false
+    private var sawPasswordChallenge = false
     /// Weak, because the coordinator is the navigation delegate the web view
     /// retains, and a strong reference back would be a cycle.
     private weak var webView: WKWebView?
@@ -331,16 +393,27 @@ final class LoginWebCoordinator: NSObject, WKNavigationDelegate, WKUIDelegate, W
     init(
         flow: LoginFlow,
         onCaptured: @escaping (SignInCapture, @escaping (Bool) -> Void) -> Void,
-        onUnavailable: @escaping (String) -> Void
+        onUnavailable: @escaping (String) -> Void,
+        profileLoader: @escaping (String, SignInCaptureFields) async -> SignInProfilePreview? = SignInProfileLoader.load
     ) {
         self.store = WKWebsiteDataStore.nonPersistent()
         self.flow = flow
         self.onCaptured = onCaptured
         self.onUnavailable = onUnavailable
+        self.profileLoader = profileLoader
     }
 
     func stopObserving() {
+        active = false
+        navigationRevision += 1
+        pageProbeTask?.cancel()
+        pageProbeTask = nil
+        passwordTask?.cancel()
+        passwordTask = nil
+        flow.session.take = nil
+        flow.session.usePassword = nil
         store.httpCookieStore.remove(self)
+        webView?.configuration.userContentController.removeScriptMessageHandler(forName: "signInPageState", contentWorld: .defaultClient)
         webView?.navigationDelegate = nil
         webView?.uiDelegate = nil
         webView = nil
@@ -351,10 +424,15 @@ final class LoginWebCoordinator: NSObject, WKNavigationDelegate, WKUIDelegate, W
         // is captured from here — a cookie changing is not a settled identity.
     }
 
-    func makeWebView() -> WKWebView {
+    func makeWebView(loadInitialPage: Bool = true) -> WKWebView {
         let config = WKWebViewConfiguration()
         config.websiteDataStore = store
         config.defaultWebpagePreferences.allowsContentJavaScript = true
+        config.userContentController.add(self, contentWorld: .defaultClient, name: "signInPageState")
+        config.userContentController.addUserScript(WKUserScript(
+            source: Self.googlePageStateScript, injectionTime: .atDocumentEnd,
+            forMainFrameOnly: true, in: .defaultClient
+        ))
         // Google's own refusal of embedded web views: on iOS WebKit sends a
         // *mobile* agent, and `accounts.google.com` answers that with "This
         // browser or app may not be secure" before the password is ever typed.
@@ -366,14 +444,12 @@ final class LoginWebCoordinator: NSObject, WKNavigationDelegate, WKUIDelegate, W
         // `SignInUserAgent` for why this is the shape it is and why
         // `ASWebAuthenticationSession` is not the answer.
         config.applicationNameForUserAgent = nil
+        // The navigation delegate also refuses app schemes in popup requests.
+        config.preferences.javaScriptCanOpenWindowsAutomatically = false
         let webView = WKWebView(frame: .zero, configuration: config)
         if SignInUserAgent.needsReplacing(defaultAgent: webView.customUserAgent ?? "") {
             webView.customUserAgent = SignInUserAgent.desktopSafari()
         }
-        // A window that opens itself is how a `youtube://` link gets followed from
-        // inside a page. The navigation policy below is the real guard; this is
-        // the one that stops the page even asking.
-        config.preferences.javaScriptCanOpenWindowsAutomatically = false
         store.httpCookieStore.add(self)
         webView.navigationDelegate = self
         webView.uiDelegate = self
@@ -381,7 +457,8 @@ final class LoginWebCoordinator: NSObject, WKNavigationDelegate, WKUIDelegate, W
         // How the confirmation button reaches the session. Set here rather than
         // handed back to the view as state — see [LoginFlow.session].
         flow.session.take = { [weak self] in self?.takeSession() }
-        webView.load(URLRequest(url: Self.loginURL))
+        flow.session.usePassword = { [weak self] in self?.selectPassword() }
+        if loadInitialPage { webView.load(URLRequest(url: Self.loginURL)) }
         return webView
     }
 
@@ -416,7 +493,7 @@ final class LoginWebCoordinator: NSObject, WKNavigationDelegate, WKUIDelegate, W
             // app and lost the sign-in, and the only way to be sure that cannot
             // happen again is for the capability not to exist on this screen.
             decisionHandler(.cancel)
-            NSLog("[BitChord] sign-in refused a navigation to \(url?.absoluteString ?? "?")")
+            NSLog("[BitChord] sign-in refused scheme: \(url?.scheme ?? "unknown")")
             flow.refusal = why
         }
     }
@@ -436,48 +513,203 @@ final class LoginWebCoordinator: NSObject, WKNavigationDelegate, WKUIDelegate, W
             if let url { webView.load(URLRequest(url: url)) }
             noteMainFrame(url, isMainFrame: true)
         case .refuse(let why):
-            NSLog("[BitChord] sign-in refused a new-window navigation to \(url?.absoluteString ?? "?")")
+            NSLog("[BitChord] sign-in refused popup scheme: \(url?.scheme ?? "unknown")")
             flow.refusal = why
         }
         return nil
     }
 
-    /// Says where the listener is, whenever the main frame stops being the sign-in.
-    ///
-    /// Every `http(s)` page loads here, so the sign-in survives a hop to a host
-    /// nobody enumerated — but a listener who has genuinely left Google's sign-in
-    /// should be able to see that rather than infer it from a page they did not
-    /// ask for. Only the main frame counts: Google's own pages load iframes, and
-    /// a line of text about an ad server is noise.
-    ///
-    /// Done here as well as in `didFinish` because the Music page is reached by a
-    /// redirect chain whose intermediate steps are the navigations, and waiting
-    /// for the final commit to notice the origin is waiting for news already in
-    /// hand. `didFinish` still re-checks, so wandering off the origin takes the
-    /// confirmation away even when the leaving hop commits without a decision.
     private func noteMainFrame(_ url: URL?, isMainFrame: Bool) {
-        guard isMainFrame, let url else { return }
-        if url.absoluteString.hasPrefix(Self.musicOrigin) {
-            flow.reachedMusicOrigin = true
+        guard active, isMainFrame else { return }
+        navigationRevision += 1
+        pageProbeTask?.cancel()
+        passwordTask?.cancel()
+        flow.selectingPassword = false
+        flow.navigating(to: url)
+        if SignInNavigation.isGoogleAccountsOrigin(url), url?.path.contains("/challenge/pwd") == true {
+            sawPasswordChallenge = true
+            pendingPasswordChoice = false
         }
-        let onSignIn = SignInNavigation.isSignInHost(url)
-        flow.offOriginHost = onSignIn ? nil : url.host?.lowercased()
-        // A refused link is newer news than the page it was on.
-        if onSignIn { flow.refusal = nil }
     }
 
-    // ---- the state the button reads ----------------------------------------
+    func webView(_ webView: WKWebView, didReceiveServerRedirectForProvisionalNavigation navigation: WKNavigation!) {
+        noteMainFrame(webView.url, isMainFrame: true)
+    }
 
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
-        // Re-checked on every navigation rather than latched: a listener who
-        // wanders off the origin must lose the button, or they can press it
-        // against a page that is no longer signed in.
-        let onOrigin = webView.url?.absoluteString.hasPrefix(Self.musicOrigin) ?? false
-        flow.reachedMusicOrigin = onOrigin
-        // The cookie store commits after `didFinish`, so the first press would
-        // otherwise race it. Warmed, not awaited — the listener decides when, and
-        // by then the jar has long since settled.
-        store.httpCookieStore.getAllCookies { _ in }
+        noteMainFrame(webView.url, isMainFrame: true)
+        guard active else { return }
+        if SignInNavigation.isGoogleAccountsOrigin(webView.url) {
+            // Prefer Google's existing password alternative once, before any
+            // password has been entered. Later 2FA challenges remain Google's.
+            if SignInNavigation.isGooglePasskeyPage(webView.url), !sawPasswordChallenge,
+               !attemptedPasswordPreference {
+                attemptedPasswordPreference = true
+                pendingPasswordChoice = true
+                selectPassword()
+            } else if pendingPasswordChoice && !sawPasswordChallenge {
+                selectPassword()
+            }
+            return
+        }
+        guard SignInNavigation.isMusicOrigin(webView.url) else { return }
+        let revision = navigationRevision
+        // Inspection controls presentation only. It does not harvest cookies or
+        // call onCaptured. A late ytcfg or an unfinished channel chooser stays in
+        // the browser; a signed-in page gets the explicit completion screen.
+        pageProbeTask = Task { @MainActor [weak self, weak webView] in
+            for attempt in 0..<3 {
+                guard let self, let webView, self.active, !Task.isCancelled,
+                      self.navigationRevision == revision,
+                      SignInNavigation.isMusicOrigin(webView.url) else { return }
+                let raw = try? await webView.evaluateJavaScript(Self.ytcfgProbe, in: nil, contentWorld: .page)
+                guard self.active, !Task.isCancelled, self.navigationRevision == revision else { return }
+                if let fields = SignInCapture.parse(jsResult: raw), fields.loggedIn {
+                    self.flow.inspectedPage(loggedIn: true)
+                    self.flow.loadingProfile = true
+                    await self.loadProfile(from: webView, fields: fields, revision: revision)
+                    return
+                }
+                if attempt < 2 { try? await Task.sleep(for: .milliseconds(200)) }
+            }
+            guard let self, self.active, !Task.isCancelled, self.navigationRevision == revision else { return }
+            self.flow.inspectedPage(loggedIn: false)
+        }
+    }
+
+    private func loadProfile(from view: WKWebView, fields: SignInCaptureFields, revision: Int) async {
+        let cookies = await withCheckedContinuation { continuation in
+            store.httpCookieStore.getAllCookies { continuation.resume(returning: $0) }
+        }
+        guard active, !Task.isCancelled, navigationRevision == revision else { return }
+        let profile = await profileLoader(Self.cookieHeader(cookies), fields)
+        guard active, !Task.isCancelled, navigationRevision == revision else { return }
+        let raw = try? await view.evaluateJavaScript(Self.ytcfgProbe, in: nil, contentWorld: .page)
+        guard active, !Task.isCancelled, navigationRevision == revision else { return }
+        flow.loadingProfile = false
+        guard let current = SignInCapture.parse(jsResult: raw), current.loggedIn,
+              SignInProfileScope(current) == SignInProfileScope(fields) else {
+            flow.chooseProfile()
+            flow.captureFailed("The selected profile changed. Review it on Google before confirming.")
+            return
+        }
+        flow.profile = profile
+        flow.profileScope = profile == nil ? nil : SignInProfileScope(fields)
+    }
+
+    func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
+        guard active, message.name == "signInPageState", message.frameInfo.isMainFrame,
+              message.webView === webView,
+              SignInNavigation.isGoogleAccountsOrigin(message.frameInfo.request.url),
+              SignInNavigation.isGoogleAccountsOrigin(webView?.url),
+              let state = message.body as? String else { return }
+        if state == "password" {
+            sawPasswordChallenge = true
+            pendingPasswordChoice = false
+            flow.passkeyHelp = false
+        } else if state == "passkey" {
+            flow.passkeyHelp = true
+            if !attemptedPasswordPreference && !sawPasswordChallenge {
+                attemptedPasswordPreference = true
+                pendingPasswordChoice = true
+                selectPassword()
+            }
+        } else if state == "other", pendingPasswordChoice && !sawPasswordChallenge {
+            selectPassword()
+        }
+    }
+
+    // Google can change challenges within one document. Observe only the kind
+    // of challenge, in an isolated world; never read input values or an account.
+    private static let googlePageStateScript = #"""
+    (() => {
+      if (location.origin !== 'https://accounts.google.com') return;
+      let previous;
+      const report = () => {
+        const path = location.pathname;
+        const state = /\/challenge\/pwd(\/|$)/.test(path) ? 'password'
+          : /\/challenge\/(pk|webauthn)(\/|$)/.test(path) ? 'passkey' : 'other';
+        if (state === previous) return;
+        previous = state;
+        window.webkit.messageHandlers.signInPageState.postMessage(state);
+      };
+      report();
+      new MutationObserver(report).observe(document.documentElement, {childList: true, subtree: true});
+      window.addEventListener('popstate', report);
+    })();
+    """#
+
+    private func selectPassword() {
+        guard active, !flow.selectingPassword, let view = webView,
+              SignInNavigation.isGoogleAccountsOrigin(view.url) else { return }
+        flow.passkeyHelp = true
+        flow.selectingPassword = true
+        flow.passwordAdvice = "Opening Google’s password option…"
+        let revision = navigationRevision
+        passwordTask = Task { @MainActor [weak self, weak view] in
+            guard let self, let view else { return }
+            let raw = try? await view.callAsyncJavaScript(Self.passwordChoiceScript, arguments: [:], in: nil, contentWorld: .defaultClient)
+            guard self.active, !Task.isCancelled, self.navigationRevision == revision else { return }
+            self.flow.selectingPassword = false
+            self.pendingPasswordChoice = false
+            if let result = raw as? String, result == "password" || result == "selectedPassword" {
+                self.flow.passkeyHelp = false
+                self.flow.passwordAdvice = nil
+            } else {
+                self.flow.passwordAdvice = "Choose ‘Try another way’ on Google, then ‘Enter your password’ if it is offered."
+            }
+        }
+    }
+
+    /// Selects only Google's own visible alternative/password controls. No
+    /// invented challenge URLs, account setting changes, or credential reads.
+    static let passwordChoiceScript = #"""
+    if (location.origin !== 'https://accounts.google.com' || !location.pathname.includes('/challenge/')) return 'unavailable';
+    // The document-end message and didFinish can both reach this document.
+    // Reuse one operation in the isolated world rather than clicking twice.
+    if (window.bitChordPasswordChoice) return await window.bitChordPasswordChoice;
+    window.bitChordPasswordChoice = (async () => {
+      const pause = ms => new Promise(resolve => setTimeout(resolve, ms));
+      const visible = el => el && el.getClientRects().length > 0 && !el.disabled && el.getAttribute('aria-disabled') !== 'true';
+      const label = el => (el.innerText || el.textContent || '').trim().replace(/\s+/g, ' ').toLowerCase();
+      const find = labels => Array.from(document.querySelectorAll('button, a, [role="button"], [role="link"]'))
+        .find(el => visible(el) && labels.includes(label(el)));
+      let openedAlternatives = false;
+      for (let attempt = 0; attempt < 12; attempt++) {
+        if (location.origin !== 'https://accounts.google.com') return 'unavailable';
+        if (Array.from(document.querySelectorAll('input[type="password"]')).some(visible)) return 'password';
+        const password = find(['enter your password', 'use your password', 'password']);
+        if (password) { password.click(); return 'selectedPassword'; }
+        if (!openedAlternatives && /\/challenge\/(pk|webauthn)(\/|$)/.test(location.pathname)) {
+          const alternative = find(['try another way', 'try another method']);
+          if (alternative) { openedAlternatives = true; alternative.click(); }
+        }
+        await pause(200);
+      }
+      return 'unavailable';
+    })();
+    try { return await window.bitChordPasswordChoice; }
+    finally { delete window.bitChordPasswordChoice; }
+    """#
+
+    func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
+        navigationFailed(error)
+    }
+
+    func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
+        navigationFailed(error)
+    }
+
+    private func navigationFailed(_ error: Error) {
+        let error = error as NSError
+        guard active, error.code != NSURLErrorCancelled else { return }
+        // Our refusal of an app link may finish as WebKit's policy-change
+        // error. Keep the existing page/profile available after that refusal.
+        if flow.refusal != nil, error.domain == "WebKitErrorDomain", error.code == 102 { return }
+        navigationRevision += 1
+        pageProbeTask?.cancel()
+        flow.inspectedPage(loggedIn: false)
+        flow.captureFailed("The sign-in page could not load. Check your connection and try again.")
     }
 
     // ---- taking the session -------------------------------------------------
@@ -489,68 +721,64 @@ final class LoginWebCoordinator: NSObject, WKNavigationDelegate, WKUIDelegate, W
     /// then reports signed out on the next launch. `LOGGED_IN` on the page is the
     /// claim that the identity has settled.
     private func takeSession() {
-        guard !captured, !flow.taking else { return }
-        guard flow.reachedMusicOrigin else {
-            flow.captureFailed("Finish signing in on the Google page first.")
+        guard active, !captured, !flow.taking else { return }
+        guard flow.pageReady, let view = webView,
+              SignInNavigation.isMusicOrigin(view.url), !view.isLoading else {
+            flow.captureFailed("Finish signing in and selecting your profile on the Google page first.")
             return
         }
         flow.taking = true
         flow.refusal = nil
         flow.captureFailedMessage = nil
-        let view = webView
-        store.httpCookieStore.getAllCookies { [weak self] cookies in
+        let revision = navigationRevision
+        store.httpCookieStore.getAllCookies { [weak self, weak view] cookies in
             let header = Self.cookieHeader(cookies)
             Task { @MainActor in
-                guard let self, let view else { return }
-                guard AuthBridge.shared.hasApiSid(cookieHeader: header) else {
-                    self.finish(message: "Google has not issued a session yet.")
+                guard let self, let view, self.active else { return }
+                guard self.navigationRevision == revision,
+                      SignInNavigation.isMusicOrigin(view.url), !view.isLoading else {
+                    self.finish(message: "The profile changed. Finish selecting it, then try again.")
                     return
                 }
-                Task { @MainActor in
-                    let raw = try? await view.evaluateJavaScript(
-                        Self.ytcfgProbe,
-                        in: nil,
-                        contentWorld: .page
+                guard AuthBridge.shared.hasApiSid(cookieHeader: header) else {
+                    self.finish(message: "Google has not issued a session yet. Try again in a moment.")
+                    return
+                }
+                let raw = try? await view.evaluateJavaScript(Self.ytcfgProbe, in: nil, contentWorld: .page)
+                guard self.active else { return }
+                guard self.navigationRevision == revision,
+                      SignInNavigation.isMusicOrigin(view.url), !view.isLoading,
+                      let fields = SignInCapture.parse(jsResult: raw), fields.loggedIn else {
+                    self.finish(message: "No signed-in profile is available on this page yet. Finish selecting your profile, then try again.")
+                    return
+                }
+                if let displayed = self.flow.profileScope, displayed != SignInProfileScope(fields) {
+                    self.flow.chooseProfile()
+                    self.finish(message: "The selected profile changed. Review it on Google before confirming.")
+                    return
+                }
+                let dataSyncId = fields.pageId ?? SignInCapture.normalizeDataSyncId(fields.dataSyncId)
+                self.captured = true
+                // Keep Checking visible until the existing verification and
+                // durable save finish. Capture alone is not a successful login.
+                self.onCaptured(
+                    SignInCapture(
+                        cookie: header,
+                        pageId: fields.pageId,
+                        dataSyncId: dataSyncId,
+                        authUser: fields.authUser,
+                        visitorData: fields.visitorData,
+                        clientVersion: fields.clientVersion,
+                        loggedIn: true
                     )
-                    guard let fields = SignInCapture.parse(jsResult: raw),
-                          fields.loggedIn
-                    else {
-                        // Upstream logs this and leaves the screen open. So does
-                        // this: the listener can try again once the page has
-                        // settled, including after switching channels in the
-                        // avatar menu.
-                        self.finish(message: "No signed-in profile is available on this page yet.")
-                        return
-                    }
-                    // A delegated identity is the most specific answer the live
-                    // page can give. Otherwise normalise its DATASYNC_ID.
-                    let dataSyncId = fields.pageId
-                        ?? SignInCapture.normalizeDataSyncId(fields.dataSyncId)
-                    self.captured = true
-                    self.flow.captureSucceeded()
-                    let coordinator = self
-                    self.onCaptured(
-                        SignInCapture(
-                            cookie: header,
-                            pageId: fields.pageId,
-                            dataSyncId: dataSyncId,
-                            authUser: fields.authUser,
-                            visitorData: fields.visitorData,
-                            clientVersion: fields.clientVersion,
-                            loggedIn: true
-                        )
-                    ) { [weak coordinator] accepted in
-                        Task { @MainActor in
-                            guard let coordinator else { return }
-                            if accepted {
-                                coordinator.flow.captureSucceeded()
-                            } else {
-                                // Validation refused the candidate. Keep the
-                                // screen open and preserve the prior saved
-                                // session so the listener can try again.
-                                coordinator.captured = false
-                                coordinator.finish(message: "No signed-in profile is available on this page yet.")
-                            }
+                ) { [weak self] accepted in
+                    Task { @MainActor in
+                        guard let self, self.active else { return }
+                        if accepted {
+                            self.flow.captureSucceeded()
+                        } else {
+                            self.captured = false
+                            self.finish(message: "Your profile could not be verified or saved. Try again, or choose a different profile.")
                         }
                     }
                 }
@@ -558,13 +786,8 @@ final class LoginWebCoordinator: NSObject, WKNavigationDelegate, WKUIDelegate, W
         }
     }
 
-    private func finish(header: String? = nil, message: String? = nil) {
-        // Kept for the refusal paths, which carry no session: the one line they
-        // need is the reason, and the screen staying open is the behaviour.
-        flow.taking = false
-        if let message {
-            onUnavailable(message)
-        }
+    private func finish(message: String) {
+        onUnavailable(message)
     }
 
     /// Upstream's `YTCFG_PROBE`, unchanged in substance: `ytcfg` is the page's

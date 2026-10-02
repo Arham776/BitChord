@@ -22,6 +22,7 @@ kotlin {
     ).forEach { target ->
         target.binaries.framework {
             baseName = "BitChordShared"
+            binaryOption("bundleId", "app.bitchord.BitChord.shared")
             isStatic = true
             xcf.add(this)
         }

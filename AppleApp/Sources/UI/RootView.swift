@@ -164,7 +164,13 @@ struct RootView: View {
             }
         }
         #else
-        Group {
+        // Keep every tab and its navigation/scroll state mounted while Settings
+        // covers it. Replacing tabShell recreates the feeds when returning.
+        ZStack {
+            tabShell
+                .opacity(appModel.settingsPresented ? 0 : 1)
+                .allowsHitTesting(!appModel.settingsPresented)
+                .accessibilityHidden(appModel.settingsPresented)
             if appModel.settingsPresented {
                 NavigationStack {
                     SettingsView(embedded: true)
@@ -176,7 +182,7 @@ struct RootView: View {
                             }
                         }
                 }
-            } else { tabShell }
+            }
         }
             .environment(\.nowPlayingZoomNamespace, nowPlayingZoom)
             .modifier(NowPlayingTakeover(

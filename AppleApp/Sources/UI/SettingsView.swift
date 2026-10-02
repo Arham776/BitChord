@@ -8,7 +8,7 @@ import AppKit
 #endif
 
 /// Apple Settings-style grouped form. Structure and copy follow upstream;
-/// chrome is System Settings / iOS Settings: monochrome glyphs, drill-downs, footers.
+/// settings appear directly in one grouped form, with drill-downs for dedicated screens.
 struct SettingsView: View {
     var embedded: Bool = false
     @Environment(\.dismiss) private var dismiss
@@ -99,13 +99,11 @@ struct SettingsView: View {
                 settingsForm
                     .navigationTitle("Settings")
                     .searchable(text: $search, prompt: "Search settings")
-                    .searchSuggestions { searchSuggestions }
             } else {
                 NavigationStack {
                     settingsForm
                         .navigationTitle("Settings")
                         .searchable(text: $search, prompt: "Search settings")
-                        .searchSuggestions { searchSuggestions }
                         #if os(iOS)
                         .toolbar {
                             ToolbarItem(placement: .confirmationAction) {
@@ -253,23 +251,6 @@ struct SettingsView: View {
             }
         }
 
-        fileprivate var glyph: SettingsGlyph.Kind {
-            switch self {
-            case .account: .person
-            case .audioQuality: .precision
-            case .downloads: .download
-            case .playback: .crossfade
-            case .appearance: .theme
-            case .performance: .performance
-            case .localMusic: .localMusic
-            case .storage: .storage
-            case .yourData: .export
-            case .miscellaneous: .lyricsSources
-            case .advanced: .equalizer
-            case .about: .nerd
-            }
-        }
-
         /// What is *in* the section, in the words a listener would use.
         ///
         /// The section titles are things like "Playback" and "Storage", which
@@ -352,26 +333,6 @@ struct SettingsView: View {
         SettingsSection.allCases.filter(shows)
     }
 
-    /// A handful of whole sections to jump to, offered under the field.
-    ///
-    /// Apple's suggestion list, used for the thing a *section* can be jumped to.
-    /// It narrows to the strongest few matches rather than every one, because a
-    /// suggestion list that lists everything is just a shorter form.
-    @ViewBuilder
-    private var searchSuggestions: some View {
-        if !search.isEmpty {
-            ForEach(visibleSections.prefix(4)) { section in
-                NavigationLink {
-                    Form { sectionContents(section) }
-                        .formStyle(.grouped)
-                        .navigationTitle(section.title)
-                } label: {
-                    Text(section.title)
-                }
-            }
-        }
-    }
-
     @ViewBuilder
     private func sectionContents(_ section: SettingsSection) -> some View {
         switch section {
@@ -393,16 +354,7 @@ struct SettingsView: View {
     private var settingsForm: some View {
         Form {
             ForEach(visibleSections) { section in
-                NavigationLink {
-                    Form { sectionContents(section) }
-                        .formStyle(.grouped)
-                        .navigationTitle(section.title)
-                } label: {
-                    HStack(spacing: 14) {
-                        SettingsGlyph(kind: section.glyph)
-                        Text(section.title).foregroundStyle(.primary)
-                    }
-                }
+                sectionContents(section)
             }
             if !search.isEmpty && visibleSections.isEmpty {
                 ContentUnavailableView.search(text: search)

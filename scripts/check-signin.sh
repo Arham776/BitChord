@@ -28,6 +28,7 @@ rm -rf "$CHECK_DIR"
 mkdir -p "$CHECK_DIR"
 
 xcrun swiftc \
+  -module-cache-path "$CHECK_DIR/modules" \
   -sdk "$(xcrun --show-sdk-path --sdk macosx)" \
   -target arm64-apple-macos15.0 \
   -swift-version 5 \

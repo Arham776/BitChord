@@ -60,6 +60,25 @@ import Foundation
 /// unlike `open`, refusing them is a decision we own.
 enum SignInNavigation {
 
+    /// A prefix match also accepts music.youtube.com.evil.test. Only the real
+    /// HTTPS origin may expose a profile or supply the captured page scope.
+    static func isMusicOrigin(_ url: URL?) -> Bool {
+        url?.scheme?.lowercased() == "https"
+            && url?.host?.lowercased() == "music.youtube.com"
+            && (url?.port == nil || url?.port == 443)
+            && url?.user == nil && url?.password == nil
+    }
+
+    static func isGoogleAccountsOrigin(_ url: URL?) -> Bool {
+        url?.scheme?.lowercased() == "https" && url?.host?.lowercased() == "accounts.google.com"
+            && (url?.port == nil || url?.port == 443) && url?.user == nil && url?.password == nil
+    }
+
+    static func isGooglePasskeyPage(_ url: URL?) -> Bool {
+        isGoogleAccountsOrigin(url) && (url?.path.contains("/challenge/pk") == true
+            || url?.path.contains("/challenge/webauthn") == true)
+    }
+
     enum Refusal: Equatable {
         /// Not a web page. WebKit would hand it to another app.
         case notAWebPage

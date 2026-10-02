@@ -52,7 +52,9 @@ The pinned upstream submodule is kept for source comparison and attribution; it 
 git submodule update --init --recursive
 ```
 
-Before generating the project, change `BITCHORD_BUNDLE_ID` near the top of `AppleApp/project.yml` to a reverse-DNS identifier you control. The widget identifier and the `group.<bundle-id>` App Group identifier derive from it.
+The Apple identifiers are fixed in the project and source: `app.bitchord.BitChord` for the app, `app.bitchord.BitChord.widget` for the widget, `group.app.bitchord.BitChord` for their shared App Group, and `app.bitchord.BitChord.credentials` for the Keychain service. Bundled frameworks use `app.bitchord.BitChord.shared` and `app.bitchord.BitChord.native-core-ffi`. The URL name and diagnostic namespaces use the same app prefix.
+
+Changing the bundle identifier creates a separate installed app with its own data container and Keychain access. Builds previously installed under a different identifier keep their data; sign in again in the new app.
 
 Build the shared framework and native audio framework, generate the Xcode project, and open it:
 
@@ -64,7 +66,7 @@ xcodegen generate --spec AppleApp/project.yml
 open AppleApp/BitChord.xcodeproj
 ```
 
-In Xcode, select the `BitChord` scheme, choose a Mac, iPhone, iPad, or Apple Silicon Simulator destination, then select your Apple Developer Team under the app and widget targets' **Signing & Capabilities**. The Team is per-developer and is not stored in the shared project configuration. For device signing, register the derived App Group with your developer account and enable it for both targets. The current entitlements are configured for development; review them, including the app sandbox setting, before preparing a distributed macOS build. The generated frameworks, Swift bindings, and Xcode project are build outputs and are ignored by Git.
+In Xcode, select the `BitChord` scheme, choose a Mac, iPhone, iPad, or Apple Silicon Simulator destination, then select your Apple Developer Team under the app and widget targets' **Signing & Capabilities**. The Team is per-developer and is not stored in the shared project configuration. For device signing, register `group.app.bitchord.BitChord` with your developer account and enable it for both targets. The current entitlements are configured for development; review them, including the app sandbox setting, before preparing a distributed macOS build. The generated frameworks, Swift bindings, and Xcode project are build outputs and are ignored by Git.
 
 `build-shared-framework.sh` builds the Debug framework by default. For a Release shared framework, run:
 

@@ -9,19 +9,7 @@ import AppIntents
 // WidgetStatePublisher. The extension never links native-core and never
 // touches the network. Tapping opens the player (deep link §9).
 
-private let appGroupIdentifier: String = {
-    if let configured = Bundle.main.object(
-        forInfoDictionaryKey: "BitChordAppGroupIdentifier"
-    ) as? String {
-        return configured
-    }
-    let widgetBundleID = Bundle.main.bundleIdentifier ?? "app.bitchord.BitChord.widget"
-    let appBundleID = widgetBundleID.hasSuffix(".widget")
-        ? String(widgetBundleID.dropLast(".widget".count))
-        : widgetBundleID
-    return "group.\(appBundleID)"
-}()
-private let groupDefaults = UserDefaults(suiteName: appGroupIdentifier)
+private let groupDefaults = UserDefaults(suiteName: "group.app.bitchord.BitChord")
 
 struct MediaWidgetEntry: TimelineEntry {
     let date: Date
@@ -200,7 +188,7 @@ struct WidgetTransportIntent: AppIntent {
     init(command: String) { self.command = command }
 
     func perform() async throws -> some IntentResult {
-        UserDefaults(suiteName: appGroupIdentifier)?.set(command, forKey: "widget.command")
+        UserDefaults(suiteName: "group.app.bitchord.BitChord")?.set(command, forKey: "widget.command")
         return .result()
     }
 }

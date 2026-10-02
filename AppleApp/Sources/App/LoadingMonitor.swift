@@ -9,7 +9,7 @@ final class LoadingMonitor: @unchecked Sendable {
     private var outstanding = false
     private let timer: DispatchSourceTimer
     private init() {
-        timer = DispatchSource.makeTimerSource(queue: DispatchQueue(label: "BitChord.loading-monitor", qos: .utility))
+        timer = DispatchSource.makeTimerSource(queue: DispatchQueue(label: "app.bitchord.BitChord.loading-monitor", qos: .utility))
         timer.schedule(deadline: .now() + 1, repeating: 1)
         timer.setEventHandler { [weak self] in self?.sample() }
         timer.resume()

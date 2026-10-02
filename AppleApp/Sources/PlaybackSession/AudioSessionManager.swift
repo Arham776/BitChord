@@ -27,7 +27,7 @@ import BitChordShared
 /// fail to start without an error worth reading. Handing the engine the
 /// session's own numbers makes the two agree by construction.
 enum AudioSessionManager {
-    private static let sessionQueue = DispatchQueue(label: "BitChord.audio-session")
+    private static let sessionQueue = DispatchQueue(label: "app.bitchord.BitChord.audio-session")
     private static let readiness = AudioSessionReadiness()
 
     /// Successful activation, invalidated on deactivation/interruption/reset.
