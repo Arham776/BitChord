@@ -15,7 +15,7 @@ private let appGroupIdentifier: String = {
     ) as? String {
         return configured
     }
-    let widgetBundleID = Bundle.main.bundleIdentifier ?? "com.example.bitchord.widget"
+    let widgetBundleID = Bundle.main.bundleIdentifier ?? "app.bitchord.BitChord.widget"
     let appBundleID = widgetBundleID.hasSuffix(".widget")
         ? String(widgetBundleID.dropLast(".widget".count))
         : widgetBundleID

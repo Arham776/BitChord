@@ -207,7 +207,7 @@ final class PlaybackController {
     private(set) var lastError: String?
 
     var volume: Double = 0.9 {
-        didSet { engine.setVolume(gain: Float(volume)) }
+        didSet { engine.setVolume(gain: Float(volume)); dolbyRenderer?.volume = Float(volume) }
     }
 
     var isPlaying: Bool { state == .playing }
@@ -240,7 +240,7 @@ final class PlaybackController {
                 guard self.mixingPreferenceGeneration == preference,
                       self.playGeneration == selection, self.resumeGeneration == intent,
                       self.isPlaying else { return }
-                self.nowPlaying.updateRate(self.playbackRate, position: self.engine.positionSeconds())
+                self.nowPlaying.updateRate(self.playbackRate, position: self.playbackPosition)
                 self.nowPlaying.requestPrimaryIfPossible(reason: "mixing preference changed")
             } catch {
                 guard self.mixingPreferenceGeneration == preference,
@@ -418,6 +418,9 @@ final class PlaybackController {
 
     private var unshuffledQueue: [QueueEntry]?
     /// Id the engine currently has loaded — nil after a cold restore until Play.
+    fileprivate var dolbyRenderer: AppleDolbyRenderer?
+    private var playbackPosition: Double { dolbyRenderer?.position ?? engine.positionSeconds() }
+    @ObservationIgnored private var durationRepairTask: Task<Void, Never>?
     private var engineLoadedId: String?
     /// The file the engine actually opened for the loaded track, as it reports
     /// it back. Kept because `QueueEntry.source` is **not** a path for a
@@ -584,7 +587,7 @@ final class PlaybackController {
                 // Selecting a secondary native card can send Play while the
                 // engine is already playing. Re-anchor its actual snapshot and
                 // honor that focus request without toggling playback off.
-                self.nowPlaying.updateRate(self.playbackRate, position: self.engine.positionSeconds())
+                self.nowPlaying.updateRate(self.playbackRate, position: self.playbackPosition)
                 self.reactivateAudioSessionAfterForeground(reason: "native play")
                 return
             }
@@ -694,7 +697,7 @@ final class PlaybackController {
                 for event in drainTechnicalEvents() { self.debugLog.record(event) }
                 self.pollWidgetCommands()
                 guard self.state == .playing else { return }
-                self.position = self.engine.positionSeconds()
+                self.position = self.playbackPosition
                 self.positionSampledAt = Date()
                 self.nowPlaying.update(position: self.position)
                 // The periodic output-health NSLog that used to sit here is
@@ -783,7 +786,7 @@ final class PlaybackController {
                 guard let self, self.isPlaying, self.playGeneration == selection,
                       self.resumeGeneration == intent, self.routeRecoveryGeneration == recovery else { return }
                 do {
-                    try engine.requestOutputRebuild(force: true)
+                    if self.dolbyRenderer == nil { try engine.requestOutputRebuild(force: true) }
                     self.nowPlaying.requestPrimaryIfPossible(reason: "route activation")
                 } catch {
                     NSLog("[BitChord] output rebuild after route change failed: \(error)")
@@ -830,12 +833,13 @@ final class PlaybackController {
         let from = Float(volume * (shouldDuck ? 1.0 : Self.duckGain))
         let to = Float(volume * (shouldDuck ? Self.duckGain : 1.0))
         let engine = self.engine
-        duckTask = Task.detached(priority: .userInitiated) {
+        duckTask = Task.detached(priority: .userInitiated) { [weak self] in
             let steps = 20
             for step in 1...steps {
                 if Task.isCancelled { return }
                 let progress = Float(step) / Float(steps)
                 engine.setVolume(gain: from + (to - from) * progress)
+                await MainActor.run { self?.dolbyRenderer?.volume = from + (to - from) * progress }
                 try? await Task.sleep(for: .milliseconds(10))
             }
         }
@@ -946,6 +950,8 @@ final class PlaybackController {
         // A restart is a new load, so the in-flight guard has to move: a resolve
         // started by the old source must not be able to `loadTrack` into the new.
         playGeneration &+= 1
+        dolbyRenderer?.stop()
+        dolbyRenderer = nil
         engineLoadedId = nil
         loadedSourcePath = nil
         loadedSourceHeaders = [:]
@@ -999,6 +1005,8 @@ final class PlaybackController {
         repeatAllStash = []
         repeatAllStashSeed = nil
         rememberRestoredStart(snap.position, of: current?.id)
+        dolbyRenderer?.stop()
+        dolbyRenderer = nil
         engineLoadedId = nil
         loadedSourcePath = nil
         loadedSourceHeaders = [:]
@@ -1177,6 +1185,7 @@ final class PlaybackController {
             let generation = resumeGeneration
             let selection = playGeneration
             let gate = loadSubmissionGate
+            let usesDolby = dolbyRenderer != nil
             // Reflect intent immediately so a second tap cancels this resume.
             state = .playing
             let engine = self.engine
@@ -1209,6 +1218,7 @@ final class PlaybackController {
                 }
                 do {
                     _ = try gate.performIfCurrent(generation: selection) {
+                        if usesDolby { return }
 #if os(iOS)
                         // Keep RemoteIO's buffered audio and decoder history
                         // when the activated hardware format still agrees;
@@ -1247,7 +1257,7 @@ final class PlaybackController {
                     else { return }
                     do {
                         self.prepareNowPlayingForPlayback(entry: entry, duration: self.duration, position: self.position)
-                        try engine.play()
+                        if let renderer = self.dolbyRenderer { renderer.play() } else { try engine.play() }
                         self.state = .playing
                         let speed = Double(PlatformSettings.shared.getFloat(key: "playback_speed", default: 1))
                         self.playbackRate = speed.isFinite ? min(max(speed, 0.5), 2.0) : 1.0
@@ -1273,7 +1283,8 @@ final class PlaybackController {
         resumeGeneration &+= 1
         wasInterrupted = false
         let loading = state == .buffering
-        if !loading { position = engine.positionSeconds() }
+        if !loading { position = playbackPosition }
+        dolbyRenderer?.pause()
         positionSampledAt = Date()
         state = .paused
         #if os(macOS)
@@ -1282,6 +1293,8 @@ final class PlaybackController {
         try? engine.pause()
         if loading {
             playGeneration &+= 1
+            dolbyRenderer?.stop()
+            dolbyRenderer = nil
             engineLoadedId = nil
             let engine = self.engine
             loadSubmissionGate.advance(to: playGeneration) { try? engine.stop() }
@@ -1463,7 +1476,7 @@ final class PlaybackController {
         // Queues and returns: the playhead is the engine's to move, and waiting
         // for it here would stall whatever thread asked — usually the main one.
         guard engineLoadedId == current?.id, engineLoadedId != nil else { return }
-        engine.seek(seconds: seconds)
+        if let dolbyRenderer { dolbyRenderer.seek(seconds) } else { engine.seek(seconds: seconds) }
         nowPlaying.update(position: seconds)
         position = seconds
         positionSampledAt = Date()
@@ -1497,15 +1510,17 @@ final class PlaybackController {
 
     private func applySpatialPreference(enabled: Bool? = nil) {
         let requested = enabled ?? PlatformSettings.shared.getBoolean(key: "spatial_audio", default: false)
-        let effective = requested && AudioRouteState.shared.permitsCustomSpatial
+        let effective = requested && dolbyRenderer == nil && AudioRouteState.shared.permitsCustomSpatial
         try? engine.setSpatialEnabled(enabled: effective)
         if effective && soundMode == "ENHANCED" { headTracker.start(engine: engine) }
         else { headTracker.stop() }
     }
 
     func updateSpeed(_ speed: Float) {
-        let sampledPosition = isPlaying ? engine.positionSeconds() : position
+        let sampledPosition = isPlaying ? playbackPosition : position
         let sampledAt = Date()
+        dolbyRenderer?.rate = speed
+        if isPlaying { dolbyRenderer?.play() }
         try? engine.setPlaybackSpeed(speed: speed)
         let rate = Double(speed)
         playbackRate = rate.isFinite ? min(max(rate, 0.5), 2.0) : 1.0
@@ -1791,6 +1806,10 @@ final class PlaybackController {
                     return
                 }
                 try? engine.setSleepGain(gain: Float(min(1, remaining / 6)))
+                await MainActor.run { [weak self] in
+                    guard let self, self.sleepDeadline == deadline else { return }
+                    self.dolbyRenderer?.volume = Float(self.volume * min(1, remaining / 6))
+                }
                 let whole = Int(remaining.rounded(.up))
                 if whole != displayedSeconds {
                     displayedSeconds = whole
@@ -1815,6 +1834,7 @@ final class PlaybackController {
         sleepDeadline = nil; sleepSecondsRemaining = nil
         sleepAfterTrack = false
         try? engine.setSleepGain(gain: 1)
+        dolbyRenderer?.volume = Float(volume * (isDucked ? Self.duckGain : 1))
         try? engine.holdTrackEnd(hold: false)
         syncEngineQueueNext()
     }
@@ -1893,6 +1913,7 @@ final class PlaybackController {
            state == .buffering || state == .playing {
             return
         }
+        durationRepairTask?.cancel()
         playGeneration += 1
         let generation = playGeneration
         resumeGeneration &+= 1
@@ -1903,6 +1924,8 @@ final class PlaybackController {
         // the expedited path below: resolve, probe and open, but no Automix
         // analysis — planning a DJ blend for a tap would hold the cut for
         // seconds, and a tap means now.
+        dolbyRenderer?.stop()
+        dolbyRenderer = nil
         try? engine.pause()
         let stoppingEngine = engine
         loadSubmissionGate.advance(to: generation) { try? stoppingEngine.stop() }
@@ -1925,6 +1948,8 @@ final class PlaybackController {
         lastError = nil
         state = .buffering
         nowPlaying.updateCommands(canNext: playingIndex + 1 < queue.count || repeatMode == .all, canPrevious: true, canSeek: false)
+        dolbyRenderer?.stop()
+        dolbyRenderer = nil
         engineLoadedId = nil
         loadedSourcePath = nil
         loadedSourceHeaders = [:]
@@ -1964,6 +1989,11 @@ final class PlaybackController {
                     self.noteResolved(entry, outcome: outcome, prefs: prefs)
                 }
                 let resolved = outcome.source
+                if PlaybackCodecCapabilities.shared.canRenderDolby(codec: resolved.codec, headers: resolved.headers) {
+                    _ = try await AudioSessionManager.activate(preferredSampleRate: nil)
+                    try await self.loadDolby(resolved, entry: entry, index: index, start: resume, generation: generation)
+                    return
+                }
                 // Manual loads cut: no Automix planning on this path. The
                 // blend machinery (safety overlap, analysis, re-plan) belongs
                 // to the background prefetcher, whose armed track a manual
@@ -2010,7 +2040,7 @@ final class PlaybackController {
                     // declares no length gives it nothing to schedule against —
                     // the incoming is then never armed and the queue advances by
                     // a cut. We already know the length.
-                    durationSeconds: entry.durationSeconds > 0 ? entry.durationSeconds : nil
+                    durationSeconds: entry.durationSeconds > 0 ? entry.durationSeconds : resolved.durationSec.map(Double.init)
                 )
                 // Engine setup and the command submission share one serial
                 // lane. If another selection arrives after this request passes
@@ -2062,6 +2092,36 @@ final class PlaybackController {
 #endif
     }
 
+    private func loadDolby(_ source: ResolvedSource, entry: QueueEntry, index: Int, start: Double, generation: UInt64) async throws {
+        guard playGeneration == generation else { return }
+        let renderer = AppleDolbyRenderer()
+        renderer.volume = Float(volume)
+        renderer.rate = Float(playbackRate)
+        dolbyRenderer = renderer
+        applySpatialPreference()
+        do {
+            let info = try await renderer.prepare(source: source.source, title: entry.title, artist: entry.artist,
+                codec: source.codec, headers: source.headers, startAt: start, claimedKbps: UInt32(max(0, source.kbps)))
+            guard playGeneration == generation, dolbyRenderer === renderer else { renderer.stop(); return }
+            renderer.onEnd = { [weak self, weak renderer] in
+                guard let self, self.playGeneration == generation, self.dolbyRenderer === renderer else { return }
+                self.handleTrackEnded(.natural, source: source.source)
+            }
+            renderer.onFailure = { [weak self, weak renderer] in
+                guard let self, self.playGeneration == generation, self.dolbyRenderer === renderer else { return }
+                self.pausePlayback()
+                self.lastError = "The Dolby source stopped serving playable audio."
+            }
+            prepareNowPlayingForPlayback(entry: entry, duration: info.durationSeconds, position: start)
+            renderer.play()
+            loadDidSucceed(entry: entry, index: index, info: info, startAt: start, headers: [:])
+        } catch {
+            renderer.stop()
+            if dolbyRenderer === renderer { dolbyRenderer = nil }
+            throw error
+        }
+    }
+
     /// Resolves the entry's source to an engine-loadable string. Local paths
     /// pass through unchanged; `"yt:<videoId>"` sources go through the
     /// `StreamResolver` to get a real HTTP URL, which has already been probed
@@ -2081,6 +2141,7 @@ final class PlaybackController {
         let headers: [String: String]
         let kbps: Int
         var lossless: Bool = false
+        var codec: String? = nil
         var durationSec: Int? = nil
         /// Player-response loudness figure (YouTube only; substitutes, cache
         /// hits and local files carry none). Rides to the engine's
@@ -2093,7 +2154,7 @@ final class PlaybackController {
 
         var format: QualityUpgrade.Format {
             QualityUpgrade.Format(
-                codec: lossless ? "flac" : nil,
+                codec: codec,
                 kbps: kbps > 0 ? kbps : nil,
                 lossless: lossless
             )
@@ -2173,14 +2234,8 @@ final class PlaybackController {
 
         @MainActor
         static func current() -> ResolvePrefs {
-            #if DEBUG
-            if ProcessInfo.processInfo.arguments.contains("--verify-navigation") {
-                return ResolvePrefs(maxKbps: Int.max, wantLossless: false, jiosaavn: false,
-                                    canSubstitute: false, preferMusicOnly: false)
-            }
-            #endif
-            let qualityKey = NetworkQuality.shared.metered ? "audio_quality_cellular" : "audio_quality_wifi"
-            let streamQuality = PlatformSettings.shared.getString(key: qualityKey, default: "LOSSLESS")
+            let streamQuality = AppSettings.shared.effectiveAudioQuality(metered: NetworkQuality.shared.metered).name
+            NSLog("[BitChord] playback quality requested=\(streamQuality) network=\(NetworkQuality.shared.metered ? "metered" : "unmetered")")
             return ResolvePrefs(
                 maxKbps: Int(NetworkQuality.shared.maxKbps),
                 wantLossless: streamQuality == "LOSSLESS",
@@ -2196,7 +2251,7 @@ final class PlaybackController {
         try Task.checkCancellation()
         if let asset = DownloadStore.shared.asset(for: entry) {
             return ResolveOutcome(source: ResolvedSource(source: asset.path, headers: [:], kbps: asset.kbps,
-                lossless: asset.lossless, origin: .local, youtubeVideoId: asset.youtubeVideoId), leftover: nil)
+                lossless: asset.lossless, codec: asset.codec, origin: .local, youtubeVideoId: asset.youtubeVideoId), leftover: nil)
         }
         if entry.source.hasPrefix("saavn:") || entry.id.hasPrefix("saavn:") {
             let id = entry.source.hasPrefix("saavn:") ? String(entry.source.dropFirst(6)) : String(entry.id.dropFirst(6))
@@ -2211,6 +2266,11 @@ final class PlaybackController {
             }
             throw InnertubeStreamResolver.StreamError(message: "JioSaavn had no stream")
         }
+        #if DEBUG
+        if entry.source.hasPrefix("dolby-test:") {
+            return ResolveOutcome(source: ResolvedSource(source: String(entry.source.dropFirst(11)), headers: [:], kbps: 0, codec: "eac3-joc"), leftover: nil)
+        }
+        #endif
         guard entry.source.hasPrefix("yt:") else {
             // A file on a remote library plays from its own address, and that address
             // needs the share's credential — the same header the cover fetch and the
@@ -2222,6 +2282,7 @@ final class PlaybackController {
                     source: entry.source,
                     headers: WebDavBridge.shared.playbackHeaders(fileUrl: entry.source),
                     kbps: 0,
+                    codec: ["ac3", "ec3", "eac3"].contains(URL(string: entry.source)?.pathExtension.lowercased() ?? "") ? URL(string: entry.source)?.pathExtension : nil,
                     origin: .local
                 ),
                 leftover: nil
@@ -2232,7 +2293,7 @@ final class PlaybackController {
            FileManager.default.fileExists(atPath: growing) {
             return ResolveOutcome(
                 source: ResolvedSource(
-                    source: growing, headers: [:], kbps: 0, origin: .cache
+                    source: growing, headers: [:], kbps: 0, durationSec: streamGate.lock.withLock { streamGate.durations[videoId] }, origin: .cache
                 ),
                 leftover: nil
             )
@@ -2248,9 +2309,10 @@ final class PlaybackController {
         }
         if let cached = await StreamFileCache.shared.path(for: videoId, maxKbps: prefs.maxKbps, requireLossless: prefs.wantLossless) {
             let metadata = await StreamFileCache.shared.metadata(at: cached)
+            let cachedDuration = metadata?.durationSeconds
             return ResolveOutcome(
                 source: ResolvedSource(
-                    source: cached, headers: [:], kbps: metadata?.kbps ?? 0, loudnessDb: metadata?.relativeLoudnessDb, origin: .cache, youtubeVideoId: metadata?.youtubeVideoId
+                    source: cached, headers: [:], kbps: metadata?.kbps ?? 0, lossless: QualityUpgrade.Format.isLosslessCodec(metadata?.codec), codec: metadata?.codec, durationSec: cachedDuration, loudnessDb: metadata?.relativeLoudnessDb, origin: .cache, youtubeVideoId: metadata?.youtubeVideoId ?? videoId
                 ),
                 leftover: nil
             )
@@ -2285,7 +2347,7 @@ final class PlaybackController {
                     source: ResolvedSource(
                         source: stream.url, headers: stream.headers,
                         kbps: stream.format.kbps ?? 0,
-                        lossless: stream.format.lossless,
+                        lossless: stream.format.lossless, codec: stream.format.codec,
                         durationSec: stream.durationSec,
                         origin: .substitute
                     ),
@@ -2305,7 +2367,7 @@ final class PlaybackController {
             let source = ResolvedSource(
                 source: stream.url, headers: stream.headers,
                 kbps: stream.format.kbps ?? 0,
-                lossless: stream.format.lossless,
+                lossless: stream.format.lossless, codec: stream.format.codec,
                 durationSec: stream.durationSec,
                 origin: .substitute
             )
@@ -2360,12 +2422,17 @@ final class PlaybackController {
             }
             throw error
         }
+        if let seconds = stream.durationSeconds, seconds > 0 {
+            streamGate.lock.withLock {
+                streamGate.durations[videoId] = seconds
+            }
+        }
         do {
             let localPath = try await streamViaKtor(
-                videoId: videoId, url: stream.url, headers: stream.headers, codec: stream.mimeType.lowercased().contains("opus") ? "Opus" : "AAC", kbps: stream.kbps, relativeLoudnessDb: stream.loudnessDb, youtubeVideoId: videoId)
+                videoId: videoId, url: stream.url, headers: stream.headers, codec: stream.mimeType.lowercased().contains("opus") ? "Opus" : "AAC", kbps: stream.kbps, relativeLoudnessDb: stream.loudnessDb, youtubeVideoId: videoId, durationSeconds: stream.durationSeconds)
             return ResolvedSource(
                 source: localPath, headers: [:], kbps: stream.kbps,
-                loudnessDb: stream.loudnessDb, origin: .youtube, youtubeVideoId: videoId
+                durationSec: stream.durationSeconds, loudnessDb: stream.loudnessDb, origin: .youtube, youtubeVideoId: videoId
             )
         } catch {
             let reason = (error as? InnertubeStreamResolver.StreamError)?.message
@@ -2381,10 +2448,10 @@ final class PlaybackController {
                 )
                 do {
                     let localPath = try await streamViaKtor(
-                        videoId: videoId, url: fresh.url, headers: fresh.headers, codec: fresh.mimeType.lowercased().contains("opus") ? "Opus" : "AAC", kbps: fresh.kbps, relativeLoudnessDb: fresh.loudnessDb, youtubeVideoId: videoId)
+                        videoId: videoId, url: fresh.url, headers: fresh.headers, codec: fresh.mimeType.lowercased().contains("opus") ? "Opus" : "AAC", kbps: fresh.kbps, relativeLoudnessDb: fresh.loudnessDb, youtubeVideoId: videoId, durationSeconds: fresh.durationSeconds)
                     return ResolvedSource(
                         source: localPath, headers: [:], kbps: fresh.kbps,
-                        loudnessDb: fresh.loudnessDb, origin: .youtube, youtubeVideoId: videoId
+                        durationSec: fresh.durationSeconds, loudnessDb: fresh.loudnessDb, origin: .youtube, youtubeVideoId: videoId
                     )
                 } catch {
                     // Refused again, or never served. Say so rather than handing
@@ -2398,7 +2465,7 @@ final class PlaybackController {
             DebugLog.shared.d(message: "\(videoId): stream failed: \(reason ?? "\(error)")")
             return ResolvedSource(
                 source: stream.url, headers: stream.headers, kbps: stream.kbps,
-                loudnessDb: stream.loudnessDb, origin: .youtube, youtubeVideoId: videoId
+                durationSec: stream.durationSeconds, loudnessDb: stream.loudnessDb, origin: .youtube, youtubeVideoId: videoId
             )
         }
     }
@@ -2423,7 +2490,7 @@ final class PlaybackController {
     ///    gets to serve it mid-track rather than being dropped for a fast 320.
     private static func resolveSubstitute(
         _ entry: QueueEntry, prefs: ResolvePrefs, waitForAll: Bool = false,
-        playingDurationSec: Int? = nil
+        playingDurationSec: Int? = nil, playing: QualityUpgrade.Format? = nil
     ) async -> ResolvedSource? {
         // Nothing configured outranks YouTube, so the race cannot be won and asking
         // would be pure latency. Answerable from the source list alone, with no
@@ -2436,14 +2503,15 @@ final class PlaybackController {
             durationSec: playingDurationSec,
             album: entry.albumName,
             isExplicit: entry.isExplicit.map { KotlinBoolean(value: $0) },
-            isVideo: entry.isVideo
+            isVideo: entry.isVideo,
+            playing: (playing ?? (waitForAll ? QualityUpgrade.Format(codec: nil, kbps: nil, lossless: false) : nil)).map { SourceSubstitution.Format(codec: $0.codec, kbps: $0.kbps, lossless: $0.lossless) }
         )
         guard let stream else { return nil }
         return ResolvedSource(
             source: stream.url,
             headers: stream.headers,
             kbps: stream.kbps ?? 0,
-            lossless: stream.lossless,
+            lossless: stream.lossless, codec: stream.codec,
             durationSec: stream.durationSec,
             origin: .substitute
         )
@@ -2507,6 +2575,7 @@ final class PlaybackController {
         var growing: [String: String] = [:]
         var growingQuality: [String: String] = [:]
         var growingKbps: [String: Int] = [:]
+        var durations: [String: Int] = [:]
     }
 
     private static let streamGate = StreamGate()
@@ -2516,12 +2585,12 @@ final class PlaybackController {
     /// appending; [StreamFileCache] is filled when the last one lands so a
     /// re-tap does not fetch again.
     private static func streamViaKtor(
-        videoId: String, url: String, headers: [String: String], codec: String = "unknown", kbps: Int = 0, relativeLoudnessDb: Double? = nil, youtubeVideoId: String? = nil
+        videoId: String, url: String, headers: [String: String], codec: String = "unknown", kbps: Int = 0, relativeLoudnessDb: Double? = nil, youtubeVideoId: String? = nil, durationSeconds: Int? = nil
     ) async throws -> String {
         let taskKey = videoId + "|" + StreamFileCache.qualityIdentity + "|" + DiskCache.hashName(url)
         let task: Task<String, Error> = streamGate.lock.withLock {
             if let existing = streamGate.tasks[taskKey] { return existing }
-            let created = Task { try await streamViaKtorOnce(videoId: videoId, url: url, headers: headers, codec: codec, kbps: kbps, relativeLoudnessDb: relativeLoudnessDb, youtubeVideoId: youtubeVideoId) }
+            let created = Task { try await streamViaKtorOnce(videoId: videoId, url: url, headers: headers, codec: codec, kbps: kbps, relativeLoudnessDb: relativeLoudnessDb, youtubeVideoId: youtubeVideoId, durationSeconds: durationSeconds) }
             streamGate.tasks[taskKey] = created
             return created
         }
@@ -2540,7 +2609,7 @@ final class PlaybackController {
     }
 
     private static func streamViaKtorOnce(
-        videoId: String, url: String, headers: [String: String], codec: String = "unknown", kbps: Int = 0, relativeLoudnessDb: Double? = nil, youtubeVideoId: String? = nil
+        videoId: String, url: String, headers: [String: String], codec: String = "unknown", kbps: Int = 0, relativeLoudnessDb: Double? = nil, youtubeVideoId: String? = nil, durationSeconds: Int? = nil
     ) async throws -> String {
         let qualityIdentity = StreamFileCache.qualityIdentity
         return try await withCheckedThrowingContinuation { continuation in
@@ -2556,7 +2625,7 @@ final class PlaybackController {
                     resumed = true
                     if let path {
                         streamGate.lock.withLock { streamGate.growing[videoId] = path; streamGate.growingQuality[videoId] = qualityIdentity; streamGate.growingKbps[videoId] = kbps }
-                        Task { await StreamFileCache.shared.noteGrowing(videoId: videoId, path: path, kbps: kbps, quality: qualityIdentity, relativeLoudnessDb: relativeLoudnessDb, youtubeVideoId: youtubeVideoId) }
+                        Task { await StreamFileCache.shared.noteGrowing(videoId: videoId, path: path, kbps: kbps, quality: qualityIdentity, relativeLoudnessDb: relativeLoudnessDb, youtubeVideoId: youtubeVideoId, durationSeconds: durationSeconds) }
                         continuation.resume(returning: path)
                     } else {
                         continuation.resume(throwing: InnertubeStreamResolver.StreamError(
@@ -2565,7 +2634,7 @@ final class PlaybackController {
                 },
                 done: DownloadCallbackAdapter { path, message in
                     if let path {
-                        Task { await StreamFileCache.shared.store(videoId, path: path, sourceIdentity: DiskCache.hashName(url), codec: codec, kbps: kbps, quality: qualityIdentity, relativeLoudnessDb: relativeLoudnessDb, youtubeVideoId: youtubeVideoId) }
+                        Task { await StreamFileCache.shared.store(videoId, path: path, sourceIdentity: DiskCache.hashName(url), codec: codec, kbps: kbps, quality: qualityIdentity, relativeLoudnessDb: relativeLoudnessDb, youtubeVideoId: youtubeVideoId, durationSeconds: durationSeconds) }
                     } else if let message {
                         print("[Playback] stream tail failed for \(videoId): \(message)")
                         streamGate.lock.withLock { streamGate.growing[videoId] = nil }
@@ -2602,13 +2671,15 @@ final class PlaybackController {
         position = startAt
         positionSampledAt = Date()
         duration = info.durationSeconds
+        repairMissingDuration(entry: entry, info: info)
         lastError = nil
         state = .playing
         persistSession()
         refreshArtwork(entry)
         fetchLyrics(for: entry)
         fetchCanvas(for: entry)
-        nerd = engine.nerdStats()
+        applySpatialPreference()
+        nerd = dolbyRenderer?.nerd ?? engine.nerdStats()
         racingLossless = QualityUpgrade.isRacing(entry.id)
         scrobbleArmed = false
         scrobbleSent = false
@@ -2629,11 +2700,33 @@ final class PlaybackController {
         widgetPublisher.publish(entry: entry, isPlaying: true,
                                 canNext: playingIndex + 1 < queue.count,
                                 canPrevious: index > 0)
-        lookForBetterCopy(entry, codec: info.codec, kbps: info.kbps)
+        if dolbyRenderer == nil { lookForBetterCopy(entry, codec: info.codec, kbps: info.kbps) }
         // The incoming source must be ready before the outgoing tail begins.
         // Waiting for the current download here made prefetch start up to eight
         // seconds late, then full analysis delayed queueing it even further.
         syncEngineQueueNext()
+    }
+
+    /// Legacy cached WebM files can lack both container and saved duration.
+    /// Repair metadata after playback starts, without delaying cached/offline audio.
+    private func repairMissingDuration(entry: QueueEntry, info: TrackInfoRec) {
+        guard duration <= 0, let videoId = entry.videoId else { return }
+        let generation = playGeneration
+        let ceiling = ResolvePrefs.current().maxKbps
+        durationRepairTask?.cancel()
+        durationRepairTask = Task { [weak self] in
+            guard let stream = try? await InnertubeStreamResolver.shared.resolve(videoId: videoId, maxKbps: ceiling),
+                  let seconds = stream.durationSeconds, seconds > 0, !Task.isCancelled,
+                  let self, self.playGeneration == generation, self.engineLoadedId == entry.id,
+                  self.loadedSourcePath == info.source, let current = self.current else { return }
+            self.duration = Double(seconds)
+            self.nowPlaying.update(id: current.id, title: current.title, artist: current.artist,
+                duration: self.duration, artworkData: current.artworkData, thumbnailUrl: current.thumbnailUrl,
+                isPlaying: self.isPlaying, position: self.position)
+            self.nowPlaying.updateCommands(canNext: self.nextEntry != nil, canPrevious: true, canSeek: true)
+            self.publishSmartWindow()
+            await StreamFileCache.shared.storeDuration(seconds, at: info.source)
+        }
     }
 
     private func loadDidFail(entry: QueueEntry, error: Error) {
@@ -2643,6 +2736,8 @@ final class PlaybackController {
         // Tearing the engine down here would stop whatever they started.
         guard state == .buffering else { return }
         state = .stopped
+        dolbyRenderer?.stop()
+        dolbyRenderer = nil
         engineLoadedId = nil
         try? engine.pause()
         let engine = self.engine
@@ -2667,6 +2762,10 @@ final class PlaybackController {
     /// Repeat-one *with* Automix arms a self-mix into the same track.
     private func syncEngineQueueNext() {
         guard !sleepAfterTrack else { return }
+        if dolbyRenderer != nil {
+            nowPlaying.updateCommands(canNext: nextEntry != nil, canPrevious: current != nil, canSeek: duration > 0)
+            return
+        }
         nowPlaying.updateCommands(canNext: playingIndex + 1 < queue.count || repeatMode == .all, canPrevious: current != nil,
                                   canSeek: engineLoadedId != nil && duration > 0)
         queueNextRevision &+= 1
@@ -2750,6 +2849,7 @@ final class PlaybackController {
                 }
                 guard stillQueueTarget else { return }
                 let resolved = outcome.source
+                guard !PlaybackCodecCapabilities.shared.canRenderDolby(codec: resolved.codec, headers: resolved.headers) else { return }
                 let incomingDuration = next.durationSeconds > 0
                     ? next.durationSeconds : Double(resolved.durationSec ?? 0)
                 let declaredDuration = incomingDuration > 0 ? incomingDuration : nil
@@ -2777,6 +2877,13 @@ final class PlaybackController {
                     loudnessDb: resolved.loudnessDb, durationSeconds: declaredDuration
                 ), expectedSource: expectedSource)
                 }) != nil else { return }
+                if let safetyPlan {
+                    await MainActor.run { [weak self] in
+                        guard let self, self.playGeneration == generation,
+                              self.queueNextRevision == revision, self.current?.id == outgoingId else { return }
+                        self.adoptAutomixPlan(safetyPlan)
+                    }
+                }
                 if automix {
                     NSLog(
                         "[BitChord] automix queued %@%@ with an immediate %.1fs overlap",
@@ -2868,12 +2975,19 @@ final class PlaybackController {
                     try await Task.sleep(nanoseconds: 2_000_000_000)
                 }
             } catch {
-                // Prefetch failure is non-fatal; the next tap/natural end re-resolves.
+                // Keep the current song playing; natural end retries with a
+                // full load and reports any final failure to the listener.
+                await MainActor.run { [weak self] in
+                    guard let self, self.playGeneration == generation,
+                          self.queueNextRevision == revision else { return }
+                    PlaybackDebugLog.shared.record("next-track preparation failed: \(error.localizedDescription)", about: nextId)
+                }
             }
         }
     }
 
     fileprivate func handleState(_ newState: PlaybackState) {
+        guard dolbyRenderer == nil else { return }
         // A load callback can arrive from the outgoing voice after the listener
         // has already selected another track. Its load result is discarded by
         // the generation gate; don't let its state callback relabel the new
@@ -2955,7 +3069,7 @@ final class PlaybackController {
                 fetchLyrics(for: entry)
                 fetchCanvas(for: entry)
             }
-            nerd = engine.nerdStats()
+            nerd = dolbyRenderer?.nerd ?? engine.nerdStats()
             racingLossless = QualityUpgrade.isRacing(entry.id)
             scrobbleArmed = false
             scrobbleSent = false
@@ -2973,7 +3087,7 @@ final class PlaybackController {
             loadedSourcePath = info.source
             loadedSourceHeaders = sourceHeadersByPath.removeValue(forKey: info.source) ?? [:]
             beginSmartMixIfNeeded()
-            lookForBetterCopy(entry, codec: info.codec, kbps: info.kbps)
+            if dolbyRenderer == nil { lookForBetterCopy(entry, codec: info.codec, kbps: info.kbps) }
         }
         persistSession()
         syncEngineQueueNext()
@@ -3003,12 +3117,13 @@ final class PlaybackController {
             )
             scrobbleSent = true
         }
-        // The queue advances through engine handoffs (gapless arm +
-        // Automix blend), not here: by the time a natural end arrives the
-        // handoff has already moved the index, and re-loading here would cut
-        // what the blend just started. A natural end with tracks remaining
-        // only happens when no blend armed, and the engine's queued next (or
-        // an empty queue) already covers it.
+        // Source validation above excludes the outgoing voice after a handoff.
+        // If the current voice reaches EOS, prefetch may have failed or not
+        // finished. Advance with a fresh load instead of assuming it was armed.
+        PlaybackDebugLog.shared.record("natural end without handoff; index=\(playingIndex) count=\(queue.count)", about: current?.id)
+        dolbyRenderer?.stop()
+        dolbyRenderer = nil
+        engineLoadedId = nil
         switch repeatMode {
         case .one:
             // Automix self-mix should have handed off before EOS. A natural end
@@ -3016,9 +3131,15 @@ final class PlaybackController {
             // (the previous seek-after-EOF path left the decoder finished).
             restartCurrentAfterNaturalEnd()
         case .all:
-            engineLoadedId = nil
+            dolbyRenderer?.stop()
+        dolbyRenderer = nil
+        engineLoadedId = nil
             next()
         case .off:
+            if playingIndex + 1 < queue.count {
+                loadCurrent(playingIndex + 1)
+                return
+            }
             state = .stopped
             position = 0
             nowPlaying.updateRate(0.0, position: 0)
@@ -3035,6 +3156,8 @@ final class PlaybackController {
         let index = playingIndex
         scrobbleArmed = false
         scrobbleSent = false
+        dolbyRenderer?.stop()
+        dolbyRenderer = nil
         engineLoadedId = nil
         loadCurrent(index)
     }
@@ -3757,8 +3880,10 @@ final class PlaybackController {
     }
 
     private func cachedFloor(kbps: UInt32) -> QualityUpgrade.Format? {
-        if kbps > 0 { return QualityUpgrade.Format(codec: nil, kbps: Int(kbps), lossless: false) }
-        return nil
+        let codec = nerd?.codec
+        guard kbps > 0 || codec != nil else { return nil }
+        return QualityUpgrade.Format(codec: codec, kbps: kbps > 0 ? Int(kbps) : nil,
+            lossless: QualityUpgrade.Format.isLosslessCodec(codec))
     }
 
     private func startUpgradeJob(
@@ -3785,16 +3910,16 @@ final class PlaybackController {
                         let playing = await MainActor.run { [weak self] () -> QualityUpgrade.Format? in
                             guard let self else { return nil }
                             let kbps = self.nerd?.kbps ?? 0
-                            return kbps > 0
-                                ? QualityUpgrade.Format(codec: nil, kbps: Int(kbps), lossless: false)
-                                : nil
+                            let codec = self.nerd?.codec
+                            return QualityUpgrade.Format(codec: codec, kbps: kbps > 0 ? Int(kbps) : nil,
+                                lossless: QualityUpgrade.Format.isLosslessCodec(codec))
                         }
                         let dur = await MainActor.run { [weak self] () -> Int? in
                             guard let self, self.duration > 0 else { return nil }
                             return Int(self.duration.rounded())
                         }
                         guard let hit = await Self.resolveSubstitute(
-                            entry, prefs: prefs, waitForAll: true, playingDurationSec: dur
+                            entry, prefs: prefs, waitForAll: true, playingDurationSec: dur, playing: playing
                         ) else { return nil }
                         let format = hit.format
                         guard QualityUpgrade.worthSwapping(format, playing: playing) else {
@@ -3935,7 +4060,7 @@ final class PlaybackController {
                     headers: stream.headers,
                     claimedKbps: Swift.UInt32(stream.format.kbps ?? 0),
                     loudnessDb: nil,
-                    durationSeconds: entry.durationSeconds > 0 ? entry.durationSeconds : nil
+                    durationSeconds: entry.durationSeconds > 0 ? entry.durationSeconds : stream.durationSec.map(Double.init)
                 ), expectedSource: outgoing)
             }) != nil else { return }
         } catch {
@@ -4074,7 +4199,7 @@ final class PlaybackController {
                         // And the same for its length — a swap continues a track
                         // that is already playing, so the current entry's figure is
                         // the right one.
-                        durationSeconds: entry.durationSeconds > 0 ? entry.durationSeconds : nil
+                        durationSeconds: entry.durationSeconds > 0 ? entry.durationSeconds : stream.durationSec.map(Double.init)
                     ),
                     crossfadeSeconds: QualityUpgrade.swapCrossfadeSeconds,
                     expectedSource: priorSource ?? ""
@@ -4175,8 +4300,13 @@ final class PlaybackController {
             smartTransitionWindow = nil
             return
         }
-        let start = max(0, (duration - fade) / duration)
-        smartTransitionWindow = TransitionWindow(start: start, end: 1)
+        // Match the mixer's authoritative analysed anchor; it can finish
+        // before the file ends. Zero denotes the initial duration-based plan.
+        let endSeconds = plan.transitionEndSeconds.isFinite && plan.transitionEndSeconds > 0
+            ? min(duration, plan.transitionEndSeconds) : duration
+        let start = max(0, (endSeconds - fade) / duration)
+        let end = min(1, endSeconds / duration)
+        smartTransitionWindow = end > start ? TransitionWindow(start: start, end: end) : nil
     }
 
     private func beginSmartMixIfNeeded() {
@@ -4260,20 +4390,20 @@ final class EngineCallbacks: EngineCallback, @unchecked Sendable {
     }
 
     func onTrackEnded(reason: TrackEndReason, source: String) {
-        Task { @MainActor in controller?.handleTrackEnded(reason, source: source) }
+        Task { @MainActor in guard controller?.dolbyRenderer == nil else { return }; controller?.handleTrackEnded(reason, source: source) }
     }
 
     func onError(message: String) {
         PlaybackDebugLog.shared.record("engine error: \(message)")
-        Task { @MainActor in controller?.handleError(message) }
+        Task { @MainActor in guard controller?.dolbyRenderer == nil else { return }; controller?.handleError(message) }
     }
 
     func onHandoff(info: TrackInfoRec) {
-        Task { @MainActor in controller?.handleHandoff(info) }
+        Task { @MainActor in guard controller?.dolbyRenderer == nil else { return }; controller?.handleHandoff(info) }
     }
 
     func onDurationChanged(seconds: Double) {
-        Task { @MainActor in controller?.handleDuration(seconds) }
+        Task { @MainActor in guard controller?.dolbyRenderer == nil else { return }; controller?.handleDuration(seconds) }
     }
 }
 
@@ -4446,12 +4576,12 @@ extension PlaybackController {
             PlatformSettings.shared.putString(key: "last_playback_context", value: savedContext)
             restoreSession()
         }
-        let ids = ["3qKFa86UuxY", "N4HWTqcvMMY", "MnaA85nYEeE", "L9M8HGw71NU",
+        let ids = ["8UhQfqMkObk", "r6fihQByHx0", "gOnyq8DjpFY", "qKyF5R-IE64",
                    "pNxTO1czMkc", "QX1KRphxnQc", "Xxq1XfsQOIE", "35tNuvmBVMc",
                    "N7IxlspnaQw", "9NM0hPDWIyg"]
         let entries = ids.enumerated().map { index, id in
             QueueEntry(id: id, title: "Navigation fixture \(index + 1)", artist: "BitChord",
-                       source: "yt:" + id, durationText: "3:00", isLocal: false)
+                       source: "yt:" + id, durationText: "", isLocal: false)
         }
         var checks: [String: Bool] = [:]
         var samples: [[String: Any]] = []
@@ -4466,15 +4596,24 @@ extension PlaybackController {
             volume = 0
             play(entries)
             for _ in 0..<50 {
-                if state != .buffering { break }
+                if (isPlaying && duration > 0) || lastError != nil { break }
                 try await Task.sleep(for: .milliseconds(400))
             }
+            checks["initial_track_playing"] = isPlaying && lastError == nil
+            checks["initial_duration_from_resolver"] = duration > 0
+            try await Task.sleep(for: .milliseconds(400))
+            checks["initial_progress_fraction"] = duration > 0 && position > 0 && position / duration > 0
+            seek(to: 15)
+            try await Task.sleep(for: .seconds(1))
+            checks["seek_changes_real_position"] = isPlaying && position >= 15 && position < 19
             sample("initial")
             var played = isPlaying
             for step in 1..<entries.count {
                 next()
                 try await Task.sleep(for: .seconds(4))
                 checks["next_\(step)_selected"] = current?.id == ids[step]
+                checks["next_\(step)_playing"] = isPlaying && lastError == nil
+                checks["next_\(step)_duration_known"] = duration > 0
                 played = played || isPlaying
                 sample("next \(step)")
             }
@@ -4485,6 +4624,7 @@ extension PlaybackController {
                 previous()
                 try await Task.sleep(for: .seconds(4))
                 checks["back_\(step)_selected"] = current?.id == ids[ids.count - 1 - step]
+                checks["back_\(step)_playing"] = isPlaying && lastError == nil
                 played = played || isPlaying
                 sample("back \(step)")
             }
@@ -4492,7 +4632,7 @@ extension PlaybackController {
             // Return to the first track after all failures and rapid selections.
             play([entries[0]])
             for _ in 0..<50 {
-                if state != .buffering { break }
+                if (isPlaying && duration > 0) || lastError != nil { break }
                 try await Task.sleep(for: .milliseconds(400))
             }
             checks["first_track_still_playable"] = isPlaying
@@ -4505,11 +4645,79 @@ extension PlaybackController {
         nowPlaying.stop()
         await AudioSessionManager.deactivate()
         let result: [String: Any] = ["checks": checks, "samples": samples,
+            "quality": ["wifiSaved": PlatformSettings.shared.getString(key: "audio_quality_wifi", default: "LOSSLESS"),
+                        "mobileSaved": PlatformSettings.shared.getString(key: "audio_quality_cellular", default: "LOSSLESS"),
+                        "wifiPolicy": AppSettings.shared.effectiveAudioQuality(metered: false).name,
+                        "mobilePolicy": AppSettings.shared.effectiveAudioQuality(metered: true).name,
+                        "metered": NetworkQuality.shared.metered,
+                        "effective": AppSettings.shared.effectiveAudioQuality(metered: NetworkQuality.shared.metered).name],
             "passed": !checks.isEmpty && checks.values.allSatisfy { $0 }]
         let report = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
             .appendingPathComponent("navigation-verification.json")
         try? JSONSerialization.data(withJSONObject: result, options: [.prettyPrinted, .sortedKeys]).write(to: report)
         debugLog.record("navigation verification complete: \(checks)")
+    }
+
+    /// Reproduces a failed/unarmed prefetch using local audio and the real engine.
+    func verifyNaturalEndFallback() async {
+        let savedQueue = UserDefaults.standard.data(forKey: "bitchord_last_played")
+        let savedContext = PlatformSettings.shared.getString(key: "last_playback_context", default: "")
+        let savedAutomix = automixEnabled, savedVolume = volume
+        let savedRepeat = repeatMode
+        var checks: [String: Bool] = [:]
+        let background = UIApplication.shared.beginBackgroundTask(withName: "natural end verification")
+        defer {
+            UIApplication.shared.endBackgroundTask(background)
+            setAutomixEnabled(savedAutomix); volume = savedVolume; repeatMode = savedRepeat
+            if let savedQueue { UserDefaults.standard.set(savedQueue, forKey: "bitchord_last_played") }
+            else { UserDefaults.standard.removeObject(forKey: "bitchord_last_played") }
+            PlatformSettings.shared.putString(key: "last_playback_context", value: savedContext)
+            restoreSession()
+        }
+        do {
+            let format = AVAudioFormat(standardFormatWithSampleRate: 44100, channels: 2)!
+            let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: 44100 * 8)!
+            buffer.frameLength = buffer.frameCapacity
+            for channel in 0..<2 {
+                for frame in 0..<Int(buffer.frameLength) {
+                    buffer.floatChannelData![channel][frame] = Float(sin(Double(frame) * 2 * .pi * 220 / 44100) * 0.02)
+                }
+            }
+            var entries: [QueueEntry] = []
+            for index in 0..<2 {
+                let path = FileManager.default.temporaryDirectory.appendingPathComponent("natural-end-\(index).wav")
+                do { let file = try AVAudioFile(forWriting: path, settings: format.settings); try file.write(from: buffer) }
+                entries.append(QueueEntry(id: "natural-end-\(index)", title: "End fixture \(index)", artist: "Validation",
+                    source: path.path, durationText: "0:08", isLocal: true))
+            }
+            volume = 0; repeatMode = .off; setAutomixEnabled(false)
+            play(entries)
+            for _ in 0..<100 { if isPlaying && engineLoadedId == entries[0].id { break }; try await Task.sleep(for: .milliseconds(100)) }
+            checks["first_started"] = isPlaying && current?.id == entries[0].id
+            // Cancel any pending arming job, then explicitly leave no successor.
+            queueNextRevision &+= 1
+            loadSubmissionGate.setQueueRevision(queueNextRevision)
+            try engine.queueNextIfCurrent(request: LoadRequest(source: "", title: "", artist: "", startSeconds: 0,
+                plan: nil, headers: [:], claimedKbps: 0, loudnessDb: nil, durationSeconds: nil), expectedSource: entries[0].source)
+            checks["no_prefetched_successor"] = engine.pendingTrack() == nil
+            for _ in 0..<120 { if current?.id == entries[1].id && isPlaying { break }; try await Task.sleep(for: .milliseconds(100)) }
+            checks["unarmed_end_advances"] = current?.id == entries[1].id && isPlaying
+            handleTrackEnded(.natural, source: entries[0].source)
+            checks["obsolete_end_ignored"] = current?.id == entries[1].id && isPlaying
+            for _ in 0..<120 { if state == .stopped { break }; try await Task.sleep(for: .milliseconds(100)) }
+            checks["final_end_releases_loaded_voice"] = state == .stopped && engineLoadedId == nil
+            togglePlayPause()
+            for _ in 0..<80 { if isPlaying && engineLoadedId == entries[1].id { break }; try await Task.sleep(for: .milliseconds(100)) }
+            checks["resume_after_end_reopens_from_start"] = isPlaying && engine.positionSeconds() < 2
+        } catch { checks["runtime_error"] = false; debugLog.record("natural end verification error: \(error)") }
+        pausePlayback(); playGeneration &+= 1; resumeGeneration &+= 1
+        loadSubmissionGate.advance(to: playGeneration) { [engine] in try? engine.stop() }
+        nowPlaying.stop(); await AudioSessionManager.deactivate()
+        let report = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("natural-end-verification.json")
+        let result: [String: Any] = ["checks": checks, "passed": !checks.isEmpty && checks.values.allSatisfy { $0 }]
+        try? JSONSerialization.data(withJSONObject: result, options: [.prettyPrinted, .sortedKeys]).write(to: report)
+        debugLog.record("natural end verification complete: \(checks)")
     }
 
     /// An explicit diagnostic launch exercises the real controller, RemoteIO,
@@ -4653,6 +4861,12 @@ extension PlaybackController {
         nowPlaying.stop()
         await AudioSessionManager.deactivate()
         let result: [String: Any] = ["checks": checks, "samples": samples,
+            "quality": ["wifiSaved": PlatformSettings.shared.getString(key: "audio_quality_wifi", default: "LOSSLESS"),
+                        "mobileSaved": PlatformSettings.shared.getString(key: "audio_quality_cellular", default: "LOSSLESS"),
+                        "wifiPolicy": AppSettings.shared.effectiveAudioQuality(metered: false).name,
+                        "mobilePolicy": AppSettings.shared.effectiveAudioQuality(metered: true).name,
+                        "metered": NetworkQuality.shared.metered,
+                        "effective": AppSettings.shared.effectiveAudioQuality(metered: NetworkQuality.shared.metered).name],
             "passed": !checks.isEmpty && checks.values.allSatisfy { $0 }]
         let report = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0].appendingPathComponent("native-resume-verification.json")
         if let data = try? JSONSerialization.data(withJSONObject: result, options: [.prettyPrinted, .sortedKeys]) { try? data.write(to: report, options: .atomic) }
@@ -4723,6 +4937,50 @@ extension PlaybackController {
         if let data = try? JSONSerialization.data(withJSONObject: result, options: [.prettyPrinted, .sortedKeys]) { try? data.write(to: report, options: .atomic) }
         print("SLEEP VALIDATION \(checks)")
         debugLog.record("sleep validation \(checks)")
+    }
+}
+#endif
+
+#if DEBUG && os(iOS)
+extension PlaybackController {
+    func verifyDolbyQueue() async {
+        let savedQueue = UserDefaults.standard.data(forKey: "bitchord_last_played")
+        let savedContext = PlatformSettings.shared.getString(key: "last_playback_context", default: "")
+        let savedVolume = volume
+        let sampleURL = "https://devstreaming-cdn.apple.com/videos/streaming/examples/adv_dv_atmos/Job932393e2-1e4f-4fdb-ab59-0d201f752656-107660254-Transcode_audio_full_en_atmos_0_1-en_audio/prog_index.m3u8"
+        var checks: [String: Bool] = [:]
+        defer {
+            pausePlayback()
+            dolbyRenderer?.stop(); dolbyRenderer = nil
+            volume = savedVolume
+            if let savedQueue { UserDefaults.standard.set(savedQueue, forKey: "bitchord_last_played") }
+            else { UserDefaults.standard.removeObject(forKey: "bitchord_last_played") }
+            PlatformSettings.shared.putString(key: "last_playback_context", value: savedContext)
+            restoreSession()
+        }
+        volume = 0
+        let entries = (0..<2).map { QueueEntry(id: "dolby-test-\($0)", title: "Dolby validation \($0)", artist: "Apple", source: "dolby-test:" + sampleURL, durationText: "", isLocal: false) }
+        play(entries)
+        for _ in 0..<150 { if isPlaying || lastError != nil { break }; try? await Task.sleep(for: .milliseconds(100)) }
+        try? await Task.sleep(for: .seconds(2))
+        checks["first_dolby_playing"] = isPlaying && dolbyRenderer != nil && position > 0.5
+        togglePlayPause()
+        let paused = playbackPosition
+        try? await Task.sleep(for: .seconds(1))
+        checks["pause_stable"] = state == .paused && abs(playbackPosition - paused) < 0.1
+        togglePlayPause()
+        try? await Task.sleep(for: .seconds(2))
+        checks["resume_progress"] = isPlaying && playbackPosition > paused + 0.5
+        next()
+        for _ in 0..<150 { if isPlaying || lastError != nil { break }; try? await Task.sleep(for: .milliseconds(100)) }
+        checks["next_dolby"] = current?.id == entries[1].id && isPlaying && dolbyRenderer != nil
+        seek(to: 0); previous()
+        for _ in 0..<150 { if isPlaying || lastError != nil { break }; try? await Task.sleep(for: .milliseconds(100)) }
+        checks["back_dolby"] = current?.id == entries[0].id && isPlaying && dolbyRenderer != nil
+        let result: [String: Any] = ["checks": checks, "passed": checks.values.allSatisfy { $0 }, "codec": nerd?.codec ?? "", "error": lastError ?? ""]
+        let report = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0].appendingPathComponent("dolby-queue-verification.json")
+        if let data = try? JSONSerialization.data(withJSONObject: result, options: [.prettyPrinted, .sortedKeys]) { try? data.write(to: report, options: .atomic) }
+        NSLog("[BitChord] Dolby queue verification complete: %@", String(describing: checks))
     }
 }
 #endif

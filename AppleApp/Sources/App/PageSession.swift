@@ -14,8 +14,8 @@ enum PageSession {
         if let selection, selection.account.cookie == currentCookie {
             identity = selection.account.accountId + ":" + selection.profile.profileId
         } else if let cookie = currentCookie {
-            // A sign-in candidate cannot write into the previous account's cache.
-            identity = "legacy:" + PageRepository.digest(cookie)
+            // A sign-in candidate cannot write into the previous account's request.
+            identity = "legacy:" + PageRequestCoordinator.digest(cookie)
         } else {
             identity = AuthStore.isLocked ? "locked" : "guest"
         }
@@ -26,6 +26,6 @@ enum PageSession {
     nonisolated static func generation() -> Int64 { AuthBridge.shared.sessionGeneration() }
     static func invalidate() {
         let partition = capture().partition
-        Task { await PageRepository.shared.invalidate(partition: partition) }
+        Task { await PageRequestCoordinator.shared.invalidate(partition: partition) }
     }
 }

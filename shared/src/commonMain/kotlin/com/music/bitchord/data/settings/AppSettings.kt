@@ -1,5 +1,6 @@
 package com.music.bitchord.data.settings
 
+import kotlinx.serialization.json.*
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -248,6 +249,17 @@ object AppSettings {
         _fullBleedArtwork.value = value
         settings.putBoolean("full_bleed_artwork", value)
     }
+
+    private val _dolbyAtmos = MutableStateFlow(settings.getBoolean("dolby_atmos", true))
+    val dolbyAtmos: StateFlow<Boolean> = _dolbyAtmos.asStateFlow()
+    fun setDolbyAtmos(value: Boolean) { _dolbyAtmos.value = value; settings.putBoolean("dolby_atmos", value) }
+
+    private val _lyricsBlur = MutableStateFlow(settings.getBoolean("lyrics_blur", true))
+    val lyricsBlur: StateFlow<Boolean> = _lyricsBlur.asStateFlow()
+    fun setLyricsBlur(value: Boolean) { _lyricsBlur.value = value; settings.putBoolean("lyrics_blur", value) }
+    private val _translationLanguage = MutableStateFlow(settings.getString("translation_language", ""))
+    val translationLanguage: StateFlow<String> = _translationLanguage.asStateFlow()
+    fun setTranslationLanguage(value: String) { _translationLanguage.value = value; settings.putString("translation_language", value) }
 
     private val _syncedLyrics = MutableStateFlow(settings.getBoolean("synced_lyrics", true))
     val syncedLyrics: StateFlow<Boolean> = _syncedLyrics.asStateFlow()
@@ -998,7 +1010,7 @@ object AppSettings {
             "skip_silence", "trim_edge_silence", "skip_non_music", "playback_speed", "audio_quality_wifi", "audio_quality_cellular",
             "download_quality", "wifi_only_downloads", "show_nerd_stats", "animated_canvas",
             "canvas_over_cellular", "prioritize_spotify_canvas", "theme_mode", "reduce_dynamic_blur", "reduce_animation",
-            "full_bleed_artwork", "synced_lyrics", "convert_video_to_audio", "swipe_to_play_next",
+            "full_bleed_artwork", "synced_lyrics", "dolby_atmos", "lyrics_blur", "translation_language", "convert_video_to_audio", "swipe_to_play_next",
             "dont_repeat_suggestions", "hide_volume_bar", "lyrics_sources", "lyrics_source_order",
             "audio_cache_limit_bytes",
             "eq_gains", "pinned_playlists", "jiosaavn_enabled", "stop_when_backgrounded",
@@ -1020,6 +1032,7 @@ object AppSettings {
         )
         val parts = keys.map { key ->
             val value = when (key) {
+                "lyrics_blur", "dolby_atmos" -> settings.getBoolean(key, true).toString()
                 "crossfade_seconds", "scrobble_min_duration", "scrobble_delay_seconds",
                 "performance_refresh_rate" ->
                     settings.getInt(key, 0).toString()
@@ -1050,15 +1063,11 @@ object AppSettings {
     }
 
     fun importPrefsJson(raw: String) {
-        val obj = raw.trim().removePrefix("{").removeSuffix("}")
-        obj.split("\",\"").forEach { chunk ->
-            val cleaned = chunk.trim().removePrefix("\"").removeSuffix("\"")
-            val idx = cleaned.indexOf("\":")
-            if (idx <= 0) return@forEach
-            val key = cleaned.substring(0, idx).replace("\"", "")
-            if (key in SECRET_KEYS) return@forEach
-            var value = cleaned.substring(idx + 2).trim()
-            if (value.startsWith("\"")) value = value.removeSurrounding("\"")
+        val obj = Json.parseToJsonElement(raw) as? JsonObject
+            ?: throw IllegalArgumentException("Settings backup must be a JSON object")
+        obj.forEach { (key, element) ->
+            if (key in SECRET_KEYS || element is JsonNull) return@forEach
+            val value = (element as? JsonPrimitive)?.content ?: return@forEach
             when (key) {
                 "crossfade_seconds" -> setCrossfadeSeconds(value.toIntOrNull() ?: 0)
                 "smart_fade_enabled" -> setSmartFadeEnabled(value.toBoolean())
@@ -1079,6 +1088,9 @@ object AppSettings {
                 "reduce_animation" -> setReduceAnimation(value.toBoolean())
                 "full_bleed_artwork" -> setFullBleedArtwork(value.toBoolean())
                 "synced_lyrics" -> setSyncedLyrics(value.toBoolean())
+                "dolby_atmos" -> setDolbyAtmos(value.toBoolean())
+                "lyrics_blur" -> setLyricsBlur(value.toBoolean())
+                "translation_language" -> setTranslationLanguage(value)
                 "convert_video_to_audio" -> setConvertVideoToAudio(value.toBoolean())
                 "swipe_to_play_next" -> setSwipeToPlayNext(value.toBoolean())
                 "dont_repeat_suggestions" -> setDontRepeatSuggestions(value.toBoolean())
@@ -1136,8 +1148,7 @@ object AppSettings {
         }
     }
 
-    private fun jsonString(s: String): String =
-        "\"" + s.replace("\\", "\\\\").replace("\"", "\\\"") + "\""
+    private fun jsonString(s: String): String = JsonPrimitive(s).toString()
 
     fun effectiveAudioQuality(metered: Boolean): AudioQuality =
         if (metered) audioQualityCellular.value else audioQualityWifi.value

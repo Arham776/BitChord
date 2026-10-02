@@ -125,21 +125,6 @@ struct RootView: View {
             if new == .search { appModel.focusSearch = true }
             _ = old
         }
-        #if os(iOS)
-        .sheet(isPresented: Binding(
-            get: { appModel.settingsPresented },
-            set: { appModel.settingsPresented = $0 }
-        )) {
-            SettingsView()
-                .environment(controller)
-                .environment(appModel)
-                .environment(auth)
-                .id(settingsSession)
-        }
-        .onChange(of: appModel.settingsPresented) { _, presented in
-            if !presented { settingsSession += 1 }
-        }
-        #endif
         #if os(macOS)
         .frame(minWidth: 1080, minHeight: 700)
         #endif
@@ -179,7 +164,20 @@ struct RootView: View {
             }
         }
         #else
-        tabShell
+        Group {
+            if appModel.settingsPresented {
+                NavigationStack {
+                    SettingsView(embedded: true)
+                        .toolbar {
+                            ToolbarItem(placement: .topBarLeading) {
+                                Button { appModel.settingsPresented = false } label: {
+                                    Label("Back", systemImage: "chevron.left")
+                                }
+                            }
+                        }
+                }
+            } else { tabShell }
+        }
             .environment(\.nowPlayingZoomNamespace, nowPlayingZoom)
             .modifier(NowPlayingTakeover(
                 isPresented: Binding(
@@ -386,9 +384,6 @@ struct RootView: View {
         .modifier(PlaybackPillMount())
     }
 
-    #if os(iOS)
-    @State private var settingsSession = 0
-    #endif
 
     #if os(macOS)
     private func sidebarLabel(_ title: String, image: ImageResource) -> some View {

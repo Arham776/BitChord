@@ -2,6 +2,9 @@ package com.music.bitchord.data.http
 
 import io.ktor.client.HttpClient
 import io.ktor.client.engine.darwin.Darwin
+import io.ktor.client.plugins.contentnegotiation.ContentNegotiation
+import io.ktor.serialization.kotlinx.json.json
+import kotlinx.serialization.json.Json
 import io.ktor.client.plugins.HttpSend
 import io.ktor.client.plugins.plugin
 import io.ktor.client.request.HttpRequestBuilder
@@ -89,7 +92,7 @@ actual object Http {
      * session: nothing writes that here, and the youtube.com cookies Google sets
      * in response to an innertube call are not credentials.
      */
-    private val client: HttpClient = HttpClient(Darwin) {
+    internal actual val client: HttpClient = HttpClient(Darwin) {
         engine {
             configureRequest {
                 // An explicit account snapshot owns this request's Cookie
@@ -102,6 +105,7 @@ actual object Http {
                 HTTPCookieStorage = cookieJar
             }
         }
+        install(ContentNegotiation) { json(Json { ignoreUnknownKeys = true; explicitNulls = false; encodeDefaults = true }) }
         install(HttpTimeout)
         expectSuccess = false
         followRedirects = false

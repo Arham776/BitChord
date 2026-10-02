@@ -48,7 +48,6 @@ struct HomeView: View {
         case .loaded(let shelves):
             ScrollView {
                 VStack(alignment: .leading, spacing: 28) {
-                    if feed.usingSavedContent { SavedContentNotice(message: feed.refreshError) }
                     if !auth.signedIn {
                         SignInBanner { auth.loginPresented = true }
                     }
@@ -84,7 +83,7 @@ struct HomeView: View {
     private func isRecentsShelf(_ shelf: FeedShelf) -> Bool {
         let title = shelf.title.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         // Accept the earlier Apple bridge title as well as upstream's canonical
-        // "Recents" so a cached feed still gets the four-row treatment.
+        // "Recents" so the feed keeps the four-row treatment.
         return title == "recents" || title == "recently played"
     }
 }
@@ -356,7 +355,6 @@ struct ExploreView: View {
     var body: some View {
         NavigationStack {
             content
-                .savedPageNotice("moodAndGenres")
                 .navigationTitle("Explore")
                 .toolbar {
                     #if os(iOS)
@@ -371,9 +369,6 @@ struct ExploreView: View {
                 }
                 .task(id: auth.sessionEpoch) {
                     await moods.load(force: false)
-                }
-                .onReceive(NotificationCenter.default.publisher(for: .pageCacheUpdated)) { note in
-                    if note.object as? String == "moodAndGenres" { Task { await moods.load(force: false) } }
                 }
         }
     }
@@ -604,7 +599,6 @@ struct MoodGenrePlaylistsView: View {
                 .refreshable { await load(force: true) }
             }
         }
-        .savedPageNotice("mood:\(category.browseId):\(category.params ?? "")")
         .navigationTitle(category.title)
         #if os(iOS)
         .navigationBarTitleDisplayMode(.large)
@@ -615,9 +609,6 @@ struct MoodGenrePlaylistsView: View {
         }
         #endif
         .task(id: auth.sessionEpoch) { shelves = []; phase = .loading; await load() }
-        .onReceive(NotificationCenter.default.publisher(for: .pageCacheUpdated)) { note in
-            if note.object as? String == "mood:\(category.browseId):\(category.params ?? "")" { Task { await load() } }
-        }
     }
 
     private func load(force: Bool = false) async {
@@ -642,9 +633,8 @@ struct MoodGenrePlaylistsView: View {
 ///
 /// The two-step shape is upstream's and it is deliberate: the grid is worth
 /// painting before it is worth labelling with pictures, and the artwork comes
-/// from the same cached response that backs each category's page, so a listener
-/// who taps a category whose cover has already appeared does not pay for it
-/// twice.
+/// from each category's page. Simultaneous requests share the network work;
+/// completed page data is not retained.
 @MainActor @Observable
 final class MoodGenreLoader {
     enum Phase { case loading, loaded([MoodGenreSection]), failed(String) }
@@ -870,9 +860,6 @@ struct LibraryLandingView: View {
                 // 2. On Device Shelf
                 onDeviceShelf
 
-                if !CacheStatus.shared.saved.isDisjoint(with: ["library", "librarySongs", "history"]) {
-                    SavedContentNotice(message: CacheStatus.shared.failures.values.first)
-                }
                 // 3. Signed-out prompt or Signed-in shelves
                 if !auth.signedIn {
                     signedInPrompt
@@ -899,9 +886,6 @@ struct LibraryLandingView: View {
         .task(id: auth.sessionEpoch) {
             downloadStore.refresh()
             await loadShelves()
-        }
-        .onReceive(NotificationCenter.default.publisher(for: .pageCacheUpdated)) { note in
-            if note.object as? String == "library" { Task { await loadShelves() } }
         }
     }
 
@@ -1845,12 +1829,7 @@ struct SavedShelfView: View {
             }
         }
         #endif
-        .savedPageNotice("library")
         .task(id: auth.sessionEpoch) { await load() }
-        .onReceive(NotificationCenter.default.publisher(for: .pageCacheUpdated)) { note in
-            guard let name = note.object as? String, ["library", "librarySongs", "history"].contains(name) else { return }
-            Task { await load() }
-        }
     }
 
     private func load(force: Bool = false) async {
@@ -1936,12 +1915,7 @@ struct SavedPlaylistsView: View {
             }
         }
         #endif
-        .savedPageNotice("library")
         .task(id: auth.sessionEpoch) { await load() }
-        .onReceive(NotificationCenter.default.publisher(for: .pageCacheUpdated)) { note in
-            guard let name = note.object as? String, ["library", "librarySongs", "history"].contains(name) else { return }
-            Task { await load() }
-        }
     }
 
     private func load(force: Bool = false) async {
@@ -2207,12 +2181,7 @@ struct UnifiedSongsView: View {
                 local.scanPicked(url)
             }
         }
-        .savedPageNotice("librarySongs")
         .task(id: auth.sessionEpoch) { await loadSongs() }
-        .onReceive(NotificationCenter.default.publisher(for: .pageCacheUpdated)) { note in
-            guard let name = note.object as? String, ["library", "librarySongs", "history"].contains(name) else { return }
-            Task { await loadSongs() }
-        }
     }
 
     private func loadSongs(force: Bool = false) async {
@@ -2360,12 +2329,7 @@ struct UnifiedAlbumsView: View {
                 local.scanPicked(url)
             }
         }
-        .savedPageNotice("library")
         .task(id: auth.sessionEpoch) { await load() }
-        .onReceive(NotificationCenter.default.publisher(for: .pageCacheUpdated)) { note in
-            guard let name = note.object as? String, ["library", "librarySongs", "history"].contains(name) else { return }
-            Task { await load() }
-        }
     }
 
     private func collectionSection(title: String, items: [ShelfCard]) -> some View {
@@ -2593,12 +2557,7 @@ struct UnifiedArtistsView: View {
                 local.scanPicked(url)
             }
         }
-        .savedPageNotice("library")
         .task(id: auth.sessionEpoch) { await load() }
-        .onReceive(NotificationCenter.default.publisher(for: .pageCacheUpdated)) { note in
-            guard let name = note.object as? String, ["library", "librarySongs", "history"].contains(name) else { return }
-            Task { await load() }
-        }
     }
 
     private func scanPrompt(kind: String) -> some View {
@@ -2800,13 +2759,7 @@ struct HistoryView: View {
             }
         }
         #endif
-        .savedPageNotice("history")
-        .savedPageNotice("library")
         .task(id: auth.sessionEpoch) { await load() }
-        .onReceive(NotificationCenter.default.publisher(for: .pageCacheUpdated)) { note in
-            guard let name = note.object as? String, ["library", "librarySongs", "history"].contains(name) else { return }
-            Task { await load() }
-        }
     }
 
     private func load(force: Bool = false) async {
@@ -2920,12 +2873,7 @@ private struct YoutubeLibraryView: View {
             }
         }
         #endif
-        .savedPageNotice("library")
         .task(id: auth.sessionEpoch) { await load() }
-        .onReceive(NotificationCenter.default.publisher(for: .pageCacheUpdated)) { note in
-            guard let name = note.object as? String, ["library", "librarySongs", "history"].contains(name) else { return }
-            Task { await load() }
-        }
     }
 
     private func pinnedShelves(_ shelves: [FeedShelf]) -> [FeedShelf] {
@@ -3177,12 +3125,7 @@ private struct LocalPlaylistsView: View {
             }
         }
         #endif
-        .savedPageNotice("library")
         .task(id: auth.sessionEpoch) { await load() }
-        .onReceive(NotificationCenter.default.publisher(for: .pageCacheUpdated)) { note in
-            guard let name = note.object as? String, ["library", "librarySongs", "history"].contains(name) else { return }
-            Task { await load() }
-        }
         .onAppear { local.restoreViewPreferences() }
         .refreshable { await load(force: true) }
         .overlay {

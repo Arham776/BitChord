@@ -1,0 +1,12 @@
+{
+  "checks": {
+    "back_dolby": true,
+    "first_dolby_playing": true,
+    "next_dolby": true,
+    "pause_stable": true,
+    "resume_progress": true
+  },
+  "codec": "EAC3-JOC",
+  "error": "",
+  "passed": true
+}

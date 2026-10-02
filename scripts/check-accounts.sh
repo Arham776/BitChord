@@ -27,6 +27,7 @@ xcrun swiftc -O -o "$bin" \
   -F "$fw" -framework BitChordShared \
   -Xlinker -rpath -Xlinker "$fw/BitChordShared.framework/Versions/A" \
   -framework Security \
+  "$repo/AppleApp/Sources/App/AppIdentity.swift" \
   "$repo/AppleApp/Sources/App/Keychain.swift" \
   "$here/accounts-verify/main.swift" || exit 2
 

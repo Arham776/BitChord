@@ -1,0 +1,154 @@
+{
+  "checks": {
+    "at_least_one_live_track_played": true,
+    "back_1_playing": true,
+    "back_1_selected": true,
+    "back_2_playing": true,
+    "back_2_selected": true,
+    "back_3_playing": true,
+    "back_3_selected": true,
+    "first_track_still_playable": true,
+    "initial_track_playing": true,
+    "next_1_playing": true,
+    "next_1_selected": true,
+    "next_2_playing": true,
+    "next_2_selected": true,
+    "next_3_playing": true,
+    "next_3_selected": true,
+    "next_4_playing": true,
+    "next_4_selected": true,
+    "next_5_playing": true,
+    "next_5_selected": true,
+    "next_6_playing": true,
+    "next_6_selected": true,
+    "next_7_playing": true,
+    "next_7_selected": true,
+    "next_8_playing": true,
+    "next_8_selected": true,
+    "next_9_playing": true,
+    "next_9_selected": true
+  },
+  "passed": true,
+  "quality": {
+    "effective": "LOSSLESS",
+    "metered": false,
+    "mobilePolicy": "LOSSLESS",
+    "mobileSaved": "LOSSLESS",
+    "wifiPolicy": "LOSSLESS",
+    "wifiSaved": "LOSSLESS"
+  },
+  "samples": [
+    {
+      "error": "",
+      "id": "8UhQfqMkObk",
+      "index": 0,
+      "label": "initial",
+      "position": 0.23,
+      "state": "playing"
+    },
+    {
+      "error": "",
+      "id": "r6fihQByHx0",
+      "index": 1,
+      "label": "next 1",
+      "position": 1.43,
+      "state": "playing"
+    },
+    {
+      "error": "",
+      "id": "gOnyq8DjpFY",
+      "index": 2,
+      "label": "next 2",
+      "position": 3.74,
+      "state": "playing"
+    },
+    {
+      "error": "",
+      "id": "qKyF5R-IE64",
+      "index": 3,
+      "label": "next 3",
+      "position": 3.11,
+      "state": "playing"
+    },
+    {
+      "error": "",
+      "id": "pNxTO1czMkc",
+      "index": 4,
+      "label": "next 4",
+      "position": 4.84,
+      "state": "playing"
+    },
+    {
+      "error": "",
+      "id": "QX1KRphxnQc",
+      "index": 5,
+      "label": "next 5",
+      "position": 3.9,
+      "state": "playing"
+    },
+    {
+      "error": "",
+      "id": "Xxq1XfsQOIE",
+      "index": 6,
+      "label": "next 6",
+      "position": 3.97,
+      "state": "playing"
+    },
+    {
+      "error": "",
+      "id": "35tNuvmBVMc",
+      "index": 7,
+      "label": "next 7",
+      "position": 3.81,
+      "state": "playing"
+    },
+    {
+      "error": "",
+      "id": "N7IxlspnaQw",
+      "index": 8,
+      "label": "next 8",
+      "position": 3.96,
+      "state": "playing"
+    },
+    {
+      "error": "",
+      "id": "9NM0hPDWIyg",
+      "index": 9,
+      "label": "next 9",
+      "position": 3.86,
+      "state": "playing"
+    },
+    {
+      "error": "",
+      "id": "N7IxlspnaQw",
+      "index": 8,
+      "label": "back 1",
+      "position": 3.85,
+      "state": "playing"
+    },
+    {
+      "error": "",
+      "id": "35tNuvmBVMc",
+      "index": 7,
+      "label": "back 2",
+      "position": 3.84,
+      "state": "playing"
+    },
+    {
+      "error": "",
+      "id": "Xxq1XfsQOIE",
+      "index": 6,
+      "label": "back 3",
+      "position": 3.87,
+      "state": "playing"
+    },
+    {
+      "error": "",
+      "id": "8UhQfqMkObk",
+      "index": 0,
+      "label": "return to first",
+      "position": 0.07,
+      "state": "playing"
+    }
+  ]
+}

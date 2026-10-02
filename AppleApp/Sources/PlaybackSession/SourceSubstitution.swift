@@ -211,7 +211,7 @@ enum SourceSubstitution {
         }
     }
 
-    private static func decode(_ json: String) -> Stream? {
+    static func decode(_ json: String) -> Stream? {
         guard let data = json.data(using: .utf8),
               let document = try? JSONDecoder().decode(StreamDocument.self, from: data)
         else { return nil }
@@ -266,6 +266,15 @@ private struct StreamDocument: Decodable {
         var isLossless: Bool?
         var isDolbyAtmos: Bool
         var summary: String
+        private enum CodingKeys: String, CodingKey { case codec, kbps, isLossless, isDolbyAtmos, summary }
+        init(from decoder: Decoder) throws {
+            let values = try decoder.container(keyedBy: CodingKeys.self)
+            codec = try values.decodeIfPresent(String.self, forKey: .codec)
+            kbps = try values.decodeIfPresent(Int.self, forKey: .kbps)
+            isLossless = try values.decodeIfPresent(Bool.self, forKey: .isLossless)
+            isDolbyAtmos = try values.decodeIfPresent(Bool.self, forKey: .isDolbyAtmos) ?? false
+            summary = try values.decodeIfPresent(String.self, forKey: .summary) ?? ""
+        }
     }
     var url: String
     var format: Format
@@ -273,4 +282,15 @@ private struct StreamDocument: Decodable {
     var belowRequest: Bool
     var durationSec: Int?
     var sourceConfigId: String?
+    private enum CodingKeys: String, CodingKey { case url, format, headers, belowRequest, durationSec, sourceConfigId }
+    init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        url = try values.decode(String.self, forKey: .url)
+        format = try values.decode(Format.self, forKey: .format)
+        // Kotlin omits its default false flags and empty header map.
+        headers = try values.decodeIfPresent([String: String].self, forKey: .headers) ?? [:]
+        belowRequest = try values.decodeIfPresent(Bool.self, forKey: .belowRequest) ?? false
+        durationSec = try values.decodeIfPresent(Int.self, forKey: .durationSec)
+        sourceConfigId = try values.decodeIfPresent(String.self, forKey: .sourceConfigId)
+    }
 }

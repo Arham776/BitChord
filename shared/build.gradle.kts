@@ -5,9 +5,9 @@ import java.util.Properties
 import org.jetbrains.kotlin.gradle.plugin.mpp.apple.XCFramework
 
 plugins {
-    kotlin("multiplatform") version "2.4.10"
-    kotlin("plugin.serialization") version "2.4.10"
-    id("com.rickclephas.kmp.nativecoroutines") version "1.0.5"
+    kotlin("multiplatform")
+    kotlin("plugin.serialization")
+    id("com.rickclephas.kmp.nativecoroutines")
 }
 
 kotlin {
@@ -29,9 +29,12 @@ kotlin {
 
     sourceSets {
         commonMain.dependencies {
-            implementation("io.ktor:ktor-client-core:3.2.0")
-            implementation("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.10.2")
-            implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.9.0")
+            implementation(project(":innertubex"))
+            implementation("io.ktor:ktor-client-core:3.5.2")
+            implementation("io.ktor:ktor-client-content-negotiation:3.5.2")
+            implementation("io.ktor:ktor-serialization-kotlinx-json:3.5.2")
+            implementation("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.11.0")
+            implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.11.0")
             implementation("com.rickclephas.kmp:kmp-nativecoroutines-core:1.0.5")
             // sqldelight: add only if upstream Room usage is confirmed (spec §1.1).
         }
@@ -42,13 +45,13 @@ kotlin {
             // test function outright, and a `@Test` that blocks the test thread
             // instead is how a suspended read deadlocks in CI rather than in a
             // screenshot.
-            implementation("org.jetbrains.kotlinx:kotlinx-coroutines-test:1.10.2")
+            implementation("org.jetbrains.kotlinx:kotlinx-coroutines-test:1.11.0")
         }
 
         // The Darwin Ktor engine only resolves for Apple targets, so it lives in
         // appleMain — the common ancestor of every configured Apple target.
         appleMain.dependencies {
-            implementation("io.ktor:ktor-client-darwin:3.2.0")
+            implementation("io.ktor:ktor-client-darwin:3.5.2")
             // The party socket is NSURLSessionWebSocketTask, not Ktor: Ktor 3.2's
             // client websockets plugin is an empty shell on Darwin, and the platform
             // API is both shorter and gives the close code and ping/pong this

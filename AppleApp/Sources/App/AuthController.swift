@@ -14,7 +14,7 @@ final class AuthController {
     var loginPresented = false
     /// Home/Explore observe this and reload after sign-in / sign-out.
     var sessionEpoch = 0 {
-        didSet { PageSession.reset(); CacheStatus.shared.reset(); LikeStore.shared.clear() }
+        didSet { PageSession.reset(); LikeStore.shared.clear() }
     }
 
     init() {
@@ -216,7 +216,7 @@ final class AuthController {
             sessionUnavailableReason = "The account could not be removed from Keychain. Try again after unlocking this device."
             return
         }
-        Task { await PageRepository.shared.invalidate() }
+        Task { await PageRequestCoordinator.shared.invalidate() }
         if let remaining = AccountStore.shared.activeAccount() {
             AccountStore.shared.restore()
             _ = AuthStore.save(remaining.cookie)

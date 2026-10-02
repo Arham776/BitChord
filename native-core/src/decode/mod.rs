@@ -19,6 +19,23 @@ mod apple_aac;
 mod opus;
 pub mod resampler;
 
+// ISO-MP4 can omit bits_per_sample for ALAC even though its validated codec
+// cookie supplies the source precision. Mirror the optional atom wrappers
+// accepted by Symphonia's ALAC decoder instead of reporting an unknown depth.
+fn alac_bit_depth(mut cookie: &[u8]) -> Option<u32> {
+    for atom in [b"frma", b"alac"] {
+        if cookie.get(4..8) == Some(atom.as_slice()) {
+            cookie = cookie.get(12..)?;
+        }
+    }
+    if !matches!(cookie.len(), 24 | 48) { return None; }
+    match cookie.get(5).copied()? {
+        depth @ (16 | 20 | 24 | 32) => Some(u32::from(depth)),
+        _ => None,
+    }
+}
+
+
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
@@ -455,7 +472,13 @@ impl SymphoniaDecoder {
         // precision. Lossy codecs decode to float, which is not their encoded
         // source depth and must not be presented as one.
         let bit_depth = if matches!(codec.as_str(), "FLAC" | "ALAC" | "PCM" | "PCM Float") {
-            audio.bits_per_sample.unwrap_or(0)
+            audio.bits_per_sample.filter(|depth| *depth > 0)
+                .or_else(|| decoder.codec_params().bits_per_sample.filter(|depth| *depth > 0))
+                .or_else(|| {
+                    (audio.codec == symphonia::core::codecs::audio::well_known::CODEC_ID_ALAC)
+                        .then(|| audio.extra_data.as_deref().and_then(alac_bit_depth)).flatten()
+                })
+                .unwrap_or(0)
         } else {
             0
         };
@@ -1337,6 +1360,21 @@ impl Drop for HttpMediaSource {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn alac_source_depth_handles_raw_and_wrapped_cookies() {
+        let mut raw = vec![0u8; 24]; raw[5] = 24;
+        assert_eq!(super::alac_bit_depth(&raw), Some(24));
+        let mut wrapped = vec![0u8; 12]; wrapped[4..8].copy_from_slice(b"alac");
+        wrapped.extend_from_slice(&raw);
+        assert_eq!(super::alac_bit_depth(&wrapped), Some(24));
+        let mut both = vec![0u8; 12]; both[4..8].copy_from_slice(b"frma");
+        both.extend_from_slice(&wrapped);
+        assert_eq!(super::alac_bit_depth(&both), Some(24));
+        for length in 0..24 { assert_eq!(super::alac_bit_depth(&raw[..length]), None); }
+        raw[5] = 0;
+        assert_eq!(super::alac_bit_depth(&raw), None);
+    }
+
     use super::*;
 
     #[test]

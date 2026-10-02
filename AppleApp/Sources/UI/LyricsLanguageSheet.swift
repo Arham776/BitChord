@@ -53,6 +53,7 @@ struct LyricsLanguageSheet: View {
                         Section(section.key) {
                             ForEach(section.values) { language in
                                 Button {
+                                    if mode == .translate { UserDefaults.standard.set(language.code, forKey: "translation_language") }
                                     translator.run(
                                         mode: mode,
                                         target: language,
@@ -115,6 +116,7 @@ struct LyricsTranslateControl: View {
     var onShowTranslated: ([LyricLineDto]) -> Void
 
     @State private var mode: LyricsTranslator.Mode?
+    @AppStorage("translation_language") private var preferredLanguage = ""
 
     var body: some View {
         HStack(spacing: 8) {
@@ -133,6 +135,7 @@ struct LyricsTranslateControl: View {
                 ProgressView().controlSize(.small)
             }
         }
+        .onAppear { translator.loadLanguages() }
         .sheet(item: $mode) { chosen in
             LyricsLanguageSheet(
                 translator: translator,
@@ -145,12 +148,25 @@ struct LyricsTranslateControl: View {
         }
     }
 
+    private var preferredTarget: LyricsTranslator.Language? {
+        let appLanguage = UserDefaults.standard.string(forKey: "app_language") ?? ""
+        let code = preferredLanguage.isEmpty ? (appLanguage.isEmpty ? Locale.current.identifier : appLanguage) : preferredLanguage
+        let languages = translator.languages(for: .translate)
+        return languages.first { $0.code.caseInsensitiveCompare(code) == .orderedSame }
+            ?? languages.first { $0.code.split(separator: "-").first == code.split(whereSeparator: { $0 == "-" || $0 == "_" }).first }
+    }
+
     private func menu(for mode: LyricsTranslator.Mode, symbol: String) -> some View {
         Menu {
-            Button {
-                self.mode = mode
-            } label: {
-                Label(mode.title, systemImage: symbol)
+            if mode == .translate, let target = preferredTarget {
+                Button("Translate to \(target.name)") {
+                    translator.run(mode: .translate, target: target, trackId: trackId, lines: lines) { result in
+                        if let result { onShowTranslated(result) }
+                    }
+                }
+                Button("Choose Language…") { self.mode = mode }
+            } else {
+                Button { self.mode = mode } label: { Label(mode.title, systemImage: symbol) }
             }
         } label: {
             Image(systemName: symbol)

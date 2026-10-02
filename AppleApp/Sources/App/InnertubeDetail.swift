@@ -95,7 +95,7 @@ final class InnertubeDetail: Sendable {
 
     @MainActor
     func browse(browseId: String, force: Bool = false) async throws -> DetailPageModel {
-        try await CachedPages.load("detail:browse:\(browseId)", force: force) { try await self.raw_browse(browseId: browseId) }
+        try await PageRequests.load("detail:browse:\(browseId)", force: force) { try await self.raw_browse(browseId: browseId) }
     }
 
     private func raw_browse(browseId: String) async throws -> DetailPageModel {
@@ -120,7 +120,7 @@ final class InnertubeDetail: Sendable {
 
     @MainActor
     func browseArtist(browseId: String, force: Bool = false) async throws -> DetailPageModel {
-        try await CachedPages.load("detail:browseArtist:\(browseId)", force: force) { try await self.raw_browseArtist(browseId: browseId) }
+        try await PageRequests.load("detail:browseArtist:\(browseId)", force: force) { try await self.raw_browseArtist(browseId: browseId) }
     }
 
     private func raw_browseArtist(browseId: String) async throws -> DetailPageModel {

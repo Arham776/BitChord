@@ -17,7 +17,7 @@ settings:
   base:
     # Change this to a reverse-DNS identifier you control before signing.
     # The shared App Group is derived from this value below.
-    BITCHORD_BUNDLE_ID: com.example.bitchord
+    BITCHORD_BUNDLE_ID: app.bitchord.BitChord
     BITCHORD_APP_GROUP_ID: "group.$(BITCHORD_BUNDLE_ID)"
     SWIFT_VERSION: "5"
     MARKETING_VERSION: "0.1.0"

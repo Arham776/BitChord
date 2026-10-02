@@ -8,7 +8,7 @@ import AppKit
 #endif
 
 /// Apple Settings-style grouped form. Structure and copy follow upstream;
-/// chrome is System Settings / iOS Settings: glyph wells, drill-downs, footers.
+/// chrome is System Settings / iOS Settings: monochrome glyphs, drill-downs, footers.
 struct SettingsView: View {
     var embedded: Bool = false
     @Environment(\.dismiss) private var dismiss
@@ -17,6 +17,7 @@ struct SettingsView: View {
     @Environment(AppModel.self) private var appModel
 
     @State private var crossfade = Int(PlatformSettings.shared.getInt(key: "crossfade_seconds", default: 0))
+    @AppStorage("dolby_atmos") private var dolbyAtmos = true
     @State private var spatial = PlatformSettings.shared.getBoolean(key: "spatial_audio", default: false)
     @State private var automix = PlatformSettings.shared.getBoolean(key: "smart_fade_enabled", default: false)
     @State private var automixSequence = PlatformSettings.shared.getBoolean(key: "automix_smart_sequence", default: true)
@@ -36,6 +37,8 @@ struct SettingsView: View {
     @State private var updateSheet: AppUpdateChecker.UpdateInfo?
     @State private var reduceAnimation = PlatformSettings.shared.getBoolean(key: "reduce_animation", default: false)
     @State private var fullBleed = PlatformSettings.shared.getBoolean(key: "full_bleed_artwork", default: true)
+    @AppStorage("lyrics_blur") private var lyricsBlur = true
+    @AppStorage("translation_language") private var translationLanguage = ""
     @State private var syncedLyrics = PlatformSettings.shared.getBoolean(key: "synced_lyrics", default: true)
     @State private var convertVideo = PlatformSettings.shared.getBoolean(key: "convert_video_to_audio", default: true)
     @State private var swipeNext = PlatformSettings.shared.getBoolean(key: "swipe_to_play_next", default: false)
@@ -117,6 +120,7 @@ struct SettingsView: View {
         .frame(minWidth: 560, idealWidth: 620, minHeight: 720)
         #endif
         .preferredColorScheme(appModel.preferredScheme)
+        .onChange(of: dolbyAtmos) { _, value in AppSettings.shared.setDolbyAtmos(value: value) }
         .onAppear {
             // The tuner holds a display link while high performance is on, so it
             // has to be (re)applied every time this screen appears — and a value
@@ -126,6 +130,8 @@ struct SettingsView: View {
             PerformanceTuner.shared.apply(highPerformance: highPerf, refreshRateHz: refreshRate)
             localFolderName = SettingsView.storedLocalFolderName()
         }
+        .onChange(of: lyricsBlur) { _, value in AppSettings.shared.setLyricsBlur(value: value) }
+        .onChange(of: translationLanguage) { _, value in AppSettings.shared.setTranslationLanguage(value: value) }
         .sheet(isPresented: $loginPresented) { loginSheet }
         .sheet(isPresented: $discordPresented) { DiscordLoginView() }
         // The offer again, from inside Settings, when Automix is switched on with
@@ -247,6 +253,23 @@ struct SettingsView: View {
             }
         }
 
+        fileprivate var glyph: SettingsGlyph.Kind {
+            switch self {
+            case .account: .person
+            case .audioQuality: .precision
+            case .downloads: .download
+            case .playback: .crossfade
+            case .appearance: .theme
+            case .performance: .performance
+            case .localMusic: .localMusic
+            case .storage: .storage
+            case .yourData: .export
+            case .miscellaneous: .lyricsSources
+            case .advanced: .equalizer
+            case .about: .nerd
+            }
+        }
+
         /// What is *in* the section, in the words a listener would use.
         ///
         /// The section titles are things like "Playback" and "Storage", which
@@ -302,7 +325,7 @@ struct SettingsView: View {
                         "pinned playlists", "delete", "erase"]
             case .miscellaneous:
                 return ["language", "lyrics", "sources", "video", "lyric video",
-                        "swipe", "suggestions", "volume bar", "lyrics source",
+                        "swipe", "suggestions", "volume bar", "lyrics source", "translation language", "blur unfocused lyrics",
                         "spotify canvas", "jiosaavn", "background", "stop when backgrounded",
                         "listen together", "party", "jam", "party code", "invite",
                         "party server", "in sync", "synchronise", "synchronize",
@@ -339,7 +362,8 @@ struct SettingsView: View {
         if !search.isEmpty {
             ForEach(visibleSections.prefix(4)) { section in
                 NavigationLink {
-                    sectionContents(section)
+                    Form { sectionContents(section) }
+                        .formStyle(.grouped)
                         .navigationTitle(section.title)
                 } label: {
                     Text(section.title)
@@ -368,34 +392,20 @@ struct SettingsView: View {
 
     private var settingsForm: some View {
         Form {
-            if shows(.account) { accountSection }
-            if shows(.audioQuality) { audioQualitySection }
-            if shows(.downloads) { downloadsSection }
-            if shows(.playback) { playbackSection }
-            if shows(.appearance) { appearanceSection }
-            if shows(.performance) { performanceSection }
-            if shows(.localMusic) { localMusicSection }
-            if shows(.storage) { storageSection }
-            if shows(.yourData) { yourDataSection }
-            if shows(.miscellaneous) { miscellaneousSection }
-            if shows(.advanced) { advancedSection }
-            if shows(.about) { aboutSection }
-            if search.isEmpty {
-                // Nothing.
-            } else if visibleSections.isEmpty {
-                // Not a `SettingsLine`: there is no setting here, so a row shaped
-                // like one — with a glyph for a thing that does not exist — is the
-                // wrong kind of empty.
-                Section {
-                    VStack(alignment: .leading, spacing: 4) {
-                        Text("No setting matches \u{201C}\(search)\u{201D}")
-                            .font(.body)
-                        Text("Try a shorter word, or the name of the section it is in.")
-                            .font(.subheadline)
-                            .foregroundStyle(.secondary)
+            ForEach(visibleSections) { section in
+                NavigationLink {
+                    Form { sectionContents(section) }
+                        .formStyle(.grouped)
+                        .navigationTitle(section.title)
+                } label: {
+                    HStack(spacing: 14) {
+                        SettingsGlyph(kind: section.glyph)
+                        Text(section.title).foregroundStyle(.primary)
                     }
-                    .padding(.vertical, 4)
                 }
+            }
+            if !search.isEmpty && visibleSections.isEmpty {
+                ContentUnavailableView.search(text: search)
             }
         }
         .formStyle(.grouped)
@@ -502,6 +512,8 @@ struct SettingsView: View {
                 selection: $cellQuality,
                 options: AudioQualityOption.stream
             )
+            Text("Lossless includes Hi-Res when an enabled source supplies it. Audio Pipeline shows the format actually decoded.")
+                .font(.footnote).foregroundStyle(.secondary)
             VStack(alignment: .leading, spacing: 10) {
                 SettingsLine(
                     glyph: .precision,
@@ -534,6 +546,10 @@ struct SettingsView: View {
             )
             #endif
             SettingsSubToggle(title: "Prefer USB DAC", isOn: $preferUsbDac)
+            SettingsToggleLine(glyph: .dolby, title: "Dolby Atmos",
+                subtitle: "Use Apple’s renderer when a source provides supported Dolby audio", isOn: $dolbyAtmos)
+                .disabled(!AppleDolbyRenderer.available)
+
 
         } header: {
             Text("Audio Quality")
@@ -839,6 +855,14 @@ struct SettingsView: View {
                 isOn: $syncedLyrics
             )
             if syncedLyrics {
+                SettingsToggleLine(glyph: .reduceBlur, title: "Blur Unfocused Lyrics",
+                                   subtitle: "Softens lines away from the words being sung", isOn: $lyricsBlur)
+                NavigationLink {
+                    TranslationPreferenceView(selection: $translationLanguage, translator: controller.lyricsTranslator)
+                } label: {
+                    SettingsLine(glyph: .lyricsSources, title: "Translation Language",
+                                 subtitle: translationLanguage.isEmpty ? "Follow the app language" : (Locale.current.localizedString(forIdentifier: translationLanguage) ?? translationLanguage)) { EmptyView() }
+                }
                 SettingsToggleLine(
                     glyph: .lyrics,
                     title: "Prefer Word-Synced Lyrics",
@@ -2000,7 +2024,7 @@ private struct SettingsSliderRow: View {
 private struct SettingsGlyph: View {
     enum Kind {
         case person, listenAs, sources, wifi, cellular, download
-        case crossfade, automix, skipSilence, spatial, equalizer, nerd, video, speed
+        case crossfade, automix, skipSilence, spatial, dolby, equalizer, nerd, video, speed
         case theme, reduceMotion, reduceBlur, fullBleed, canvas, lyrics, lyricsSources
         case storage, clearSongs, clearImages
         case swipe, dontRepeat, hideVolume
@@ -2015,15 +2039,68 @@ private struct SettingsGlyph: View {
     var kind: Kind
 
     var body: some View {
-        RoundedRectangle(cornerRadius: 7, style: .continuous)
-            .fill(fill)
-            .frame(width: 29, height: 29)
-            .overlay {
-                Image(systemName: symbol)
-                    .font(.system(size: 14, weight: .semibold))
-                    .foregroundStyle(.white)
-            }
-            .accessibilityHidden(true)
+        Group {
+            if let asset { Image(asset).resizable().scaledToFit() }
+            else { Image(systemName: symbol).font(.system(size: 21)) }
+        }
+        .foregroundStyle(.primary)
+        .frame(width: 29, height: 29)
+        .accessibilityHidden(true)
+    }
+
+    private var asset: String? {
+        switch kind {
+        case .dolby: "bch-dolby"
+        case .performance: "bch-performance"
+        case .refreshRate: "bch-frame-rate"
+        case .download: "bch-download"
+        case .lyrics: "bch-lyrics"
+        case .localMusic: "bch-library"
+        case .musicOnly: "bch-music-note"
+        case .dontRepeat: "bch-clock"
+        default: "bch-settings-\(symbolName)"
+        }
+    }
+    private var symbolName: String {
+        switch kind {
+        case .person: "person"
+        case .listenAs, .listenTogether: "groups"
+        case .sources: "extension"
+        case .wifi: "wifi"
+        case .cellular: "signal_cellular_alt"
+        case .crossfade: "waves"
+        case .automix, .models: "auto_awesome"
+        case .skipSilence, .hideVolume: "volume_off"
+        case .dolby: "surround_sound"
+        case .spatial: "surround_sound"
+        case .equalizer, .align: "tune"
+        case .nerd, .replay: "bar_chart"
+        case .video: "smart_display"
+        case .theme: "brightness_4"
+        case .reduceMotion: "motion_photos_off"
+        case .reduceBlur: "blur_off"
+        case .fullBleed: "fullscreen"
+        case .canvas: "animation"
+        case .lyricsSources: "language"
+        case .storage: "storage"
+        case .clearSongs, .clearImages: "delete_sweep"
+        case .swipe: "playlist_play"
+        case .genres: "local_offer"
+        case .export: "file_upload"
+        case .importData, .update: "file_download"
+        case .loudness, .precision: "graphic_eq"
+        case .sharedFolder, .folder: "folder"
+        case .filter: "filter_alt"
+        case .songStatus: "visibility_off"
+        case .mesh: "gradient"
+        case .speed, .performance: "speed"
+        case .refreshRate: "monitor"
+        case .cpu: "memory"
+        case .discord: "chat"
+        case .listenBrainz: "cloud"
+        case .lastFm: "history"
+        default: "settings"
+        }
     }
 
     private var symbol: String {
@@ -2038,6 +2115,7 @@ private struct SettingsGlyph: View {
         case .speed: "gauge.with.dots.needle.67percent"
         case .automix: "sparkles"
         case .skipSilence: "speaker.slash.fill"
+        case .dolby: "hifispeaker.2.fill"
         case .spatial: "hifispeaker.2.fill"
         case .equalizer: "slider.vertical.3"
         case .nerd: "chart.bar.fill"
@@ -2087,62 +2165,7 @@ private struct SettingsGlyph: View {
         }
     }
 
-    private var fill: Color {
-        switch kind {
-        case .person: .blue
-        // Indigo rather than the account row's blue: the two are adjacent in the
-        // same section and the same colour would read as the same destination.
-        case .listenAs: .indigo
-        case .sources: .orange
-        case .wifi: .blue
-        case .cellular: .green
-        case .download: Color(red: 0.20, green: 0.48, blue: 0.96)
-        case .crossfade: .purple
-        case .speed: .blue
-        case .automix: Color(red: 0.93, green: 0.27, blue: 0.48)
-        case .skipSilence: .gray
-        case .spatial: .teal
-        case .equalizer: .orange
-        case .nerd: .indigo
-        case .video: .purple
-        case .theme: .gray
-        case .reduceMotion: .orange
-        case .reduceBlur: .gray
-        case .fullBleed: .blue
-        case .canvas: Color(red: 0.93, green: 0.27, blue: 0.48)
-        case .lyrics: .blue
-        case .lyricsSources: .teal
-        case .storage: .gray
-        case .clearSongs, .clearImages: Color(red: 0.94, green: 0.27, blue: 0.27)
-        case .swipe: .blue
-        case .dontRepeat: .orange
-        case .hideVolume: .gray
-        case .discord: Color(red: 0.35, green: 0.40, blue: 0.87)
-        case .listenBrainz: Color(red: 0.20, green: 0.60, blue: 0.86)
-        case .lastFm: Color(red: 0.83, green: 0.18, blue: 0.18)
-        case .replay: .indigo
-        case .genres: .orange
-        case .export, .importData: .gray
-        case .listenTogether: .teal
-        case .update: .indigo
-        case .precision: .purple
-        case .loudness: .teal
-        case .sharedFolder: Color(red: 0.20, green: 0.48, blue: 0.96)
-        case .cpu: .orange
-        // The Automix row's own red, one shade down: the same feature, a different
-        // part of it.
-        case .models: Color(red: 0.72, green: 0.25, blue: 0.52)
-        case .musicOnly: .purple
-        case .performance: .red
-        case .refreshRate: .blue
-        case .folder: .blue
-        case .localMusic: .pink
-        case .filter: .gray
-        case .songStatus: .gray
-        case .align: .teal
-        case .mesh: .indigo
-        }
-    }
+
 }
 
 private struct AudioQualityOption: Identifiable {
@@ -2154,7 +2177,7 @@ private struct AudioQualityOption: Identifiable {
         .init(id: "LOW", title: "Low", detail: "64 kbps · uses the least data"),
         .init(id: "MEDIUM", title: "Medium", detail: "Best available · ~171 kbps Opus"),
         .init(id: "HIGH", title: "High", detail: "JioSaavn up to 320 kbps · YouTube fallback"),
-        .init(id: "LOSSLESS", title: "Lossless", detail: "Requests lossless audio from sources that support it"),
+        .init(id: "LOSSLESS", title: "Lossless", detail: "Lossless and Hi-Res from sources that supply them"),
     ]
 
     static let download: [AudioQualityOption] = [
@@ -2673,5 +2696,28 @@ private enum BitChordBackup {
             return
         }
         AppSettings.shared.importPrefsJson(raw: raw)
+    }
+}
+
+
+private struct TranslationPreferenceView: View {
+    @Binding var selection: String
+    let translator: LyricsTranslator
+    @State private var search = ""
+    var body: some View {
+        List {
+            Button { selection = "" } label: {
+                HStack { Text("Follow the App Language"); Spacer(); if selection.isEmpty { Image(systemName: "checkmark") } }
+            }
+            ForEach(translator.languages(for: .translate).filter { search.isEmpty || $0.name.localizedCaseInsensitiveContains(search) }) { language in
+                Button { selection = language.code } label: {
+                    HStack { Text(language.name); Spacer(); if selection == language.code { Image(systemName: "checkmark") } }
+                }
+            }
+        }
+        .foregroundStyle(.primary)
+        .navigationTitle("Translation Language")
+        .searchable(text: $search)
+        .onAppear { translator.loadLanguages() }
     }
 }

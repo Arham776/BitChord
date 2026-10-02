@@ -85,3 +85,11 @@ The bundled FFT implementation's notices remain in its source files.
 and true-peak measurement for completed local audio. It is distributed under
 the MIT license; its complete notice is bundled in
 `AppleApp/Resources/AudioLicenses/ebur128-MIT.txt`.
+
+### Settings icons
+
+Settings uses Material Icons Rounded from Google's `material-design-icons`
+repository (Apache License 2.0), with the license bundled in
+`AppleApp/Resources/AudioLicenses/material-icons.txt`. BitChord's custom
+performance/frame-rate icons and the upstream Dolby mark are adapted from
+`vendor/bitchord-upstream`. The Dolby mark remains Dolby's trademark.

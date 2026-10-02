@@ -811,7 +811,8 @@ object SourceResolver {
         stream: SourceStream,
         title: String,
     ): Boolean {
-        if (!stream.format.isKnownUnsupportedByNativeDecoder) return false
+        if (!stream.format.isKnownUnsupportedByNativeDecoder ||
+            PlaybackCodecCapabilities.canRenderDolby(stream.format.codec, stream.headers)) return false
         DebugLog.d(
             "${source.displayName} offered ${stream.format.summary} for '$title', " +
                 "which the native decoder cannot play; trying another source",

@@ -36,13 +36,26 @@ struct BitChordApp: App {
                     #if os(iOS)
                     if ProcessInfo.processInfo.arguments.contains("--verify-restored-resume") {
                         CipherUnlockWiring.install()
+                        ApplePoTokenWiring.install()
+                    PlaybackCodecCapabilities.shared.setAppleDolbyAvailable(value: AppleDolbyRenderer.available)
                         let mixing = ProcessInfo.processInfo.arguments.contains("--mixing-on")
                         await controller.verifyRestoredResumeBehavior(mixing: mixing)
                         return
                     }
                     if ProcessInfo.processInfo.arguments.contains("--verify-navigation") {
                         CipherUnlockWiring.install()
+                        ApplePoTokenWiring.install()
+                    PlaybackCodecCapabilities.shared.setAppleDolbyAvailable(value: AppleDolbyRenderer.available)
                         await controller.verifyRapidNavigation()
+                        return
+                    }
+                    if ProcessInfo.processInfo.arguments.contains("--verify-dolby") {
+                        PlaybackCodecCapabilities.shared.setAppleDolbyAvailable(value: AppleDolbyRenderer.available)
+                        await controller.verifyDolbyQueue()
+                        return
+                    }
+                    if ProcessInfo.processInfo.arguments.contains("--verify-natural-end") {
+                        await controller.verifyNaturalEndFallback()
                         return
                     }
                     if ProcessInfo.processInfo.arguments.contains("--verify-native-resume") {
@@ -56,6 +69,8 @@ struct BitChordApp: App {
                     }
                     #endif
                     CipherUnlockWiring.install()
+                    ApplePoTokenWiring.install()
+                    PlaybackCodecCapabilities.shared.setAppleDolbyAvailable(value: AppleDolbyRenderer.available)
                     SecretStoreWiring.install()
                     ModuleEngineWiring.install()
                     PartySocket.register()
@@ -81,6 +96,7 @@ struct BitChordApp: App {
                     // the models are optional.
                     Task {
                         await LaunchReadiness.shared.waitForContent()
+                        Task { await PageRequestCoordinator.shared.removeLegacyCache() }
                         AutomixModelStore.shared.refresh()
                         AutomixModelStore.shared.onChanged = {
                             Task { await reloadAutomixModels() }

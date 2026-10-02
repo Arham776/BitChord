@@ -218,8 +218,7 @@ private final class DoneCB: LibraryActionsBridgeDoneCallback {
                 handler(false, "Account changed; reload before trying again"); return
             }
             if ok {
-                await PageRepository.shared.invalidate(partition: context.partition)
-                CacheStatus.shared.reset()
+                await PageRequestCoordinator.shared.invalidate(partition: context.partition)
             }
             guard context.generation == PageSession.generation() else {
                 handler(false, "Account changed; reload before trying again"); return
@@ -243,8 +242,7 @@ private final class JsonCB: LibraryActionsBridgeJsonCallback {
                 handler(nil, "Account changed; reload before trying again"); return
             }
             if invalidateOnSuccess, json != nil {
-                await PageRepository.shared.invalidate(partition: context.partition)
-                CacheStatus.shared.reset()
+                await PageRequestCoordinator.shared.invalidate(partition: context.partition)
             }
             guard context.generation == PageSession.generation() else {
                 handler(nil, "Account changed; reload before trying again"); return

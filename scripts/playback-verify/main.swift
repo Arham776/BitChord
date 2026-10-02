@@ -35,11 +35,26 @@ let ids = ProcessInfo.processInfo.environment["VIDEO_IDS"]?
 
 CipherUnlockWiring.install(player: YouTubePlayerJs(solverDirectory: URL(fileURLWithPath: CommandLine.arguments[1])))
 
+ApplePoTokenProvider.solverURL = URL(fileURLWithPath: CommandLine.arguments[1]).appendingPathComponent("po_token.html")
+ApplePoTokenWiring.install()
+
+if ProcessInfo.processInfo.environment["VERIFY_PO_TOKEN"] == "1" {
+    do {
+        guard let visitor = try await Innertube.shared.ensureVisitorData(refresh: false) else { throw PlaybackError.noValue("Missing visitor identity") }
+        let minted = await withCheckedContinuation { continuation in
+            ApplePoTokenProvider.shared.generate(videoId: ids[0], visitorData: visitor, callback: TokenVerification { player, streaming in
+                continuation.resume(returning: !(player ?? "").isEmpty && !(streaming ?? "").isEmpty)
+            })
+        }
+        print(minted ? "PASS upstream web playback verification minted both tokens" : "FAIL upstream web playback verification unavailable")
+    } catch { print("FAIL web playback verification bootstrap") }
+}
+
 var failures: [String] = []
 var served: [(String, String, Int, String)] = []
 var unavailable: [String] = []
 
-for id in ids {
+for (idIndex, id) in ids.enumerated() {
     let began = Date()
     do {
         let json = try await withCheckedThrowingContinuation { c in
@@ -53,12 +68,19 @@ for id in ids {
         }
         guard let data = json.data(using: .utf8),
               let payload = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let urlString = payload["url"] as? String, let url = URL(string: urlString),
-              let headers = payload["headers"] as? [String: String]
+              let urlString = payload["url"] as? String, let url = URL(string: urlString)
         else {
             failures.append("\(id): resolved but the payload had no URL in it")
             continue
         }
+        if ProcessInfo.processInfo.environment["VERIFY_DURATION"] == "1" {
+            guard let seconds = payload["durationSeconds"] as? Int, seconds > 0 else {
+                failures.append("\(id): playback payload lost the track duration")
+                continue
+            }
+            print("Duration \(id): \(seconds)s")
+        }
+        let headers = payload["headers"] as? [String: String] ?? [:]
         let kbps = (payload["kbps"] as? Int) ?? 0
         let mime = (payload["mimeType"] as? String) ?? "?"
 
@@ -79,6 +101,10 @@ for id in ids {
                 continue
             }
             served.append((id, mime, kbps, got))
+            if idIndex == 0 && ProcessInfo.processInfo.environment["REJECT_FIRST_PROFILE"] == "1" {
+                PlayerBridge.shared.onPlaybackRefused(url: urlString, responseCode: 403)
+                print("Injected a served-URL refusal to exercise fresh upstream recovery")
+            }
         } catch {
             failures.append("\(id): resolved, but the range read failed — \(error.localizedDescription)")
             print("FAIL \(id)  \(kbps)kbps  \(mime)  range read failed: \(error.localizedDescription)")
@@ -92,7 +118,7 @@ for id in ids {
         // when playback does not work.
         let trackRefusal = raw.lowercased().contains("unavailable")
             || raw.lowercased().contains("not available")
-        if trackRefusal {
+        if trackRefusal && ProcessInfo.processInfo.environment["STRICT_PLAYBACK"] != "1" && !(ProcessInfo.processInfo.environment["REJECT_FIRST_PROFILE"] == "1" && idIndex > 0 && id == ids[0]) {
             print("skip  \(id)  not available to this network or account")
             unavailable.append(id)
         } else {
@@ -153,4 +179,10 @@ private final class PlaybackResolve: PlayerBridgeResolveCallback {
     private let handler: (String?, String?) -> Void
     init(_ handler: @escaping (String?, String?) -> Void) { self.handler = handler }
     func onResult(json: String?, message: String?) { handler(json, message) }
+}
+
+final class TokenVerification: NSObject, PlaybackTokenBridgeTokenCallback {
+    let reply: (String?, String?) -> Void
+    init(_ reply: @escaping (String?, String?) -> Void) { self.reply = reply }
+    func onResult(playerToken: String?, streamingToken: String?) { reply(playerToken, streamingToken) }
 }

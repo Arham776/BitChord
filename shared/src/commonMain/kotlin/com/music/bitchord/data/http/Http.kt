@@ -36,6 +36,8 @@ package com.music.bitchord.data.http
  * (Spotify's `sp_dc`). It is never used for the account session.
  */
 expect object Http {
+    /** Shared transport for maintained extraction and its media requests. */
+    internal val client: io.ktor.client.HttpClient
     /** POST JSON, return the response body as text. */
     @Throws(Exception::class)
     suspend fun postJson(

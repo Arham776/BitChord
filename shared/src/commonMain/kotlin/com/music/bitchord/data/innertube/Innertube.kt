@@ -659,12 +659,14 @@ object Innertube {
             },
         )
 
-    suspend fun pingAtr(baseUrl: String, cpn: String, generation: Long = sessionGeneration): Int =
-        Http.getStatus(
+    suspend fun pingAtr(baseUrl: String, cpn: String, generation: Long = sessionGeneration): Int {
+        val headers = statsHeaders(baseUrl, generation)
+        return Http.getStatus(
             url = baseUrl,
-            headers = statsHeaders(baseUrl, generation),
+            headers = headers,
             query = mapOf("cpn" to cpn),
-        )
+        ).also { checkSession(generation) }
+    }
 
     private suspend fun pingStats(
         baseUrl: String,
@@ -674,9 +676,10 @@ object Innertube {
     ): Int {
         checkSession(generation)
         val session = requestSession()
+        val headers = statsHeaders(baseUrl, generation, session)
         return Http.getStatus(
         url = baseUrl,
-        headers = statsHeaders(baseUrl, generation, session),
+        headers = headers,
         query = mapOf(
             "ver" to "2",
             "c" to "WEB_REMIX",

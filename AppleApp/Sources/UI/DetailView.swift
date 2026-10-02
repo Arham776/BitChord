@@ -105,10 +105,6 @@ struct DetailView: View {
             pinned = PlaylistPinning.pinnedIds().contains(browseId)
             await load()
         }
-        .onReceive(NotificationCenter.default.publisher(for: .pageCacheUpdated)) { note in
-            guard let name = note.object as? String, name == "detail:browse:\(browseId)" || name == "detail:browseArtist:\(browseId)" else { return }
-            Task { await load() }
-        }
     }
 
     private func loadedPage(_ page: DetailPageModel) -> some View {
@@ -132,10 +128,6 @@ struct DetailView: View {
                     }
 
                     VStack(alignment: .leading, spacing: 0) {
-                        if CacheStatus.shared.saved.contains("detail:browse:\(browseId)") || CacheStatus.shared.saved.contains("detail:browseArtist:\(browseId)") {
-                            SavedContentNotice(message: CacheStatus.shared.failures["detail:browse:\(browseId)"])
-                                .padding(.vertical, 8)
-                        }
                         if !page.songs.isEmpty {
                             if searching {
                                 searchField(tint: tint)

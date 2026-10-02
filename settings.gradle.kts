@@ -16,3 +16,6 @@ dependencyResolutionManagement {
 rootProject.name = "bitchord-apple"
 
 include(":shared")
+
+include(":innertubex")
+project(":innertubex").projectDir = file("vendor/innertubex")

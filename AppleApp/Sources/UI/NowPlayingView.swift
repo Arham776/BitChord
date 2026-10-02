@@ -2594,6 +2594,7 @@ struct LyricsPane: View {
 }
 
 private struct WordSyncedLine: View {
+    @AppStorage("lyrics_blur") private var lyricsBlur = true
     let line: LyricLineDto
     let hasSyncedTimings: Bool
     let active: Bool
@@ -2635,7 +2636,7 @@ private struct WordSyncedLine: View {
             }
         }
         .opacity(hasSyncedTimings ? (active ? 1 : max(0.18, 0.58 - Double(distance) * 0.12)) : 0.9)
-        .blur(radius: hasSyncedTimings && !active ? min(CGFloat(distance) * 1.15, 4) : 0)
+        .blur(radius: lyricsBlur && hasSyncedTimings && !active ? min(CGFloat(distance) * 1.15, 4) : 0)
         .animation(.easeInOut(duration: 0.2), value: active)
         .animation(.easeInOut(duration: 0.2), value: distance)
         .animation(.easeInOut(duration: 0.12), value: Int(position * 10))

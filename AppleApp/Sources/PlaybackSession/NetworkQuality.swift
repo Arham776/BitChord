@@ -1,20 +1,23 @@
 import Foundation
 import Network
+import Observation
 import BitChordShared
 
 /// Wi-Fi vs cellular (metered) for per-network quality ceilings.
 @MainActor
+@Observable
 final class NetworkQuality {
     static let shared = NetworkQuality()
     private(set) var metered = false
     private(set) var connected = true
-    private let monitor = NWPathMonitor()
+    @ObservationIgnored private let monitor = NWPathMonitor()
 
     init() {
         monitor.pathUpdateHandler = { [weak self] path in
             let expensive = path.isExpensive || path.isConstrained
             Task { @MainActor in
                 self?.metered = expensive; self?.connected = path.status == .satisfied
+                AppSettings.shared.setMeteredConnection(value: KotlinBoolean(bool: expensive))
                 DownloadStore.shared.networkPolicyChanged()
             }
         }
@@ -22,11 +25,7 @@ final class NetworkQuality {
     }
 
     var maxKbps: Swift.Int32 {
-        let key = metered ? "audio_quality_cellular" : "audio_quality_wifi"
-        switch PlatformSettings.shared.getString(key: key, default: "LOSSLESS") {
-        case "LOW": return 64
-        default: return Swift.Int32.max
-        }
+        AppSettings.shared.effectiveAudioQuality(metered: metered).maxKbps
     }
 
     var canvasAllowed: Bool {

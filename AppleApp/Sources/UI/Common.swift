@@ -217,7 +217,7 @@ final class ArtworkCache: @unchecked Sendable {
     /// the caller falls back to its async load, which populates both tiers.
     private func cacheKey(_ url: String) -> String {
         let headers = WebDavBridge.shared.playbackHeaders(fileUrl: url)
-        return PageRepository.digest(url + headers.sorted { $0.key < $1.key }.map { "\($0.key):\($0.value)" }.joined(separator: "\u{0}"))
+        return PageRequestCoordinator.digest(url + headers.sorted { $0.key < $1.key }.map { "\($0.key):\($0.value)" }.joined(separator: "\u{0}"))
     }
     func get(_ url: String) -> PlatformImage? {
         memory.object(forKey: cacheKey(url) as NSString)
@@ -578,13 +578,14 @@ struct ThinSlider: View {
                         .frame(width: max(0, to - from))
                         .offset(x: from)
                 }
-                if fraction > 0 && !(mixing && !dragging) {
+                if fraction > 0 {
                     Capsule()
                         .fill(Color.white.opacity(0.92))
+                        .overlay {
+                            if mixing && !dragging { MixSheenBar().opacity(0.35) }
+                        }
+                        .clipShape(Capsule())
                         .frame(width: max(height, geo.size.width * fraction))
-                }
-                if mixing && !dragging {
-                    MixSheenBar()
                 }
             }
             .frame(height: height)
@@ -779,7 +780,7 @@ actor ArtworkRequests {
     static let shared = ArtworkRequests()
     private var flights: [String: Task<Data?, Never>] = [:]
     func data(url: String, headers: [String: String]) async -> Data? {
-        let key = PageRepository.digest(url + headers.sorted { $0.key < $1.key }.map { "\($0.key):\($0.value)" }.joined())
+        let key = PageRequestCoordinator.digest(url + headers.sorted { $0.key < $1.key }.map { "\($0.key):\($0.value)" }.joined())
         if let task = flights[key] { return await task.value }
         let task = Task<Data?, Never> {
             guard let endpoint = URL(string: url) else { return nil }

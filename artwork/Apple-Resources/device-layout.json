@@ -1,0 +1,52 @@
+[
+  {
+    "name": "iPad",
+    "bezel": "hoverify-ipad.png",
+    "size": [
+      2624,
+      1872
+    ],
+    "screen": [
+      102,
+      102,
+      2420,
+      1668
+    ],
+    "radius": 60,
+    "placement": [
+      755,
+      560,
+      780
+    ],
+    "screenshot": "/Users/baguma/Downloads/Screenshot 2026-10-01 at 16.57.19.png",
+    "imageSize": [
+      2778,
+      1940
+    ]
+  },
+  {
+    "name": "iPhone",
+    "bezel": "hoverify-iphone.png",
+    "size": [
+      1440,
+      2988
+    ],
+    "screen": [
+      60,
+      60,
+      1320,
+      2868
+    ],
+    "radius": 186,
+    "placement": [
+      1490,
+      335,
+      370
+    ],
+    "screenshot": "/Users/baguma/Downloads/Screenshot 2026-10-01 at 16.53.02.png",
+    "imageSize": [
+      1290,
+      2796
+    ]
+  }
+]

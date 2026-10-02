@@ -15,7 +15,6 @@ final class FeedLoader {
     static let explore = FeedLoader(.explore)
     private(set) var phase: Phase = .loading
     private(set) var loadingMore = false
-    private(set) var usingSavedContent = false
     private(set) var refreshError: String?
     private var continuation: String?
     private var loadedEpoch: Int?
@@ -23,7 +22,7 @@ final class FeedLoader {
     private var loadTask: Task<Void, Never>?
     private var requestID = UUID()
     private let source: Source
-    private var cacheName: String { source == .home ? "home" : "explore" }
+    private var pageName: String { source == .home ? "home" : "explore" }
 
     init(_ source: Source) { self.source = source }
     func load() async { await load(force: true, epoch: loadedEpoch) }
@@ -33,7 +32,7 @@ final class FeedLoader {
         if let loadTask, context == current { await loadTask.value; return }
         if context != current {
             loadTask?.cancel(); loadTask = nil
-            phase = .loading; continuation = nil; usingSavedContent = false
+            phase = .loading; continuation = nil
         }
         context = current
         let id = UUID(); requestID = id
@@ -45,14 +44,6 @@ final class FeedLoader {
 
     private func fetch(force: Bool, epoch: Int?, context: PageContext, id: UUID) async {
         refreshError = nil
-        let cacheRevision = await PageRepository.shared.cacheRevision()
-        let saved = await PageRepository.shared.saved(cacheName, context: context)
-        guard requestID == id, PageSession.generation() == context.generation, !Task.isCancelled else { return }
-        if !force, loadedEpoch == epoch, let saved, saved.fresh, case .loaded = phase { return }
-        if let saved, let result = try? JSONDecoder().decode(FeedResult.self, from: saved.data) {
-            phase = .loaded(result.shelves); usingSavedContent = true
-            Task { await LaunchReadiness.shared.contentAppeared() }
-        }
         continuation = nil
         do {
             let started = ContinuousClock.now
@@ -62,22 +53,19 @@ final class FeedLoader {
                 if !result.shelves.isEmpty {
                     phase = .loaded(result.shelves)
                     Task { await LaunchReadiness.shared.contentAppeared() }
-                    usingSavedContent = false
                     if first {
-                        PlaybackDebugLog.shared.record("\(cacheName) first content: \(started.duration(to: .now))")
+                        PlaybackDebugLog.shared.record("\(pageName) first content: \(started.duration(to: .now))")
                         first = false
                     }
                 }
                 continuation = result.continuation
                 loadedEpoch = epoch
-                if let data = try? JSONEncoder().encode(result) {
-                    await PageRepository.shared.store(data, name: cacheName, context: context, expectedRevision: cacheRevision, currentGeneration: { PageSession.generation() })
-                }
+
             }
         } catch {
             guard requestID == id, PageSession.generation() == context.generation, !Task.isCancelled else { return }
             continuation = nil
-            if case .loaded = phase { refreshError = error.localizedDescription; usingSavedContent = true }
+            if case .loaded = phase { refreshError = error.localizedDescription }
             else { phase = .failed(error.localizedDescription) }
         }
     }
@@ -101,16 +89,6 @@ final class FeedLoader {
             guard requestID == id, PageSession.generation() == context.generation, !Task.isCancelled else { return }
             refreshError = error.localizedDescription
         }
-    }
-}
-
-struct SavedContentNotice: View {
-    var message: String? = nil
-    var body: some View {
-        Label(message == nil ? "Showing saved content · Refreshing" : "Showing saved content · Couldn't refresh",
-              systemImage: "clock.arrow.circlepath")
-            .font(.caption).foregroundStyle(.secondary)
-            .accessibilityHint(message ?? "Content will update when the refresh finishes")
     }
 }
 
@@ -363,19 +341,4 @@ struct HeroShelf: View {
             }
         }
     }
-}
-
-private struct SavedPageNoticeModifier: ViewModifier {
-    let name: String
-    func body(content: Content) -> some View {
-        content.overlay(alignment: .bottom) {
-            if CacheStatus.shared.saved.contains(name) {
-                SavedContentNotice(message: CacheStatus.shared.failures[name])
-                    .padding(10).background(.regularMaterial, in: Capsule()).padding(12)
-            }
-        }
-    }
-}
-extension View {
-    func savedPageNotice(_ name: String) -> some View { modifier(SavedPageNoticeModifier(name: name)) }
 }

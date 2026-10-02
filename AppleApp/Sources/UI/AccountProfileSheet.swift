@@ -12,6 +12,9 @@ struct AccountProfileSheet: View {
     @Environment(AuthController.self) private var auth
     @Environment(PlaybackController.self) private var controller
     @Environment(AppModel.self) private var appModel
+    #if os(macOS)
+    @Environment(\.openSettings) private var openSettings
+    #endif
     @Environment(\.dismiss) private var dismiss
 
     @State private var showingSignOutConfirm = false
@@ -67,11 +70,13 @@ struct AccountProfileSheet: View {
 
                 // MARK: - Settings Drill-Down
                 Section {
-                    NavigationLink {
-                        SettingsView(embedded: true)
-                            .environment(controller)
-                            .environment(appModel)
-                            .environment(auth)
+                    Button {
+                        dismiss()
+                        #if os(macOS)
+                        openSettings()
+                        #else
+                        appModel.settingsPresented = true
+                        #endif
                     } label: {
                         HStack(spacing: 14) {
                             ZStack {
@@ -296,6 +301,9 @@ struct TopBarAccountButton: View {
     @Environment(AuthController.self) private var auth
     @Environment(PlaybackController.self) private var controller
     @Environment(AppModel.self) private var appModel
+    #if os(macOS)
+    @Environment(\.openSettings) private var openSettings
+    #endif
     @State private var showingProfiles = false
 
     var body: some View {
@@ -353,7 +361,11 @@ struct TopBarAccountButton: View {
                 }
 
                 Button {
-                    showingProfiles = true
+                    #if os(macOS)
+                    openSettings()
+                    #else
+                    appModel.settingsPresented = true
+                    #endif
                 } label: {
                     Label("Settings", systemImage: "gearshape")
                 }
@@ -440,6 +452,9 @@ struct AccountAvatarButton: View {
     @Environment(AuthController.self) private var auth
     @Environment(PlaybackController.self) private var controller
     @Environment(AppModel.self) private var appModel
+    #if os(macOS)
+    @Environment(\.openSettings) private var openSettings
+    #endif
     @State private var showingSheet = false
 
     private var profile: AccountProfile? { auth.listeningAs?.activeProfile }

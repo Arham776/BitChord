@@ -141,7 +141,7 @@ final class InnertubeFeed: Sendable {
     /// The mood and genre categories behind Explore.
     @MainActor
     func moodAndGenres(force: Bool = false) async throws -> [MoodGenreSection] {
-        try await CachedPages.load("moodAndGenres", force: force) { try await self.raw_moodAndGenres() }
+        try await PageRequests.load("moodAndGenres", force: force) { try await self.raw_moodAndGenres() }
     }
 
     private func raw_moodAndGenres() async throws -> [MoodGenreSection] {
@@ -167,7 +167,7 @@ final class InnertubeFeed: Sendable {
     /// One category's playlist shelves.
     @MainActor
     func moodGenreShelves(browseId: String, params: String?, force: Bool = false) async throws -> [FeedShelf] {
-        try await CachedPages.load("mood:\(browseId):\(params ?? "")", force: force) {
+        try await PageRequests.load("mood:\(browseId):\(params ?? "")", force: force) {
             try await self.fetch {
                 HomeBridge.shared.moodGenreShelves(browseId: browseId, params: params, callback: $0)
             }.shelves
@@ -184,7 +184,7 @@ final class InnertubeFeed: Sendable {
 
     @MainActor
     func history(force: Bool = false) async throws -> [YouTubeSong] {
-        try await CachedPages.load("history", force: force) { try await self.raw_history() }
+        try await PageRequests.load("history", force: force) { try await self.raw_history() }
     }
 
     private func raw_history() async throws -> [YouTubeSong] {
@@ -206,7 +206,7 @@ final class InnertubeFeed: Sendable {
 
     @MainActor
     func library(force: Bool = false) async throws -> [FeedShelf] {
-        try await CachedPages.load("library", force: force) { try await self.raw_library() }
+        try await PageRequests.load("library", force: force) { try await self.raw_library() }
     }
 
     private func raw_library() async throws -> [FeedShelf] {
@@ -231,7 +231,7 @@ final class InnertubeFeed: Sendable {
     /// contract as `history()`.
     @MainActor
     func librarySongs(force: Bool = false) async throws -> [YouTubeSong] {
-        try await CachedPages.load("librarySongs", force: force) { try await self.raw_librarySongs() }
+        try await PageRequests.load("librarySongs", force: force) { try await self.raw_librarySongs() }
     }
 
     private func raw_librarySongs() async throws -> [YouTubeSong] {
