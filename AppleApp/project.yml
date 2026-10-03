@@ -16,7 +16,7 @@ options:
 settings:
   base:
     SWIFT_VERSION: "5"
-    MARKETING_VERSION: "0.1.0"
+    MARKETING_VERSION: "0.1.1"
     CURRENT_PROJECT_VERSION: "1"
     # Typed asset symbols (Image(.bchHome)) — Xcode 15+ asset codegen.
     ASSETCATALOG_COMPILER_GENERATE_SWIFT_ASSET_SYMBOL_EXTENSIONS: "YES"
@@ -28,6 +28,10 @@ settings:
     # BitChordShared / NativeCoreFFI slices.
     EXCLUDED_ARCHS[sdk=iphonesimulator*]: x86_64
     EXCLUDED_ARCHS[sdk=macosx*]: x86_64
+packages:
+  Sparkle:
+    url: https://github.com/sparkle-project/Sparkle
+    from: 2.10.0
 targets:
   BitChord:
     type: application
@@ -35,6 +39,9 @@ targets:
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: app.bitchord.BitChord
+        # The Mac executable lives in Contents/MacOS while embedded frameworks
+        # live in Contents/Frameworks; the iOS default runpath omits this parent.
+        LD_RUNPATH_SEARCH_PATHS[sdk=macosx*]: "$(inherited) @executable_path/../Frameworks"
         # Resolve Music Understanding on OS 27+; leave Automix on Rust MIR below that.
         OTHER_LDFLAGS: "$(inherited) -weak_framework MusicUnderstanding"
     sources:
@@ -70,6 +77,9 @@ targets:
       - sdk: MusicUnderstanding.framework
         weak: true
       - sdk: Speech.framework
+      - package: Sparkle
+        product: Sparkle
+        destinationFilters: [macOS]
     info:
       path: BitChord-Info.plist
       properties:
@@ -77,6 +87,12 @@ targets:
         CFBundleShortVersionString: "$(MARKETING_VERSION)"
         CFBundleVersion: "$(CURRENT_PROJECT_VERSION)"
         LSApplicationCategoryType: public.app-category.music
+        SUFeedURL: https://raw.githubusercontent.com/bagumamartin/BitChord/main/appcast.xml
+        SUPublicEDKey: ZoHTuKtTzesqdu6L5WyVZRkdP3v9gHJExOoM9nBEvjU=
+        SUEnableAutomaticChecks: true
+        SUAutomaticallyUpdate: false
+        SUVerifyUpdateBeforeExtraction: true
+        SURequireSignedFeed: true
         CFBundleURLTypes:
           - CFBundleURLName: app.bitchord.BitChord
             CFBundleURLSchemes: [bitchord]

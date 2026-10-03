@@ -14,6 +14,7 @@ struct RootView: View {
     @Environment(AppModel.self) private var appModel
     @Environment(AuthController.self) private var auth
     @Environment(ToastCenter.self) private var toast
+    @State private var updateChecker = UpdateChecker.shared
     #if os(macOS)
     @Environment(\.openSettings) private var openSettings
     #endif
@@ -121,6 +122,23 @@ struct RootView: View {
         )) {
             RenamePlaylistAlert()
         }
+        #if os(iOS)
+        .alert("A BitChord update is available", isPresented: Binding(
+            get: { updateChecker.available != nil },
+            set: { if !$0 { updateChecker.dismiss() } }
+        )) {
+            Button("View Release Notes") {
+                if let release = updateChecker.available,
+                   let url = URL(string: release.releaseUrl) {
+                    UIApplication.shared.open(url)
+                }
+                updateChecker.dismiss()
+            }
+            Button("Later", role: .cancel) { updateChecker.dismiss() }
+        } message: {
+            Text("BitChord \(updateChecker.available?.version ?? "") is available. Update using the same method you used to install BitChord. The release page has the change notes.")
+        }
+        #endif
         .onChange(of: tabBinding.wrappedValue) { old, new in
             if new == .search { appModel.focusSearch = true }
             _ = old

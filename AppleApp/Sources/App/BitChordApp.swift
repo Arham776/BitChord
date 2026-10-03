@@ -78,6 +78,15 @@ struct BitChordApp: App {
                     SecretStoreWiring.install()
                     ModuleEngineWiring.install()
                     PartySocket.register()
+                    // Update checks are launch-level behavior rather than an About
+                    // screen side effect. On iPhone and iPad this raises the update
+                    // alert wherever the listener starts; on Mac the About row and
+                    // the update sheet remain available.
+                    #if os(iOS)
+                    Task { await UpdateChecker.shared.pollOnce() }
+                    #else
+                    _ = MacUpdateManager.shared
+                    #endif
                     // Before anything can reach the coordinator: it needs the platform
                     // clock and somewhere to publish, and a coordinator that has
                     // neither measures against a clock of zero and believes the answer.

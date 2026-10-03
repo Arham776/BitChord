@@ -2,6 +2,25 @@ import SwiftUI
 import Observation
 import BitChordShared
 
+/// The GitHub release fields this UI needs. Kept native so iOS and macOS builds
+/// always check this repository directly, without depending on a stale generated
+/// Kotlin framework binary for its repository URL.
+struct AppReleaseUpdate: Identifiable {
+    let version: String
+    let releaseUrl: String
+    let notes: String?
+
+    var id: String { version }
+}
+
+private struct GitHubReleasePayload: Decodable {
+    let tag_name: String
+    let html_url: String
+    let body: String?
+    let draft: Bool
+    let prerelease: Bool
+}
+
 /// Whether this build is behind the one on the project's GitHub releases.
 ///
 /// Upstream's `AppUpdateChecker`, with the two Android halves left off: it downloads
@@ -24,7 +43,7 @@ final class UpdateChecker {
     static let shared = UpdateChecker()
 
     /// The release, when there is one this build is behind.
-    private(set) var available: AppUpdateChecker.UpdateInfo?
+    private(set) var available: AppReleaseUpdate?
 
     /// A check in flight. Every control that reaches the network is disabled on it,
     /// because a button that appears to work and does nothing is worse than one that
@@ -79,7 +98,7 @@ final class UpdateChecker {
 
     /// The person pressed the button, so they are told either way.
     @discardableResult
-    func check() async -> AppUpdateChecker.UpdateInfo? {
+    func check() async -> AppReleaseUpdate? {
         checking = true
         problem = nil
         defer { checking = false }
@@ -107,27 +126,31 @@ final class UpdateChecker {
         available = nil
     }
 
-    private func fetchLatest() async -> AppUpdateChecker.UpdateInfo? {
+    private func fetchLatest() async -> AppReleaseUpdate? {
         do {
-            return try await withCheckedThrowingContinuation { continuation in
-                AppUpdateChecker.shared.latest { release, error in
-                    if let error { continuation.resume(throwing: error) }
-                    else { continuation.resume(returning: release) }
-                }
-            }
+            var request = URLRequest(
+                url: URL(string: "https://api.github.com/repos/bagumamartin/BitChord/releases/latest")!
+            )
+            request.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
+            request.setValue("BitChord macOS and iOS updater", forHTTPHeaderField: "User-Agent")
+            let (data, response) = try await URLSession.shared.data(for: request)
+            guard let response = response as? HTTPURLResponse,
+                  (200..<300).contains(response.statusCode) else { return nil }
+            let release = try JSONDecoder().decode(GitHubReleasePayload.self, from: data)
+            guard !release.draft, !release.prerelease else { return nil }
+            let version = release.tag_name
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+                .replacingOccurrences(of: "^[vV]", with: "", options: .regularExpression)
+            guard !version.isEmpty, URL(string: release.html_url) != nil else { return nil }
+            return AppReleaseUpdate(
+                version: version,
+                releaseUrl: release.html_url,
+                notes: release.body?.trimmingCharacters(in: .whitespacesAndNewlines)
+            )
         } catch {
             return nil
         }
     }
-}
-
-/// An `AppUpdateChecker.UpdateInfo` as something `sheet(item:)` can hold.
-///
-/// Retroactive, and by version rather than by object identity, because the sheet is
-/// handed the value the store already holds and `sheet(item:)` compares items by id
-/// on every render.
-extension AppUpdateChecker.UpdateInfo: @retroactive Identifiable {
-    public var id: String { version }
 }
 
 /// The release, as a sheet: its version, its notes, and the way to get it.
@@ -139,7 +162,7 @@ extension AppUpdateChecker.UpdateInfo: @retroactive Identifiable {
 ///
 /// `Identifiable` by the version, as above.
 struct UpdateSheet: View {
-    let release: AppUpdateChecker.UpdateInfo
+    let release: AppReleaseUpdate
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {

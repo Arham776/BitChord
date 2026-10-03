@@ -120,11 +120,11 @@ class AppUpdateCheckerTest {
     fun `a release object is read for its tag its page and its notes`() {
         val info = release(
             tag = "v2.1.0",
-            url = "https://github.com/kushagrasinghx/BitChord/releases/tag/v2.1.0",
+            url = "https://github.com/bagumamartin/BitChord/releases/tag/v2.1.0",
             body = "## What's new\n- WebDAV\n",
         )
         assertEquals("2.1.0", info?.version)
-        assertEquals("https://github.com/kushagrasinghx/BitChord/releases/tag/v2.1.0", info?.releaseUrl)
+        assertEquals("https://github.com/bagumamartin/BitChord/releases/tag/v2.1.0", info?.releaseUrl)
         assertEquals("## What's new\n- WebDAV", info?.notes)
     }
 

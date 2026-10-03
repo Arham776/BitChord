@@ -34,7 +34,7 @@ struct SettingsView: View {
     @State private var reduceBlur = PlatformSettings.shared.getBoolean(key: "reduce_dynamic_blur", default: false)
     @State private var update = UpdateChecker.shared
     /// The release being shown, and nil when nothing is.
-    @State private var updateSheet: AppUpdateChecker.UpdateInfo?
+    @State private var updateSheet: AppReleaseUpdate?
     @State private var reduceAnimation = PlatformSettings.shared.getBoolean(key: "reduce_animation", default: false)
     @State private var fullBleed = PlatformSettings.shared.getBoolean(key: "full_bleed_artwork", default: true)
     @AppStorage("lyrics_blur") private var lyricsBlur = true
@@ -1196,9 +1196,13 @@ struct SettingsView: View {
             LabeledContent("Engine", value: "native-core v\(coreVersion())")
             LabeledContent("Logic Core", value: GreetingKt.sharedGreeting())
             LabeledContent("Version", value: update.currentVersion)
+            #if os(macOS)
+            MacUpdateSettings()
+            #else
             updateRow
-            Link("GitHub", destination: URL(string: "https://github.com/kushagrasinghx/BitChord")!)
-            Link("Developer", destination: URL(string: "https://github.com/kushagrasinghx")!)
+            #endif
+            Link("GitHub", destination: URL(string: "https://github.com/bagumamartin/BitChord")!)
+            Link("Developer", destination: URL(string: "https://github.com/bagumamartin")!)
             Link("Discord", destination: URL(string: "https://discord.gg/pDdKfrdHY6")!)
         } header: {
             Text("About")
@@ -1211,7 +1215,6 @@ struct SettingsView: View {
             UpdateSheet(release: release)
                 .environment(update)
         }
-        .task { await update.pollOnce() }
     }
 
     /// The update row, which is three things depending on what is known.
