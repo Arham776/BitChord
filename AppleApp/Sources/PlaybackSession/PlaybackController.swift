@@ -804,6 +804,7 @@ final class PlaybackController {
             playingIndex = index
             current = queue[index]
             persistSession()
+            maybeAutoplay(force: true)
             syncEngineQueueNext()
             scheduleSequencing()
             return
@@ -1017,7 +1018,6 @@ final class PlaybackController {
     /// Upstream `playRadio`: seed plus related mix via `next` + QueueBuilder.
     func playRadio(_ entry: QueueEntry, context: String? = nil) {
         play([entry], at: 0, context: context)
-        maybeAutoplay(force: true)
     }
 
     /// SwiftUI `onMove` entry: destination is the pre-remove insertion index.
@@ -1150,14 +1150,14 @@ final class PlaybackController {
             return
         }
         if current == nil {
-            if !queue.isEmpty { loadCurrent(min(playingIndex, queue.count - 1)) }
+            if !queue.isEmpty { loadCurrent(min(playingIndex, queue.count - 1), refreshAutoplay: false) }
             return
         }
         if engineLoadedId != current?.id {
             // Only when it is still the track the position was saved for.
             let start = restoredStart.flatMap { $0.entryId == current?.id ? $0.position : nil }
             restoredStart = nil
-            loadCurrent(playingIndex, startAt: start)
+            loadCurrent(playingIndex, startAt: start, refreshAutoplay: false)
             return
         }
         if isPlaying {
@@ -1329,7 +1329,11 @@ final class PlaybackController {
     }
 
     func next() {
-        noteLocalIntent()
+        advanceToNext(userInitiated: true)
+    }
+
+    private func advanceToNext(userInitiated: Bool) {
+        if userInitiated { noteLocalIntent() }
         guard !queue.isEmpty else { return }
         let target: Int
         if playingIndex + 1 < queue.count {
@@ -1343,8 +1347,15 @@ final class PlaybackController {
         // (syncEngineQueueNext), so a skip promotes it instantly instead of
         // re-resolving it over the network. Falls through to a full load
         // when nothing is armed.
-        if trySkipToArmed(target) { return }
-        loadCurrent(target)
+        if trySkipToArmed(target) {
+            if userInitiated {
+                maybeAutoplay(force: true)
+            } else {
+                maybeAutoplay(lowWaterRefill: true)
+            }
+            return
+        }
+        loadCurrent(target, refreshAutoplay: userInitiated)
     }
 
     /// Promotes the engine's armed successor when it is the requested queue
@@ -1375,7 +1386,7 @@ final class PlaybackController {
         // The engine moved under a concurrent edit; converge on the target
         // with a full load rather than playing the wrong track.
         guard info.title == entry.title, info.artist == entry.artist else {
-            loadCurrent(target)
+            loadCurrent(target, refreshAutoplay: false)
             return true
         }
         // Promoting an armed successor is a new selection too. Invalidate
@@ -1386,7 +1397,7 @@ final class PlaybackController {
         // Ensure the promoted output is unmuted; this is idempotent for an
         // already playing session.
         do { try engine.play() } catch {
-            loadCurrent(target)
+            loadCurrent(target, refreshAutoplay: false)
             return true
         }
         let headers = sourceHeadersByPath.removeValue(forKey: info.source) ?? [:]
@@ -1431,9 +1442,7 @@ final class PlaybackController {
         autoplayRefresh.invalidate()
         persistSession()
         syncEngineQueueNext()
-        if next != .all {
-            maybeAutoplay()
-        }
+        maybeAutoplay(force: true)
     }
 
     func toggleShuffle() {
@@ -1894,7 +1903,7 @@ final class PlaybackController {
 
     // ---- Engine bridge ------------------------------------------------------
 
-    private func loadCurrent(_ index: Int, startAt: Double? = nil) {
+    private func loadCurrent(_ index: Int, startAt: Double? = nil, refreshAutoplay: Bool = true) {
         guard queue.indices.contains(index) else { return }
         startEngineIfNeeded()
         let engineStartupTask = self.engineStartupTask
@@ -1938,7 +1947,11 @@ final class PlaybackController {
         duration = 0
         lastError = nil
         state = .buffering
-        maybeAutoplay()
+        if refreshAutoplay {
+            maybeAutoplay(force: true)
+        } else {
+            maybeAutoplay(lowWaterRefill: true)
+        }
         nowPlaying.updateCommands(canNext: playingIndex + 1 < queue.count || repeatMode == .all, canPrevious: true, canSeek: false)
         dolbyRenderer?.stop()
         dolbyRenderer = nil
@@ -2757,7 +2770,6 @@ final class PlaybackController {
     /// must not arm the next song — the current track seeks to 0 at EOS.
     /// Repeat-one *with* Automix arms a self-mix into the same track.
     private func syncEngineQueueNext() {
-        maybeAutoplay()
         guard !sleepAfterTrack else { return }
         if dolbyRenderer != nil {
             nowPlaying.updateCommands(canNext: nextEntry != nil, canPrevious: current != nil, canSeek: duration > 0)
@@ -2786,7 +2798,6 @@ final class PlaybackController {
         warmUpcoming(around: playingIndex, generation: generation)
         if repeatMode == .one && !automixEnabled { return }
         guard let next = nextEntry else {
-            maybeAutoplay()
             return
         }
         let nextId = next.id
@@ -3095,6 +3106,7 @@ final class PlaybackController {
         persistSession()
         syncEngineQueueNext()
         scheduleSequencing()
+        maybeAutoplay(lowWaterRefill: true)
     }
 
     fileprivate func handleTrackEnded(_ reason: TrackEndReason, source: String) {
@@ -3136,12 +3148,12 @@ final class PlaybackController {
             restartCurrentAfterNaturalEnd()
         case .all:
             dolbyRenderer?.stop()
-        dolbyRenderer = nil
-        engineLoadedId = nil
-            next()
+            dolbyRenderer = nil
+            engineLoadedId = nil
+            advanceToNext(userInitiated: false)
         case .off:
             if playingIndex + 1 < queue.count {
-                loadCurrent(playingIndex + 1)
+                loadCurrent(playingIndex + 1, refreshAutoplay: false)
                 return
             }
             state = .stopped
@@ -3163,7 +3175,7 @@ final class PlaybackController {
         dolbyRenderer?.stop()
         dolbyRenderer = nil
         engineLoadedId = nil
-        loadCurrent(index)
+        loadCurrent(index, refreshAutoplay: false)
     }
 
     fileprivate func handleDuration(_ seconds: Double) {
@@ -3590,17 +3602,24 @@ final class PlaybackController {
         )
     }
 
-    private func maybeAutoplay(force: Bool = false) {
+    private func maybeAutoplay(force: Bool = false, lowWaterRefill: Bool = false) {
         guard let context = recommendationContext,
+              force || (lowWaterRefill && PlaybackQueuePolicy.shouldRefillAutoplay(
+                  upcomingCount: queue.count - playingIndex - 1
+              )),
               let request = autoplayRefresh.begin(context, force: force) else { return }
         let videoId = String(context.source.dropFirst(3))
         fetchRecommendations(videoId: videoId) { [weak self] json, _ in
             Task { @MainActor in
                 guard let self, let json, let currentContext = self.recommendationContext,
                       self.autoplayRefresh.accepts(request, current: currentContext) else { return }
-                // Keep the current/played prefix and every manual or list entry.
-                // Replace the old suggestions only after a successful fresh reply.
-                let kept = PlaybackQueuePolicy.withoutUpcomingAutoplay(self.queue, after: self.playingIndex)
+                // An explicit action replaces stale suggestions but keeps the
+                // played prefix and user/list entries. Natural low-water refills
+                // append behind everything already queued.
+                let kept = force
+                    ? PlaybackQueuePolicy.withoutUpcomingAutoplay(self.queue, after: self.playingIndex)
+                    : self.queue
+                guard kept.indices.contains(self.playingIndex) else { return }
                 // QueueBuilder reads the final existing entry as the station seed.
                 // Its filtering snapshot ends with the current song; actual queue
                 // positions and manual/list priority are unchanged.
@@ -4977,10 +4996,12 @@ extension PlaybackController {
             return String(data: try! JSONSerialization.data(withJSONObject: rows), encoding: .utf8)!
         }
         func settle() async { try? await Task.sleep(for: .milliseconds(100)) }
-        maybeAutoplay()
+        maybeAutoplay(lowWaterRefill: true)
         checks["initial_seed_requested"] = replies.count == 1 && replies[0].0 == "test-seed01"
         addToQueue(.youtube(videoId: "manual-song", title: "Manual", artist: "Manual artist"))
-        checks["queue_edit_refreshes"] = replies.count == 2
+        checks["queue_add_does_not_refresh_immediately"] = replies.count == 1
+        maybeAutoplay(force: true)
+        checks["queue_add_is_used_by_next_refresh"] = replies.count == 2
         replies[0].1(songs(["stale-song"]), nil)
         await settle()
         checks["stale_queue_reply_ignored"] = !queue.contains { $0.id == "stale-song" }
@@ -4989,22 +5010,46 @@ extension PlaybackController {
         checks["manual_before_deduplicated_tail"] = queue.map(\.id) == ["test-seed01", "manual-song", "suggestion1", "suggestion2"]
         addToQueue(.youtube(videoId: "suggestion1", title: "Picked manually", artist: "Artist"))
         checks["manual_pick_promotes_suggestion"] = queue.map(\.id) == ["test-seed01", "manual-song", "suggestion1", "suggestion2"] && !queue[2].fromAutoplay
+        let beforeRemoval = replies.count
+        if let removeIndex = queue.firstIndex(where: { $0.id == "suggestion2" }) {
+            removeFromQueue(at: removeIndex)
+        }
+        checks["queue_removal_does_not_refresh_immediately"] = replies.count == beforeRemoval && !queue.contains { $0.id == "suggestion2" }
         let beforeRating = replies.count
         refreshAfterRating(failure: "refused", sessionGeneration: PageSession.generation())
-        checks["failed_rating_keeps_tail"] = replies.count == beforeRating && queue.last?.id == "suggestion2"
+        checks["failed_rating_keeps_tail"] = replies.count == beforeRating && queue.last?.id == "suggestion1"
         refreshAfterRating(failure: nil, sessionGeneration: PageSession.generation())
         checks["successful_rating_refreshes"] = replies.count == beforeRating + 1
         replies.last!.1(songs(["fresh-tail1"]), nil)
         await settle()
         checks["rating_replaces_only_unplayed_tail"] = queue.map(\.id) == ["test-seed01", "manual-song", "suggestion1", "fresh-tail1"]
         let outgoing = replies.last!
+
+        let threeUpcoming = (0..<3).map {
+            QueueEntry.youtube(videoId: "queued-\($0)", title: "Queued \($0)", artist: "Artist")
+        }
+        queue = [queue[0]] + threeUpcoming
+        playingIndex = 0
+        current = queue[0]
+        let beforeNaturalHandoff = replies.count
+        maybeAutoplay(lowWaterRefill: true)
+        checks["natural_handoff_does_not_refresh_with_three_upcoming"] = replies.count == beforeNaturalHandoff
+
         playingIndex = 1; current = queue[1]; playGeneration &+= 1
-        maybeAutoplay()
+        maybeAutoplay(lowWaterRefill: true)
+        let refillReply = replies.last!
+        checks["low_water_refill_uses_current_seed"] = refillReply.0 == "queued-0" && replies.count == beforeNaturalHandoff + 1
+        refillReply.1(songs(["queued-1", "low-water-extra"]), nil)
+        await settle()
+        checks["low_water_refill_appends_and_deduplicates"] = queue.map(\.id) == ["test-seed01", "queued-0", "queued-1", "queued-2", "low-water-extra"]
+
+        playingIndex = 2; current = queue[2]; playGeneration &+= 1
+        maybeAutoplay(force: true)
         let nextReply = replies.last!
-        checks["next_uses_new_seed"] = nextReply.0 == "manual-song"
-        playingIndex = 0; current = queue[0]; playGeneration &+= 1
-        maybeAutoplay()
-        checks["back_requests_seed_again"] = replies.last!.0 == "test-seed01"
+        checks["manual_next_uses_new_seed"] = nextReply.0 == "queued-1"
+        playingIndex = 1; current = queue[1]; playGeneration &+= 1
+        maybeAutoplay(force: true)
+        checks["manual_previous_uses_selected_seed"] = replies.last!.0 == "queued-0"
         nextReply.1(songs(["stale-next1"]), nil); outgoing.1(songs(["stale-rate1"]), nil)
         await settle()
         checks["stale_selection_reply_ignored"] = !queue.contains { $0.id.hasPrefix("stale-") }

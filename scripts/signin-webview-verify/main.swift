@@ -123,52 +123,27 @@ import BitChordShared
 
         await load(selected, origin: URL(string: "https://music.youtube.com.evil.test/")!)
         check("a lookalike cannot enable confirmation despite its ytcfg", !flow.pageReady && !flow.showsCompletion)
-        let passwordHTML = #"""
+        let challengeHTML = #"""
         <html><body>
-        <button id="alternative" onclick="window.alternativeClicks=(window.alternativeClicks || 0)+1; setTimeout(() => { document.getElementById('passwordOption').hidden=false; this.hidden=true; }, 300);">Try another way</button>
-        <button id="passwordOption" hidden onclick="window.passwordClicks=(window.passwordClicks || 0)+1; window.passwordChosen=true; document.getElementById('passwordInput').hidden=false; this.hidden=true;">Enter your password</button>
-        <input id="passwordInput" type="password" value="synthetic-do-not-touch" hidden>
+        <button id="alternative" onclick="window.alternativeClicks=(window.alternativeClicks || 0)+1">Try another way</button>
+        <button id="passwordOption" onclick="window.passwordClicks=(window.passwordClicks || 0)+1">Enter your password</button>
+        <input id="passwordInput" type="password" value="synthetic-do-not-touch">
         </body></html>
         """#
-        func waitForFlag(_ view: WKWebView, _ flag: String) async -> Bool {
-            for _ in 0..<100 {
-                if (try? await view.evaluateJavaScript("window." + flag + " === true", in: nil, contentWorld: .page)) as? Bool == true { return true }
-                try? await Task.sleep(for: .milliseconds(50))
-            }
-            return false
+        func challengeActionsRemainUntouched(_ webView: WKWebView) async -> Bool {
+            try? await Task.sleep(for: .milliseconds(600))
+            return (try? await webView.evaluateJavaScript(
+                "(window.alternativeClicks || 0) === 0 && (window.passwordClicks || 0) === 0 && document.getElementById('passwordInput').value === 'synthetic-do-not-touch'",
+                in: nil, contentWorld: .page
+            )) as? Bool == true
         }
-        view.loadHTMLString(passwordHTML, baseURL: URL(string: "https://accounts.google.com/v3/signin/challenge/pk"))
-        let passwordChosen = await waitForFlag(view, "passwordChosen")
-        check("the passkey-first page opens Google's real password alternative", passwordChosen)
-        let clickedOnce = (try? await view.evaluateJavaScript("window.alternativeClicks === 1 && window.passwordClicks === 1", in: nil, contentWorld: .page)) as? Bool
-        check("overlapping page callbacks choose each method once", clickedOnce == true)
-        let untouched = (try? await view.evaluateJavaScript("document.getElementById('passwordInput').value === 'synthetic-do-not-touch'", in: nil, contentWorld: .page)) as? Bool
-        check("choosing a method never changes credential fields", untouched == true)
-        view.loadHTMLString("<html><body><button onclick='window.laterChallengeSkipped=true'>Try another way</button></body></html>", baseURL: URL(string: "https://accounts.google.com/v3/signin/challenge/pk"))
-        try? await Task.sleep(for: .milliseconds(500))
-        let skippedAgain = (try? await view.evaluateJavaScript("window.laterChallengeSkipped === true", in: nil, contentWorld: .page)) as? Bool
-        check("a later verification challenge is not automatically skipped", skippedAgain == false)
+        view.loadHTMLString(challengeHTML, baseURL: URL(string: "https://accounts.google.com/v3/signin/challenge/pk"))
+        check("Google's passkey challenge stays under the user's control", await challengeActionsRemainUntouched(view))
 
-        let spaFlow = LoginFlow()
-        let spaCoordinator = LoginWebCoordinator(flow: spaFlow, onCaptured: { _, _ in }, onUnavailable: { spaFlow.captureFailed($0) }, profileLoader: { _, _ in nil })
-        let spaView = spaCoordinator.makeWebView(loadInitialPage: false)
-        spaView.frame = view.frame
-        spaView.loadHTMLString(passwordHTML, baseURL: URL(string: "https://accounts.google.com/v3/signin/identifier"))
-        await waitUntil { !spaView.isLoading }
-        _ = try? await spaView.evaluateJavaScript("history.pushState({}, '', '/v3/signin/challenge/pk'); document.body.appendChild(document.createElement('span'));", in: nil, contentWorld: .page)
-        let spaChosen = await waitForFlag(spaView, "passwordChosen")
-        check("a passkey challenge inside the same document is handled", spaChosen)
-        spaCoordinator.stopObserving()
-
-        let unavailableFlow = LoginFlow()
-        let unavailableCoordinator = LoginWebCoordinator(flow: unavailableFlow, onCaptured: { _, _ in }, onUnavailable: { unavailableFlow.captureFailed($0) })
-        let unavailableView = unavailableCoordinator.makeWebView(loadInitialPage: false)
-        unavailableView.frame = view.frame
-        unavailableView.loadHTMLString("<html><body><button onclick='this.hidden=true; document.getElementById(\"device\").hidden=false'>Try another way</button><button id='device' hidden onclick='window.deviceChosen=true'>Use another device</button></body></html>", baseURL: URL(string: "https://accounts.google.com/v3/signin/challenge/pk"))
-        await waitUntil { unavailableFlow.passwordAdvice?.contains("if it is offered") == true }
-        let choseDevice = (try? await unavailableView.evaluateJavaScript("window.deviceChosen === true", in: nil, contentWorld: .page)) as? Bool
-        check("when Google offers no password, other methods remain the user's choice", choseDevice == false && unavailableFlow.passkeyHelp && !unavailableFlow.selectingPassword)
-        unavailableCoordinator.stopObserving()
+        view.loadHTMLString(challengeHTML, baseURL: URL(string: "https://accounts.google.com/v3/signin/identifier"))
+        await waitUntil { !view.isLoading }
+        _ = try? await view.evaluateJavaScript("history.pushState({}, '', '/v3/signin/challenge/pk'); document.body.appendChild(document.createElement('span'));", in: nil, contentWorld: .page)
+        check("same-page challenge changes do not click Google's choices", await challengeActionsRemainUntouched(view))
 
         let layoutFlow = LoginFlow()
         layoutFlow.navigating(to: musicURL)

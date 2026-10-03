@@ -69,16 +69,6 @@ enum SignInNavigation {
             && url?.user == nil && url?.password == nil
     }
 
-    static func isGoogleAccountsOrigin(_ url: URL?) -> Bool {
-        url?.scheme?.lowercased() == "https" && url?.host?.lowercased() == "accounts.google.com"
-            && (url?.port == nil || url?.port == 443) && url?.user == nil && url?.password == nil
-    }
-
-    static func isGooglePasskeyPage(_ url: URL?) -> Bool {
-        isGoogleAccountsOrigin(url) && (url?.path.contains("/challenge/pk") == true
-            || url?.path.contains("/challenge/webauthn") == true)
-    }
-
     enum Refusal: Equatable {
         /// Not a web page. WebKit would hand it to another app.
         case notAWebPage

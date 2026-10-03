@@ -26,6 +26,35 @@ if [[ -z "$generate_appcast" ]]; then
   exit 1
 fi
 
+remote_url="$(git -C "$repo_root" remote get-url origin)"
+case "$remote_url" in
+  git@*:* )
+    remote_host="${remote_url#git@}"
+    remote_host="${remote_host%%:*}"
+    repository_path="${remote_url#*:}"
+    ;;
+  ssh://git@*/* )
+    remote_host="${remote_url#ssh://git@}"
+    remote_host="${remote_host%%/*}"
+    repository_path="${remote_url#ssh://git@*/}"
+    ;;
+  https://*/*|http://*/* )
+    remote_host="${remote_url#*://}"
+    remote_host="${remote_host%%/*}"
+    repository_path="${remote_url#*://*/}"
+    ;;
+  * )
+    echo "Could not determine a GitHub repository URL from origin: $remote_url" >&2
+    exit 1
+    ;;
+esac
+repository_path="${repository_path%.git}"
+if [[ -z "$remote_host" || -z "$repository_path" ]]; then
+  echo "Could not determine a GitHub repository URL from origin: $remote_url" >&2
+  exit 1
+fi
+github_repo_url="https://$remote_host/$repository_path"
+
 archive_name="$(basename "$dmg_path")"
 notes_name="${archive_name%.*}.md"
 stage="$(mktemp -d)"
@@ -36,8 +65,8 @@ cp "$notes_path" "$stage/$notes_name"
 
 "$generate_appcast" \
   --account BitChord \
-  --download-url-prefix "https://github.com/bagumamartin/BitChord/releases/download/$tag/" \
-  --full-release-notes-url "https://github.com/bagumamartin/BitChord/releases/tag/$tag" \
+  --download-url-prefix "$github_repo_url/releases/download/$tag/" \
+  --full-release-notes-url "$github_repo_url/releases/tag/$tag" \
   --embed-release-notes \
   "$stage"
 

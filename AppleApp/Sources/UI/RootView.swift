@@ -2,6 +2,8 @@ import SwiftUI
 import BitChordShared
 #if os(iOS)
 import UIKit
+#elseif os(macOS)
+import AppKit
 #endif
 
 /// Root navigation shell — one `TabView` with `.sidebarAdaptable` (UI spec §2):
@@ -169,16 +171,15 @@ struct RootView: View {
     @ViewBuilder
     private var shell: some View {
         #if os(macOS)
-        // Music's Mac model: the player *is* the window. A hidden TabView
-        // still injects the sidebar toggle into the toolbar, so it leaves
-        // the hierarchy while the player is up. Home/Explore loaders live
-        // on RootView and the tab is `@SceneStorage`, so dismiss does not
-        // refetch or reset the selected tab.
-        Group {
+        // Keep the tab hierarchy mounted while the player covers the window.
+        // Removing it loses navigation paths, scroll offsets, and local loaders.
+        ZStack {
+            tabShell
+                .opacity(appModel.nowPlayingPresented ? 0 : 1)
+                .allowsHitTesting(!appModel.nowPlayingPresented)
+                .accessibilityHidden(appModel.nowPlayingPresented)
             if appModel.nowPlayingPresented {
                 NowPlayingView()
-            } else {
-                tabShell
             }
         }
         #else
@@ -384,6 +385,10 @@ struct RootView: View {
         #endif
         #if os(macOS)
         .environment(\.sidebarRowSize, .medium)
+        .overlay(alignment: .topLeading) {
+            MacWindowToolbar(isPlayerPresented: appModel.nowPlayingPresented)
+                .frame(width: 0, height: 0)
+        }
         .toolbar {
             if !appModel.nowPlayingPresented {
                 ToolbarItem {
@@ -456,6 +461,101 @@ struct RootView: View {
         #endif
     }
 }
+
+#if os(macOS)
+/// Configure the system-generated toolbar items without creating another
+/// sidebar button. TabView puts its toggle in the sidebar's toolbar section;
+/// that section can have no room for it when the sidebar is collapsed.
+private struct MacWindowToolbar: NSViewRepresentable {
+    let isPlayerPresented: Bool
+
+    func makeNSView(context: Context) -> MacWindowToolbarView { MacWindowToolbarView() }
+    func updateNSView(_ nsView: MacWindowToolbarView, context: Context) {
+        nsView.setPlayerPresented(isPlayerPresented)
+    }
+}
+
+private final class MacWindowToolbarView: NSView {
+    private var isPlayerPresented = false
+    private var wasPlayerPresented = false
+    private var normalItems: [NSToolbarItem.Identifier: Bool] = [:]
+    private var observers: [NSObjectProtocol] = []
+    private var updateScheduled = false
+
+    func setPlayerPresented(_ presented: Bool) {
+        guard isPlayerPresented != presented else { return }
+        isPlayerPresented = presented
+        scheduleUpdate()
+    }
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        observers.forEach { NotificationCenter.default.removeObserver($0) }
+        observers.removeAll()
+        guard let window else { return }
+        for name in [NSToolbar.willAddItemNotification, NSToolbar.didRemoveItemNotification] {
+            observers.append(NotificationCenter.default.addObserver(forName: name, object: nil, queue: .main) { [weak self] note in
+                guard let self, (note.object as? NSToolbar) === self.window?.toolbar else { return }
+                self.scheduleUpdate()
+            })
+        }
+        observers.append(NotificationCenter.default.addObserver(forName: NSWindow.didResizeNotification, object: window, queue: .main) { [weak self] _ in
+            self?.scheduleUpdate()
+        })
+        scheduleUpdate()
+    }
+
+    deinit {
+        observers.forEach { NotificationCenter.default.removeObserver($0) }
+    }
+
+    private func scheduleUpdate() {
+        guard window != nil, !updateScheduled else { return }
+        updateScheduled = true
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.updateScheduled = false
+            self.configureToolbar()
+        }
+    }
+
+    private func configureToolbar() {
+        guard let toolbar = window?.toolbar else { return }
+        if isPlayerPresented {
+            for item in toolbar.items where normalItems[item.itemIdentifier] != nil {
+                item.isHidden = true
+            }
+        } else {
+            if wasPlayerPresented {
+                for item in toolbar.items {
+                    if let hidden = normalItems[item.itemIdentifier] { item.isHidden = hidden }
+                }
+            }
+            // Keep SwiftUI's own control and action. Reinserting its identifier
+            // asks the window's existing toolbar delegate for the same item.
+            if let toggleIndex = toolbar.items.firstIndex(where: Self.isSidebarToggle),
+               let dividerIndex = toolbar.items.firstIndex(where: {
+                   $0 is NSTrackingSeparatorToolbarItem
+               }), toggleIndex < dividerIndex {
+                let identifier = toolbar.items[toggleIndex].itemIdentifier
+                toolbar.removeItem(at: toggleIndex)
+                toolbar.insertItem(withItemIdentifier: identifier, at: dividerIndex)
+            }
+            if let toggle = toolbar.items.first(where: Self.isSidebarToggle) {
+                toggle.visibilityPriority = .user
+                toggle.isNavigational = true
+            }
+            normalItems = Dictionary(toolbar.items.map { ($0.itemIdentifier, $0.isHidden) }, uniquingKeysWith: { first, _ in first })
+        }
+        wasPlayerPresented = isPlayerPresented
+    }
+
+    private static func isSidebarToggle(_ item: NSToolbarItem) -> Bool {
+        item.itemIdentifier == .toggleSidebar
+            || item.itemIdentifier.rawValue.hasSuffix(".toggleSidebar")
+    }
+}
+#endif
 
 /// The shared playback pill (UI spec §3.1/§3.2): `.tabViewBottomAccessory` on
 /// iOS 26 — Music's own bottom accessory — with a material `safeAreaInset`

@@ -38,6 +38,8 @@ let shuffledSeed = PlaybackQueuePolicy.startingWith(queue, seed: 4)
 check(shuffledSeed.first?.id == "high" && Set(shuffledSeed.map(\.id)) == Set(queue.map(\.id)), "A random Shuffle seed keeps all earlier candidates")
 let mixed = [track("played-auto", autoplay: true), track("seed"), track("manual"), track("old-auto", autoplay: true)]
 check(PlaybackQueuePolicy.withoutUpcomingAutoplay(mixed, after: 1).map(\.id) == ["played-auto", "seed", "manual"], "Refresh keeps played autoplay and manual entries")
+check(!PlaybackQueuePolicy.shouldRefillAutoplay(upcomingCount: 3), "Natural handoff leaves a three-item queue alone")
+check(PlaybackQueuePolicy.shouldRefillAutoplay(upcomingCount: 2), "Natural handoff refills below the three-item watermark")
 func context(_ source: String = "yt:seed", index: Int = 0, generation: UInt64 = 1, edit: UInt64 = 0, session: Int64 = 1) -> AutoplayRefreshState.Context {
     .init(source: source, index: index, playbackGeneration: generation, queueEditRevision: edit, sessionGeneration: session)
 }

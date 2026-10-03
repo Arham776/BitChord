@@ -5,6 +5,12 @@ import Foundation
 enum PlaybackQueuePolicy {
     enum HeroState { case inactive, playing, paused }
 
+    static let autoplayRefillThreshold = 3
+
+    static func shouldRefillAutoplay(upcomingCount: Int) -> Bool {
+        upcomingCount < autoplayRefillThreshold
+    }
+
     static func heroState(
         origin: String?, listID: String, hasQueue: Bool, stopped: Bool, playingOrBuffering: Bool
     ) -> HeroState {

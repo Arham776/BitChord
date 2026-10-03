@@ -29,7 +29,7 @@ install” setting.
 
    ```sh
    scripts/generate-mac-appcast.sh v0.1.2 \
-     "/path/to/BitChord 0.1.2.dmg" \
+     "/path/to/BitChord-0.1.2.dmg" \
      "/path/to/0.1.2-release-notes.md"
    ```
 

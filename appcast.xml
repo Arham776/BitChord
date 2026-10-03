@@ -1,11 +1,43 @@
-<?xml version="1.0" encoding="utf-8" standalone="yes"?><!-- sparkle-sign-warning:
+<?xml version="1.0" encoding="utf-8" standalone="yes"?>
+<!-- sparkle-sign-warning:
 IMPORTANT: This file was signed by Sparkle. Any modifications to this file requires re-signing this file with generate_appcast or sign_update! The signed signature will be embedded at the end of this file.
---><rss xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle" version="2.0">
+-->
+<rss xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle" version="2.0">
     <channel>
         <title>BitChord</title>
         <link>https://github.com/bagumamartin/BitChord</link>
         <description>BitChord for macOS updates</description>
         <language>en</language>
+        <item>
+            <title>0.1.2</title>
+            <pubDate>Sat, 03 Oct 2026 16:59:18 +0200</pubDate>
+            <sparkle:fullReleaseNotesLink>https://github.com/bagumamartin/BitChord/releases/tag/v0.1.2</sparkle:fullReleaseNotesLink>
+            <sparkle:version>2</sparkle:version>
+            <sparkle:shortVersionString>0.1.2</sparkle:shortVersionString>
+            <sparkle:minimumSystemVersion>15.0</sparkle:minimumSystemVersion>
+            <sparkle:hardwareRequirements>arm64</sparkle:hardwareRequirements>
+            <description sparkle:format="markdown"><![CDATA[### What's changed
+- Recommendation queues now refresh on deliberate listening actions and refill only when fewer than three tracks remain, keeping natural song transitions steady.
+- Removing tracks from the queue no longer triggers an immediate refresh; Automix can still reorder queued tracks.
+- Google sign-in follows Google's own flow without BitChord intercepting password or passkey steps.
+- The macOS sidebar toggle stays visible, Recents loading layouts adapt to larger screens, and closing Now Playing returns to the same screen and position.
+
+### macOS download
+This Apple Silicon build is ad-hoc signed and is not notarized by Apple. macOS may block its first launch.
+
+Only continue if you downloaded BitChord from the official BitChord GitHub release and trust it.
+
+**System Settings:** Move BitChord to Applications and try to open it once. If macOS blocks it, open System Settings → Privacy & Security, scroll to Security, choose **Open Anyway** for BitChord, then confirm **Open** in the warning dialog.
+
+**Terminal:** After moving BitChord to Applications, open Terminal and run:
+```sh
+xattr -dr com.apple.quarantine "/Applications/BitChord.app"
+open "/Applications/BitChord.app"
+```
+This removes the downloaded-file quarantine attribute from the app bundle so Gatekeeper no longer blocks this launch.
+]]></description>
+            <enclosure url="https://github.com/bagumamartin/BitChord/releases/download/v0.1.2/BitChord-0.1.2.dmg" length="18888551" type="application/octet-stream" sparkle:edSignature="Gi03Hxfuw9UADe0qokK/PTN5lAw8n10+AKxOKF9Ua3OLBhWMO9ze0891iKFTtnwwfVpt2T5i3/24j6puNzHrAg=="/>
+        </item>
         <item>
             <title>0.1.1</title>
             <pubDate>Sat, 03 Oct 2026 11:09:16 +0200</pubDate>
@@ -37,10 +69,11 @@ open "/Applications/BitChord.app"
 ```
 This removes the downloaded-file quarantine attribute from the app bundle so Gatekeeper no longer blocks this launch.
 ]]></description>
-            <enclosure url="https://github.com/bagumamartin/BitChord/releases/download/v0.1.1/BitChord-0.1.1.dmg" length="18889885" type="application/octet-stream" sparkle:edSignature="un6iq+DEM1JyWsBJSvt7WIg7Z8g+gEszAwjUkSKUszgBnhIG3yzPVjtS5i/oJD9+DVFmNuHGZ5o6MdRnU+opDw=="></enclosure>
+            <enclosure url="https://github.com/bagumamartin/BitChord/releases/download/v0.1.1/BitChord-0.1.1.dmg" length="18889885" type="application/octet-stream" sparkle:edSignature="un6iq+DEM1JyWsBJSvt7WIg7Z8g+gEszAwjUkSKUszgBnhIG3yzPVjtS5i/oJD9+DVFmNuHGZ5o6MdRnU+opDw=="/>
         </item>
     </channel>
-</rss><!-- sparkle-signatures:
-edSignature: Q+Fuijansa8PMNMg2JfrqOJldSGNulY2D6VcmG6Dvzwjd7z7NiV8EnqYHmv6BMNs85/VN4JkBOENnJHOb5gJDw==
-length: 3128
+</rss>
+<!-- sparkle-signatures:
+edSignature: ElIbnz1B+XpbMhesUyqPezxMi0lOrunXSVxBbnU3AKzbsP4avVDLRqWw/Hd+4WajZlEelkkTYo5XHLoQVFrYBA==
+length: 5337
 -->

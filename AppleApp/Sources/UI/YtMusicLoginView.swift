@@ -21,16 +21,6 @@ struct YtMusicLoginView: View {
                         .foregroundStyle(flow.captureFailedMessage == nil ? Color.secondary : Color.orange)
                         .multilineTextAlignment(.center)
                         .frame(maxWidth: .infinity)
-                    if flow.passkeyHelp {
-                        Button {
-                            flow.session.usePassword?()
-                        } label: {
-                            if flow.selectingPassword { ProgressView().controlSize(.small) }
-                            else { Text("Use Password") }
-                        }
-                        .buttonStyle(.bordered)
-                        .disabled(flow.selectingPassword)
-                    }
                 }
                 .padding(.horizontal, 20)
                 .padding(.vertical, 12)
@@ -372,7 +362,7 @@ private struct LoginWebView: UIViewRepresentable {
 /// completion handlers are the only thing here that is not, and those hop to the
 /// main actor themselves rather than mutating observed state off it.
 @MainActor
-final class LoginWebCoordinator: NSObject, WKNavigationDelegate, WKUIDelegate, WKHTTPCookieStoreObserver, WKScriptMessageHandler {
+final class LoginWebCoordinator: NSObject, WKNavigationDelegate, WKUIDelegate, WKHTTPCookieStoreObserver {
     private let flow: LoginFlow
     private let onCaptured: (SignInCapture, @escaping (Bool) -> Void) -> Void
     private let onUnavailable: (String) -> Void
@@ -382,10 +372,6 @@ final class LoginWebCoordinator: NSObject, WKNavigationDelegate, WKUIDelegate, W
     private var active = true
     private var navigationRevision = 0
     private var pageProbeTask: Task<Void, Never>?
-    private var passwordTask: Task<Void, Never>?
-    private var attemptedPasswordPreference = false
-    private var pendingPasswordChoice = false
-    private var sawPasswordChallenge = false
     /// Weak, because the coordinator is the navigation delegate the web view
     /// retains, and a strong reference back would be a cycle.
     private weak var webView: WKWebView?
@@ -408,12 +394,8 @@ final class LoginWebCoordinator: NSObject, WKNavigationDelegate, WKUIDelegate, W
         navigationRevision += 1
         pageProbeTask?.cancel()
         pageProbeTask = nil
-        passwordTask?.cancel()
-        passwordTask = nil
         flow.session.take = nil
-        flow.session.usePassword = nil
         store.httpCookieStore.remove(self)
-        webView?.configuration.userContentController.removeScriptMessageHandler(forName: "signInPageState", contentWorld: .defaultClient)
         webView?.navigationDelegate = nil
         webView?.uiDelegate = nil
         webView = nil
@@ -428,11 +410,6 @@ final class LoginWebCoordinator: NSObject, WKNavigationDelegate, WKUIDelegate, W
         let config = WKWebViewConfiguration()
         config.websiteDataStore = store
         config.defaultWebpagePreferences.allowsContentJavaScript = true
-        config.userContentController.add(self, contentWorld: .defaultClient, name: "signInPageState")
-        config.userContentController.addUserScript(WKUserScript(
-            source: Self.googlePageStateScript, injectionTime: .atDocumentEnd,
-            forMainFrameOnly: true, in: .defaultClient
-        ))
         // Google's own refusal of embedded web views: on iOS WebKit sends a
         // *mobile* agent, and `accounts.google.com` answers that with "This
         // browser or app may not be secure" before the password is ever typed.
@@ -457,7 +434,6 @@ final class LoginWebCoordinator: NSObject, WKNavigationDelegate, WKUIDelegate, W
         // How the confirmation button reaches the session. Set here rather than
         // handed back to the view as state — see [LoginFlow.session].
         flow.session.take = { [weak self] in self?.takeSession() }
-        flow.session.usePassword = { [weak self] in self?.selectPassword() }
         if loadInitialPage { webView.load(URLRequest(url: Self.loginURL)) }
         return webView
     }
@@ -523,13 +499,7 @@ final class LoginWebCoordinator: NSObject, WKNavigationDelegate, WKUIDelegate, W
         guard active, isMainFrame else { return }
         navigationRevision += 1
         pageProbeTask?.cancel()
-        passwordTask?.cancel()
-        flow.selectingPassword = false
         flow.navigating(to: url)
-        if SignInNavigation.isGoogleAccountsOrigin(url), url?.path.contains("/challenge/pwd") == true {
-            sawPasswordChallenge = true
-            pendingPasswordChoice = false
-        }
     }
 
     func webView(_ webView: WKWebView, didReceiveServerRedirectForProvisionalNavigation navigation: WKNavigation!) {
@@ -539,19 +509,6 @@ final class LoginWebCoordinator: NSObject, WKNavigationDelegate, WKUIDelegate, W
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
         noteMainFrame(webView.url, isMainFrame: true)
         guard active else { return }
-        if SignInNavigation.isGoogleAccountsOrigin(webView.url) {
-            // Prefer Google's existing password alternative once, before any
-            // password has been entered. Later 2FA challenges remain Google's.
-            if SignInNavigation.isGooglePasskeyPage(webView.url), !sawPasswordChallenge,
-               !attemptedPasswordPreference {
-                attemptedPasswordPreference = true
-                pendingPasswordChoice = true
-                selectPassword()
-            } else if pendingPasswordChoice && !sawPasswordChallenge {
-                selectPassword()
-            }
-            return
-        }
         guard SignInNavigation.isMusicOrigin(webView.url) else { return }
         let revision = navigationRevision
         // Inspection controls presentation only. It does not harvest cookies or
@@ -596,101 +553,6 @@ final class LoginWebCoordinator: NSObject, WKNavigationDelegate, WKUIDelegate, W
         flow.profile = profile
         flow.profileScope = profile == nil ? nil : SignInProfileScope(fields)
     }
-
-    func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
-        guard active, message.name == "signInPageState", message.frameInfo.isMainFrame,
-              message.webView === webView,
-              SignInNavigation.isGoogleAccountsOrigin(message.frameInfo.request.url),
-              SignInNavigation.isGoogleAccountsOrigin(webView?.url),
-              let state = message.body as? String else { return }
-        if state == "password" {
-            sawPasswordChallenge = true
-            pendingPasswordChoice = false
-            flow.passkeyHelp = false
-        } else if state == "passkey" {
-            flow.passkeyHelp = true
-            if !attemptedPasswordPreference && !sawPasswordChallenge {
-                attemptedPasswordPreference = true
-                pendingPasswordChoice = true
-                selectPassword()
-            }
-        } else if state == "other", pendingPasswordChoice && !sawPasswordChallenge {
-            selectPassword()
-        }
-    }
-
-    // Google can change challenges within one document. Observe only the kind
-    // of challenge, in an isolated world; never read input values or an account.
-    private static let googlePageStateScript = #"""
-    (() => {
-      if (location.origin !== 'https://accounts.google.com') return;
-      let previous;
-      const report = () => {
-        const path = location.pathname;
-        const state = /\/challenge\/pwd(\/|$)/.test(path) ? 'password'
-          : /\/challenge\/(pk|webauthn)(\/|$)/.test(path) ? 'passkey' : 'other';
-        if (state === previous) return;
-        previous = state;
-        window.webkit.messageHandlers.signInPageState.postMessage(state);
-      };
-      report();
-      new MutationObserver(report).observe(document.documentElement, {childList: true, subtree: true});
-      window.addEventListener('popstate', report);
-    })();
-    """#
-
-    private func selectPassword() {
-        guard active, !flow.selectingPassword, let view = webView,
-              SignInNavigation.isGoogleAccountsOrigin(view.url) else { return }
-        flow.passkeyHelp = true
-        flow.selectingPassword = true
-        flow.passwordAdvice = "Opening Google’s password option…"
-        let revision = navigationRevision
-        passwordTask = Task { @MainActor [weak self, weak view] in
-            guard let self, let view else { return }
-            let raw = try? await view.callAsyncJavaScript(Self.passwordChoiceScript, arguments: [:], in: nil, contentWorld: .defaultClient)
-            guard self.active, !Task.isCancelled, self.navigationRevision == revision else { return }
-            self.flow.selectingPassword = false
-            self.pendingPasswordChoice = false
-            if let result = raw as? String, result == "password" || result == "selectedPassword" {
-                self.flow.passkeyHelp = false
-                self.flow.passwordAdvice = nil
-            } else {
-                self.flow.passwordAdvice = "Choose ‘Try another way’ on Google, then ‘Enter your password’ if it is offered."
-            }
-        }
-    }
-
-    /// Selects only Google's own visible alternative/password controls. No
-    /// invented challenge URLs, account setting changes, or credential reads.
-    static let passwordChoiceScript = #"""
-    if (location.origin !== 'https://accounts.google.com' || !location.pathname.includes('/challenge/')) return 'unavailable';
-    // The document-end message and didFinish can both reach this document.
-    // Reuse one operation in the isolated world rather than clicking twice.
-    if (window.bitChordPasswordChoice) return await window.bitChordPasswordChoice;
-    window.bitChordPasswordChoice = (async () => {
-      const pause = ms => new Promise(resolve => setTimeout(resolve, ms));
-      const visible = el => el && el.getClientRects().length > 0 && !el.disabled && el.getAttribute('aria-disabled') !== 'true';
-      const label = el => (el.innerText || el.textContent || '').trim().replace(/\s+/g, ' ').toLowerCase();
-      const find = labels => Array.from(document.querySelectorAll('button, a, [role="button"], [role="link"]'))
-        .find(el => visible(el) && labels.includes(label(el)));
-      let openedAlternatives = false;
-      for (let attempt = 0; attempt < 12; attempt++) {
-        if (location.origin !== 'https://accounts.google.com') return 'unavailable';
-        if (Array.from(document.querySelectorAll('input[type="password"]')).some(visible)) return 'password';
-        const password = find(['enter your password', 'use your password', 'password']);
-        if (password) { password.click(); return 'selectedPassword'; }
-        if (!openedAlternatives && /\/challenge\/(pk|webauthn)(\/|$)/.test(location.pathname)) {
-          const alternative = find(['try another way', 'try another method']);
-          if (alternative) { openedAlternatives = true; alternative.click(); }
-        }
-        await pause(200);
-      }
-      return 'unavailable';
-    })();
-    try { return await window.bitChordPasswordChoice; }
-    finally { delete window.bitChordPasswordChoice; }
-    """#
 
     func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
         navigationFailed(error)

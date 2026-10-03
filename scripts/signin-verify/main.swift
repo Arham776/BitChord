@@ -229,10 +229,6 @@ for url in ["http://yt3.googleusercontent.com/x", "file:///tmp/avatar", "https:/
 let originalScope = SignInProfileScope(SignInCaptureFields(loggedIn: true, pageId: "brand", dataSyncId: "account||brand", authUser: "1", visitorData: nil, clientVersion: nil))
 let changedScope = SignInProfileScope(SignInCaptureFields(loggedIn: true, pageId: "other-brand", dataSyncId: "account||other-brand", authUser: "1", visitorData: nil, clientVersion: nil))
 check("two channels under one account are different review identities", originalScope != changedScope)
-check("passkey help only appears on Google's real challenge", SignInNavigation.isGooglePasskeyPage(URL(string: "https://accounts.google.com/v3/signin/challenge/pk")))
-check("a lookalike cannot request password navigation", !SignInNavigation.isGooglePasskeyPage(URL(string: "https://accounts.google.com.evil.test/v3/signin/challenge/pk")))
-check("the identifier screen is not a passkey challenge", !SignInNavigation.isGooglePasskeyPage(URL(string: "https://accounts.google.com/v3/signin/identifier")))
-
 // ---- the user agent -------------------------------------------------------
 
 // A second harness, `check-signin-live.sh`, asks Google. These are the parts

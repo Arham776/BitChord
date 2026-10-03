@@ -88,6 +88,18 @@ struct HomeView: View {
     }
 }
 
+private enum RecentShelfLayout {
+    static let columnSpacing: CGFloat = 12
+
+    static func columnWidth(viewportWidth: CGFloat) -> CGFloat {
+        min(viewportWidth * 0.88, 400)
+    }
+
+    static func placeholderCount(availableWidth: CGFloat, itemWidth: CGFloat, spacing: CGFloat) -> Int {
+        max(1, Int(ceil((availableWidth + spacing) / (itemWidth + spacing))))
+    }
+}
+
 /// The upstream Home loading state reserves the Recents shelf and matches the
 /// saved list/grid layout so content does not jump when the feed arrives.
 private struct HomeFeedSkeleton: View {
@@ -107,37 +119,54 @@ private struct HomeFeedSkeleton: View {
                 }
                 if isList {
                     GeometryReader { geometry in
-                        VStack(spacing: 0) {
-                            ForEach(0..<4, id: \.self) { index in
-                                HStack(spacing: 12) {
-                                    RecentsSkeletonBlock(height: 48, cornerRadius: 7).frame(width: 48)
-                                    VStack(alignment: .leading, spacing: 7) {
-                                        RecentsSkeletonBlock(height: 14, cornerRadius: 4)
-                                            .frame(width: [150.0, 112.0, 134.0, 96.0][index])
-                                        RecentsSkeletonBlock(height: 12, cornerRadius: 4)
-                                            .frame(width: [92.0, 122.0, 78.0, 106.0][index])
+                        let columnWidth = RecentShelfLayout.columnWidth(viewportWidth: geometry.size.width + 48)
+                        let count = RecentShelfLayout.placeholderCount(
+                            availableWidth: geometry.size.width, itemWidth: columnWidth,
+                            spacing: RecentShelfLayout.columnSpacing
+                        )
+                        HStack(alignment: .top, spacing: RecentShelfLayout.columnSpacing) {
+                            ForEach(0..<count, id: \.self) { _ in
+                                VStack(spacing: 0) {
+                                    ForEach(0..<4, id: \.self) { index in
+                                        HStack(spacing: 12) {
+                                            RecentsSkeletonBlock(height: 48, cornerRadius: 7).frame(width: 48)
+                                            VStack(alignment: .leading, spacing: 7) {
+                                                RecentsSkeletonBlock(height: 14, cornerRadius: 4)
+                                                    .frame(width: [150.0, 112.0, 134.0, 96.0][index])
+                                                RecentsSkeletonBlock(height: 12, cornerRadius: 4)
+                                                    .frame(width: [92.0, 122.0, 78.0, 106.0][index])
+                                            }
+                                            Spacer(minLength: 4)
+                                            RecentsSkeletonBlock(height: 20, cornerRadius: 10).frame(width: 20)
+                                        }
+                                        .frame(height: 56)
                                     }
-                                    Spacer(minLength: 4)
-                                    RecentsSkeletonBlock(height: 20, cornerRadius: 10).frame(width: 20)
                                 }
-                                .frame(height: 56)
+                                .frame(width: columnWidth, alignment: .leading)
                             }
                         }
-                        .frame(width: min(geometry.size.width * 0.88, 400), alignment: .leading)
+                        .frame(width: geometry.size.width, alignment: .leading)
+                        .clipped()
                     }
                     .frame(height: 4 * 56)
                 } else {
                     GeometryReader { geometry in
-                        let cardWidth = min(geometry.size.width * 0.70, 320.0)
-                        HStack(spacing: 14) {
-                            ForEach(0..<2, id: \.self) { _ in
-                                RecentsSkeletonBlock(height: cardWidth / 0.92, cornerRadius: 18)
-                                    .frame(width: cardWidth)
+                        let count = RecentShelfLayout.placeholderCount(
+                            availableWidth: geometry.size.width, itemWidth: 160, spacing: 14
+                        )
+                        HStack(alignment: .top, spacing: 14) {
+                            ForEach(0..<count, id: \.self) { _ in
+                                VStack(alignment: .leading, spacing: 8) {
+                                    RecentsSkeletonBlock(height: 160, cornerRadius: 10).frame(width: 160)
+                                    RecentsSkeletonBlock(height: 14, cornerRadius: 4).frame(width: 118)
+                                    RecentsSkeletonBlock(height: 12, cornerRadius: 4).frame(width: 82)
+                                }
                             }
                         }
+                        .frame(width: geometry.size.width, alignment: .leading)
+                        .clipped()
                     }
-                    .frame(maxWidth: 320 / 0.70)
-                    .aspectRatio(0.92 / 0.70, contentMode: .fit)
+                    .frame(height: 202)
                 }
             }
             ForEach(0..<2, id: \.self) { shelf in
@@ -250,7 +279,7 @@ struct RecentShelf: View {
                                 }
                                 // Upstream's trackColumnWidth is 88% of the
                                 // viewport, capped at 400 points.
-                                .frame(width: min(geometry.size.width * 0.88, 400), alignment: .leading)
+                                .frame(width: RecentShelfLayout.columnWidth(viewportWidth: geometry.size.width), alignment: .leading)
                             }
                         }
                         .padding(.horizontal, 24)

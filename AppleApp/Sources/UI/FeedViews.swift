@@ -30,19 +30,20 @@ final class FeedLoader {
     func load(force: Bool, epoch: Int?) async {
         let current = PageSession.capture()
         if let loadTask, context == current { await loadTask.value; return }
+        if !force, context == current, loadedEpoch == epoch, case .loaded = phase { return }
         if context != current {
             loadTask?.cancel(); loadTask = nil
             phase = .loading; continuation = nil
         }
         context = current
         let id = UUID(); requestID = id
-        let task = Task { await self.fetch(force: force, epoch: epoch, context: current, id: id) }
+        let task = Task { await self.fetch(epoch: epoch, context: current, id: id) }
         loadTask = task
         await task.value
         if requestID == id { loadTask = nil }
     }
 
-    private func fetch(force: Bool, epoch: Int?, context: PageContext, id: UUID) async {
+    private func fetch(epoch: Int?, context: PageContext, id: UUID) async {
         refreshError = nil
         continuation = nil
         do {

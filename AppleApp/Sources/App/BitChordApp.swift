@@ -184,7 +184,10 @@ struct BitChordApp: App {
         .defaultSize(width: 1280, height: 820)
         .windowResizability(.contentMinSize)
         .windowStyle(.automatic)
-        .commands { PlaybackCommands(controller: controller, appModel: appModel) }
+        .commands {
+            SidebarCommands()
+            PlaybackCommands(controller: controller, appModel: appModel)
+        }
 #endif
 #if os(macOS)
         Settings {

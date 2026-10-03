@@ -173,9 +173,6 @@ final class LoginFlow {
     var profile: SignInProfilePreview?
     var profileScope: SignInProfileScope?
     var loadingProfile = false
-    var passkeyHelp = false
-    var selectingPassword = false
-    var passwordAdvice: String?
     var captureFailedMessage: String?
     var refusal: SignInNavigation.Refusal?
     var offOriginHost: String?
@@ -200,8 +197,6 @@ final class LoginFlow {
         profile = nil
         profileScope = nil
         loadingProfile = false
-        passkeyHelp = SignInNavigation.isGooglePasskeyPage(url)
-        passwordAdvice = nil
         offOriginHost = SignInNavigation.isSignInHost(url) ? nil : url?.host
         refusal = nil
     }
@@ -230,9 +225,6 @@ final class LoginFlow {
 
     var prompt: String? {
         if let captureFailedMessage { return captureFailedMessage }
-        if passkeyHelp {
-            return passwordAdvice ?? "Passkeys are unavailable in this sign-in window. Use your password or choose another method on Google."
-        }
         if let refusal { return refusal.summary }
         if reachedMusicOrigin {
             return signedInProfileAvailable
@@ -248,5 +240,4 @@ final class LoginFlow {
 /// the confirmation action as an observable mutation during a view update.
 final class SignInSession {
     var take: (() -> Void)?
-    var usePassword: (() -> Void)?
 }
