@@ -10,6 +10,8 @@ enum LastPlayed {
         var repeatMode: PlaybackController.RepeatMode
         var shuffleEnabled: Bool
         var volume: Double
+        var contextID: String?
+        var contextTitle: String?
     }
 
     private static let key = "bitchord_last_played"
@@ -22,7 +24,9 @@ enum LastPlayed {
         position: Double,
         repeatMode: PlaybackController.RepeatMode,
         shuffleEnabled: Bool,
-        volume: Double
+        volume: Double,
+        contextID: String? = nil,
+        contextTitle: String? = nil
     ) {
         guard !tracks.isEmpty, tracks.indices.contains(index) else { return }
         let start = max(0, min(index - keepBehind, max(0, tracks.count - maxTracks)))
@@ -34,7 +38,9 @@ enum LastPlayed {
             positionMs: Int64(max(0, position) * 1000),
             repeatMode: repeatMode.rawValue,
             shuffle: shuffleEnabled,
-            volume: volume
+            volume: volume,
+            contextID: contextID,
+            contextTitle: contextTitle
         )
         if let data = try? JSONEncoder().encode(stored) {
             UserDefaults.standard.set(data, forKey: key)
@@ -52,7 +58,9 @@ enum LastPlayed {
             position: Double(max(0, stored.positionMs)) / 1000,
             repeatMode: PlaybackController.RepeatMode(rawValue: stored.repeatMode) ?? .off,
             shuffleEnabled: stored.shuffle,
-            volume: stored.volume > 0 ? min(stored.volume, 1) : 0.9
+            volume: stored.volume > 0 ? min(stored.volume, 1) : 0.9,
+            contextID: stored.contextID,
+            contextTitle: stored.contextTitle
         )
     }
 
@@ -63,6 +71,8 @@ enum LastPlayed {
         var repeatMode: Int
         var shuffle: Bool
         var volume: Double
+        var contextID: String?
+        var contextTitle: String?
     }
 
     private struct StoredTrack: Codable {
@@ -78,6 +88,7 @@ enum LastPlayed {
         var artistId: String?
         var albumId: String?
         var setVideoId: String?
+        var contextOrder: Int?
 
         init(_ entry: QueueEntry) {
             id = entry.id
@@ -92,6 +103,7 @@ enum LastPlayed {
             artistId = entry.artistId
             albumId = entry.albumId
             setVideoId = entry.setVideoId
+            contextOrder = entry.contextOrder
         }
 
         var entry: QueueEntry {
@@ -100,7 +112,7 @@ enum LastPlayed {
                 thumbnailUrl: thumbnailUrl, durationText: durationText,
                 albumName: albumName, artworkData: nil, isLocal: isLocal,
                 fromAutoplay: fromAutoplay, artistId: artistId, albumId: albumId,
-                setVideoId: setVideoId
+                setVideoId: setVideoId, contextOrder: contextOrder
             )
         }
     }

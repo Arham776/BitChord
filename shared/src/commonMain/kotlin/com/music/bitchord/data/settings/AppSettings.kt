@@ -119,7 +119,7 @@ object AppSettings {
         settings.putInt("crossfade_seconds", _crossfadeSeconds.value)
     }
 
-    private val _smartFadeEnabled = MutableStateFlow(settings.getBoolean("smart_fade_enabled", false))
+    private val _smartFadeEnabled = MutableStateFlow(settings.getBoolean("smart_fade_enabled", true))
     val smartFadeEnabled: StateFlow<Boolean> = _smartFadeEnabled.asStateFlow()
     fun setSmartFadeEnabled(value: Boolean) {
         _smartFadeEnabled.value = value

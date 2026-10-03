@@ -91,6 +91,7 @@ final class DownloadStore {
         var pendingDeletes: Set<String>? = nil
     }
     private var index = Index()
+    @ObservationIgnored private var historyOriginsByPath: [String: String]?
     private var restoreTask: Task<Void, Never>?
     private var restoreActions: [@MainActor () -> Void] = []
     private(set) var restoring = false
@@ -138,6 +139,7 @@ final class DownloadStore {
                 switch restored {
                 case .success(let restoredIndex):
                     self.index = restoredIndex
+                    self.historyOriginsByPath = nil
                     self.jobs = restoredIndex.jobs.map { job in
                         var job = job
                         if job.status == .running { job.status = .queued; job.runID = UUID().uuidString }
@@ -235,6 +237,7 @@ final class DownloadStore {
         } catch { return nil }
     }
     private func persist() {
+        historyOriginsByPath = nil
         guard writable else { return }
         index.jobs = jobs
         do { try JSONEncoder().encode(index).write(to: indexURL, options: .atomic) }
@@ -300,6 +303,19 @@ final class DownloadStore {
         }
     }
     func provenance(for path: String) -> String? { index.assets.values.first { canonicalPath($0.path) == canonicalPath(path) }?.youtubeVideoId }
+    /// History belongs to the selected YouTube song, even when its saved audio
+    /// came from a lossless substitute. Region analysis still uses `provenance`.
+    func selectedYouTubeVideoId(for path: String) -> String? {
+        if historyOriginsByPath == nil {
+            var origins: [String: String] = [:]
+            for asset in index.assets.values {
+                let id = asset.entry.source.hasPrefix("yt:") ? asset.entry.videoId : asset.youtubeVideoId
+                if let id { origins[asset.path] = id }
+            }
+            historyOriginsByPath = origins
+        }
+        return historyOriginsByPath?[path] ?? historyOriginsByPath?[canonicalPath(path)]
+    }
     func retainPlayback(paths: Set<String>) { leasePaths = Set(paths.map(canonicalPath)); prune() }
     func progress(_ owner: Owner) -> String {
         let done = owner.requests.filter { id in index.bindings[id].flatMap { index.assets[$0] }.map(valid) ?? false }.count

@@ -21,6 +21,12 @@ if [ -z "${JAVA_HOME:-}" ]; then
   fi
 fi
 
+# Kotlin/Native's embedded C dependencies otherwise inherit the active SDK's
+# version (for example iOS 26.5), making their object files too new for the
+# application's iOS 18 / macOS 15 deployment targets.
+export IPHONEOS_DEPLOYMENT_TARGET="${IPHONEOS_DEPLOYMENT_TARGET:-18.0}"
+export MACOSX_DEPLOYMENT_TARGET="${MACOSX_DEPLOYMENT_TARGET:-15.0}"
+
 # Full task name required — `assembleBitChordShared` alone is ambiguous
 # (KGP also creates Debug/Release variants).
 ./gradlew :shared:assembleBitChordSharedXCFramework

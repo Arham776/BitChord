@@ -8,7 +8,7 @@ enum LibraryActions {
         LikeStore.shared.set(videoId, status)
         return await withCheckedContinuation { cont in
             LibraryActionsBridge.shared.rate(videoId: videoId, status: status, callback: DoneCB { ok, msg in
-                cont.resume(returning: ok ? nil : msg)
+                cont.resume(returning: ok ? nil : (msg ?? "YouTube could not update this rating."))
             })
         }
     }

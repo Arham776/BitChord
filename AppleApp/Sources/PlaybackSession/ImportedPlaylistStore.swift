@@ -126,7 +126,13 @@ struct ImportedPlaylistDetailView: View {
                     HStack(spacing: 4) {
                         SongRow(
                             entry: entry,
-                            play: { controller.play(playable, at: playIndex, context: playlist.title) },
+                            play: {
+                                controller.play(
+                                    playable, at: playIndex, context: playlist.title,
+                                    contextID: "imported-playlist:\(playlist.id)",
+                                    shuffleRequested: controller.shuffleEnabled
+                                )
+                            },
                             playNext: { controller.playNext(entry) },
                             addToQueue: { controller.addToQueue(entry) }
                         )
@@ -203,9 +209,18 @@ struct ImportedPlaylistDetailView: View {
         .safeAreaInset(edge: .bottom) {
             if !playable.isEmpty {
                 Button {
-                    controller.play(playable, context: playlist.title)
+                    controller.togglePlaybackContext(
+                        playable, title: playlist.title,
+                        contextID: "imported-playlist:\(playlist.id)",
+                        shuffleRequested: controller.shuffleEnabled
+                    )
                 } label: {
-                    Label("Play Imported Playlist", systemImage: "play.fill")
+                    Label(
+                        controller.isPlaybackContextPlaying("imported-playlist:\(playlist.id)")
+                            ? "Pause Imported Playlist" : "Play Imported Playlist",
+                        systemImage: controller.isPlaybackContextPlaying("imported-playlist:\(playlist.id)")
+                            ? "pause.fill" : "play.fill"
+                    )
                         .frame(maxWidth: .infinity)
                 }
                 .buttonStyle(.borderedProminent)

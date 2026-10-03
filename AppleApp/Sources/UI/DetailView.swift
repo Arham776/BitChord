@@ -461,17 +461,22 @@ struct DetailView: View {
                     }
                 }
 
-                PlayPill(iconOnly: false) {
-                    controller.play(page.songs.map { toEntry($0, fallbackArt: fallbackArt(page)) }, at: 0)
+                PlayPill(iconOnly: false, isPlaying: controller.isPlaybackContextPlaying(browseId)) {
+                    let entries = page.songs.map { toEntry($0, fallbackArt: fallbackArt(page)) }
+                    controller.togglePlaybackContext(
+                        entries, title: page.title, contextID: browseId,
+                        shuffleRequested: controller.shuffleEnabled
+                    )
                 }
 
                 CircleIconButton(
                     icon: Image(.bchShuffle),
                     label: "Shuffle"
                 ) {
-                    var shuffled = page.songs.map { toEntry($0, fallbackArt: fallbackArt(page)) }
-                    shuffled.shuffle()
-                    controller.play(shuffled, at: 0)
+                    controller.play(
+                        page.songs.map { toEntry($0, fallbackArt: fallbackArt(page)) },
+                        context: page.title, contextID: browseId, shuffleRequested: true, shuffleStart: true
+                    )
                 }
             } else {
                 if auth.signedIn, page.libraryPlaylistId != nil {
@@ -490,13 +495,18 @@ struct DetailView: View {
                     icon: Image(.bchShuffle),
                     label: "Shuffle"
                 ) {
-                    var shuffled = page.songs.map { toEntry($0, fallbackArt: fallbackArt(page)) }
-                    shuffled.shuffle()
-                    controller.play(shuffled, at: 0)
+                    controller.play(
+                        page.songs.map { toEntry($0, fallbackArt: fallbackArt(page)) },
+                        context: page.title, contextID: browseId, shuffleRequested: true, shuffleStart: true
+                    )
                 }
 
-                PlayPill(iconOnly: true) {
-                    controller.play(page.songs.map { toEntry($0, fallbackArt: fallbackArt(page)) }, at: 0)
+                PlayPill(iconOnly: true, isPlaying: controller.isPlaybackContextPlaying(browseId)) {
+                    let entries = page.songs.map { toEntry($0, fallbackArt: fallbackArt(page)) }
+                    controller.togglePlaybackContext(
+                        entries, title: page.title, contextID: browseId,
+                        shuffleRequested: controller.shuffleEnabled
+                    )
                 }
 
                 CircleIconButton(
@@ -733,7 +743,14 @@ struct DetailView: View {
                     ForEach(Array(songs.enumerated()), id: \.offset) { index, song in
                         SongRow(
                             entry: toEntry(song, fallbackArt: fallback),
-                            play: { controller.play(page.songs.map { toEntry($0, fallbackArt: fallback) }, at: page.songs.firstIndex(where: { $0.videoId == song.videoId }) ?? index) },
+                            play: {
+                                controller.play(
+                                    page.songs.map { toEntry($0, fallbackArt: fallback) },
+                                    at: page.songs.firstIndex(where: { $0.videoId == song.videoId }) ?? index,
+                                    context: page.title, contextID: browseId,
+                                    shuffleRequested: controller.shuffleEnabled
+                                )
+                            },
                             playNext: { controller.playNext(toEntry(song, fallbackArt: fallback)) },
                             addToQueue: { controller.addToQueue(toEntry(song, fallbackArt: fallback)) },
                             playlistBrowseId: browseId,
@@ -781,7 +798,14 @@ struct DetailView: View {
                     ForEach(Array(songs.enumerated()), id: \.element.videoId) { index, song in
                         SongRow(
                             entry: toEntry(song, fallbackArt: fallback),
-                            play: { controller.play(page.songs.map { toEntry($0, fallbackArt: fallback) }, at: page.songs.firstIndex(where: { $0.videoId == song.videoId }) ?? index) },
+                            play: {
+                                controller.play(
+                                    page.songs.map { toEntry($0, fallbackArt: fallback) },
+                                    at: page.songs.firstIndex(where: { $0.videoId == song.videoId }) ?? index,
+                                    context: page.title, contextID: browseId,
+                                    shuffleRequested: controller.shuffleEnabled
+                                )
+                            },
                             playNext: { controller.playNext(toEntry(song, fallbackArt: fallback)) },
                             addToQueue: { controller.addToQueue(toEntry(song, fallbackArt: fallback)) },
                             playlistBrowseId: browseId,
@@ -1031,6 +1055,7 @@ private struct CircleIconButton: View {
 private struct PlayPill: View {
     var iconOnly: Bool = true
     var size: CGFloat = 46
+    var isPlaying: Bool = false
     let action: () -> Void
 
     var body: some View {
@@ -1040,20 +1065,20 @@ private struct PlayPill: View {
                     Circle()
                         .fill(Color.white)
                         .overlay {
-                            Image(systemName: "play.fill")
+                            Image(systemName: isPlaying ? "pause.fill" : "play.fill")
                                 .resizable()
                                 .scaledToFit()
                                 .frame(width: size * 0.40, height: size * 0.40)
-                                .offset(x: 1.5)
+                                .offset(x: isPlaying ? 0 : 1.5)
                                 .foregroundStyle(Color.black)
                         }
                         .frame(width: size, height: size)
                 } else {
                     HStack(spacing: 8) {
-                        Image(systemName: "play.fill")
+                        Image(systemName: isPlaying ? "pause.fill" : "play.fill")
                             .font(.body.weight(.bold))
                             .foregroundStyle(Color.black)
-                        Text("Play")
+                        Text(isPlaying ? "Pause" : "Play")
                             .font(.body.weight(.semibold))
                             .foregroundStyle(Color.black)
                     }
@@ -1065,7 +1090,8 @@ private struct PlayPill: View {
             .shadow(color: .black.opacity(0.20), radius: 6, y: 3)
         }
         .buttonStyle(.plain)
-        .accessibilityLabel("Play")
+        .accessibilityLabel(isPlaying ? "Pause" : "Play")
+        .help(isPlaying ? "Pause" : "Play")
     }
 }
 
@@ -1093,4 +1119,3 @@ private struct CircleMenuButton<Content: View>: View {
         .help(label)
     }
 }
-

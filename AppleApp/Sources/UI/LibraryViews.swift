@@ -1283,9 +1283,10 @@ struct DownloadsView: View {
     private var playShuffleRow: some View {
         HStack(spacing: 12) {
             Button {
-                controller.play(filteredAndSortedTracks.map(QueueEntry.from), at: 0)
+                controller.togglePlaybackContext(filteredAndSortedTracks.map(QueueEntry.from), title: "Downloads", contextID: "downloads:songs")
             } label: {
-                Label("Play", systemImage: "play.fill")
+                Label(controller.isPlaybackContextPlaying("downloads:songs") ? "Pause" : "Play",
+                      systemImage: controller.isPlaybackContextPlaying("downloads:songs") ? "pause.fill" : "play.fill")
                     .font(.subheadline.weight(.semibold))
                     .frame(maxWidth: .infinity)
                     .padding(.vertical, 8)
@@ -1294,9 +1295,7 @@ struct DownloadsView: View {
             .clipShape(Capsule())
 
             Button {
-                var shuffled = filteredAndSortedTracks.map(QueueEntry.from)
-                shuffled.shuffle()
-                controller.play(shuffled, at: 0)
+                controller.play(filteredAndSortedTracks.map(QueueEntry.from), context: "Downloads", contextID: "downloads:songs", shuffleRequested: true, shuffleStart: true)
             } label: {
                 Label("Shuffle", systemImage: "shuffle")
                     .font(.subheadline.weight(.semibold))
@@ -1320,7 +1319,7 @@ struct DownloadsView: View {
                     SongRow(
                         entry: QueueEntry.from(track),
                         play: {
-                            controller.play(filteredAndSortedTracks.map(QueueEntry.from), at: index)
+                            controller.play(filteredAndSortedTracks.map(QueueEntry.from), at: index, context: "Downloads", contextID: "downloads:songs")
                         },
                         playNext: { controller.playNext(QueueEntry.from(track)) },
                         addToQueue: { controller.addToQueue(QueueEntry.from(track)) }
@@ -1337,7 +1336,7 @@ struct DownloadsView: View {
             LazyVGrid(columns: [GridItem(.adaptive(minimum: 160), spacing: 18)], spacing: 22) {
                 ForEach(albumGroups, id: \.name) { group in
                     Button {
-                        controller.play(group.tracks.map(QueueEntry.from), at: 0)
+                        controller.play(group.tracks.map(QueueEntry.from), context: group.name, contextID: "local-album:\(group.artist):\(group.name)")
                     } label: {
                         VStack(alignment: .leading, spacing: 8) {
                             ArtworkView(url: nil, data: group.tracks.first?.artwork, side: 160)
@@ -1561,7 +1560,7 @@ struct LocalSongsBrowser: View {
                             entry: QueueEntry.from(track),
                             play: {
                                 let shown = local.visibleTracks
-                                controller.play(shown.map(QueueEntry.from), at: index)
+                                controller.play(shown.map(QueueEntry.from), at: index, context: "On Device", contextID: "local:songs")
                             },
                             playNext: { controller.playNext(QueueEntry.from(track)) },
                             addToQueue: { controller.addToQueue(QueueEntry.from(track)) }
@@ -1579,7 +1578,7 @@ struct LocalSongsBrowser: View {
                         ForEach(Array(local.visibleTracks.enumerated()), id: \.element.id) { index, track in
                             LocalTrackCard(track: track) {
                                 let shown = local.visibleTracks
-                                controller.play(shown.map(QueueEntry.from), at: index)
+                                controller.play(shown.map(QueueEntry.from), at: index, context: "On Device", contextID: "local:songs")
                             }
                         }
                     }
@@ -1593,9 +1592,10 @@ struct LocalSongsBrowser: View {
     private var playShuffleBar: some View {
         HStack(spacing: 12) {
             Button {
-                controller.play(local.visibleTracks.map(QueueEntry.from), at: 0)
+                controller.togglePlaybackContext(local.visibleTracks.map(QueueEntry.from), title: "On Device", contextID: "local:songs")
             } label: {
-                Label("Play", systemImage: "play.fill")
+                Label(controller.isPlaybackContextPlaying("local:songs") ? "Pause" : "Play",
+                      systemImage: controller.isPlaybackContextPlaying("local:songs") ? "pause.fill" : "play.fill")
                     .font(.subheadline.weight(.semibold))
                     .frame(maxWidth: .infinity)
                     .padding(.vertical, 8)
@@ -1604,9 +1604,7 @@ struct LocalSongsBrowser: View {
             .clipShape(Capsule())
 
             Button {
-                var shuffled = local.visibleTracks.map(QueueEntry.from)
-                shuffled.shuffle()
-                controller.play(shuffled, at: 0)
+                controller.play(local.visibleTracks.map(QueueEntry.from), context: "On Device", contextID: "local:songs", shuffleRequested: true, shuffleStart: true)
             } label: {
                 Label("Shuffle", systemImage: "shuffle")
                     .font(.subheadline.weight(.semibold))
@@ -1710,7 +1708,7 @@ struct LocalAlbumCell: View {
 
     var body: some View {
         Button {
-            controller.play(group.tracks.map(QueueEntry.from), at: 0)
+            controller.play(group.tracks.map(QueueEntry.from), context: group.name, contextID: "local-album:\(group.artist):\(group.name)")
         } label: {
             VStack(alignment: .leading, spacing: 8) {
                 ArtworkView(url: nil, data: group.tracks.first?.artwork, side: 170)
@@ -2087,7 +2085,7 @@ struct UnifiedSongsView: View {
                                 ForEach(Array(songs.enumerated()), id: \.element.id) { index, song in
                                     SongRow(
                                         entry: songEntry(song),
-                                        play: { controller.play(cloudEntries, at: index) },
+                                        play: { controller.play(cloudEntries, at: index, context: title, contextID: "library:songs") },
                                         playNext: { controller.playNext(songEntry(song)) },
                                         addToQueue: { controller.addToQueue(songEntry(song)) }
                                     )
@@ -2124,7 +2122,7 @@ struct UnifiedSongsView: View {
                                     SongRow(
                                         entry: QueueEntry.from(track),
                                         play: {
-                                            controller.play(local.visibleTracks.map(QueueEntry.from), at: index)
+                                            controller.play(local.visibleTracks.map(QueueEntry.from), at: index, context: "On Device", contextID: "local:songs")
                                         },
                                         playNext: { controller.playNext(QueueEntry.from(track)) },
                                         addToQueue: { controller.addToQueue(QueueEntry.from(track)) }
@@ -2678,7 +2676,7 @@ private struct ArtistGroupRow: View {
                 ForEach(Array(group.tracks.enumerated()), id: \.element.id) { index, track in
                     SongRow(
                         entry: QueueEntry.from(track),
-                        play: { controller.play(group.tracks.map(QueueEntry.from), at: index) }
+                        play: { controller.play(group.tracks.map(QueueEntry.from), at: index, context: group.name, contextID: "local-artist:\(group.name)") }
                     )
                 }
             }
@@ -3270,7 +3268,7 @@ private struct LocalM3uDetailView: View {
                 SongRow(
                     entry: QueueEntry.from(track),
                     play: {
-                        controller.play(playlist.tracks.map(QueueEntry.from), at: index)
+                        controller.play(playlist.tracks.map(QueueEntry.from), at: index, context: playlist.name, contextID: "m3u:\(playlist.id)")
                     },
                     playNext: { controller.playNext(QueueEntry.from(track)) },
                     addToQueue: { controller.addToQueue(QueueEntry.from(track)) }

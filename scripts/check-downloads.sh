@@ -8,14 +8,11 @@ python3 - "$ROOT" "$WORK" <<'PY'
 import sys
 from pathlib import Path
 root, work = map(Path, sys.argv[1:])
-s = (root/'AppleApp/Sources/PlaybackSession/PlaybackController.swift').read_text()
-a = s.index('struct QueueEntry:')
-b = s.index('/// Where on the playing track', a)
-(work/'QueueEntry.swift').write_text('import Foundation\nimport BitChordShared\n' + s[a:b])
+(work/'QueueEntry.swift').write_text((root/'AppleApp/Sources/PlaybackSession/QueueEntry.swift').read_text())
 PY
 NATIVE="$ROOT/AppleApp/Frameworks/NativeCoreFFI.xcframework/macos-arm64"
 SHARED="$ROOT/AppleApp/Frameworks/BitChordShared.xcframework/macos-arm64"
-xcrun swiftc -module-cache-path "$WORK/modules" -parse-as-library -O -o "$WORK/verify" \
+xcrun swiftc -module-cache-path "$WORK/modules" -parse-as-library -o "$WORK/verify" \
  -F "$NATIVE" -framework NativeCoreFFI -F "$SHARED" -framework BitChordShared \
  -framework CoreAudio -framework AudioToolbox \
  -Xlinker -rpath -Xlinker "$SHARED/BitChordShared.framework/Versions/A" \

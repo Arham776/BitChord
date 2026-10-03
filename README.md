@@ -18,14 +18,14 @@ The project is source-first. iPhone and iPad users build and sign the app themse
 
 The current codebase includes:
 
-- YouTube Music search, browsing, and playback, with optional account sign-in.
+- YouTube Music search, browsing, and playback, with optional Google sign-in. Sign-in lets you review the profile before saving; accounts with multiple YouTube channels can switch profiles in Settings.
 - Configurable music sources and source modules, local music files, and WebDAV libraries.
 - A native playback engine with downloads, queue management, gapless playback, crossfade, equalizer, and audio-route information.
 - Lyrics from multiple providers, including word-synced lyrics where a source supplies them.
 - Automix transitions with beat analysis. Optional analysis models can be downloaded in the app; Automix retains a fallback when they are not installed.
 - Listen Together, which requires a compatible server address supplied by the listener.
 - Widgets, Discord Rich Presence, and Last.fm or ListenBrainz scrobbling.
-- Apple-platform audio options, including spatial processing and, on macOS, conditional bit-perfect output when the selected DAC and source format allow it.
+- Apple-platform audio options, including Dolby Atmos through Apple's renderer for supported source streams, spatial processing, and, on macOS, conditional bit-perfect output when the selected DAC and source format allow it.
 
 Features that depend on external services, sources, audio routes, or optional models may behave differently as those dependencies change.
 
@@ -52,9 +52,7 @@ The pinned upstream submodule is kept for source comparison and attribution; it 
 git submodule update --init --recursive
 ```
 
-The Apple identifiers are fixed in the project and source: `app.bitchord.BitChord` for the app, `app.bitchord.BitChord.widget` for the widget, `group.app.bitchord.BitChord` for their shared App Group, and `app.bitchord.BitChord.credentials` for the Keychain service. Bundled frameworks use `app.bitchord.BitChord.shared` and `app.bitchord.BitChord.native-core-ffi`. The URL name and diagnostic namespaces use the same app prefix.
-
-Changing the bundle identifier creates a separate installed app with its own data container and Keychain access. Builds previously installed under a different identifier keep their data; sign in again in the new app.
+An earlier build installed under a different app identifier remains a separate app; its local data and Keychain session are not migrated. Sign in again in this build, and keep the earlier install if you still need data stored there.
 
 Build the shared framework and native audio framework, generate the Xcode project, and open it:
 
@@ -66,7 +64,7 @@ xcodegen generate --spec AppleApp/project.yml
 open AppleApp/BitChord.xcodeproj
 ```
 
-In Xcode, select the `BitChord` scheme, choose a Mac, iPhone, iPad, or Apple Silicon Simulator destination, then select your Apple Developer Team under the app and widget targets' **Signing & Capabilities**. The Team is per-developer and is not stored in the shared project configuration. For device signing, register `group.app.bitchord.BitChord` with your developer account and enable it for both targets. The current entitlements are configured for development; review them, including the app sandbox setting, before preparing a distributed macOS build. The generated frameworks, Swift bindings, and Xcode project are build outputs and are ignored by Git.
+In Xcode, select the `BitChord` scheme, choose a Mac, iPhone, iPad, or Apple Silicon Simulator destination, then select your Apple Developer Team under the app and widget targets' **Signing & Capabilities**. The Team is per-developer and is not stored in the shared project configuration. For device signing, register and enable the App Group entitlement for both targets with your developer account. The current entitlements are configured for development; review them, including the app sandbox setting, before preparing a distributed macOS build. The generated frameworks, Swift bindings, and Xcode project are build outputs and are ignored by Git.
 
 `build-shared-framework.sh` builds the Debug framework by default. For a Release shared framework, run:
 

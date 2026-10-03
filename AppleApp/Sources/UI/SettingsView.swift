@@ -19,7 +19,7 @@ struct SettingsView: View {
     @State private var crossfade = Int(PlatformSettings.shared.getInt(key: "crossfade_seconds", default: 0))
     @AppStorage("dolby_atmos") private var dolbyAtmos = true
     @State private var spatial = PlatformSettings.shared.getBoolean(key: "spatial_audio", default: false)
-    @State private var automix = PlatformSettings.shared.getBoolean(key: "smart_fade_enabled", default: false)
+    @State private var automix = PlatformSettings.shared.getBoolean(key: "smart_fade_enabled", default: true)
     @State private var automixSequence = PlatformSettings.shared.getBoolean(key: "automix_smart_sequence", default: true)
     @State private var trimEdges = PlatformSettings.shared.getBoolean(key: "trim_edge_silence", default: false)
     @State private var skipNonMusic = PlatformSettings.shared.getBoolean(key: "skip_non_music", default: false)
@@ -609,7 +609,7 @@ struct SettingsView: View {
                 SettingsToggleLine(
                     glyph: .automix,
                     title: "Smart Sequencing",
-                    subtitle: "Reorder Autoplay and shuffle-pool tails for tempo/key fit. Never touches your curated queue or albums.",
+                    subtitle: "Order upcoming list tracks and Autoplay suggestions for smooth transitions, listening taste and freshness. Takes priority over Shuffle; manually queued tracks keep their order.",
                     isOn: $automixSequence
                 )
             }
@@ -2216,6 +2216,7 @@ private struct SettingsPlaybackPersist: ViewModifier {
             }
             .onChange(of: automixSequence) { _, value in
                 PlatformSettings.shared.putBoolean(key: "automix_smart_sequence", value: value)
+                controller.smartSequencingPreferenceChanged()
             }
             .onChange(of: automixPerf) { _, value in
                 controller.setAutomixPerformanceMode(value)

@@ -84,6 +84,18 @@ final class FixtureBackend: DownloadBackend, @unchecked Sendable {
         try JSONEncoder().encode(fixture).write(to: index)
         let store = DownloadStore(directory: root, startWorker: false)
         assert(store.asset(for: entry) != nil, "verified download found")
+        assert(store.selectedYouTubeVideoId(for: path) == entry.videoId, "saved YouTube origin survives local-file playback")
+        assert(store.selectedYouTubeVideoId(for: exported) == nil, "an unrelated local file has no invented YouTube origin")
+        var substitute = asset
+        substitute.youtubeVideoId = nil
+        substitute.provider = "lossless-substitute"
+        var substituted = fixture
+        substituted.assets[asset.id] = substitute
+        let substituteRoot = root.appendingPathComponent("substitute")
+        try FileManager.default.createDirectory(at: substituteRoot, withIntermediateDirectories: true)
+        try JSONEncoder().encode(substituted).write(to: substituteRoot.appendingPathComponent("index.json"))
+        let substituteStore = DownloadStore(directory: substituteRoot, startWorker: false)
+        assert(substituteStore.selectedYouTubeVideoId(for: path) == entry.videoId, "history retains the selected YouTube song for a saved lossless substitute")
         assert(store.asset(for: other) == nil, "identical title is not recording identity")
         assert(store.download(entry) == .alreadyExists, "individual ownership reuses quality-compatible asset")
         store.removeOwner("first"); assert(FileManager.default.fileExists(atPath: path), "overlapping owner preserves audio")

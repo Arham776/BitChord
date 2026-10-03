@@ -9,101 +9,7 @@ import AVFoundation
 import AppKit
 #endif
 
-/// One playable entry in the queue. Wraps either a local file path or a
-/// resolved stream URL; metadata mirrors upstream's `Song` row.
-struct QueueEntry: Identifiable, Hashable, Sendable, Codable {
-    let id: String
-    var title: String
-    var artist: String
-    var source: String
-    var thumbnailUrl: String?
-    var durationText: String?
-    var albumName: String?
-    var artworkData: Data?
-    /// The audio is already on a disk this device can reach, so it is not something
-    /// to download and not a catalogue row to rate.
-    ///
-    /// True for a file in the device's own library *and* for a file on a remote
-    /// library the listener configured — a share on their own server is already saved
-    /// as far as they are concerned, and offering to download it would be offering to
-    /// copy a file they already have. It is not, and must not be read as, "a path on
-    /// this device": a remote row's [source] is an `https` address, so the places that
-    /// treat `source` as a filesystem path ask again before they open it.
-    var isLocal: Bool
-    var fromAutoplay: Bool = false
-    var artistId: String? = nil
-    var albumId: String? = nil
-    var setVideoId: String? = nil
-
-    /// Clean or uncensored edition, or nil when the originating catalogue did not
-    /// say.
-    ///
-    /// Tri-state on purpose, for the same reason it is one in the shared `Song`:
-    /// "not stated" and "stated as clean" are different claims, and the cross-source
-    /// matcher rejects a candidate whose stated edition contradicts the target's
-    /// while refusing to reject one that has simply made no claim.
-    var isExplicit: Bool? = nil
-
-    /// Whether this row is a music video rather than catalogue audio.
-    ///
-    /// Load-bearing beyond the badge: a video's runtime includes a visual intro or
-    /// outro, so the matcher must not treat it as evidence about the audio's length,
-    /// and a source match is another recording and can be a wrong song altogether.
-    var isVideo: Bool = false
-
-    var videoId: String? {
-        if source.hasPrefix("yt:") { return String(source.dropFirst(3)) }
-        if isLocal { return nil }
-        return id
-    }
-
-    /// "title artist album" for the Automix speech/live guard (upstream
-    /// `TransitionPlanner.itemText`).
-    var itemText: String {
-        [title, artist, albumName ?? ""]
-            .filter { !$0.isEmpty }
-            .joined(separator: " ")
-    }
-
-    /// Upstream `TransitionPlanner.sameAlbum` — the two rows are the same
-    /// recording by album id, or by album name + artist.
-    func sameAlbum(as other: QueueEntry) -> Bool {
-        if let a = albumId, let b = other.albumId, !a.isEmpty, a == b { return true }
-        if let a = albumName, let b = other.albumName, !a.isEmpty, a == b, artist == other.artist {
-            return true
-        }
-        return false
-    }
-
-    static func youtube(
-        videoId: String,
-        title: String,
-        artist: String,
-        thumbnailUrl: String? = nil,
-        durationText: String? = nil,
-        albumName: String? = nil,
-        artistId: String? = nil,
-        albumId: String? = nil,
-        setVideoId: String? = nil,
-        fromAutoplay: Bool = false
-    ) -> QueueEntry {
-        QueueEntry(
-            id: videoId, title: title, artist: artist, source: "yt:\(videoId)",
-            thumbnailUrl: thumbnailUrl, durationText: durationText, albumName: albumName,
-            artworkData: nil, isLocal: false, fromAutoplay: fromAutoplay,
-            artistId: artistId, albumId: albumId, setVideoId: setVideoId
-        )
-    }
-
-    var durationSeconds: Double {
-        let parts = (durationText ?? "").split(separator: ":").compactMap { Double($0) }
-        switch parts.count {
-        case 2: return parts[0] * 60 + parts[1]
-        case 3: return parts[0] * 3600 + parts[1] * 60 + parts[2]
-        default: return 0
-        }
-    }
-
+extension QueueEntry {
     static func from(_ song: Song) -> QueueEntry {
         QueueEntry(
             id: song.videoId,
@@ -136,19 +42,9 @@ struct QueueEntry: Identifiable, Hashable, Sendable, Codable {
         )
     }
 
-    static func formatDuration(_ seconds: Double) -> String {
-        let total = Int(seconds.rounded())
-        let mins = total / 60
-        let secs = total % 60
-        let hours = mins / 60
-        return hours > 0
-            ? String(format: "%d:%02d:%02d", hours, mins % 60, secs)
-            : String(format: "%d:%02d", mins, secs)
-    }
-
-    fileprivate func asSongJSON() -> SongJSON {
+    fileprivate func asSongJSON(videoIDOverride: String? = nil) -> SongJSON {
         SongJSON(
-            videoId: videoId ?? id,
+            videoId: videoIDOverride ?? videoId ?? id,
             title: title,
             artist: artist,
             thumbnailUrl: thumbnailUrl,
@@ -200,6 +96,8 @@ final class PlaybackController {
     private(set) var current: QueueEntry?
     /// Shelf or collection that started this queue, for the player caption.
     private(set) var playbackContext: String?
+    /// Stable identity for the collection behind the queue, used by its hero control.
+    private(set) var playbackContextID: String?
     private(set) var queue: [QueueEntry] = []
     private(set) var playingIndex: Int = 0
     private(set) var position: Double = 0
@@ -272,6 +170,13 @@ final class PlaybackController {
     private var repeatAllStash: [QueueEntry] = []
     /// `id` of the track that was current when [repeatAllStash] was taken.
     private var repeatAllStashSeed: String?
+    @ObservationIgnored private var autoplayRefresh = AutoplayRefreshState()
+    @ObservationIgnored private var queueEditRevision: UInt64 = 0
+    @ObservationIgnored private var sequencingTask: Task<Void, Never>?
+    @ObservationIgnored private var sequencingGeneration: UInt64 = 0
+    #if DEBUG
+    @ObservationIgnored private var recommendationFetchOverride: ((String, @escaping (String?, String?) -> Void) -> Void)?
+    #endif
     private(set) var lyrics: [LyricLineDto] = []
     /// Empty when lyrics came from the file itself (EmbeddedLyrics).
     private(set) var lyricsSourceLabel: String?
@@ -343,7 +248,7 @@ final class PlaybackController {
     private var sleepSecondsRemaining: Int?
     private(set) var sleepAfterTrack = false
     private(set) var autoplayEnabled = PlatformSettings.shared.getBoolean(key: "autoplay", default: true)
-    private(set) var automixEnabled = PlatformSettings.shared.getBoolean(key: "smart_fade_enabled", default: false)
+    private(set) var automixEnabled = PlatformSettings.shared.getBoolean(key: "smart_fade_enabled", default: true)
     var hideVolumeBar = PlatformSettings.shared.getBoolean(key: "hide_volume_bar", default: false)
     /// Hides the "Playing from" / "Played by" caption on the main player.
     /// Read by the player UI; persisted here so the choice survives restarts.
@@ -416,12 +321,13 @@ final class PlaybackController {
     private var upgradeFor: String?
     private var mixFadeUntil: Date?
 
-    private var unshuffledQueue: [QueueEntry]?
     /// Id the engine currently has loaded — nil after a cold restore until Play.
     fileprivate var dolbyRenderer: AppleDolbyRenderer?
     private var playbackPosition: Double { dolbyRenderer?.position ?? engine.positionSeconds() }
     @ObservationIgnored private var durationRepairTask: Task<Void, Never>?
     private var engineLoadedId: String?
+    /// Cached once per selection; history polling does not scan download assets.
+    private var historyVideoID: String?
     /// The file the engine actually opened for the loaded track, as it reports
     /// it back. Kept because `QueueEntry.source` is **not** a path for a
     /// YouTube track — it is `yt:<videoId>` (see `QueueEntry.youtube`) — and the
@@ -833,13 +739,13 @@ final class PlaybackController {
         let from = Float(volume * (shouldDuck ? 1.0 : Self.duckGain))
         let to = Float(volume * (shouldDuck ? Self.duckGain : 1.0))
         let engine = self.engine
-        duckTask = Task.detached(priority: .userInitiated) { [weak self] in
+        duckTask = Task(priority: .userInitiated) { [weak self] in
             let steps = 20
             for step in 1...steps {
                 if Task.isCancelled { return }
                 let progress = Float(step) / Float(steps)
                 engine.setVolume(gain: from + (to - from) * progress)
-                await MainActor.run { self?.dolbyRenderer?.volume = from + (to - from) * progress }
+                self?.dolbyRenderer?.volume = from + (to - from) * progress
                 try? await Task.sleep(for: .milliseconds(10))
             }
         }
@@ -848,32 +754,94 @@ final class PlaybackController {
     // ---- Queue operations ---------------------------------------------------
 
     /// Plays `entries`, starting at `index`. Replaces the queue.
-    func play(_ entries: [QueueEntry], at index: Int = 0, context: String? = nil) {
+    func play(
+        _ entries: [QueueEntry],
+        at index: Int = 0,
+        context: String? = nil,
+        contextID: String? = nil,
+        shuffleRequested: Bool? = nil,
+        shuffleStart: Bool = false
+    ) {
         noteLocalIntent()
         guard entries.indices.contains(index) else { return }
         let entry = entries[index]
         // Same song already loading or playing: extra taps are from the
         // download delay, not a request to restart.
-        if current?.id == entry.id, state == .buffering || state == .playing {
+        if current?.id == entry.id,
+           playbackContextID == contextID,
+           !shuffleStart, shuffleRequested == nil || shuffleRequested == shuffleEnabled,
+           queue.filter({ $0.contextOrder != nil }).sorted(by: { ($0.contextOrder ?? 0) < ($1.contextOrder ?? 0) }).map(\.id) == entries.map(\.id),
+           state == .buffering || state == .playing {
             return
         }
-        if current?.id == entry.id, state == .paused, engineLoadedId == nil {
-            queue = entries
-            playingIndex = index
-            persistSession()
-            togglePlayPause()
-            return
+        let useShuffle = shuffleRequested ?? shuffleEnabled
+        var entries = entries.enumerated().map { offset, value in
+            var value = value
+            value.contextOrder = offset
+            value.fromAutoplay = false
+            return value
         }
-        queue = entries
+        var index = index
+        if shuffleStart, useShuffle, !automixSequencingEnabled {
+            entries = PlaybackQueuePolicy.startingWith(entries, seed: Int.random(in: entries.indices))
+            index = 0
+        }
+        let selected = entries[index]
+        queue = PlaybackQueuePolicy.orderList(
+            entries, after: index, automix: automixSequencingEnabled,
+            shuffle: useShuffle, scores: tasteScores(entries)
+        )
         playbackContext = context
-        unshuffledQueue = nil
-        shuffleEnabled = false
+        playbackContextID = contextID
+        shuffleEnabled = useShuffle
+        queueEditRevision &+= 1
+        autoplayRefresh.invalidate()
         restoredStart = nil
         repeatAllStash = []
         repeatAllStashSeed = nil
-        persistSession()
         startEngineIfNeeded()
+        if engineLoadedId == selected.id, current?.source == selected.source, state == .playing {
+            playingIndex = index
+            current = queue[index]
+            persistSession()
+            syncEngineQueueNext()
+            scheduleSequencing()
+            return
+        }
         loadCurrent(index)
+    }
+
+    private var automixSequencingEnabled: Bool {
+        automixEnabled && PlatformSettings.shared.getBoolean(key: "automix_smart_sequence", default: true)
+    }
+
+    func isPlaybackContextActive(_ contextID: String) -> Bool {
+        playbackContextState(contextID) != .inactive
+    }
+
+    func isPlaybackContextPlaying(_ contextID: String) -> Bool {
+        playbackContextState(contextID) == .playing
+    }
+
+    private func playbackContextState(_ contextID: String) -> PlaybackQueuePolicy.HeroState {
+        PlaybackQueuePolicy.heroState(
+            origin: playbackContextID, listID: contextID, hasQueue: !queue.isEmpty,
+            stopped: state == .stopped, playingOrBuffering: state == .playing || state == .buffering
+        )
+    }
+
+    func togglePlaybackContext(
+        _ entries: [QueueEntry],
+        at index: Int = 0,
+        title: String,
+        contextID: String,
+        shuffleRequested: Bool? = nil
+    ) {
+        if isPlaybackContextActive(contextID) {
+            togglePlayPause()
+        } else {
+            play(entries, at: index, context: title, contextID: contextID, shuffleRequested: shuffleRequested, shuffleStart: true)
+        }
     }
 
     // ---- Revert to original / upgrade quality --------------------------------
@@ -978,7 +946,8 @@ final class PlaybackController {
             position: position,
             repeatMode: repeatMode,
             shuffleEnabled: shuffleEnabled,
-            volume: volume
+            volume: volume,
+            contextID: playbackContextID, contextTitle: playbackContext
         )
     }
 
@@ -993,7 +962,8 @@ final class PlaybackController {
     func restoreSession() {
         guard let snap = LastPlayed.load() else { return }
         let savedContext = PlatformSettings.shared.getString(key: "last_playback_context", default: "")
-        playbackContext = savedContext.isEmpty ? nil : savedContext
+        playbackContext = snap.contextTitle ?? (savedContext.isEmpty ? nil : savedContext)
+        playbackContextID = snap.contextID
         queue = snap.tracks
         playingIndex = snap.index
         current = queue[snap.index]
@@ -1027,12 +997,13 @@ final class PlaybackController {
     func playNext(_ entry: QueueEntry) {
         noteLocalIntent()
         let wasEmpty = queue.isEmpty
+        var entry = entry
+        entry.contextOrder = nil
+        entry.fromAutoplay = false
+        removeAutoplayDuplicate(of: entry)
         let at = min(playingIndex + 1, queue.count)
         queue.insert(entry, at: at)
-        if var original = unshuffledQueue {
-            original.insert(entry, at: min(at, original.count))
-            unshuffledQueue = original
-        }
+        queueEditRevision &+= 1
         persistSession()
         // As `addToQueue`: "play next" on an idle player is a request to play.
         if wasEmpty, isIdle {
@@ -1070,10 +1041,12 @@ final class PlaybackController {
         if !inMix { to = min(to, hi - 1) }
         if to == from || to < lo { return }
         var copy = queue
-        let item = copy.remove(at: from)
+        var item = copy.remove(at: from)
+        if !inMix { item.contextOrder = nil }
         let insertAt = min(max(to, 0), copy.count)
         copy.insert(item, at: insertAt)
         queue = copy
+        queueEditRevision &+= 1
         persistSession()
         syncEngineQueueNext()
     }
@@ -1106,8 +1079,13 @@ final class PlaybackController {
     func addToQueue(_ entry: QueueEntry) {
         noteLocalIntent()
         let wasEmpty = queue.isEmpty
-        queue.append(entry)
-        unshuffledQueue?.append(entry)
+        var entry = entry
+        entry.contextOrder = nil
+        entry.fromAutoplay = false
+        removeAutoplayDuplicate(of: entry)
+        let at = min(autoplaySectionStart, queue.count)
+        queue.insert(entry, at: at)
+        queueEditRevision &+= 1
         persistSession()
         if wasEmpty, isIdle {
             // Nothing was playing and nothing was queued: this is the queue.
@@ -1116,6 +1094,14 @@ final class PlaybackController {
             return
         }
         syncEngineQueueNext()
+    }
+
+    private func removeAutoplayDuplicate(of entry: QueueEntry) {
+        let duplicateIndices = queue.indices.filter {
+            $0 > playingIndex && queue[$0].fromAutoplay && queue[$0].id == entry.id
+        }
+        guard !duplicateIndices.isEmpty else { return }
+        queue.remove(atOffsets: IndexSet(duplicateIndices))
     }
 
     /// Nothing loaded into the engine and nothing on its way there.
@@ -1404,6 +1390,7 @@ final class PlaybackController {
             return true
         }
         let headers = sourceHeadersByPath.removeValue(forKey: info.source) ?? [:]
+        PlaybackTrackerBridge.shared.onTrackChanged(positionSeconds: Int64(position))
         loadDidSucceed(entry: entry, index: target, info: info, startAt: 0, headers: headers)
         return true
     }
@@ -1441,6 +1428,7 @@ final class PlaybackController {
             restoreAutoplayTracks()
         }
         repeatMode = next
+        autoplayRefresh.invalidate()
         persistSession()
         syncEngineQueueNext()
         if next != .all {
@@ -1449,26 +1437,25 @@ final class PlaybackController {
     }
 
     func toggleShuffle() {
-        if shuffleEnabled {
-            if let original = unshuffledQueue {
-                let currentId = current?.id
-                queue = original
-                if let currentId, let idx = queue.firstIndex(where: { $0.id == currentId }) {
-                    playingIndex = idx
-                }
-            }
-            unshuffledQueue = nil
-            shuffleEnabled = false
-        } else {
-            unshuffledQueue = queue
-            let head = Array(queue.prefix(playingIndex + 1))
-            var tail = Array(queue.dropFirst(playingIndex + 1))
-            tail.shuffle()
-            queue = head + tail
-            shuffleEnabled = true
-        }
+        shuffleEnabled.toggle()
+        applyListOrder()
+    }
+
+    /// Reorders only list slots. Played tracks, manual additions and the separate
+    /// recommendation tail keep their places when playback mode changes.
+    private func applyListOrder() {
+        queue = PlaybackQueuePolicy.orderList(
+            queue, after: playingIndex, automix: automixSequencingEnabled,
+            shuffle: shuffleEnabled, scores: tasteScores(queue)
+        )
+        queueEditRevision &+= 1
         persistSession()
         syncEngineQueueNext()
+        scheduleSequencing()
+    }
+
+    func smartSequencingPreferenceChanged() {
+        applyListOrder()
     }
 
     func seek(to seconds: Double) {
@@ -1476,6 +1463,11 @@ final class PlaybackController {
         // Queues and returns: the playhead is the engine's to move, and waiting
         // for it here would stall whatever thread asked — usually the main one.
         guard engineLoadedId == current?.id, engineLoadedId != nil else { return }
+        if seconds <= 0.1, position > Self.backRestartsAfter, isPlaying,
+           let id = historyVideoID {
+            PlaybackTrackerBridge.shared.onTrackChanged(positionSeconds: Int64(position))
+            PlaybackTrackerBridge.shared.onPlaying(videoId: id)
+        }
         if let dolbyRenderer { dolbyRenderer.seek(seconds) } else { engine.seek(seconds: seconds) }
         nowPlaying.update(position: seconds)
         position = seconds
@@ -1487,11 +1479,10 @@ final class PlaybackController {
         guard !adjusted.isEmpty else { return }
         let removedIds = Set(adjusted.map { queue[$0].id })
         queue.remove(atOffsets: IndexSet(adjusted))
-        if let original = unshuffledQueue {
-            unshuffledQueue = original.filter { !removedIds.contains($0.id) }
-        }
         removedIds.forEach { QualityUpgrade.forget($0) }
-        if playingIndex >= queue.count { playingIndex = max(0, queue.count - 1) }
+        playingIndex -= adjusted.filter { $0 < playingIndex }.count
+        playingIndex = min(playingIndex, max(0, queue.count - 1))
+        queueEditRevision &+= 1
         persistSession()
         syncEngineQueueNext()
     }
@@ -1853,10 +1844,7 @@ final class PlaybackController {
         let removed = queue[(playingIndex + 1)...]
         removed.forEach { QualityUpgrade.forget($0.id) }
         queue.removeSubrange((playingIndex + 1)...)
-        if let original = unshuffledQueue {
-            let kept = Set(queue.map(\.id))
-            unshuffledQueue = original.filter { kept.contains($0.id) }
-        }
+        queueEditRevision &+= 1
         persistSession()
         syncEngineQueueNext()
     }
@@ -1865,12 +1853,13 @@ final class PlaybackController {
         autoplayEnabled.toggle()
         AppSettings.shared.setAutoplay(value: autoplayEnabled)
         if !autoplayEnabled {
+            autoplayRefresh.invalidate()
             // Upstream clears the stash when AutoPlay is switched off mid-loop
             // so ending ALL later does not resurrect dropped suggestions.
             repeatAllStash = []
             repeatAllStashSeed = nil
         } else if repeatMode != .all {
-            maybeAutoplay()
+            maybeAutoplay(force: true)
         }
     }
 
@@ -1884,6 +1873,7 @@ final class PlaybackController {
         AppSettings.shared.setSmartFadeEnabled(value: enabled)
         refreshPlaybackRegions()
         syncEngineQueueNext()
+        applyListOrder()
     }
 
     func authoriseLastFm() {
@@ -1942,11 +1932,13 @@ final class PlaybackController {
         let wasAudible = state == .playing || (state == .paused && engineLoadedId != nil)
         playingIndex = index
         current = entry
+        historyVideoID = youtubeVideoID(for: entry)
         let outgoingPosition = position
         position = startAt ?? 0
         duration = 0
         lastError = nil
         state = .buffering
+        maybeAutoplay()
         nowPlaying.updateCommands(canNext: playingIndex + 1 < queue.count || repeatMode == .all, canPrevious: true, canSeek: false)
         dolbyRenderer?.stop()
         dolbyRenderer = nil
@@ -1962,6 +1954,7 @@ final class PlaybackController {
         widgetPublisher.publish(entry: entry, isPlaying: false,
                                 canNext: index + 1 < queue.count,
                                 canPrevious: index > 0)
+        persistSession()
         // Start read-ahead after this selection has loaded (syncEngineQueueNext).
         // Rapid Next taps must not start four speculative resolver walks ahead
         // of the track the listener is actually waiting for.
@@ -2665,6 +2658,7 @@ final class PlaybackController {
         NSLog("[BitChord] loaded track at %.2fs (duration %.2fs)", startAt, info.durationSeconds)
         playingIndex = index
         current = entry
+        historyVideoID = youtubeVideoID(for: entry)
         engineLoadedId = entry.id
         loadedSourcePath = info.source
         loadedSourceHeaders = headers
@@ -2683,8 +2677,9 @@ final class PlaybackController {
         racingLossless = QualityUpgrade.isRacing(entry.id)
         scrobbleArmed = false
         scrobbleSent = false
-        if entry.source.hasPrefix("yt:") {
-            PlaybackTrackerBridge.shared.onPlaying(videoId: String(entry.source.dropFirst(3)))
+        if let id = historyVideoID {
+            QueueBuilderBridge.shared.rememberPlayed(videoId: id)
+            PlaybackTrackerBridge.shared.onPlaying(videoId: id)
         }
         publishPresence()
         ScrobbleBridge.shared.nowPlaying(
@@ -2705,6 +2700,7 @@ final class PlaybackController {
         // Waiting for the current download here made prefetch start up to eight
         // seconds late, then full analysis delayed queueing it even further.
         syncEngineQueueNext()
+        scheduleSequencing()
     }
 
     /// Legacy cached WebM files can lack both container and saved duration.
@@ -2761,6 +2757,7 @@ final class PlaybackController {
     /// must not arm the next song — the current track seeks to 0 at EOS.
     /// Repeat-one *with* Automix arms a self-mix into the same track.
     private func syncEngineQueueNext() {
+        maybeAutoplay()
         guard !sleepAfterTrack else { return }
         if dolbyRenderer != nil {
             nowPlaying.updateCommands(canNext: nextEntry != nil, canPrevious: current != nil, canSeek: duration > 0)
@@ -2768,6 +2765,9 @@ final class PlaybackController {
         }
         nowPlaying.updateCommands(canNext: playingIndex + 1 < queue.count || repeatMode == .all, canPrevious: current != nil,
                                   canSeek: engineLoadedId != nil && duration > 0)
+        // Recommendation replies can arrive before the selected song has loaded.
+        // Read-ahead starts after that load, using its authoritative audio path.
+        guard engineLoadedId != nil, engineLoadedId == current?.id else { return }
         queueNextRevision &+= 1
         let revision = queueNextRevision
         let gate = loadSubmissionGate
@@ -3060,7 +3060,9 @@ final class PlaybackController {
         }
         let outgoingPosition = position
         let sameSong = current?.id == queue[playingIndex].id
+        autoplayRefresh.invalidate()
         current = queue[playingIndex]
+        historyVideoID = current.flatMap(youtubeVideoID)
         duration = info.durationSeconds
         position = 0
         if let entry = current {
@@ -3074,8 +3076,9 @@ final class PlaybackController {
             scrobbleArmed = false
             scrobbleSent = false
             PlaybackTrackerBridge.shared.onTrackChanged(positionSeconds: Int64(outgoingPosition))
-            if entry.source.hasPrefix("yt:") {
-                PlaybackTrackerBridge.shared.onPlaying(videoId: String(entry.source.dropFirst(3)))
+            if let id = historyVideoID {
+                QueueBuilderBridge.shared.rememberPlayed(videoId: id)
+                PlaybackTrackerBridge.shared.onPlaying(videoId: id)
             }
             publishPresence()
             nowPlaying.update(
@@ -3091,6 +3094,7 @@ final class PlaybackController {
         }
         persistSession()
         syncEngineQueueNext()
+        scheduleSequencing()
     }
 
     fileprivate func handleTrackEnded(_ reason: TrackEndReason, source: String) {
@@ -3100,15 +3104,15 @@ final class PlaybackController {
         // selection. Empty source keeps backward compatibility with callers
         // that do not report one.
         if !source.isEmpty, let loaded = loadedSourcePath, loaded != source { return }
+        if historyVideoID != nil {
+            PlaybackTrackerBridge.shared.onPlaybackFinished(positionSeconds: Int64(position))
+        }
         if sleepAfterTrack {
             sleepAfterTrack = false
             pausePlayback(releaseAudioSession: true)
             try? engine.holdTrackEnd(hold: false)
             try? engine.setSleepGain(gain: 1)
             return
-        }
-        if let current, current.source.hasPrefix("yt:") {
-            PlaybackTrackerBridge.shared.onPlaybackFinished(positionSeconds: Int64(position))
         }
         if let current, !scrobbleSent {
             ScrobbleBridge.shared.scrobble(
@@ -3434,9 +3438,9 @@ final class PlaybackController {
     }
 
     private func tickHistory() {
-        guard let current, current.source.hasPrefix("yt:") else { return }
+        guard let id = historyVideoID else { return }
         PlaybackTrackerBridge.shared.onProgress(
-            videoId: String(current.source.dropFirst(3)),
+            videoId: id,
             positionSeconds: Int64(position)
         )
     }
@@ -3502,10 +3506,33 @@ final class PlaybackController {
     /// playback failure is.
     func toggleLike(videoId: String) {
         Task { @MainActor [weak self] in
-            if let failure = await LibraryActions.toggleLike(videoId: videoId) {
+            if let failure = await self?.toggleLikeAndWait(videoId: videoId) {
                 self?.lastError = failure
             }
         }
+    }
+
+    func toggleLikeAndWait(videoId: String) async -> String? {
+        let generation = PageSession.generation()
+        let failure = await LibraryActions.toggleLike(videoId: videoId)
+        refreshAfterRating(failure: failure, sessionGeneration: generation)
+        return failure
+    }
+
+    func rateTrack(videoId: String, status: String) async -> String? {
+        let generation = PageSession.generation()
+        let previous = LibraryActions.cachedLike(videoId)
+        let failure = await LibraryActions.rate(videoId: videoId, status: status)
+        if generation == PageSession.generation() {
+            if failure != nil { LikeStore.shared.set(videoId, previous) }
+            refreshAfterRating(failure: failure, sessionGeneration: generation)
+        }
+        return failure
+    }
+
+    private func refreshAfterRating(failure: String?, sessionGeneration: Int64) {
+        guard failure == nil, sessionGeneration == PageSession.generation() else { return }
+        maybeAutoplay(force: true)
     }
 
     var isLiked: Bool {
@@ -3549,27 +3576,44 @@ final class PlaybackController {
         return position + elapsed * playbackRate
     }
 
+    private func youtubeVideoID(for entry: QueueEntry) -> String? {
+        if entry.source.hasPrefix("yt:") { return entry.videoId }
+        return entry.isLocal ? DownloadStore.shared.selectedYouTubeVideoId(for: entry.source) : nil
+    }
+
+    private var recommendationContext: AutoplayRefreshState.Context? {
+        guard autoplayEnabled, repeatMode != .all, let current,
+              let id = youtubeVideoID(for: current), state != .stopped else { return nil }
+        return .init(
+            source: "yt:\(id)", index: playingIndex, playbackGeneration: playGeneration,
+            queueEditRevision: queueEditRevision, sessionGeneration: PageSession.generation()
+        )
+    }
+
     private func maybeAutoplay(force: Bool = false) {
-        guard autoplayEnabled,
-              repeatMode != .all,
-              let current, current.source.hasPrefix("yt:") else { return }
-        let remaining = queue.count - playingIndex - 1
-        if !force, remaining >= 6 { return }
-        let videoId = String(current.source.dropFirst(3))
-        QueueBuilderBridge.shared.rememberPlayed(videoId: videoId)
-        AutoPlayBridge.shared.related(videoId: videoId, callback: AutoPlayAdapter { [weak self] json, _ in
+        guard let context = recommendationContext,
+              let request = autoplayRefresh.begin(context, force: force) else { return }
+        let videoId = String(context.source.dropFirst(3))
+        fetchRecommendations(videoId: videoId) { [weak self] json, _ in
             Task { @MainActor in
-                guard let self, let json else { return }
-                // Repeat-all may have been switched on while the request was out.
-                guard self.autoplayEnabled, self.repeatMode != .all else { return }
-                let existing = (try? JSONEncoder().encode(self.queue.map { $0.asSongJSON() }))
+                guard let self, let json, let currentContext = self.recommendationContext,
+                      self.autoplayRefresh.accepts(request, current: currentContext) else { return }
+                // Keep the current/played prefix and every manual or list entry.
+                // Replace the old suggestions only after a successful fresh reply.
+                let kept = PlaybackQueuePolicy.withoutUpcomingAutoplay(self.queue, after: self.playingIndex)
+                // QueueBuilder reads the final existing entry as the station seed.
+                // Its filtering snapshot ends with the current song; actual queue
+                // positions and manual/list priority are unchanged.
+                let filteringEntries = kept.enumerated().filter { $0.offset != self.playingIndex }.map(\.element) + [kept[self.playingIndex]]
+                let existing = (try? JSONEncoder().encode(filteringEntries.map { $0.asSongJSON(videoIDOverride: self.youtubeVideoID(for: $0)) }))
                     .flatMap { String(data: $0, encoding: .utf8) } ?? "[]"
                 let extraJson = QueueBuilderBridge.shared.extendJson(
                     existingJson: existing, candidatesJson: json, limit: Int32(8)
                 )
                 guard let data = extraJson.data(using: .utf8),
                       let songs = try? JSONDecoder().decode([SongDTO].self, from: data) else { return }
-                let extras = songs.map {
+                var known = Set(kept.map(\.id))
+                let extras = songs.filter { known.insert($0.videoId).inserted }.map {
                     QueueEntry.youtube(
                         videoId: $0.videoId, title: $0.title, artist: $0.artist,
                         thumbnailUrl: $0.thumbnailUrl, durationText: $0.durationText,
@@ -3577,138 +3621,126 @@ final class PlaybackController {
                         fromAutoplay: true
                     )
                 }
-                let known = Set(self.queue.map(\.id))
-                self.queue.append(contentsOf: extras.filter { !known.contains($0.id) })
-                await self.reorderAutoplayTailForAutomix()
+                self.queue = kept + extras
+                self.persistSession()
                 self.syncEngineQueueNext()
+                self.scheduleSequencing()
             }
-        })
+        }
     }
 
-    /// When Smart Sequencing is on, rank the Autoplay tail against the current
-    /// track using local cache paths and bring the best mixable candidate next.
-    private func reorderAutoplayTailForAutomix() async {
-        guard automixEnabled,
-              PlatformSettings.shared.getBoolean(key: "automix_smart_sequence", default: true),
-              let current
-        else { return }
-        let start = autoplaySectionStart
-        guard start < queue.count else { return }
-        let window = Array(queue[start..<min(queue.count, start + 12)])
-        guard window.count >= 2 else { return }
+    private func fetchRecommendations(videoId: String, response: @escaping (String?, String?) -> Void) {
+        #if DEBUG
+        if let recommendationFetchOverride { recommendationFetchOverride(videoId, response); return }
+        #endif
+        AutoPlayBridge.shared.related(videoId: videoId, callback: AutoPlayAdapter(response))
+    }
 
-        var paths: [String] = []
-        var texts: [String] = []
-        var indices: [Int] = []
-        var candidates: [QueueEntry] = []
-        for (offset, entry) in window.enumerated() {
-            let videoId: String?
-            if entry.source.hasPrefix("yt:") {
-                videoId = String(entry.source.dropFirst(3))
-            } else if entry.isLocal {
-                videoId = nil
-            } else {
-                videoId = nil
-            }
-            let path: String?
-            if entry.isLocal, !entry.source.isEmpty, FileManager.default.fileExists(atPath: entry.source) {
-                path = entry.source
-            } else if let videoId {
-                path = await StreamFileCache.shared.path(for: videoId)
-            } else {
-                path = nil
-            }
-            guard let path, FileManager.default.fileExists(atPath: path) else { continue }
-            paths.append(path)
-            texts.append(entry.itemText)
-            indices.append(start + offset)
-            candidates.append(entry)
-        }
-        guard paths.count >= 2,
-              let currentPath = loadedSourcePath,
-              FileManager.default.fileExists(atPath: currentPath)
-        else { return }
-
-        let fade = Double(PlatformSettings.shared.getInt(key: "crossfade_seconds", default: 0))
-        let skipVocals = automixPerformanceMode == "EFFICIENT"
-        let ranked = rankAutomixCandidates(
-            currentPath: currentPath,
-            candidatePaths: paths,
-            currentText: current.itemText,
-            candidateTexts: texts,
-            crossfadeSeconds: fade,
-            skipVocals: skipVocals
-        )
-        guard let bestLocal = ranked.first.map(Int.init),
-              bestLocal >= 0,
-              bestLocal < indices.count
-        else { return }
-
-        // The native planner supplies transition quality. Reorder the same
-        // cached candidates using local taste and recency as well, so a
-        // technically clean but repeatedly heard track does not always win.
-        // The hand-built queue prefix is outside this method and is untouched.
-        let mixRank = Dictionary(uniqueKeysWithValues: ranked.enumerated().map { rank, value in
-            (Int(value), rank)
-        })
+    private func tasteScores(_ entries: [QueueEntry], transitionFits: [Int: Double] = [:]) -> [Double] {
         let taste = ListeningStore.shared.summary(includeGenres: true)
-        let lastPlayedById = ListeningStore.shared.lastPlayedByTrack()
+        let lastPlayed = ListeningStore.shared.lastPlayedByTrack()
         let now = Date().timeIntervalSince1970 * 1000
-        let bestTasteLocal = candidates.indices.max { lhs, rhs in
-            autoplayCandidateScore(
-                candidates[lhs], mixRank: mixRank[lhs] ?? ranked.count,
-                candidateCount: candidates.count, taste: taste,
-                lastPlayedById: lastPlayedById, now: now
-            ) < autoplayCandidateScore(
-                candidates[rhs], mixRank: mixRank[rhs] ?? ranked.count,
-                candidateCount: candidates.count, taste: taste,
-                lastPlayedById: lastPlayedById, now: now
+        return entries.enumerated().map { index, entry in
+            let primaryArtist = ListeningStore.primaryArtist(entry.artist) ?? entry.artist
+            let artistRank = taste.artists.firstIndex {
+                $0.name.caseInsensitiveCompare(primaryArtist) == .orderedSame
+            }
+            let artistAffinity = artistRank.map { max(0, 1.0 - Double($0) / 10.0) } ?? 0
+            let artistGenres = ListeningStore.shared.knownGenres[primaryArtist] ?? []
+            let genreRank = taste.genres.firstIndex { genre in
+                artistGenres.contains { $0.caseInsensitiveCompare(genre.name) == .orderedSame }
+            }
+            let genreAffinity = genreRank.map { max(0, 1.0 - Double($0) / 10.0) } ?? 0
+            return PlaybackQueuePolicy.score(
+                transitionFit: transitionFits[index], affinity: max(artistAffinity, genreAffinity),
+                playedAt: lastPlayed[entry.id], now: now
             )
         }
-        guard let bestTasteLocal else { return }
-        let bestQueueIndex = indices[bestTasteLocal]
-        guard bestQueueIndex != start else { return }
-
-        var next = queue
-        let best = next.remove(at: bestQueueIndex)
-        next.insert(best, at: start)
-        queue = next
-        NSLog(
-            "[BitChord] smart sequencing moved %@ ahead in Autoplay tail (transition rank %d)",
-            best.title,
-            Int32(mixRank[bestTasteLocal] ?? ranked.count)
-        )
     }
 
-    private func autoplayCandidateScore(
-        _ entry: QueueEntry,
-        mixRank: Int,
-        candidateCount: Int,
-        taste: ReplaySummary,
-        lastPlayedById: [String: Double],
-        now: TimeInterval
-    ) -> Double {
-        let transition = candidateCount <= 1
-            ? 0.5
-            : 1.0 - Double(mixRank) / Double(candidateCount - 1)
-        let primaryArtist = ListeningStore.primaryArtist(entry.artist) ?? entry.artist
-        let artistRank = taste.artists.firstIndex {
-            $0.name.caseInsensitiveCompare(primaryArtist) == .orderedSame
+    private func scheduleSequencing() {
+        sequencingTask?.cancel()
+        sequencingGeneration &+= 1
+        guard automixSequencingEnabled, let current else { return }
+        let initial = queue
+        let initialScores = tasteScores(initial)
+        for positions in [PlaybackQueuePolicy.listIndices(initial, after: playingIndex),
+                          PlaybackQueuePolicy.autoplayIndices(initial, after: playingIndex)] {
+            queue = PlaybackQueuePolicy.replacing(
+                queue, at: positions,
+                with: PlaybackQueuePolicy.ranked(positions, scores: initialScores).map { initial[$0] }
+            )
         }
-        let artistAffinity = artistRank.map { max(0, 1.0 - Double($0) / 10.0) } ?? 0
-        let artistGenres = ListeningStore.shared.knownGenres[primaryArtist] ?? []
-        let bestGenreRank = taste.genres.enumerated().first { _, genre in
-            artistGenres.contains { $0.caseInsensitiveCompare(genre.name) == .orderedSame }
-        }?.offset
-        let genreAffinity = bestGenreRank.map { max(0, 1.0 - Double($0) / 10.0) } ?? 0
-        let tasteAffinity = max(artistAffinity, genreAffinity)
-
-        let playedAt = lastPlayedById[entry.id]
-        let isRecent = (playedAt ?? 0) > now - 14 * 24 * 60 * 60 * 1000
-        let novelty = playedAt == nil ? 1.0 : (isRecent ? 0.0 : 0.65)
-        let repeatPenalty = isRecent ? 0.25 : 0.0
-
-        return transition * 0.60 + tasteAffinity * 0.25 + novelty * 0.15 - repeatPenalty
+        if queue != initial { persistSession(); syncEngineQueueNext() }
+        let generation = sequencingGeneration
+        let snapshot = queue
+        let index = playingIndex
+        let playbackGeneration = playGeneration
+        let sessionGeneration = PageSession.generation()
+        let currentPath = loadedSourcePath
+        let fade = Double(PlatformSettings.shared.getInt(key: "crossfade_seconds", default: 0))
+        let skipVocals = automixPerformanceMode == "EFFICIENT"
+        let listPositions = PlaybackQueuePolicy.listIndices(snapshot, after: index)
+        let autoplayPositions = PlaybackQueuePolicy.autoplayIndices(snapshot, after: index)
+        guard listPositions.count > 1 || autoplayPositions.count > 1 else { return }
+        // Taste/freshness gives every candidate an order immediately. Decode and
+        // analyse only a bounded window of audio already available on this device.
+        let fallback = tasteScores(snapshot)
+        sequencingTask = Task(priority: .utility) { [weak self] in
+            var transitionFits: [Int: Double] = [:]
+            if let currentPath, FileManager.default.fileExists(atPath: currentPath) {
+                for positions in [Array(listPositions.prefix(12)), Array(autoplayPositions.prefix(12))] {
+                    var paths: [String] = []
+                    var texts: [String] = []
+                    var available: [Int] = []
+                    for position in positions {
+                        if Task.isCancelled { return }
+                        let entry = snapshot[position]
+                        let path: String?
+                        if entry.isLocal, FileManager.default.fileExists(atPath: entry.source) {
+                            path = entry.source
+                        } else if entry.source.hasPrefix("yt:"), let id = entry.videoId {
+                            path = await StreamFileCache.shared.path(for: id)
+                        } else { path = nil }
+                        if let path, FileManager.default.fileExists(atPath: path) {
+                            paths.append(path)
+                            texts.append(entry.itemText)
+                            available.append(position)
+                        }
+                    }
+                    guard !Task.isCancelled else { return }
+                    if paths.count > 1 {
+                        let ranked = await AutomixQueueRanker.shared.rank(
+                            currentPath: currentPath, candidatePaths: paths,
+                            currentText: current.itemText, candidateTexts: texts,
+                            crossfadeSeconds: fade, skipVocals: skipVocals
+                        )
+                        for (rank, value) in ranked.enumerated() {
+                            let candidate = Int(value)
+                            if available.indices.contains(candidate) {
+                                transitionFits[available[candidate]] = 1 - Double(rank) / Double(max(1, available.count - 1))
+                            }
+                        }
+                    }
+                }
+            }
+            guard let self, !Task.isCancelled, self.sequencingGeneration == generation,
+                  self.automixSequencingEnabled, self.queue == snapshot, self.playingIndex == index,
+                  self.playGeneration == playbackGeneration, self.current?.id == current.id,
+                  PageSession.generation() == sessionGeneration else { return }
+            let scores = transitionFits.isEmpty ? fallback : self.tasteScores(snapshot, transitionFits: transitionFits)
+            var ordered = snapshot
+            for positions in [listPositions, autoplayPositions] {
+                ordered = PlaybackQueuePolicy.replacing(
+                    ordered, at: positions,
+                    with: PlaybackQueuePolicy.ranked(positions, scores: scores).map { snapshot[$0] }
+                )
+            }
+            guard ordered != self.queue else { return }
+            self.queue = ordered
+            self.persistSession()
+            self.syncEngineQueueNext()
+        }
     }
 
     /// Clears AutoPlay's tail for the duration of repeat-all, keeping it to put back.
@@ -3727,10 +3759,6 @@ final class PlaybackController {
         }
         guard !dropped.isEmpty else { return }
         queue = kept
-        if let original = unshuffledQueue {
-            let droppedIds = Set(dropped.map(\.id))
-            unshuffledQueue = original.filter { !droppedIds.contains($0.id) }
-        }
         repeatAllStash = dropped
         repeatAllStashSeed = seed
         persistSession()
@@ -3748,7 +3776,6 @@ final class PlaybackController {
         let restored = stashed.filter { !present.contains($0.id) }
         guard !restored.isEmpty else { return }
         queue.append(contentsOf: restored)
-        unshuffledQueue?.append(contentsOf: restored)
         persistSession()
     }
 
@@ -4455,6 +4482,20 @@ private final class CanvasAdapter: CanvasBridgeCanvasCallback {
     func onResult(json: String?) { handler(json) }
 }
 
+/// Serial background analysis avoids a burst of decodes after rapid skips.
+private actor AutomixQueueRanker {
+    static let shared = AutomixQueueRanker()
+    func rank(currentPath: String, candidatePaths: [String], currentText: String,
+              candidateTexts: [String], crossfadeSeconds: Double, skipVocals: Bool) -> [UInt32] {
+        guard !Task.isCancelled else { return [] }
+        return rankAutomixCandidates(
+            currentPath: currentPath, candidatePaths: candidatePaths,
+            currentText: currentText, candidateTexts: candidateTexts,
+            crossfadeSeconds: crossfadeSeconds, skipVocals: skipVocals
+        )
+    }
+}
+
 private final class AutoPlayAdapter: AutoPlayBridgeAutoPlayCallback {
     private let handler: (String?, String?) -> Void
     init(_ handler: @escaping (String?, String?) -> Void) { self.handler = handler }
@@ -4874,6 +4915,115 @@ extension PlaybackController {
         print("NATIVE RESUME VERIFICATION \(checks)")
     }
 #endif
+
+    /// Explicit Mac validation launch: local audio and controlled recommendation
+    /// replies. Run in an isolated bundle so the listener's queue/preferences stay intact.
+    func verifyQueueBehavior() async {
+        var checks: [String: Bool] = [:]
+        volume = 0
+        autoplayEnabled = false
+        setAutomixEnabled(false)
+        repeatMode = .off
+        let root = FileManager.default.temporaryDirectory
+        let path = root.appendingPathComponent("queue-validation.wav")
+        func word<T: FixedWidthInteger>(_ value: T) -> Data {
+            var value = value.littleEndian
+            return withUnsafeBytes(of: &value) { Data($0) }
+        }
+        let count: UInt32 = 44100 * 20
+        var audio = Data("RIFF".utf8); audio.append(word(UInt32(36 + count * 4)))
+        audio.append(Data("WAVEfmt ".utf8)); audio.append(word(UInt32(16)))
+        audio.append(word(UInt16(1))); audio.append(word(UInt16(2))); audio.append(word(UInt32(44100)))
+        audio.append(word(UInt32(44100 * 4))); audio.append(word(UInt16(4))); audio.append(word(UInt16(16)))
+        audio.append(Data("data".utf8)); audio.append(word(count * 4))
+        audio.append(Data(count: Int(count * 4)))
+        try? audio.write(to: path)
+        let entry = QueueEntry(id: "queue-local", title: "", artist: "", source: path.path, durationText: "0:20", isLocal: true)
+        togglePlaybackContext([entry], title: "First list", contextID: "first")
+        checks["buffering_hero_shows_pause"] = isPlaybackContextPlaying("first")
+        for _ in 0..<100 { if isPlaying || lastError != nil { break }; try? await Task.sleep(for: .milliseconds(100)) }
+        checks["local_audio_loaded"] = isPlaying && lastError == nil
+        togglePlaybackContext([entry], title: "First list", contextID: "first")
+        checks["same_list_pauses"] = state == .paused && !isPlaybackContextPlaying("first")
+        togglePlaybackContext([entry], title: "First list", contextID: "first")
+        for _ in 0..<30 { if isPlaying { break }; try? await Task.sleep(for: .milliseconds(100)) }
+        checks["same_list_resumes"] = isPlaying && isPlaybackContextPlaying("first")
+        togglePlaybackContext([entry], title: "Second list", contextID: "second")
+        checks["different_list_replaces_origin"] = playbackContextID == "second" && !isPlaybackContextActive("first")
+        let second = QueueEntry(id: "queue-second", title: "", artist: "", source: path.path, durationText: "0:20", isLocal: true)
+        let third = QueueEntry(id: "queue-third", title: "", artist: "", source: path.path, durationText: "0:20", isLocal: true)
+        let list = [entry, second, third]
+        setAutomixEnabled(true)
+        play(list, at: 1, context: "Automix list", contextID: "automix-list", shuffleRequested: true)
+        checks["automix_row_keeps_selected_and_prefix"] = current?.id == second.id && playingIndex == 1 && queue[0].id == entry.id
+        play(list, context: "Automix hero", contextID: "automix-hero", shuffleRequested: true, shuffleStart: true)
+        checks["automix_overrides_shuffle_seed"] = current?.id == entry.id && playingIndex == 0
+        setAutomixEnabled(false)
+        play(list, context: "Shuffle list", contextID: "shuffle-list", shuffleRequested: true, shuffleStart: true)
+        checks["shuffle_hero_keeps_all_tracks"] = Set(queue.map(\.id)) == Set(list.map(\.id)) && playingIndex == 0
+        for _ in 0..<100 { if isPlaying || lastError != nil { break }; try? await Task.sleep(for: .milliseconds(100)) }
+        pausePlayback()
+        engineLoadedId = nil
+        current = .youtube(videoId: "test-seed01", title: "Seed", artist: "Seed artist")
+        queue = [current!]
+        playingIndex = 0
+        state = .paused
+        autoplayEnabled = true
+        autoplayRefresh.invalidate()
+        var replies: [(String, (String?, String?) -> Void)] = []
+        recommendationFetchOverride = { seed, reply in replies.append((seed, reply)) }
+        func songs(_ ids: [String]) -> String {
+            let rows = ids.map { ["videoId": $0, "title": $0, "artist": "Artist \($0)"] }
+            return String(data: try! JSONSerialization.data(withJSONObject: rows), encoding: .utf8)!
+        }
+        func settle() async { try? await Task.sleep(for: .milliseconds(100)) }
+        maybeAutoplay()
+        checks["initial_seed_requested"] = replies.count == 1 && replies[0].0 == "test-seed01"
+        addToQueue(.youtube(videoId: "manual-song", title: "Manual", artist: "Manual artist"))
+        checks["queue_edit_refreshes"] = replies.count == 2
+        replies[0].1(songs(["stale-song"]), nil)
+        await settle()
+        checks["stale_queue_reply_ignored"] = !queue.contains { $0.id == "stale-song" }
+        replies[1].1(songs(["manual-song", "suggestion1", "suggestion1", "suggestion2"]), nil)
+        await settle()
+        checks["manual_before_deduplicated_tail"] = queue.map(\.id) == ["test-seed01", "manual-song", "suggestion1", "suggestion2"]
+        addToQueue(.youtube(videoId: "suggestion1", title: "Picked manually", artist: "Artist"))
+        checks["manual_pick_promotes_suggestion"] = queue.map(\.id) == ["test-seed01", "manual-song", "suggestion1", "suggestion2"] && !queue[2].fromAutoplay
+        let beforeRating = replies.count
+        refreshAfterRating(failure: "refused", sessionGeneration: PageSession.generation())
+        checks["failed_rating_keeps_tail"] = replies.count == beforeRating && queue.last?.id == "suggestion2"
+        refreshAfterRating(failure: nil, sessionGeneration: PageSession.generation())
+        checks["successful_rating_refreshes"] = replies.count == beforeRating + 1
+        replies.last!.1(songs(["fresh-tail1"]), nil)
+        await settle()
+        checks["rating_replaces_only_unplayed_tail"] = queue.map(\.id) == ["test-seed01", "manual-song", "suggestion1", "fresh-tail1"]
+        let outgoing = replies.last!
+        playingIndex = 1; current = queue[1]; playGeneration &+= 1
+        maybeAutoplay()
+        let nextReply = replies.last!
+        checks["next_uses_new_seed"] = nextReply.0 == "manual-song"
+        playingIndex = 0; current = queue[0]; playGeneration &+= 1
+        maybeAutoplay()
+        checks["back_requests_seed_again"] = replies.last!.0 == "test-seed01"
+        nextReply.1(songs(["stale-next1"]), nil); outgoing.1(songs(["stale-rate1"]), nil)
+        await settle()
+        checks["stale_selection_reply_ignored"] = !queue.contains { $0.id.hasPrefix("stale-") }
+        let pending = replies.last!
+        toggleAutoplay()
+        pending.1(songs(["disabled001"]), nil)
+        await settle()
+        checks["disabled_autoplay_rejects_reply"] = !queue.contains { $0.id == "disabled001" }
+        recommendationFetchOverride = nil
+        sequencingTask?.cancel()
+        try? engine.stop()
+        let result: [String: Any] = ["checks": checks, "passed": checks.values.allSatisfy { $0 }]
+        let report = URL(fileURLWithPath: "/tmp/bitchord-queue-runtime.json")
+        if let data = try? JSONSerialization.data(withJSONObject: result, options: [.prettyPrinted, .sortedKeys]) { try? data.write(to: report, options: .atomic) }
+        print("QUEUE VALIDATION \(checks)")
+        #if os(macOS)
+        NSApplication.shared.terminate(nil)
+        #endif
+    }
 
     /// Runs only on an explicit validation launch in a separate app container.
     func verifySleepBehavior() async {

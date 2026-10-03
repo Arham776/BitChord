@@ -131,7 +131,7 @@ struct SongActionButtons: View {
         // Same shape as `toggleDislike` below: the optimistic write and its
         // rollback live in `LibraryActions.toggleLike`, and a refusal is said
         // out loud instead of being written to `_`.
-        if let failure = await LibraryActions.toggleLike(videoId: videoId) {
+        if let failure = await controller.toggleLikeAndWait(videoId: videoId) {
             toast.show(failure, kind: .failure)
         }
     }
@@ -154,7 +154,7 @@ struct SongActionButtons: View {
             ? LikeStatus.dislike
             : (LibraryActions.cachedLike(videoId) == "LIKE" ? LikeStatus.like : .indifferent)
         let next = wasDisliked ? "INDIFFERENT" : "DISLIKE"
-        if let failure = await LibraryActions.rate(videoId: videoId, status: next) {
+        if let failure = await controller.rateTrack(videoId: videoId, status: next) {
             toast.show(failure, kind: .failure)
             return
         }
@@ -238,9 +238,10 @@ struct BrowseActionButtons: View {
 
     private func playCollection(_ browseId: String, shuffle: Bool) async {
         guard let page = try? await InnertubeDetail.shared.browse(browseId: browseId) else { return }
-        var entries = page.songs.map { $0.asEntry(fallbackArt: page.thumbnailUrl) }
-        if shuffle { entries.shuffle() }
-        if !entries.isEmpty { controller.play(entries, at: 0) }
+        let entries = page.songs.map { $0.asEntry(fallbackArt: page.thumbnailUrl) }
+        if !entries.isEmpty {
+            controller.play(entries, context: page.title, contextID: browseId, shuffleRequested: shuffle || controller.shuffleEnabled, shuffleStart: true)
+        }
     }
 }
 

@@ -33,6 +33,10 @@ struct BitChordApp: App {
                 .environment(party)
                 .task {
                     #if DEBUG
+                    if ProcessInfo.processInfo.arguments.contains("--verify-queue") {
+                        await controller.verifyQueueBehavior()
+                        return
+                    }
                     #if os(iOS)
                     if ProcessInfo.processInfo.arguments.contains("--verify-restored-resume") {
                         CipherUnlockWiring.install()
