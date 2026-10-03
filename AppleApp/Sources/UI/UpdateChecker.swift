@@ -13,6 +13,21 @@ struct AppReleaseUpdate: Identifiable {
     var id: String { version }
 }
 
+/// Shared acknowledgement storage for the in-app iOS notice and Sparkle on macOS.
+enum UpdateAcknowledgementStore {
+    private static let key = "bitchord.acknowledgedUpdateVersions"
+
+    static func contains(_ version: String) -> Bool {
+        (UserDefaults.standard.stringArray(forKey: key) ?? []).contains(version)
+    }
+
+    static func record(_ version: String) {
+        var versions = Set(UserDefaults.standard.stringArray(forKey: key) ?? [])
+        versions.insert(version)
+        UserDefaults.standard.set(versions.sorted(), forKey: key)
+    }
+}
+
 private struct GitHubReleasePayload: Decodable {
     let tag_name: String
     let html_url: String
@@ -92,7 +107,9 @@ final class UpdateChecker {
             latest: release.version,
             current: comparableVersion
         ) {
-            available = release
+            if !UpdateAcknowledgementStore.contains(release.version) {
+                available = release
+            }
         }
     }
 
@@ -117,12 +134,12 @@ final class UpdateChecker {
         return nil
     }
 
-    /// Dismiss the notice, so it does not reappear on the next launch.
-    ///
-    /// For this session only. A release the listener chose to ignore is not a release
-    /// they chose to never see, and there is no "don't ask again" upstream either —
-    /// which is the right call, because an update notice is worth seeing twice.
+    /// Acknowledge this release so launch polling will not raise the same notice
+    /// again. A later release has a different version and is still offered.
     func dismiss() {
+        if let version = available?.version {
+            UpdateAcknowledgementStore.record(version)
+        }
         available = nil
     }
 
