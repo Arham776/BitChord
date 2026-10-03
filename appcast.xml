@@ -9,6 +9,35 @@ IMPORTANT: This file was signed by Sparkle. Any modifications to this file requi
         <description>BitChord for macOS updates</description>
         <language>en</language>
         <item>
+            <title>0.1.3</title>
+            <pubDate>Sat, 03 Oct 2026 18:03:53 +0200</pubDate>
+            <sparkle:fullReleaseNotesLink>https://github.com/bagumamartin/BitChord/releases/tag/v0.1.3</sparkle:fullReleaseNotesLink>
+            <sparkle:version>3</sparkle:version>
+            <sparkle:shortVersionString>0.1.3</sparkle:shortVersionString>
+            <sparkle:minimumSystemVersion>15.0</sparkle:minimumSystemVersion>
+            <sparkle:hardwareRequirements>arm64</sparkle:hardwareRequirements>
+            <description sparkle:format="markdown"><![CDATA[### What's changed
+- Update notices now remember when you've acted on a release, so the same version won't keep appearing. A newer release will still be announced.
+- On iPhone and iPad, choosing either alert action acknowledges that release. On Mac, Sparkle remembers your choice.
+
+### macOS build
+Apple Silicon (arm64). The app is ad-hoc signed and the build is not notarized, so macOS may block the first launch.
+
+### Opening BitChord on macOS
+Only continue if you downloaded this DMG from the official BitChord release and trust it.
+
+**System Settings:** Move BitChord to Applications and try to open it once. If macOS blocks it, open System Settings → Privacy & Security, scroll to Security, choose **Open Anyway** for BitChord, then confirm **Open** in the warning dialog.
+
+**Terminal:** After moving BitChord to Applications, open Terminal and run:
+```sh
+xattr -dr com.apple.quarantine "/Applications/BitChord.app"
+open "/Applications/BitChord.app"
+```
+This removes the downloaded-file quarantine attribute from the app bundle so Gatekeeper no longer blocks this launch.
+]]></description>
+            <enclosure url="https://github.com/bagumamartin/BitChord/releases/download/v0.1.3/BitChord-0.1.3.dmg" length="18888922" type="application/octet-stream" sparkle:edSignature="cuTIOCUff6NUW1VGv3s+IwTmM4tG6vJkncWysbxEe3FMpLtNJZWU5zAaBTJDgMBoJqzUVsSkKI2VTOk8wcqZCQ=="/>
+        </item>
+        <item>
             <title>0.1.2</title>
             <pubDate>Sat, 03 Oct 2026 16:59:18 +0200</pubDate>
             <sparkle:fullReleaseNotesLink>https://github.com/bagumamartin/BitChord/releases/tag/v0.1.2</sparkle:fullReleaseNotesLink>
@@ -74,6 +103,6 @@ This removes the downloaded-file quarantine attribute from the app bundle so Gat
     </channel>
 </rss>
 <!-- sparkle-signatures:
-edSignature: ElIbnz1B+XpbMhesUyqPezxMi0lOrunXSVxBbnU3AKzbsP4avVDLRqWw/Hd+4WajZlEelkkTYo5XHLoQVFrYBA==
-length: 5337
+edSignature: 4nUNSirQebj/Z1NTNwenJLZ8C/LiA2bvNQIhnOv2bW/C5dikYa/0EKBnfjjTtsZO3n8B8JMunu/AVS2rVMXGDA==
+length: 7313
 -->
