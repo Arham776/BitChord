@@ -34,11 +34,12 @@ jobs:
       - name: Create local.properties
         run: touch local.properties
 
-      - name: Build shared framework
+           - name: Build shared framework
         env:
           IPHONEOS_DEPLOYMENT_TARGET: '18.0'
           MACOSX_DEPLOYMENT_TARGET: '15.0'
         run: |
+          touch local.properties
           chmod +x scripts/*.sh
           CONFIG=release ./scripts/build-shared-framework.sh
 
