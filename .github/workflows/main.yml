@@ -1,0 +1,74 @@
+name: Build BitChord iOS
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Select Xcode
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: '16.4'
+
+      - name: Install dependencies
+        run: brew install xcodegen cmake
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,aarch64-apple-ios,aarch64-apple-ios-sim
+
+      - name: Build shared framework
+        env:
+          IPHONEOS_DEPLOYMENT_TARGET: '18.0'
+          MACOSX_DEPLOYMENT_TARGET: '15.0'
+        run: |
+          chmod +x scripts/*.sh
+          CONFIG=release ./scripts/build-shared-framework.sh
+
+      - name: Build native audio core
+        run: ./scripts/build-native-core.sh
+
+      - name: Generate Xcode project
+        run: xcodegen generate --spec AppleApp/project.yml
+
+      - name: Build iOS app
+        run: |
+          set -o pipefail
+          xcodebuild \
+            -project AppleApp/BitChord.xcodeproj \
+            -scheme BitChord \
+            -sdk iphoneos \
+            -configuration Release \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            build | xcpretty
+
+      - name: Package IPA
+        run: |
+          mkdir -p Payload
+          cp -R build/Build/Products/Release-iphoneos/BitChord.app Payload/
+          zip -r BitChord-unsigned.ipa Payload
+
+      - name: Upload IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: BitChord-iOS
+          path: BitChord-unsigned.ipa
